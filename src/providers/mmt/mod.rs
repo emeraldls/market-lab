@@ -5,10 +5,14 @@ use serde_json::Value;
 
 use crate::domain::enums::BookMode;
 use crate::domain::requests::{InspectRequest, ReplayRequest};
-use crate::domain::types::{OrderBookLevel, OrderBookSnapshot, ProviderHealth, TopOfBook};
+use crate::domain::types::{
+    OrderBookLevel, OrderBookSnapshot, ProviderHealth, TopOfBook, VdCandle, VdSeries,
+};
 
 pub mod utils;
 pub mod ws;
+pub mod ws_client;
+pub mod ws_vd;
 
 use utils::{normalize_symbol_for_mmt, normalize_to_ms, parse_levels};
 
@@ -33,6 +37,58 @@ impl MmtProvider {
         depth: u16,
     ) -> Result<OrderBookSnapshot> {
         fetch_orderbook_snapshot(exchange, symbol, depth).await
+    }
+
+    pub async fn vd(
+        exchange: &str,
+        symbol: &str,
+        tf: &str,
+        from: u64,
+        to: u64,
+        bucket: u8,
+    ) -> Result<VdSeries> {
+        let api_key = mmt_api_key()?;
+        let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
+        let exchange = exchange.trim().to_lowercase();
+
+        let url = format!("{MMT_BASE_URL}/vd");
+        let resp = Client::new()
+            .get(url)
+            .timeout(std::time::Duration::from_secs(MMT_HTTP_TIMEOUT_SECS))
+            .header("X-API-Key", api_key)
+            .query(&[
+                ("exchange", exchange.as_str()),
+                ("symbol", normalized_symbol.as_str()),
+                ("tf", tf),
+                ("from", &from.to_string()),
+                ("to", &to.to_string()),
+                ("bucket", &bucket.to_string()),
+            ])
+            .send()
+            .await
+            .context("failed to call MMT /vd")?;
+
+        let status = resp.status();
+        let body: Value = resp
+            .json()
+            .await
+            .context("failed to decode MMT /vd response")?;
+        if !status.is_success() {
+            bail!("MMT /vd returned HTTP {} body={}", status, body);
+        }
+
+        let parsed: VdResponse =
+            serde_json::from_value(body).context("invalid /vd payload shape")?;
+        Ok(VdSeries {
+            exchange: parsed.exchange,
+            symbol: parsed.symbol,
+            tf: parsed.tf,
+            from: parsed.from,
+            to: parsed.to,
+            bucket,
+            points: parsed.points,
+            data: parsed.data,
+        })
     }
 
     pub async fn replay(_req: &ReplayRequest) -> Result<Vec<TopOfBook>> {
@@ -67,6 +123,17 @@ impl MmtProvider {
             details: body,
         })
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct VdResponse {
+    data: Vec<VdCandle>,
+    exchange: String,
+    symbol: String,
+    tf: String,
+    from: u64,
+    to: u64,
+    points: usize,
 }
 
 #[derive(Debug, Deserialize)]

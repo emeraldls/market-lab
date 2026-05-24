@@ -18,6 +18,10 @@ pub struct Cli {
 pub enum Commands {
     Inspect(InspectArgs),
     Replay(ReplayArgs),
+    Source {
+        #[command(subcommand)]
+        command: SourceCommands,
+    },
     Study {
         #[command(subcommand)]
         command: StudyCommands,
@@ -26,10 +30,184 @@ pub enum Commands {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum SourceCommands {
+    Orderbook(SourceOrderbookArgs),
+    Vd(SourceVdArgs),
+}
+
+#[derive(Subcommand, Debug)]
 pub enum StudyCommands {
     Slippage(SlippageArgs),
     Imbalance(ImbalanceArgs),
     Vamp(VampArgs),
+    Cvd(CvdArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct SourceVdArgs {
+    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
+    pub provider: CliProviderKind,
+    #[arg(long)]
+    pub exchange: String,
+    #[arg(long)]
+    pub symbol: String,
+    #[arg(long)]
+    pub timeframe: u32,
+    #[arg(long)]
+    pub from: u64,
+    #[arg(long)]
+    pub to: u64,
+    #[arg(long, default_value_t = 1)]
+    pub bucket: u8,
+    #[arg(long, default_value_t = false)]
+    pub stream: bool,
+    #[arg(long, default_value_t = 50)]
+    pub buffer_size: u16,
+    #[arg(long, default_value_t = 1000)]
+    pub interval_ms: u64,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl SourceVdArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.exchange.trim().is_empty() {
+            bail!("--exchange cannot be empty");
+        }
+        if !is_valid_symbol(&self.symbol) {
+            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        mmt_timeframe_from_seconds(self.timeframe)?;
+        if self.from >= self.to {
+            bail!("--from must be less than --to");
+        }
+        if !(1..=11).contains(&self.bucket) {
+            bail!("--bucket must be in range 1..=11");
+        }
+        if self.buffer_size == 0 {
+            bail!("--buffer-size must be >= 1");
+        }
+        if self.interval_ms == 0 {
+            bail!("--interval-ms must be >= 1");
+        }
+        Ok(())
+    }
+
+    pub fn mmt_tf(&self) -> Result<&'static str> {
+        mmt_timeframe_from_seconds(self.timeframe)
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct CvdArgs {
+    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
+    pub provider: CliProviderKind,
+    #[arg(long)]
+    pub exchange: String,
+    #[arg(long)]
+    pub symbol: String,
+    #[arg(long)]
+    pub timeframe: u32,
+    #[arg(long)]
+    pub from: u64,
+    #[arg(long)]
+    pub to: u64,
+    #[arg(long, default_value_t = 1)]
+    pub bucket: u8,
+    #[arg(long, default_value_t = false)]
+    pub stream: bool,
+    #[arg(long, default_value_t = 50)]
+    pub buffer_size: u16,
+    #[arg(long, default_value_t = 1000)]
+    pub interval_ms: u64,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl CvdArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.exchange.trim().is_empty() {
+            bail!("--exchange cannot be empty");
+        }
+        if !is_valid_symbol(&self.symbol) {
+            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        mmt_timeframe_from_seconds(self.timeframe)?;
+        if self.from >= self.to {
+            bail!("--from must be less than --to");
+        }
+        if !(1..=11).contains(&self.bucket) {
+            bail!("--bucket must be in range 1..=11");
+        }
+        if self.buffer_size == 0 {
+            bail!("--buffer-size must be >= 1");
+        }
+        if self.interval_ms == 0 {
+            bail!("--interval-ms must be >= 1");
+        }
+        Ok(())
+    }
+
+    pub fn mmt_tf(&self) -> Result<&'static str> {
+        mmt_timeframe_from_seconds(self.timeframe)
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct SourceOrderbookArgs {
+    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
+    pub provider: CliProviderKind,
+    #[arg(long)]
+    pub exchange: String,
+    #[arg(long)]
+    pub symbol: String,
+    #[arg(long, default_value_t = 100)]
+    pub depth: u16,
+    #[arg(long, default_value_t = false)]
+    pub stream: bool,
+    #[arg(long, default_value_t = 50)]
+    pub buffer_size: u16,
+    #[arg(long, default_value_t = 1000)]
+    pub interval_ms: u64,
+    #[arg(long)]
+    pub min_size: Option<f64>,
+    #[arg(long)]
+    pub max_size: Option<f64>,
+    #[arg(long)]
+    pub price_group: Option<f64>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl SourceOrderbookArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.exchange.trim().is_empty() {
+            bail!("--exchange cannot be empty");
+        }
+        if !is_valid_symbol(&self.symbol) {
+            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        if self.depth == 0 {
+            bail!("--depth must be >= 1");
+        }
+        if self.buffer_size == 0 {
+            bail!("--buffer-size must be >= 1");
+        }
+        if self.interval_ms == 0 {
+            bail!("--interval must be >= 1");
+        }
+        if let Some(pg) = self.price_group
+            && pg <= 0.0
+        {
+            bail!("--price-group must be > 0");
+        }
+        if let (Some(min), Some(max)) = (self.min_size, self.max_size)
+            && min > max
+        {
+            bail!("--min-size cannot be greater than --max-size");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Args)]
@@ -313,6 +491,22 @@ fn is_valid_symbol(symbol: &str) -> bool {
     }
 }
 
+fn mmt_timeframe_from_seconds(seconds: u32) -> Result<&'static str> {
+    match seconds {
+        60 => Ok("1m"),
+        300 => Ok("5m"),
+        900 => Ok("15m"),
+        1800 => Ok("30m"),
+        3600 => Ok("1h"),
+        14_400 => Ok("4h"),
+        86_400 => Ok("1d"),
+        _ => bail!(
+            "unsupported --timeframe seconds: {} (supported: 60,300,900,1800,3600,14400,86400)",
+            seconds
+        ),
+    }
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum CliProviderKind {
     MarketLab,
@@ -396,6 +590,78 @@ mod tests {
     }
 
     #[test]
+    fn parse_source_vd_command() {
+        let cli = Cli::try_parse_from([
+            "market-lab",
+            "source",
+            "vd",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "binancef",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+            "--from",
+            "1704067200",
+            "--to",
+            "1704067800",
+            "--bucket",
+            "1",
+            "--output",
+            "json",
+        ])
+        .expect("source vd parse should succeed");
+
+        match cli.command {
+            Commands::Source {
+                command: SourceCommands::Vd(args),
+            } => {
+                assert_eq!(args.bucket, 1);
+                assert_eq!(args.timeframe, 60);
+            }
+            _ => panic!("expected source vd command"),
+        }
+    }
+
+    #[test]
+    fn parse_study_cvd_command() {
+        let cli = Cli::try_parse_from([
+            "market-lab",
+            "study",
+            "cvd",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "binancef",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+            "--from",
+            "1704067200",
+            "--to",
+            "1704067800",
+            "--bucket",
+            "1",
+            "--output",
+            "json",
+        ])
+        .expect("study cvd parse should succeed");
+
+        match cli.command {
+            Commands::Study {
+                command: StudyCommands::Cvd(args),
+            } => {
+                assert_eq!(args.bucket, 1);
+                assert_eq!(args.timeframe, 60);
+            }
+            _ => panic!("expected study cvd command"),
+        }
+    }
+
+    #[test]
     fn parse_health_command() {
         let cli = Cli::try_parse_from(["market-lab", "health", "--provider", "mmt"])
             .expect("health parse should succeed");
@@ -467,6 +733,42 @@ mod tests {
                 assert_eq!(args.dollar_depth, 50000.0);
             }
             _ => panic!("expected study vamp command"),
+        }
+    }
+
+    #[test]
+    fn parse_source_orderbook_command() {
+        let cli = Cli::try_parse_from([
+            "market-lab",
+            "source",
+            "orderbook",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "bybitf",
+            "--symbol",
+            "BTC/USDT",
+            "--depth",
+            "100",
+            "--stream",
+            "--interval-ms",
+            "500",
+            "--min-size",
+            "0.1",
+            "--price-group",
+            "1",
+        ])
+        .expect("source orderbook parse should succeed");
+
+        match cli.command {
+            Commands::Source {
+                command: SourceCommands::Orderbook(args),
+            } => {
+                assert!(matches!(args.provider, CliProviderKind::Mmt));
+                assert!(args.stream);
+                assert_eq!(args.interval_ms, 500);
+            }
+            _ => panic!("expected source orderbook command"),
         }
     }
 }

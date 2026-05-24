@@ -64,6 +64,43 @@ pub struct VampEstimate {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VdCandle {
+    pub t: u64,
+    pub o: f64,
+    pub h: f64,
+    pub l: f64,
+    pub c: f64,
+    pub n: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VdSeries {
+    pub exchange: String,
+    pub symbol: String,
+    pub tf: String,
+    pub from: u64,
+    pub to: u64,
+    pub bucket: u8,
+    pub points: usize,
+    pub data: Vec<VdCandle>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CvdStudyResult {
+    pub exchange: String,
+    pub symbol: String,
+    pub tf: String,
+    pub from: u64,
+    pub to: u64,
+    pub bucket: u8,
+    pub points: usize,
+    pub first_close: f64,
+    pub last_close: f64,
+    pub delta: f64,
+    pub candles: Vec<VdCandle>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProviderHealth {
     pub provider: String,
     pub status: String,
