@@ -18,10 +18,18 @@ pub struct Cli {
 pub enum Commands {
     Inspect(InspectArgs),
     Replay(ReplayArgs),
+    Study {
+        #[command(subcommand)]
+        command: StudyCommands,
+    },
+    Health(HealthArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum StudyCommands {
     Slippage(SlippageArgs),
     Imbalance(ImbalanceArgs),
     Vamp(VampArgs),
-    Health(HealthArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -398,9 +406,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_imbalance_command() {
+    fn parse_study_imbalance_command() {
         let cli = Cli::try_parse_from([
             "market-lab",
+            "study",
             "imbalance",
             "--provider",
             "mmt",
@@ -414,22 +423,25 @@ mod tests {
             "25",
             "--stream",
         ])
-        .expect("imbalance parse should succeed");
+        .expect("study imbalance parse should succeed");
 
         match cli.command {
-            Commands::Imbalance(args) => {
+            Commands::Study {
+                command: StudyCommands::Imbalance(args),
+            } => {
                 assert!(matches!(args.provider, CliProviderKind::Mmt));
                 assert_eq!(args.depth, 25);
                 assert!(args.stream);
             }
-            _ => panic!("expected imbalance command"),
+            _ => panic!("expected study imbalance command"),
         }
     }
 
     #[test]
-    fn parse_vamp_command() {
+    fn parse_study_vamp_command() {
         let cli = Cli::try_parse_from([
             "market-lab",
+            "study",
             "vamp",
             "--provider",
             "mmt",
@@ -444,15 +456,17 @@ mod tests {
             "--dollar-depth",
             "50000",
         ])
-        .expect("vamp parse should succeed");
+        .expect("study vamp parse should succeed");
 
         match cli.command {
-            Commands::Vamp(args) => {
+            Commands::Study {
+                command: StudyCommands::Vamp(args),
+            } => {
                 assert!(matches!(args.provider, CliProviderKind::Mmt));
                 assert_eq!(args.depth, 100);
                 assert_eq!(args.dollar_depth, 50000.0);
             }
-            _ => panic!("expected vamp command"),
+            _ => panic!("expected study vamp command"),
         }
     }
 }
