@@ -155,3 +155,15 @@ pub struct ProviderHealth {
     pub status: String,
     pub details: serde_json::Value,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SystemStatus {
+    pub app: String,
+    pub version: String,
+    pub provider: String,
+    pub command_groups: Vec<String>,
+    pub sources: Vec<String>,
+    pub studies: Vec<String>,
+    pub strategies: Vec<String>,
+    pub provider_health: ProviderHealth,
+}

@@ -4,10 +4,10 @@ use crate::domain::enums::ProviderKind;
 use crate::domain::requests::{InspectRequest, ReplayRequest};
 use crate::domain::types::{OrderBookSnapshot, ProviderHealth, TopOfBook};
 
-pub mod marketlab;
+pub mod marketlab_cloud;
 pub mod mmt;
 
-use marketlab::MarketLabProvider;
+use marketlab_cloud::MarketLabProvider;
 use mmt::MmtProvider;
 
 pub trait MarketDataProvider {

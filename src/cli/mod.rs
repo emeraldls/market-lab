@@ -32,6 +32,7 @@ pub enum Commands {
         command: StrategyCommands,
     },
     Health(HealthArgs),
+    Status(StatusArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -53,7 +54,24 @@ pub enum StudyCommands {
 
 #[derive(Subcommand, Debug)]
 pub enum StrategyCommands {
-    SmaCrossover(SmaCrossoverArgs),
+    Run {
+        #[command(subcommand)]
+        command: StrategyRunCommands,
+    },
+    Backtest {
+        #[command(subcommand)]
+        command: StrategyBacktestCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum StrategyRunCommands {
+    SmaCrossover(RunSmaCrossoverArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum StrategyBacktestCommands {
+    SmaCrossover(BacktestSmaCrossoverArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -305,6 +323,14 @@ impl SourceOrderbookArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct HealthArgs {
+    #[arg(long, value_enum, default_value_t = CliProviderKind::MarketLab)]
+    pub provider: CliProviderKind,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct StatusArgs {
     #[arg(long, value_enum, default_value_t = CliProviderKind::MarketLab)]
     pub provider: CliProviderKind,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
@@ -614,7 +640,7 @@ pub struct DepthArgs {
 }
 
 #[derive(Clone, Debug, Args)]
-pub struct SmaCrossoverArgs {
+pub struct RunSmaCrossoverArgs {
     #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
     pub provider: CliProviderKind,
     #[arg(long)]
@@ -625,37 +651,21 @@ pub struct SmaCrossoverArgs {
     pub timeframe: u32,
     #[arg(long)]
     pub from: Option<u64>,
-    #[arg(long)]
-    pub to: Option<u64>,
     #[arg(long, default_value_t = 20)]
     pub fast: usize,
     #[arg(long, default_value_t = 50)]
     pub slow: usize,
     #[arg(long, default_value_t = 1)]
     pub confirm_bars: usize,
-    #[arg(long, default_value_t = false)]
-    pub stream: bool,
     #[arg(long, default_value_t = 50)]
     pub buffer_size: u16,
-    #[arg(long, default_value_t = 0.3)]
-    pub oos_ratio: f64,
-    #[arg(long)]
-    pub min_trades: Option<usize>,
-    #[arg(long)]
-    pub min_oos_sharpe: Option<f64>,
-    #[arg(long)]
-    pub max_oos_sharpe: Option<f64>,
-    #[arg(long)]
-    pub min_oos_vs_is_ratio: Option<f64>,
-    #[arg(long)]
-    pub max_drawdown: Option<f64>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
     #[arg(long, default_value_t = false)]
     pub verbose: bool,
 }
 
-impl SmaCrossoverArgs {
+impl RunSmaCrossoverArgs {
     pub fn validate(&self) -> Result<()> {
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
@@ -676,44 +686,58 @@ impl SmaCrossoverArgs {
         if self.buffer_size == 0 {
             bail!("--buffer-size must be >= 1");
         }
-        if !(0.0..1.0).contains(&self.oos_ratio) {
-            bail!("--oos-ratio must be > 0 and < 1");
-        }
-        if let Some(v) = self.max_drawdown
-            && v < 0.0
-        {
-            bail!("--max-drawdown must be >= 0");
-        }
-        if self.stream {
-            if self.to.is_some() {
-                bail!("--to is not allowed with --stream");
-            }
-            if self.min_trades.is_some()
-                || self.min_oos_sharpe.is_some()
-                || self.max_oos_sharpe.is_some()
-                || self.min_oos_vs_is_ratio.is_some()
-                || self.max_drawdown.is_some()
-            {
-                bail!(
-                    "backtest threshold flags are not allowed with --stream"
-                );
-            }
-        } else {
-            let from = self
-                .from
-                .ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?;
-            let to = self
-                .to
-                .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?;
-            if from >= to {
-                bail!("--from must be less than --to");
-            }
-        }
         Ok(())
     }
+}
 
-    pub fn mmt_tf(&self) -> Result<&'static str> {
-        mmt_timeframe_from_seconds(self.timeframe)
+#[derive(Clone, Debug, Args)]
+pub struct BacktestSmaCrossoverArgs {
+    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
+    pub provider: CliProviderKind,
+    #[arg(long)]
+    pub exchange: String,
+    #[arg(long)]
+    pub symbol: String,
+    #[arg(long)]
+    pub timeframe: u32,
+    #[arg(long)]
+    pub from: u64,
+    #[arg(long)]
+    pub to: u64,
+    #[arg(long, default_value_t = 20)]
+    pub fast: usize,
+    #[arg(long, default_value_t = 50)]
+    pub slow: usize,
+    #[arg(long, default_value_t = 1)]
+    pub confirm_bars: usize,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+    #[arg(long, default_value_t = false)]
+    pub verbose: bool,
+}
+
+impl BacktestSmaCrossoverArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.exchange.trim().is_empty() {
+            bail!("--exchange cannot be empty");
+        }
+        if !is_valid_symbol(&self.symbol) {
+            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        mmt_timeframe_from_seconds(self.timeframe)?;
+        if self.fast < 2 {
+            bail!("--fast must be >= 2");
+        }
+        if self.slow <= self.fast {
+            bail!("--slow must be greater than --fast");
+        }
+        if self.confirm_bars < 1 {
+            bail!("--confirm-bars must be >= 1");
+        }
+        if self.from >= self.to {
+            bail!("--from must be less than --to");
+        }
+        Ok(())
     }
 }
 
@@ -1084,6 +1108,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_status_command() {
+        let cli = Cli::try_parse_from(["market-lab", "status", "--provider", "mmt"])
+            .expect("status parse should succeed");
+        match cli.command {
+            Commands::Status(args) => assert!(matches!(args.provider, CliProviderKind::Mmt)),
+            _ => panic!("expected status command"),
+        }
+    }
+
+    #[test]
     fn parse_study_imbalance_command() {
         let cli = Cli::try_parse_from([
             "market-lab",
@@ -1185,6 +1219,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "market-lab",
             "strategy",
+            "backtest",
             "sma-crossover",
             "--provider",
             "mmt",
@@ -1202,29 +1237,26 @@ mod tests {
             "20",
             "--slow",
             "50",
-            "--min-trades",
-            "10",
         ])
         .expect("strategy parse should succeed");
 
         match cli.command {
             Commands::Strategy {
-                command: StrategyCommands::SmaCrossover(args),
+                command: StrategyCommands::Backtest { command: StrategyBacktestCommands::SmaCrossover(args) },
             } => {
-                assert_eq!(args.from, Some(1704067200));
-                assert_eq!(args.to, Some(1704067800));
-                assert_eq!(args.min_trades, Some(10));
-                assert!(!args.stream);
+                assert_eq!(args.from, 1704067200);
+                assert_eq!(args.to, 1704067800);
             }
-            _ => panic!("expected strategy sma-crossover command"),
+            _ => panic!("expected strategy backtest sma-crossover command"),
         }
     }
 
     #[test]
-    fn reject_strategy_thresholds_in_stream_mode() {
+    fn parse_strategy_run_with_from_command() {
         let cli = Cli::try_parse_from([
             "market-lab",
             "strategy",
+            "run",
             "sma-crossover",
             "--provider",
             "mmt",
@@ -1234,64 +1266,28 @@ mod tests {
             "BTC/USDT",
             "--timeframe",
             "60",
-            "--stream",
-            "--min-oos-sharpe",
-            "1.2",
-        ])
-        .expect("strategy parse should succeed");
-
-        match cli.command {
-            Commands::Strategy {
-                command: StrategyCommands::SmaCrossover(args),
-            } => {
-                let err = args.validate().expect_err("validate should fail");
-                assert!(
-                    err.to_string()
-                        .contains("backtest threshold flags are not allowed with --stream")
-                );
-            }
-            _ => panic!("expected strategy sma-crossover command"),
-        }
-    }
-
-    #[test]
-    fn parse_strategy_stream_with_from_command() {
-        let cli = Cli::try_parse_from([
-            "market-lab",
-            "strategy",
-            "sma-crossover",
-            "--provider",
-            "mmt",
-            "--exchange",
-            "bybitf",
-            "--symbol",
-            "BTC/USDT",
-            "--timeframe",
-            "60",
-            "--stream",
             "--from",
             "1704067200",
         ])
-        .expect("strategy stream parse should succeed");
+        .expect("strategy run parse should succeed");
 
         match cli.command {
             Commands::Strategy {
-                command: StrategyCommands::SmaCrossover(args),
+                command: StrategyCommands::Run { command: StrategyRunCommands::SmaCrossover(args) },
             } => {
                 args.validate().expect("validate should succeed");
-                assert!(args.stream);
                 assert_eq!(args.from, Some(1704067200));
-                assert_eq!(args.to, None);
             }
-            _ => panic!("expected strategy sma-crossover command"),
+            _ => panic!("expected strategy run sma-crossover command"),
         }
     }
 
     #[test]
-    fn reject_strategy_stream_with_to() {
-        let cli = Cli::try_parse_from([
+    fn reject_strategy_run_with_to() {
+        let err = Cli::try_parse_from([
             "market-lab",
             "strategy",
+            "run",
             "sma-crossover",
             "--provider",
             "mmt",
@@ -1301,20 +1297,10 @@ mod tests {
             "BTC/USDT",
             "--timeframe",
             "60",
-            "--stream",
             "--to",
             "1704067800",
         ])
-        .expect("strategy parse should succeed");
-
-        match cli.command {
-            Commands::Strategy {
-                command: StrategyCommands::SmaCrossover(args),
-            } => {
-                let err = args.validate().expect_err("validate should fail");
-                assert!(err.to_string().contains("--to is not allowed with --stream"));
-            }
-            _ => panic!("expected strategy sma-crossover command"),
-        }
+        .expect_err("strategy run parse should fail");
+        assert!(err.to_string().contains("--to"));
     }
 }

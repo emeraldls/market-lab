@@ -8,7 +8,10 @@ mod core;
 mod domain;
 mod providers;
 
-use cli::{Cli, Commands, SourceCommands, StrategyCommands, StudyCommands};
+use cli::{
+    Cli, Commands, SourceCommands, StrategyBacktestCommands, StrategyCommands,
+    StrategyRunCommands, StudyCommands,
+};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -34,11 +37,19 @@ async fn main() -> Result<()> {
             StudyCommands::Cvd(args) => commands::study::cvd::handle(args).await?,
         },
         Commands::Strategy { command: strategy } => match strategy {
-            StrategyCommands::SmaCrossover(args) => {
-                commands::strategy::sma_crossover::handle(args).await?
-            }
+            StrategyCommands::Run { command } => match command {
+                StrategyRunCommands::SmaCrossover(args) => {
+                    commands::strategy::sma_crossover::handle_run(args).await?
+                }
+            },
+            StrategyCommands::Backtest { command } => match command {
+                StrategyBacktestCommands::SmaCrossover(args) => {
+                    commands::strategy::sma_crossover::handle_backtest(args).await?
+                }
+            },
         },
         Commands::Health(args) => commands::system::health::handle(args).await?,
+        Commands::Status(args) => commands::system::status::handle(args).await?,
     }
 
     Ok(())

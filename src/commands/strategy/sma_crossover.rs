@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use crate::cli::{CliProviderKind, OutputFormat, SmaCrossoverArgs};
+use crate::cli::{BacktestSmaCrossoverArgs, CliProviderKind, OutputFormat, RunSmaCrossoverArgs};
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::ws_candles::MmtCandlesStream;
 
@@ -81,12 +81,6 @@ struct StrategyInputs {
     fast: usize,
     slow: usize,
     confirm_bars: usize,
-    oos_ratio: Option<f64>,
-    min_trades: Option<usize>,
-    min_oos_sharpe: Option<f64>,
-    max_oos_sharpe: Option<f64>,
-    min_oos_vs_is_ratio: Option<f64>,
-    max_drawdown: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,11 +100,6 @@ struct StrategyDecision {
 
 #[derive(Debug, Clone, Serialize)]
 struct StrategyMetrics {
-    trades: usize,
-    in_sample_sharpe: Option<f64>,
-    out_of_sample_sharpe: Option<f64>,
-    oos_vs_is_ratio: Option<f64>,
-    max_drawdown: Option<f64>,
     prev_fast: f64,
     prev_slow: f64,
     curr_fast: f64,
@@ -120,9 +109,7 @@ struct StrategyMetrics {
 #[derive(Debug, Clone, Serialize)]
 struct BacktestPerformance {
     trades: usize,
-    in_sample_sharpe: Option<f64>,
-    out_of_sample_sharpe: Option<f64>,
-    oos_vs_is_ratio: Option<f64>,
+    sharpe: Option<f64>,
     max_drawdown: Option<f64>,
 }
 
@@ -141,98 +128,160 @@ struct CrossoverState {
 #[derive(Debug, Clone, Default)]
 struct PerformanceMetrics {
     trades: usize,
-    in_sample_sharpe: Option<f64>,
-    out_of_sample_sharpe: Option<f64>,
-    oos_vs_is_ratio: Option<f64>,
+    sharpe: Option<f64>,
     max_drawdown: Option<f64>,
 }
 
-pub async fn handle(args: SmaCrossoverArgs) -> Result<()> {
-    args.validate()?;
+#[derive(Debug, Clone)]
+struct StrategyCommonArgs {
+    provider: CliProviderKind,
+    exchange: String,
+    symbol: String,
+    timeframe: u32,
+    fast: usize,
+    slow: usize,
+    confirm_bars: usize,
+    buffer_size: u16,
+    output: OutputFormat,
+    verbose: bool,
+}
 
-    if !matches!(args.provider, CliProviderKind::Mmt) {
+impl From<&RunSmaCrossoverArgs> for StrategyCommonArgs {
+    fn from(value: &RunSmaCrossoverArgs) -> Self {
+        Self {
+            provider: value.provider,
+            exchange: value.exchange.clone(),
+            symbol: value.symbol.clone(),
+            timeframe: value.timeframe,
+            fast: value.fast,
+            slow: value.slow,
+            confirm_bars: value.confirm_bars,
+            buffer_size: value.buffer_size,
+            output: value.output,
+            verbose: value.verbose,
+        }
+    }
+}
+
+impl From<&BacktestSmaCrossoverArgs> for StrategyCommonArgs {
+    fn from(value: &BacktestSmaCrossoverArgs) -> Self {
+        Self {
+            provider: value.provider,
+            exchange: value.exchange.clone(),
+            symbol: value.symbol.clone(),
+            timeframe: value.timeframe,
+            fast: value.fast,
+            slow: value.slow,
+            confirm_bars: value.confirm_bars,
+            buffer_size: 50,
+            output: value.output,
+            verbose: value.verbose,
+        }
+    }
+}
+
+impl StrategyCommonArgs {
+    fn mmt_tf(&self) -> Result<&'static str> {
+        match self.timeframe {
+            60 => Ok("1m"),
+            300 => Ok("5m"),
+            900 => Ok("15m"),
+            1800 => Ok("30m"),
+            3600 => Ok("1h"),
+            14_400 => Ok("4h"),
+            86_400 => Ok("1d"),
+            _ => bail!(
+                "unsupported --timeframe seconds: {} (supported: 60,300,900,1800,3600,14400,86400)",
+                self.timeframe
+            ),
+        }
+    }
+}
+
+pub async fn handle_run(args: RunSmaCrossoverArgs) -> Result<()> {
+    args.validate()?;
+    let common = StrategyCommonArgs::from(&args);
+
+    if !matches!(common.provider, CliProviderKind::Mmt) {
         bail!("strategy sma-crossover currently supports only --provider mmt");
     }
 
-    if args.stream {
-        return stream_strategy(args).await;
-    }
-
-    evaluate_window(args).await
+    stream_strategy(args, common).await
 }
 
-async fn evaluate_window(args: SmaCrossoverArgs) -> Result<()> {
-    let from = args
-        .from
-        .ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?;
-    let to = args
-        .to
-        .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?;
+pub async fn handle_backtest(args: BacktestSmaCrossoverArgs) -> Result<()> {
+    args.validate()?;
+    let common = StrategyCommonArgs::from(&args);
+
+    if !matches!(common.provider, CliProviderKind::Mmt) {
+        bail!("strategy sma-crossover currently supports only --provider mmt");
+    }
+
+    evaluate_window(args, common).await
+}
+
+async fn evaluate_window(args: BacktestSmaCrossoverArgs, common: StrategyCommonArgs) -> Result<()> {
+    let from = args.from;
+    let to = args.to;
 
     let series = MmtProvider::candles(
-        &args.exchange,
-        &args.symbol,
-        args.mmt_tf()?,
+        &common.exchange,
+        &common.symbol,
+        common.mmt_tf()?,
         from,
         to,
     )
     .await?;
 
     let closes: Vec<f64> = series.data.iter().map(|x| x.c).collect();
-    let crossover = crossover_state(&closes, args.fast, args.slow, args.confirm_bars)?;
-    let performance = backtest_metrics(&closes, &args)?;
+    let crossover = crossover_state(&closes, common.fast, common.slow, common.confirm_bars)?;
+    let performance = backtest_metrics(&closes, &common)?;
     let result = BacktestResult {
         r#type: "strategy.backtest.result",
         version: "1",
         strategy: "sma-crossover",
         provider: "mmt".to_string(),
-        exchange: args.exchange.to_lowercase(),
-        symbol: args.symbol.to_uppercase(),
+        exchange: common.exchange.to_lowercase(),
+        symbol: common.symbol.to_uppercase(),
         ts_ms: to * 1000,
         window: StrategyWindow {
             from: Some(from),
             to: Some(to),
-            timeframe_sec: args.timeframe,
+            timeframe_sec: common.timeframe,
         },
-        inputs: strategy_inputs(&args),
+        inputs: strategy_inputs(&common),
         performance: BacktestPerformance {
             trades: performance.trades,
-            in_sample_sharpe: performance.in_sample_sharpe,
-            out_of_sample_sharpe: performance.out_of_sample_sharpe,
-            oos_vs_is_ratio: performance.oos_vs_is_ratio,
+            sharpe: performance.sharpe,
             max_drawdown: performance.max_drawdown,
         },
         latest_state: StrategyMetrics {
-            trades: performance.trades,
             prev_fast: crossover.prev_fast,
             prev_slow: crossover.prev_slow,
             curr_fast: crossover.curr_fast,
             curr_slow: crossover.curr_slow,
-            in_sample_sharpe: performance.in_sample_sharpe,
-            out_of_sample_sharpe: performance.out_of_sample_sharpe,
-            oos_vs_is_ratio: performance.oos_vs_is_ratio,
-            max_drawdown: performance.max_drawdown,
         },
-        reasons: validation_reasons(&args, &performance, &crossover),
+        reasons: validation_reasons(&common, &performance, &crossover),
     };
 
-    render_backtest_result(&result, args.output, args.verbose)
+    render_backtest_result(&result, common.output, common.verbose)
 }
 
-async fn stream_strategy(args: SmaCrossoverArgs) -> Result<()> {
-    if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
+async fn stream_strategy(args: RunSmaCrossoverArgs, common: StrategyCommonArgs) -> Result<()> {
+    if matches!(common.output, OutputFormat::Csv | OutputFormat::Parquet) {
         bail!("stream mode currently supports only --output terminal|json|jsonl");
     }
 
-    let mut stream = MmtCandlesStream::connect(&args.exchange, &args.symbol, args.mmt_tf()?).await?;
+    let mut stream = MmtCandlesStream::connect(&common.exchange, &common.symbol, common.mmt_tf()?).await?;
     let first_candle = stream.next_candle().await?;
-    let mut history = load_stream_warmup_closes(&args, first_candle.t).await?;
-    let history_cap = (args.slow + args.confirm_bars + 8).max(64);
+    let mut history = load_stream_warmup_closes(&args, &common, first_candle.t).await?;
+    let history_cap = (common.slow + common.confirm_bars + 8).max(64);
     trim_history(&mut history, history_cap);
     let mut open_candle: Option<(u64, f64)> = Some((first_candle.t, first_candle.c));
     let mut buf: VecDeque<String> = VecDeque::with_capacity(args.buffer_size as usize);
     emit_startup_state(
-        &args,
+        &common,
+        args.from,
         &history,
         first_candle.t,
         first_candle.c,
@@ -265,12 +314,13 @@ async fn stream_strategy(args: SmaCrossoverArgs) -> Result<()> {
                         let closes: Vec<f64> = history.iter().copied().collect();
                         if let Ok(crossover) = crossover_state(&closes, args.fast, args.slow, args.confirm_bars) {
                             let result = build_stream_result(
-                                &args,
+                                &common,
+                                args.from,
                                 closed_ts,
                                 &crossover,
                                 live_decision(&crossover),
                                 vec![
-                                    format!("live tf={} on_close=true", args.mmt_tf()?),
+                                    format!("live tf={} on_close=true", common.mmt_tf()?),
                                     format!(
                                         "prev_fast={:.6} prev_slow={:.6} curr_fast={:.6} curr_slow={:.6}",
                                         crossover.prev_fast, crossover.prev_slow, crossover.curr_fast, crossover.curr_slow
@@ -278,7 +328,7 @@ async fn stream_strategy(args: SmaCrossoverArgs) -> Result<()> {
                                 ],
                             );
 
-                            emit_stream_result(&result, args.output, args.verbose, args.buffer_size, &mut buf)?;
+                            emit_stream_result(&result, common.output, common.verbose, args.buffer_size, &mut buf)?;
                         }
 
                         open_candle = Some((candle.t, candle.c));
@@ -291,22 +341,17 @@ async fn stream_strategy(args: SmaCrossoverArgs) -> Result<()> {
     Ok(())
 }
 
-fn strategy_inputs(args: &SmaCrossoverArgs) -> StrategyInputs {
+fn strategy_inputs(args: &StrategyCommonArgs) -> StrategyInputs {
     StrategyInputs {
         fast: args.fast,
         slow: args.slow,
         confirm_bars: args.confirm_bars,
-        oos_ratio: (!args.stream).then_some(args.oos_ratio),
-        min_trades: args.min_trades,
-        min_oos_sharpe: args.min_oos_sharpe,
-        max_oos_sharpe: args.max_oos_sharpe,
-        min_oos_vs_is_ratio: args.min_oos_vs_is_ratio,
-        max_drawdown: args.max_drawdown,
     }
 }
 
 fn emit_startup_state(
-    args: &SmaCrossoverArgs,
+    args: &StrategyCommonArgs,
+    from: Option<u64>,
     history: &VecDeque<f64>,
     open_ts: u64,
     open_close: f64,
@@ -328,7 +373,7 @@ fn emit_startup_state(
             crossover.prev_fast, crossover.prev_slow, crossover.curr_fast, crossover.curr_slow
         ),
     ];
-    let result = build_stream_result(args, open_ts, &crossover, decision, reasons);
+    let result = build_stream_result(args, from, open_ts, &crossover, decision, reasons);
 
     emit_stream_result(&result, args.output, args.verbose, args.buffer_size, buf)
 }
@@ -356,7 +401,8 @@ fn live_decision(crossover: &CrossoverState) -> StrategyDecision {
 }
 
 fn build_stream_result(
-    args: &SmaCrossoverArgs,
+    args: &StrategyCommonArgs,
+    from: Option<u64>,
     ts_s: u64,
     crossover: &CrossoverState,
     decision: StrategyDecision,
@@ -372,7 +418,7 @@ fn build_stream_result(
         ts_ms: ts_s * 1000,
         mode: "stream",
         window: StrategyWindow {
-            from: args.from,
+            from,
             to: None,
             timeframe_sec: args.timeframe,
         },
@@ -385,11 +431,6 @@ fn build_stream_result(
         },
         decision,
         metrics: StrategyMetrics {
-            trades: 0,
-            in_sample_sharpe: None,
-            out_of_sample_sharpe: None,
-            oos_vs_is_ratio: None,
-            max_drawdown: None,
             prev_fast: crossover.prev_fast,
             prev_slow: crossover.prev_slow,
             curr_fast: crossover.curr_fast,
@@ -431,9 +472,13 @@ fn emit_stream_result(
     Ok(())
 }
 
-async fn load_stream_warmup_closes(args: &SmaCrossoverArgs, first_stream_ts: u64) -> Result<VecDeque<f64>> {
-    let tf_sec = args.timeframe as u64;
-    let warmup_bars = (args.slow + args.confirm_bars + 8).max(64) as u64;
+async fn load_stream_warmup_closes(
+    args: &RunSmaCrossoverArgs,
+    common: &StrategyCommonArgs,
+    first_stream_ts: u64,
+) -> Result<VecDeque<f64>> {
+    let tf_sec = common.timeframe as u64;
+    let warmup_bars = (common.slow + common.confirm_bars + 8).max(64) as u64;
     let aligned_first = first_stream_ts - (first_stream_ts % tf_sec);
     let aligned_first_ms = aligned_first * 1000;
     let from = args
@@ -441,9 +486,9 @@ async fn load_stream_warmup_closes(args: &SmaCrossoverArgs, first_stream_ts: u64
         .unwrap_or_else(|| aligned_first_ms.saturating_sub(warmup_bars * tf_sec * 1000));
 
     let series = MmtProvider::candles(
-        &args.exchange,
-        &args.symbol,
-        args.mmt_tf()?,
+        &common.exchange,
+        &common.symbol,
+        common.mmt_tf()?,
         from,
         aligned_first_ms,
     )
@@ -465,7 +510,7 @@ fn trim_history(history: &mut VecDeque<f64>, cap: usize) {
 }
 
 fn validation_reasons(
-    args: &SmaCrossoverArgs,
+    args: &StrategyCommonArgs,
     metrics: &PerformanceMetrics,
     crossover: &CrossoverState,
 ) -> Vec<String> {
@@ -478,11 +523,9 @@ fn validation_reasons(
             args.confirm_bars
         ),
         format!(
-            "trades={} is_sharpe={:.4?} oos_sharpe={:.4?} oos_vs_is_ratio={:.4?} max_drawdown={:.4?}",
+            "trades={} sharpe={:.4?} max_drawdown={:.4?}",
             metrics.trades,
-            metrics.in_sample_sharpe,
-            metrics.out_of_sample_sharpe,
-            metrics.oos_vs_is_ratio,
+            metrics.sharpe,
             metrics.max_drawdown
         ),
         format!(
@@ -492,31 +535,19 @@ fn validation_reasons(
     ]
 }
 
-fn backtest_metrics(closes: &[f64], args: &SmaCrossoverArgs) -> Result<PerformanceMetrics> {
+fn backtest_metrics(closes: &[f64], args: &StrategyCommonArgs) -> Result<PerformanceMetrics> {
     let returns = strategy_returns(closes, args.fast, args.slow)?;
     if returns.is_empty() {
         return Ok(PerformanceMetrics::default());
     }
 
-    let split_idx = ((returns.len() as f64) * (1.0 - args.oos_ratio)).floor() as usize;
-    let split_idx = split_idx.clamp(1, returns.len());
-    let in_sample = &returns[..split_idx];
-    let out_of_sample = &returns[split_idx..];
-
     let trades = count_trades(closes, args.fast, args.slow)?;
-    let in_sample_sharpe = sharpe(in_sample);
-    let out_of_sample_sharpe = sharpe(out_of_sample);
-    let oos_vs_is_ratio = match (in_sample_sharpe, out_of_sample_sharpe) {
-        (Some(is), Some(oos)) if is.abs() > f64::EPSILON => Some(oos / is),
-        _ => None,
-    };
+    let sharpe = sharpe(&returns);
     let max_drawdown = max_drawdown(&returns);
 
     Ok(PerformanceMetrics {
         trades,
-        in_sample_sharpe,
-        out_of_sample_sharpe,
-        oos_vs_is_ratio,
+        sharpe,
         max_drawdown,
     })
 }
@@ -694,11 +725,9 @@ fn render_backtest_result(result: &BacktestResult, output: OutputFormat, verbose
                 result.inputs.confirm_bars
             );
             println!(
-                "trades={} is_sharpe={:.4?} oos_sharpe={:.4?} ratio={:.4?} max_drawdown={:.4?}",
+                "trades={} sharpe={:.4?} max_drawdown={:.4?}",
                 result.performance.trades,
-                result.performance.in_sample_sharpe,
-                result.performance.out_of_sample_sharpe,
-                result.performance.oos_vs_is_ratio,
+                result.performance.sharpe,
                 result.performance.max_drawdown
             );
             if verbose {
@@ -825,12 +854,6 @@ mod tests {
                 fast: 20,
                 slow: 50,
                 confirm_bars: 1,
-                oos_ratio: Some(0.3),
-                min_trades: Some(5),
-                min_oos_sharpe: Some(1.0),
-                max_oos_sharpe: None,
-                min_oos_vs_is_ratio: None,
-                max_drawdown: Some(0.2),
             },
             signal: StrategySignal {
                 event: "no_cross",
@@ -844,11 +867,6 @@ mod tests {
                 reason: "test".to_string(),
             },
             metrics: StrategyMetrics {
-                trades: 0,
-                in_sample_sharpe: None,
-                out_of_sample_sharpe: None,
-                oos_vs_is_ratio: None,
-                max_drawdown: None,
                 prev_fast: 0.0,
                 prev_slow: 0.0,
                 curr_fast: 0.0,
@@ -883,26 +901,13 @@ mod tests {
                 fast: 20,
                 slow: 50,
                 confirm_bars: 1,
-                oos_ratio: Some(0.3),
-                min_trades: Some(5),
-                min_oos_sharpe: Some(1.0),
-                max_oos_sharpe: None,
-                min_oos_vs_is_ratio: None,
-                max_drawdown: Some(0.2),
             },
             performance: BacktestPerformance {
                 trades: 5,
-                in_sample_sharpe: Some(1.0),
-                out_of_sample_sharpe: Some(0.5),
-                oos_vs_is_ratio: Some(0.5),
+                sharpe: Some(1.0),
                 max_drawdown: Some(0.1),
             },
             latest_state: StrategyMetrics {
-                trades: 5,
-                in_sample_sharpe: Some(1.0),
-                out_of_sample_sharpe: Some(0.5),
-                oos_vs_is_ratio: Some(0.5),
-                max_drawdown: Some(0.1),
                 prev_fast: 0.0,
                 prev_slow: 0.0,
                 curr_fast: 0.0,
@@ -943,12 +948,6 @@ mod tests {
                 fast: 20,
                 slow: 50,
                 confirm_bars: 1,
-                oos_ratio: Some(0.3),
-                min_trades: Some(5),
-                min_oos_sharpe: Some(1.0),
-                max_oos_sharpe: None,
-                min_oos_vs_is_ratio: None,
-                max_drawdown: Some(0.2),
             },
             signal: StrategySignal {
                 event: "no_cross",
@@ -962,11 +961,6 @@ mod tests {
                 reason: "test".to_string(),
             },
             metrics: StrategyMetrics {
-                trades: 1,
-                in_sample_sharpe: Some(1.0),
-                out_of_sample_sharpe: Some(0.5),
-                oos_vs_is_ratio: Some(0.5),
-                max_drawdown: Some(0.1),
                 prev_fast: 1.0,
                 prev_slow: 2.0,
                 curr_fast: 3.0,
@@ -1013,26 +1007,13 @@ mod tests {
                 fast: 20,
                 slow: 50,
                 confirm_bars: 1,
-                oos_ratio: Some(0.3),
-                min_trades: Some(5),
-                min_oos_sharpe: Some(1.0),
-                max_oos_sharpe: None,
-                min_oos_vs_is_ratio: None,
-                max_drawdown: Some(0.2),
             },
             performance: BacktestPerformance {
                 trades: 5,
-                in_sample_sharpe: Some(1.0),
-                out_of_sample_sharpe: Some(0.5),
-                oos_vs_is_ratio: Some(0.5),
+                sharpe: Some(1.0),
                 max_drawdown: Some(0.1),
             },
             latest_state: StrategyMetrics {
-                trades: 5,
-                in_sample_sharpe: Some(1.0),
-                out_of_sample_sharpe: Some(0.5),
-                oos_vs_is_ratio: Some(0.5),
-                max_drawdown: Some(0.1),
                 prev_fast: 1.0,
                 prev_slow: 2.0,
                 curr_fast: 3.0,
