@@ -48,6 +48,31 @@ pub struct ImbalanceEstimate {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SpreadEstimate {
+    pub exchange: String,
+    pub symbol: String,
+    pub at: u64,
+    pub best_bid: f64,
+    pub best_ask: f64,
+    pub spread_abs: f64,
+    pub spread_bps: f64,
+    pub mid: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DepthEstimate {
+    pub exchange: String,
+    pub symbol: String,
+    pub at: u64,
+    pub levels: u16,
+    pub bid_base: f64,
+    pub ask_base: f64,
+    pub bid_quote: f64,
+    pub ask_quote: f64,
+    pub total_quote: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VampEstimate {
     pub exchange: String,
     pub symbol: String,
@@ -61,6 +86,30 @@ pub struct VampEstimate {
     pub max_reachable_quote_ask: f64,
     pub max_reachable_quote_bid: f64,
     pub complete: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OhlcvtCandle {
+    pub t: u64,
+    pub o: f64,
+    pub h: f64,
+    pub l: f64,
+    pub c: f64,
+    pub vb: f64,
+    pub vs: f64,
+    pub tb: u64,
+    pub ts: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CandleSeries {
+    pub exchange: String,
+    pub symbol: String,
+    pub tf: String,
+    pub from: u64,
+    pub to: u64,
+    pub points: usize,
+    pub data: Vec<OhlcvtCandle>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -6,15 +6,17 @@ use serde_json::Value;
 use crate::domain::enums::BookMode;
 use crate::domain::requests::{InspectRequest, ReplayRequest};
 use crate::domain::types::{
-    OrderBookLevel, OrderBookSnapshot, ProviderHealth, TopOfBook, VdCandle, VdSeries,
+    CandleSeries, OhlcvtCandle, OrderBookLevel, OrderBookSnapshot, ProviderHealth, TopOfBook,
+    VdCandle, VdSeries,
 };
 
 pub mod utils;
 pub mod ws;
+pub mod ws_candles;
 pub mod ws_client;
 pub mod ws_vd;
 
-use utils::{normalize_symbol_for_mmt, normalize_to_ms, parse_levels};
+use utils::{normalize_symbol_for_mmt, normalize_to_ms, normalize_to_seconds, parse_levels};
 
 const MMT_BASE_URL: &str = "https://eu-central-1.mmt.gg/api/v1";
 const MMT_API_KEY_ENV: &str = "MMT_API_KEY";
@@ -50,6 +52,8 @@ impl MmtProvider {
         let api_key = mmt_api_key()?;
         let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
         let exchange = exchange.trim().to_lowercase();
+        let from_s = normalize_to_seconds(from);
+        let to_s = normalize_to_seconds(to);
 
         let url = format!("{MMT_BASE_URL}/vd");
         let resp = Client::new()
@@ -60,8 +64,8 @@ impl MmtProvider {
                 ("exchange", exchange.as_str()),
                 ("symbol", normalized_symbol.as_str()),
                 ("tf", tf),
-                ("from", &from.to_string()),
-                ("to", &to.to_string()),
+                ("from", &from_s.to_string()),
+                ("to", &to_s.to_string()),
                 ("bucket", &bucket.to_string()),
             ])
             .send()
@@ -83,9 +87,60 @@ impl MmtProvider {
             exchange: parsed.exchange,
             symbol: parsed.symbol,
             tf: parsed.tf,
-            from: parsed.from,
-            to: parsed.to,
+            from: normalize_to_ms(parsed.from),
+            to: normalize_to_ms(parsed.to),
             bucket,
+            points: parsed.points,
+            data: parsed.data,
+        })
+    }
+
+    pub async fn candles(
+        exchange: &str,
+        symbol: &str,
+        tf: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<CandleSeries> {
+        let api_key = mmt_api_key()?;
+        let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
+        let exchange = exchange.trim().to_lowercase();
+        let from_s = normalize_to_seconds(from);
+        let to_s = normalize_to_seconds(to);
+
+        let url = format!("{MMT_BASE_URL}/candles");
+        let resp = Client::new()
+            .get(url)
+            .timeout(std::time::Duration::from_secs(MMT_HTTP_TIMEOUT_SECS))
+            .header("X-API-Key", api_key)
+            .query(&[
+                ("exchange", exchange.as_str()),
+                ("symbol", normalized_symbol.as_str()),
+                ("tf", tf),
+                ("from", &from_s.to_string()),
+                ("to", &to_s.to_string()),
+            ])
+            .send()
+            .await
+            .context("failed to call MMT /candles")?;
+
+        let status = resp.status();
+        let body: Value = resp
+            .json()
+            .await
+            .context("failed to decode MMT /candles response")?;
+        if !status.is_success() {
+            bail!("MMT /candles returned HTTP {} body={}", status, body);
+        }
+
+        let parsed: CandleResponse =
+            serde_json::from_value(body).context("invalid /candles payload shape")?;
+        Ok(CandleSeries {
+            exchange: parsed.exchange,
+            symbol: parsed.symbol,
+            tf: parsed.tf,
+            from: normalize_to_ms(parsed.from),
+            to: normalize_to_ms(parsed.to),
             points: parsed.points,
             data: parsed.data,
         })
@@ -128,6 +183,17 @@ impl MmtProvider {
 #[derive(Debug, Deserialize)]
 struct VdResponse {
     data: Vec<VdCandle>,
+    exchange: String,
+    symbol: String,
+    tf: String,
+    from: u64,
+    to: u64,
+    points: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct CandleResponse {
+    data: Vec<OhlcvtCandle>,
     exchange: String,
     symbol: String,
     tf: String,

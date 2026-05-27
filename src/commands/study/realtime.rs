@@ -14,14 +14,16 @@ pub struct StreamRunConfig {
     pub output: crate::cli::OutputFormat,
 }
 
-pub async fn run_mmt_realtime<F, G, T>(
+pub async fn run_mmt_realtime<F, G, J, T>(
     cfg: StreamRunConfig,
     mut calc: F,
     mut to_terminal_line: G,
+    mut to_json: J,
 ) -> Result<()>
 where
     F: FnMut(&crate::domain::types::OrderBookSnapshot) -> Result<T>,
     G: FnMut(&T) -> String,
+    J: FnMut(&T, crate::cli::OutputFormat) -> Result<String>,
     T: Serialize,
 {
     let state_cap = (cfg.depth as usize).saturating_mul(10).clamp(100, 10_000);
@@ -39,8 +41,8 @@ where
                 let snap = snap?;
                 let out = calc(&snap)?;
                 match cfg.output {
-                    crate::cli::OutputFormat::Json => {
-                        println!("{}", serde_json::to_string(&out)?);
+                    crate::cli::OutputFormat::Json | crate::cli::OutputFormat::Jsonl => {
+                        println!("{}", to_json(&out, cfg.output)?);
                     }
                     crate::cli::OutputFormat::Terminal => {
                         let line = to_terminal_line(&out);

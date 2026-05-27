@@ -3,12 +3,14 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 
 use crate::cli::{CvdArgs, OutputFormat};
 use crate::domain::types::{CvdStudyResult, VdCandle, VdSeries};
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::ws_vd::MmtVdStream;
-use serde::Serialize;
+
+use super::common::{StudyEnvelope, print_study_json};
 
 #[derive(Debug, Clone, Serialize)]
 struct CvdStreamPoint {
@@ -27,12 +29,20 @@ struct CvdStreamPoint {
     cvd_since_start: f64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct CvdInputs {
+    timeframe_sec: u32,
+    bucket: u8,
+    from: Option<u64>,
+    to: Option<u64>,
+}
+
 pub async fn handle(args: CvdArgs) -> Result<()> {
     args.validate()?;
 
     if args.stream {
         if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
-            bail!("stream mode currently supports only --output terminal|json");
+            bail!("stream mode currently supports only --output terminal|json|jsonl");
         }
         return stream_cvd(args).await;
     }
@@ -41,14 +51,16 @@ pub async fn handle(args: CvdArgs) -> Result<()> {
         &args.exchange,
         &args.symbol,
         args.mmt_tf()?,
-        args.from,
-        args.to,
+        args.from
+            .ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?,
+        args.to
+            .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?,
         args.bucket,
     )
     .await?;
 
     let result = to_cvd_result(series);
-    render(&result, args.output)
+    render(&result, args.output, args.verbose)
 }
 
 async fn stream_cvd(args: CvdArgs) -> Result<()> {
@@ -91,8 +103,27 @@ async fn stream_cvd(args: CvdArgs) -> Result<()> {
                     delta_step,
                     cvd_since_start,
                 };
+                let env = StudyEnvelope {
+                    r#type: "study.cvd.result".to_string(),
+                    version: "1",
+                    provider: "mmt",
+                    exchange: args.exchange.to_lowercase(),
+                    symbol: args.symbol.to_uppercase(),
+                    ts_ms: c.t * 1000,
+                    stream: true,
+                    inputs: CvdInputs {
+                        timeframe_sec: args.timeframe,
+                        bucket: args.bucket,
+                        from: None,
+                        to: None,
+                    },
+                    metrics: point,
+                    meta: serde_json::json!({}),
+                };
                 match args.output {
-                    OutputFormat::Json => println!("{}", serde_json::to_string(&point)?),
+                    OutputFormat::Json | OutputFormat::Jsonl => {
+                        print_study_json(&env, args.output, args.verbose)?
+                    }
                     OutputFormat::Terminal => {
                         let line = format!(
                             "t={} tf={} bucket={} c={} step={} cvd={} trades={}",
@@ -130,7 +161,24 @@ fn to_cvd_result(series: VdSeries) -> CvdStudyResult {
     }
 }
 
-fn render(result: &CvdStudyResult, output: OutputFormat) -> Result<()> {
+fn render(result: &CvdStudyResult, output: OutputFormat, verbose: bool) -> Result<()> {
+    let env = StudyEnvelope {
+        r#type: "study.cvd.result".to_string(),
+        version: "1",
+        provider: "mmt",
+        exchange: result.exchange.to_lowercase(),
+        symbol: result.symbol.to_uppercase(),
+        ts_ms: result.to * 1000,
+        stream: false,
+        inputs: CvdInputs {
+            timeframe_sec: 0,
+            bucket: result.bucket,
+            from: Some(result.from),
+            to: Some(result.to),
+        },
+        metrics: result.clone(),
+        meta: serde_json::json!({}),
+    };
     match output {
         OutputFormat::Terminal => {
             println!(
@@ -146,7 +194,7 @@ fn render(result: &CvdStudyResult, output: OutputFormat) -> Result<()> {
                 result.delta
             );
         }
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(result)?),
+        OutputFormat::Json | OutputFormat::Jsonl => print_study_json(&env, output, verbose)?,
         OutputFormat::Csv | OutputFormat::Parquet => {
             println!("TODO cvd export: {:?}", output);
         }

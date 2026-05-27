@@ -3,7 +3,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::domain::enums::{BookMode, ProviderKind, Side};
 use crate::domain::requests::{
-    ImbalanceRequest, InspectRequest, ReplayRequest, SlippageRequest, VampRequest,
+    DepthRequest, ImbalanceRequest, InspectRequest, ReplayRequest, SlippageRequest, SpreadRequest,
+    VampRequest,
 };
 
 #[derive(Parser, Debug)]
@@ -26,6 +27,10 @@ pub enum Commands {
         #[command(subcommand)]
         command: StudyCommands,
     },
+    Strategy {
+        #[command(subcommand)]
+        command: StrategyCommands,
+    },
     Health(HealthArgs),
 }
 
@@ -33,14 +38,22 @@ pub enum Commands {
 pub enum SourceCommands {
     Orderbook(SourceOrderbookArgs),
     Vd(SourceVdArgs),
+    Candles(SourceCandlesArgs),
 }
 
 #[derive(Subcommand, Debug)]
 pub enum StudyCommands {
     Slippage(SlippageArgs),
     Imbalance(ImbalanceArgs),
+    Spread(SpreadArgs),
+    Depth(DepthArgs),
     Vamp(VampArgs),
     Cvd(CvdArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum StrategyCommands {
+    SmaCrossover(SmaCrossoverArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -54,9 +67,9 @@ pub struct SourceVdArgs {
     #[arg(long)]
     pub timeframe: u32,
     #[arg(long)]
-    pub from: u64,
+    pub from: Option<u64>,
     #[arg(long)]
-    pub to: u64,
+    pub to: Option<u64>,
     #[arg(long, default_value_t = 1)]
     pub bucket: u8,
     #[arg(long, default_value_t = false)]
@@ -78,8 +91,16 @@ impl SourceVdArgs {
             bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
         mmt_timeframe_from_seconds(self.timeframe)?;
-        if self.from >= self.to {
-            bail!("--from must be less than --to");
+        if self.stream {
+            if self.from.is_some() || self.to.is_some() {
+                bail!("--from/--to are not allowed with --stream");
+            }
+        } else {
+            let from = self.from.ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?;
+            let to = self.to.ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?;
+            if from >= to {
+                bail!("--from must be less than --to");
+            }
         }
         if !(1..=11).contains(&self.bucket) {
             bail!("--bucket must be in range 1..=11");
@@ -109,9 +130,9 @@ pub struct CvdArgs {
     #[arg(long)]
     pub timeframe: u32,
     #[arg(long)]
-    pub from: u64,
+    pub from: Option<u64>,
     #[arg(long)]
-    pub to: u64,
+    pub to: Option<u64>,
     #[arg(long, default_value_t = 1)]
     pub bucket: u8,
     #[arg(long, default_value_t = false)]
@@ -122,6 +143,70 @@ pub struct CvdArgs {
     pub interval_ms: u64,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
+    #[arg(long, default_value_t = false)]
+    pub verbose: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct SourceCandlesArgs {
+    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
+    pub provider: CliProviderKind,
+    #[arg(long)]
+    pub exchange: String,
+    #[arg(long)]
+    pub symbol: String,
+    #[arg(long)]
+    pub timeframe: u32,
+    #[arg(long)]
+    pub from: Option<u64>,
+    #[arg(long)]
+    pub to: Option<u64>,
+    #[arg(long, default_value_t = false)]
+    pub stream: bool,
+    #[arg(long, default_value_t = 50)]
+    pub buffer_size: u16,
+    #[arg(long, default_value_t = 1000)]
+    pub interval_ms: u64,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl SourceCandlesArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.exchange.trim().is_empty() {
+            bail!("--exchange cannot be empty");
+        }
+        if !is_valid_symbol(&self.symbol) {
+            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        mmt_timeframe_from_seconds(self.timeframe)?;
+        if self.stream {
+            if self.from.is_some() || self.to.is_some() {
+                bail!("--from/--to are not allowed with --stream");
+            }
+        } else {
+            let from = self
+                .from
+                .ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?;
+            let to = self
+                .to
+                .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?;
+            if from >= to {
+                bail!("--from must be less than --to");
+            }
+        }
+        if self.buffer_size == 0 {
+            bail!("--buffer-size must be >= 1");
+        }
+        if self.interval_ms == 0 {
+            bail!("--interval-ms must be >= 1");
+        }
+        Ok(())
+    }
+
+    pub fn mmt_tf(&self) -> Result<&'static str> {
+        mmt_timeframe_from_seconds(self.timeframe)
+    }
 }
 
 impl CvdArgs {
@@ -133,8 +218,16 @@ impl CvdArgs {
             bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
         mmt_timeframe_from_seconds(self.timeframe)?;
-        if self.from >= self.to {
-            bail!("--from must be less than --to");
+        if self.stream {
+            if self.from.is_some() || self.to.is_some() {
+                bail!("--from/--to are not allowed with --stream");
+            }
+        } else {
+            let from = self.from.ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?;
+            let to = self.to.ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?;
+            if from >= to {
+                bail!("--from must be less than --to");
+            }
         }
         if !(1..=11).contains(&self.bucket) {
             bail!("--bucket must be in range 1..=11");
@@ -321,8 +414,6 @@ pub struct SlippageArgs {
     pub side: CliSide,
     #[arg(long)]
     pub notional: f64,
-    #[arg(long)]
-    pub at: u64,
     #[arg(long, default_value_t = 200)]
     pub depth: u16,
     #[arg(long, value_enum, default_value_t = CliBookMode::Binned)]
@@ -333,6 +424,8 @@ pub struct SlippageArgs {
     pub buffer_size: u16,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
+    #[arg(long, default_value_t = false)]
+    pub verbose: bool,
 }
 
 impl SlippageArgs {
@@ -362,7 +455,6 @@ impl SlippageArgs {
             symbol: self.symbol.clone(),
             side: self.side.into(),
             notional: self.notional,
-            at: self.at,
             depth: self.depth,
             book_mode: self.book_mode.into(),
             stream: self.stream,
@@ -379,8 +471,6 @@ pub struct ImbalanceArgs {
     pub exchange: String,
     #[arg(long)]
     pub symbol: String,
-    #[arg(long)]
-    pub at: u64,
     #[arg(long, default_value_t = 20)]
     pub depth: u16,
     #[arg(long, value_enum, default_value_t = CliBookMode::Binned)]
@@ -391,6 +481,8 @@ pub struct ImbalanceArgs {
     pub buffer_size: u16,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
+    #[arg(long, default_value_t = false)]
+    pub verbose: bool,
 }
 
 impl ImbalanceArgs {
@@ -415,7 +507,6 @@ impl ImbalanceArgs {
             provider: self.provider.into(),
             exchange: self.exchange.clone(),
             symbol: self.symbol.clone(),
-            at: self.at,
             depth: self.depth,
             book_mode: self.book_mode.into(),
             stream: self.stream,
@@ -432,8 +523,6 @@ pub struct VampArgs {
     pub exchange: String,
     #[arg(long)]
     pub symbol: String,
-    #[arg(long)]
-    pub at: u64,
     #[arg(long, default_value_t = 200)]
     pub depth: u16,
     #[arg(long)]
@@ -446,6 +535,216 @@ pub struct VampArgs {
     pub buffer_size: u16,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
+    #[arg(long, default_value_t = false)]
+    pub verbose: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct SpreadArgs {
+    #[arg(long, value_enum, default_value_t = CliProviderKind::MarketLab)]
+    pub provider: CliProviderKind,
+    #[arg(long)]
+    pub exchange: String,
+    #[arg(long)]
+    pub symbol: String,
+    #[arg(long, default_value_t = 20)]
+    pub depth: u16,
+    #[arg(long, value_enum, default_value_t = CliBookMode::Binned)]
+    pub book_mode: CliBookMode,
+    #[arg(long, default_value_t = false)]
+    pub stream: bool,
+    #[arg(long, default_value_t = 50)]
+    pub buffer_size: u16,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+    #[arg(long, default_value_t = false)]
+    pub verbose: bool,
+}
+
+impl SpreadArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.exchange.trim().is_empty() {
+            bail!("--exchange cannot be empty");
+        }
+        if !is_valid_symbol(&self.symbol) {
+            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        if self.depth == 0 {
+            bail!("--depth must be >= 1");
+        }
+        if self.buffer_size == 0 {
+            bail!("--buffer-size must be >= 1");
+        }
+        Ok(())
+    }
+
+    pub fn to_request(&self) -> SpreadRequest {
+        SpreadRequest {
+            provider: self.provider.into(),
+            exchange: self.exchange.clone(),
+            symbol: self.symbol.clone(),
+            depth: self.depth,
+            book_mode: self.book_mode.into(),
+            stream: self.stream,
+            buffer_size: self.buffer_size,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct DepthArgs {
+    #[arg(long, value_enum, default_value_t = CliProviderKind::MarketLab)]
+    pub provider: CliProviderKind,
+    #[arg(long)]
+    pub exchange: String,
+    #[arg(long)]
+    pub symbol: String,
+    #[arg(long, default_value_t = 20)]
+    pub levels: u16,
+    #[arg(long, value_enum, default_value_t = CliBookMode::Binned)]
+    pub book_mode: CliBookMode,
+    #[arg(long, default_value_t = false)]
+    pub stream: bool,
+    #[arg(long, default_value_t = 50)]
+    pub buffer_size: u16,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+    #[arg(long, default_value_t = false)]
+    pub verbose: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct SmaCrossoverArgs {
+    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
+    pub provider: CliProviderKind,
+    #[arg(long)]
+    pub exchange: String,
+    #[arg(long)]
+    pub symbol: String,
+    #[arg(long)]
+    pub timeframe: u32,
+    #[arg(long)]
+    pub from: Option<u64>,
+    #[arg(long)]
+    pub to: Option<u64>,
+    #[arg(long, default_value_t = 20)]
+    pub fast: usize,
+    #[arg(long, default_value_t = 50)]
+    pub slow: usize,
+    #[arg(long, default_value_t = 1)]
+    pub confirm_bars: usize,
+    #[arg(long, default_value_t = false)]
+    pub stream: bool,
+    #[arg(long, default_value_t = 50)]
+    pub buffer_size: u16,
+    #[arg(long, default_value_t = 0.3)]
+    pub oos_ratio: f64,
+    #[arg(long)]
+    pub min_trades: Option<usize>,
+    #[arg(long)]
+    pub min_oos_sharpe: Option<f64>,
+    #[arg(long)]
+    pub max_oos_sharpe: Option<f64>,
+    #[arg(long)]
+    pub min_oos_vs_is_ratio: Option<f64>,
+    #[arg(long)]
+    pub max_drawdown: Option<f64>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+    #[arg(long, default_value_t = false)]
+    pub verbose: bool,
+}
+
+impl SmaCrossoverArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.exchange.trim().is_empty() {
+            bail!("--exchange cannot be empty");
+        }
+        if !is_valid_symbol(&self.symbol) {
+            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        mmt_timeframe_from_seconds(self.timeframe)?;
+        if self.fast < 2 {
+            bail!("--fast must be >= 2");
+        }
+        if self.slow <= self.fast {
+            bail!("--slow must be greater than --fast");
+        }
+        if self.confirm_bars < 1 {
+            bail!("--confirm-bars must be >= 1");
+        }
+        if self.buffer_size == 0 {
+            bail!("--buffer-size must be >= 1");
+        }
+        if !(0.0..1.0).contains(&self.oos_ratio) {
+            bail!("--oos-ratio must be > 0 and < 1");
+        }
+        if let Some(v) = self.max_drawdown
+            && v < 0.0
+        {
+            bail!("--max-drawdown must be >= 0");
+        }
+        if self.stream {
+            if self.to.is_some() {
+                bail!("--to is not allowed with --stream");
+            }
+            if self.min_trades.is_some()
+                || self.min_oos_sharpe.is_some()
+                || self.max_oos_sharpe.is_some()
+                || self.min_oos_vs_is_ratio.is_some()
+                || self.max_drawdown.is_some()
+            {
+                bail!(
+                    "backtest threshold flags are not allowed with --stream"
+                );
+            }
+        } else {
+            let from = self
+                .from
+                .ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?;
+            let to = self
+                .to
+                .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?;
+            if from >= to {
+                bail!("--from must be less than --to");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn mmt_tf(&self) -> Result<&'static str> {
+        mmt_timeframe_from_seconds(self.timeframe)
+    }
+}
+
+impl DepthArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.exchange.trim().is_empty() {
+            bail!("--exchange cannot be empty");
+        }
+        if !is_valid_symbol(&self.symbol) {
+            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        if self.levels == 0 {
+            bail!("--levels must be >= 1");
+        }
+        if self.buffer_size == 0 {
+            bail!("--buffer-size must be >= 1");
+        }
+        Ok(())
+    }
+
+    pub fn to_request(&self) -> DepthRequest {
+        DepthRequest {
+            provider: self.provider.into(),
+            exchange: self.exchange.clone(),
+            symbol: self.symbol.clone(),
+            levels: self.levels,
+            book_mode: self.book_mode.into(),
+            stream: self.stream,
+            buffer_size: self.buffer_size,
+        }
+    }
 }
 
 impl VampArgs {
@@ -473,7 +772,6 @@ impl VampArgs {
             provider: self.provider.into(),
             exchange: self.exchange.clone(),
             symbol: self.symbol.clone(),
-            at: self.at,
             depth: self.depth,
             dollar_depth: self.dollar_depth,
             book_mode: self.book_mode.into(),
@@ -556,6 +854,7 @@ impl From<CliBookMode> for BookMode {
 pub enum OutputFormat {
     Terminal,
     Json,
+    Jsonl,
     Csv,
     Parquet,
 }
@@ -620,6 +919,8 @@ mod tests {
             } => {
                 assert_eq!(args.bucket, 1);
                 assert_eq!(args.timeframe, 60);
+                assert_eq!(args.from, Some(1704067200));
+                assert_eq!(args.to, Some(1704067800));
             }
             _ => panic!("expected source vd command"),
         }
@@ -656,8 +957,119 @@ mod tests {
             } => {
                 assert_eq!(args.bucket, 1);
                 assert_eq!(args.timeframe, 60);
+                assert_eq!(args.from, Some(1704067200));
+                assert_eq!(args.to, Some(1704067800));
             }
             _ => panic!("expected study cvd command"),
+        }
+    }
+
+    #[test]
+    fn reject_source_vd_from_to_in_stream_mode() {
+        let cli = Cli::try_parse_from([
+            "market-lab",
+            "source",
+            "vd",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "binancef",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+            "--bucket",
+            "1",
+            "--stream",
+            "--from",
+            "1704067200",
+            "--to",
+            "1704067800",
+        ])
+        .expect("parse should succeed");
+
+        match cli.command {
+            Commands::Source {
+                command: SourceCommands::Vd(args),
+            } => {
+                let err = args.validate().expect_err("validate should fail");
+                assert!(
+                    err.to_string()
+                        .contains("--from/--to are not allowed with --stream")
+                );
+            }
+            _ => panic!("expected source vd command"),
+        }
+    }
+
+    #[test]
+    fn parse_source_candles_command() {
+        let cli = Cli::try_parse_from([
+            "market-lab",
+            "source",
+            "candles",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "binancef",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+            "--from",
+            "1704067200",
+            "--to",
+            "1704067800",
+            "--output",
+            "json",
+        ])
+        .expect("source candles parse should succeed");
+
+        match cli.command {
+            Commands::Source {
+                command: SourceCommands::Candles(args),
+            } => {
+                assert_eq!(args.timeframe, 60);
+                assert_eq!(args.from, Some(1704067200));
+                assert_eq!(args.to, Some(1704067800));
+            }
+            _ => panic!("expected source candles command"),
+        }
+    }
+
+    #[test]
+    fn reject_source_candles_from_to_in_stream_mode() {
+        let cli = Cli::try_parse_from([
+            "market-lab",
+            "source",
+            "candles",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "binancef",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+            "--stream",
+            "--from",
+            "1704067200",
+            "--to",
+            "1704067800",
+        ])
+        .expect("parse should succeed");
+
+        match cli.command {
+            Commands::Source {
+                command: SourceCommands::Candles(args),
+            } => {
+                let err = args.validate().expect_err("validate should fail");
+                assert!(
+                    err.to_string()
+                        .contains("--from/--to are not allowed with --stream")
+                );
+            }
+            _ => panic!("expected source candles command"),
         }
     }
 
@@ -683,8 +1095,6 @@ mod tests {
             "bybitf",
             "--symbol",
             "BTC/USDT",
-            "--at",
-            "1716200000000",
             "--depth",
             "25",
             "--stream",
@@ -715,8 +1125,6 @@ mod tests {
             "bybitf",
             "--symbol",
             "BTC/USDT",
-            "--at",
-            "1716200000000",
             "--depth",
             "100",
             "--dollar-depth",
@@ -769,6 +1177,144 @@ mod tests {
                 assert_eq!(args.interval_ms, 500);
             }
             _ => panic!("expected source orderbook command"),
+        }
+    }
+
+    #[test]
+    fn parse_strategy_sma_crossover_window_command() {
+        let cli = Cli::try_parse_from([
+            "market-lab",
+            "strategy",
+            "sma-crossover",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "bybitf",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+            "--from",
+            "1704067200",
+            "--to",
+            "1704067800",
+            "--fast",
+            "20",
+            "--slow",
+            "50",
+            "--min-trades",
+            "10",
+        ])
+        .expect("strategy parse should succeed");
+
+        match cli.command {
+            Commands::Strategy {
+                command: StrategyCommands::SmaCrossover(args),
+            } => {
+                assert_eq!(args.from, Some(1704067200));
+                assert_eq!(args.to, Some(1704067800));
+                assert_eq!(args.min_trades, Some(10));
+                assert!(!args.stream);
+            }
+            _ => panic!("expected strategy sma-crossover command"),
+        }
+    }
+
+    #[test]
+    fn reject_strategy_thresholds_in_stream_mode() {
+        let cli = Cli::try_parse_from([
+            "market-lab",
+            "strategy",
+            "sma-crossover",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "bybitf",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+            "--stream",
+            "--min-oos-sharpe",
+            "1.2",
+        ])
+        .expect("strategy parse should succeed");
+
+        match cli.command {
+            Commands::Strategy {
+                command: StrategyCommands::SmaCrossover(args),
+            } => {
+                let err = args.validate().expect_err("validate should fail");
+                assert!(
+                    err.to_string()
+                        .contains("backtest threshold flags are not allowed with --stream")
+                );
+            }
+            _ => panic!("expected strategy sma-crossover command"),
+        }
+    }
+
+    #[test]
+    fn parse_strategy_stream_with_from_command() {
+        let cli = Cli::try_parse_from([
+            "market-lab",
+            "strategy",
+            "sma-crossover",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "bybitf",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+            "--stream",
+            "--from",
+            "1704067200",
+        ])
+        .expect("strategy stream parse should succeed");
+
+        match cli.command {
+            Commands::Strategy {
+                command: StrategyCommands::SmaCrossover(args),
+            } => {
+                args.validate().expect("validate should succeed");
+                assert!(args.stream);
+                assert_eq!(args.from, Some(1704067200));
+                assert_eq!(args.to, None);
+            }
+            _ => panic!("expected strategy sma-crossover command"),
+        }
+    }
+
+    #[test]
+    fn reject_strategy_stream_with_to() {
+        let cli = Cli::try_parse_from([
+            "market-lab",
+            "strategy",
+            "sma-crossover",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "bybitf",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+            "--stream",
+            "--to",
+            "1704067800",
+        ])
+        .expect("strategy parse should succeed");
+
+        match cli.command {
+            Commands::Strategy {
+                command: StrategyCommands::SmaCrossover(args),
+            } => {
+                let err = args.validate().expect_err("validate should fail");
+                assert!(err.to_string().contains("--to is not allowed with --stream"));
+            }
+            _ => panic!("expected strategy sma-crossover command"),
         }
     }
 }

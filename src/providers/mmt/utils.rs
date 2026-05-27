@@ -20,6 +20,10 @@ pub fn normalize_to_ms(ts: u64) -> u64 {
     if ts < 10_000_000_000 { ts * 1000 } else { ts }
 }
 
+pub fn normalize_to_seconds(ts: u64) -> u64 {
+    if ts >= 10_000_000_000 { ts / 1000 } else { ts }
+}
+
 pub fn parse_levels(maybe_levels: Option<&Value>) -> Result<Vec<OrderBookLevel>> {
     let Some(levels) = maybe_levels else {
         return Ok(Vec::new());

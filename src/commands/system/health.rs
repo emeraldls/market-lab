@@ -21,6 +21,7 @@ fn render(health: &ProviderHealth, output: OutputFormat) -> Result<()> {
             );
         }
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(health)?),
+        OutputFormat::Jsonl => println!("{}", serde_json::to_string(health)?),
         OutputFormat::Csv | OutputFormat::Parquet => {
             println!("TODO health export: {:?}", output);
         }

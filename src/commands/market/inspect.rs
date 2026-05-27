@@ -28,6 +28,9 @@ fn render(snapshot: &OrderBookSnapshot, output: OutputFormat) -> Result<()> {
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(snapshot)?);
         }
+        OutputFormat::Jsonl => {
+            println!("{}", serde_json::to_string(snapshot)?);
+        }
         OutputFormat::Csv | OutputFormat::Parquet => {
             println!("TODO inspect export: {:?}", output);
         }

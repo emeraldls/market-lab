@@ -25,6 +25,7 @@ fn render(events: &[TopOfBook], output: OutputFormat) -> Result<()> {
             }
         }
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(events)?),
+        OutputFormat::Jsonl => println!("{}", serde_json::to_string(events)?),
         OutputFormat::Csv | OutputFormat::Parquet => {
             println!("TODO replay export: {:?}", output);
         }
