@@ -50,6 +50,7 @@ async fn main() -> Result<()> {
         },
         Commands::Health(args) => commands::system::health::handle(args).await?,
         Commands::Status(args) => commands::system::status::handle(args).await?,
+        Commands::Upgrade(args) => commands::system::upgrade::handle(args).await?,
     }
 
     Ok(())

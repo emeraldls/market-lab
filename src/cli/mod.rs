@@ -33,6 +33,7 @@ pub enum Commands {
     },
     Health(HealthArgs),
     Status(StatusArgs),
+    Upgrade(UpgradeArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -341,6 +342,14 @@ pub struct HealthArgs {
 pub struct StatusArgs {
     #[arg(long, value_enum, default_value_t = CliProviderKind::MarketLab)]
     pub provider: CliProviderKind,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct UpgradeArgs {
+    #[arg(long, default_value_t = false)]
+    pub check: bool,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
 }
@@ -1122,6 +1131,20 @@ mod tests {
         match cli.command {
             Commands::Status(args) => assert!(matches!(args.provider, CliProviderKind::Mmt)),
             _ => panic!("expected status command"),
+        }
+    }
+
+    #[test]
+    fn parse_upgrade_check_command() {
+        let cli = Cli::try_parse_from(["mlab", "upgrade", "--check", "--output", "json"])
+            .expect("upgrade parse should succeed");
+
+        match cli.command {
+            Commands::Upgrade(args) => {
+                assert!(args.check);
+                assert!(matches!(args.output, OutputFormat::Json));
+            }
+            _ => panic!("expected upgrade command"),
         }
     }
 

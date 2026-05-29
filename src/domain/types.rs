@@ -167,3 +167,14 @@ pub struct SystemStatus {
     pub strategies: Vec<String>,
     pub provider_health: ProviderHealth,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UpgradeStatus {
+    pub app: String,
+    pub current_version: String,
+    pub latest_version: String,
+    pub target: String,
+    pub up_to_date: bool,
+    pub updated: bool,
+    pub asset_url: String,
+}
