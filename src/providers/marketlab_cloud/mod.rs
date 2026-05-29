@@ -1,5 +1,9 @@
 use anyhow::Result;
 
+/*
+    just gonna provide cloud for hyperliquid specific data, if need other data source, should use mmt
+*/
+
 use crate::domain::requests::{InspectRequest, ReplayRequest};
 use crate::domain::types::{OrderBookLevel, OrderBookSnapshot, ProviderHealth, TopOfBook};
 

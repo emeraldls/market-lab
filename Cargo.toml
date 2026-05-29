@@ -1,7 +1,11 @@
 [package]
 name = "market-lab"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
+
+[[bin]]
+name = "mlab"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.102"

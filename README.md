@@ -26,7 +26,7 @@ cargo run -- source orderbook \
 
 ## Docs
 
-- [mlab.int8.me](https://mlab.int8.me)
+- [mlab](https://marketlab.hooklytics.com)
 
 ## License
 

@@ -8,7 +8,7 @@ use crate::domain::requests::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "market-lab")]
+#[command(name = "mlab")]
 #[command(version, about = "Deterministic market replay CLI", long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
