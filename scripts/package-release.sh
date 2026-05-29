@@ -19,7 +19,9 @@ resolve_version() {
 
 resolve_binary_path() {
   local target="$1"
-  if [[ "$target" == "$HOST_TARGET" ]]; then
+  if [[ -n "${RELEASE_TARGET:-}" ]]; then
+    echo "target/$target/release/mlab"
+  elif [[ "$target" == "$HOST_TARGET" ]]; then
     echo "target/release/mlab"
   else
     echo "target/$target/release/mlab"
@@ -31,7 +33,7 @@ if [[ $# -ne 0 ]]; then
   exit 1
 fi
 
-TARGET="${TARGET:-$HOST_TARGET}"
+TARGET="${RELEASE_TARGET:-$HOST_TARGET}"
 VERSION="$(resolve_version)"
 BINARY_PATH="$(resolve_binary_path "$TARGET")"
 
