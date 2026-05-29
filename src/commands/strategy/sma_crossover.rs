@@ -224,14 +224,8 @@ async fn evaluate_window(args: BacktestSmaCrossoverArgs, common: StrategyCommonA
     let from = args.from;
     let to = args.to;
 
-    let series = MmtProvider::candles(
-        &common.exchange,
-        &common.symbol,
-        common.mmt_tf()?,
-        from,
-        to,
-    )
-    .await?;
+    let series =
+        MmtProvider::candles(&common.exchange, &common.symbol, common.mmt_tf()?, from, to).await?;
 
     let closes: Vec<f64> = series.data.iter().map(|x| x.c).collect();
     let crossover = crossover_state(&closes, common.fast, common.slow, common.confirm_bars)?;
@@ -272,7 +266,8 @@ async fn stream_strategy(args: RunSmaCrossoverArgs, common: StrategyCommonArgs) 
         bail!("stream mode currently supports only --output terminal|json|jsonl");
     }
 
-    let mut stream = MmtCandlesStream::connect(&common.exchange, &common.symbol, common.mmt_tf()?).await?;
+    let mut stream =
+        MmtCandlesStream::connect(&common.exchange, &common.symbol, common.mmt_tf()?).await?;
     let first_candle = stream.next_candle().await?;
     let mut history = load_stream_warmup_closes(&args, &common, first_candle.t).await?;
     let history_cap = (common.slow + common.confirm_bars + 8).max(64);
@@ -524,9 +519,7 @@ fn validation_reasons(
         ),
         format!(
             "trades={} sharpe={:.4?} max_drawdown={:.4?}",
-            metrics.trades,
-            metrics.sharpe,
-            metrics.max_drawdown
+            metrics.trades, metrics.sharpe, metrics.max_drawdown
         ),
         format!(
             "latest_signal={} side={} strength_bps={:.4}",
@@ -707,7 +700,11 @@ fn max_drawdown(returns: &[f64]) -> Option<f64> {
     Some(max_dd)
 }
 
-fn render_backtest_result(result: &BacktestResult, output: OutputFormat, verbose: bool) -> Result<()> {
+fn render_backtest_result(
+    result: &BacktestResult,
+    output: OutputFormat,
+    verbose: bool,
+) -> Result<()> {
     match output {
         OutputFormat::Terminal => {
             println!(
@@ -719,10 +716,7 @@ fn render_backtest_result(result: &BacktestResult, output: OutputFormat, verbose
             );
             println!(
                 "strategy: {} fast={} slow={} confirm={}",
-                result.strategy,
-                result.inputs.fast,
-                result.inputs.slow,
-                result.inputs.confirm_bars
+                result.strategy, result.inputs.fast, result.inputs.slow, result.inputs.confirm_bars
             );
             println!(
                 "trades={} sharpe={:.4?} max_drawdown={:.4?}",
@@ -809,7 +803,10 @@ fn print_backtest_json(result: &BacktestResult, output: OutputFormat, verbose: b
 
 fn render_terminal(buf: &VecDeque<String>) -> Result<()> {
     print!("\x1B[2J\x1B[H");
-    println!("market-lab strategy sma-crossover stream (latest {} updates)", buf.len());
+    println!(
+        "market-lab strategy sma-crossover stream (latest {} updates)",
+        buf.len()
+    );
     println!("---------------------------------------------------------------");
     for line in buf {
         println!("{}", line);

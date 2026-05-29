@@ -32,7 +32,12 @@ pub async fn handle(args: SourceOrderbookArgs) -> Result<()> {
 
     let snap = MmtProvider::live_orderbook(&args.exchange, &args.symbol, args.depth).await?;
     let env = build_orderbook_envelope(&snap, &args, false)?;
-    render_json_or_terminal(&env, &args.output, format_terminal_summary, "source orderbook")
+    render_json_or_terminal(
+        &env,
+        &args.output,
+        format_terminal_summary,
+        "source orderbook",
+    )
 }
 
 async fn stream_orderbook(args: SourceOrderbookArgs) -> Result<()> {

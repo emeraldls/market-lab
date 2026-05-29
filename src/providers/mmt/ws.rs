@@ -1,6 +1,6 @@
-use anyhow::{Context, Result, bail};
 use crate::core::orderbook::OrderBookState;
 use crate::domain::types::OrderBookSnapshot;
+use anyhow::{Context, Result, bail};
 
 use super::utils::{normalize_symbol_for_mmt, normalize_to_ms, parse_levels};
 use super::ws_client::MmtWsClient;

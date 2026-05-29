@@ -9,8 +9,8 @@ mod domain;
 mod providers;
 
 use cli::{
-    Cli, Commands, SourceCommands, StrategyBacktestCommands, StrategyCommands,
-    StrategyRunCommands, StudyCommands,
+    Cli, Commands, SourceCommands, StrategyBacktestCommands, StrategyCommands, StrategyRunCommands,
+    StudyCommands,
 };
 
 #[global_allocator]

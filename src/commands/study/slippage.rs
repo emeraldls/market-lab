@@ -41,8 +41,7 @@ pub async fn handle(args: SlippageArgs) -> Result<()> {
                 output: args.output,
             },
             move |snap| {
-                let metrics =
-                    estimate_slippage(snap, req.notional, snap.timestamp_ms, req.side)?;
+                let metrics = estimate_slippage(snap, req.notional, snap.timestamp_ms, req.side)?;
                 Ok(to_envelope(
                     provider_name(req.provider),
                     &req.exchange,
@@ -61,23 +60,27 @@ pub async fn handle(args: SlippageArgs) -> Result<()> {
             |out| {
                 format!(
                     "{} {} @ {}: avg_fill={} slippage_bps={}",
-                    out.metrics.symbol, out.metrics.side, out.metrics.at, out.metrics.avg_fill_price, out.metrics.slippage_bps
+                    out.metrics.symbol,
+                    out.metrics.side,
+                    out.metrics.at,
+                    out.metrics.avg_fill_price,
+                    out.metrics.slippage_bps
                 )
             },
-            |out, output| Ok(match output {
-                OutputFormat::Json => serde_json::to_string_pretty(out)?,
-                OutputFormat::Jsonl => serde_json::to_string(out)?,
-                _ => unreachable!(),
-            }),
+            |out, output| {
+                Ok(match output {
+                    OutputFormat::Json => serde_json::to_string_pretty(out)?,
+                    OutputFormat::Jsonl => serde_json::to_string(out)?,
+                    _ => unreachable!(),
+                })
+            },
         )
         .await;
     }
 
     let snapshot = match req.provider {
         ProviderKind::Mmt => {
-            eprintln!(
-                "note: MMT slippage uses live /orderbook snapshot"
-            );
+            eprintln!("note: MMT slippage uses live /orderbook snapshot");
             MmtProvider::live_orderbook(&req.exchange, &req.symbol, req.depth).await?
         }
         _ => {

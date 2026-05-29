@@ -56,14 +56,21 @@ pub async fn handle(args: SpreadArgs) -> Result<()> {
             |out| {
                 format!(
                     "{} @ {} bid={} ask={} spread={} spread_bps={}",
-                    out.metrics.symbol, out.metrics.at, out.metrics.best_bid, out.metrics.best_ask, out.metrics.spread_abs, out.metrics.spread_bps
+                    out.metrics.symbol,
+                    out.metrics.at,
+                    out.metrics.best_bid,
+                    out.metrics.best_ask,
+                    out.metrics.spread_abs,
+                    out.metrics.spread_bps
                 )
             },
-            |out, output| Ok(match output {
-                OutputFormat::Json => serde_json::to_string_pretty(out)?,
-                OutputFormat::Jsonl => serde_json::to_string(out)?,
-                _ => unreachable!(),
-            }),
+            |out, output| {
+                Ok(match output {
+                    OutputFormat::Json => serde_json::to_string_pretty(out)?,
+                    OutputFormat::Jsonl => serde_json::to_string(out)?,
+                    _ => unreachable!(),
+                })
+            },
         )
         .await;
     }
@@ -103,7 +110,10 @@ pub async fn handle(args: SpreadArgs) -> Result<()> {
     render(&env, args.output, args.verbose)
 }
 
-fn estimate_spread(book: &crate::domain::types::OrderBookSnapshot, at: u64) -> Result<SpreadEstimate> {
+fn estimate_spread(
+    book: &crate::domain::types::OrderBookSnapshot,
+    at: u64,
+) -> Result<SpreadEstimate> {
     let best_bid = book
         .bids
         .first()
@@ -145,7 +155,13 @@ fn render(
             let out = &env.metrics;
             println!(
                 "{} @ {} bid={} ask={} spread={} spread_bps={} mid={}",
-                out.symbol, out.at, out.best_bid, out.best_ask, out.spread_abs, out.spread_bps, out.mid
+                out.symbol,
+                out.at,
+                out.best_bid,
+                out.best_ask,
+                out.spread_abs,
+                out.spread_bps,
+                out.mid
             );
         }
         OutputFormat::Json | OutputFormat::Jsonl => print_study_json(env, output, verbose)?,

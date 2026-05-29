@@ -56,14 +56,21 @@ pub async fn handle(args: DepthArgs) -> Result<()> {
             |out| {
                 format!(
                     "{} @ {} levels={} bid_quote={} ask_quote={} total_quote={}",
-                    out.metrics.symbol, out.metrics.at, out.metrics.levels, out.metrics.bid_quote, out.metrics.ask_quote, out.metrics.total_quote
+                    out.metrics.symbol,
+                    out.metrics.at,
+                    out.metrics.levels,
+                    out.metrics.bid_quote,
+                    out.metrics.ask_quote,
+                    out.metrics.total_quote
                 )
             },
-            |out, output| Ok(match output {
-                OutputFormat::Json => serde_json::to_string_pretty(out)?,
-                OutputFormat::Jsonl => serde_json::to_string(out)?,
-                _ => unreachable!(),
-            }),
+            |out, output| {
+                Ok(match output {
+                    OutputFormat::Json => serde_json::to_string_pretty(out)?,
+                    OutputFormat::Jsonl => serde_json::to_string(out)?,
+                    _ => unreachable!(),
+                })
+            },
         )
         .await;
     }

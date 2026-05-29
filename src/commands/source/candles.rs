@@ -80,7 +80,8 @@ pub async fn handle(args: SourceCandlesArgs) -> Result<()> {
 }
 
 async fn stream_candles(args: SourceCandlesArgs) -> Result<()> {
-    let mut stream = MmtCandlesStream::connect(&args.exchange, &args.symbol, args.mmt_tf()?).await?;
+    let mut stream =
+        MmtCandlesStream::connect(&args.exchange, &args.symbol, args.mmt_tf()?).await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest: Option<OhlcvtCandle> = None;
     let mut buf: VecDeque<String> = VecDeque::with_capacity(args.buffer_size as usize);

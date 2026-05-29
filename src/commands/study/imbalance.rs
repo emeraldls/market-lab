@@ -56,23 +56,28 @@ pub async fn handle(args: ImbalanceArgs) -> Result<()> {
             |out| {
                 format!(
                     "{} @ {} depth={} imbalance={:.6} bid_vol={} ask_vol={}",
-                    out.metrics.symbol, out.metrics.at, out.metrics.depth, out.metrics.imbalance, out.metrics.bid_volume, out.metrics.ask_volume
+                    out.metrics.symbol,
+                    out.metrics.at,
+                    out.metrics.depth,
+                    out.metrics.imbalance,
+                    out.metrics.bid_volume,
+                    out.metrics.ask_volume
                 )
             },
-            |out, output| Ok(match output {
-                OutputFormat::Json => serde_json::to_string_pretty(out)?,
-                OutputFormat::Jsonl => serde_json::to_string(out)?,
-                _ => unreachable!(),
-            }),
+            |out, output| {
+                Ok(match output {
+                    OutputFormat::Json => serde_json::to_string_pretty(out)?,
+                    OutputFormat::Jsonl => serde_json::to_string(out)?,
+                    _ => unreachable!(),
+                })
+            },
         )
         .await;
     }
 
     let snapshot = match req.provider {
         ProviderKind::Mmt => {
-            eprintln!(
-                "note: MMT imbalance uses live /orderbook snapshot"
-            );
+            eprintln!("note: MMT imbalance uses live /orderbook snapshot");
             MmtProvider::live_orderbook(&req.exchange, &req.symbol, req.depth).await?
         }
         _ => {

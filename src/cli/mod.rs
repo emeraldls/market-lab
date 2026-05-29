@@ -114,8 +114,12 @@ impl SourceVdArgs {
                 bail!("--from/--to are not allowed with --stream");
             }
         } else {
-            let from = self.from.ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?;
-            let to = self.to.ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?;
+            let from = self
+                .from
+                .ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?;
+            let to = self
+                .to
+                .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?;
             if from >= to {
                 bail!("--from must be less than --to");
             }
@@ -241,8 +245,12 @@ impl CvdArgs {
                 bail!("--from/--to are not allowed with --stream");
             }
         } else {
-            let from = self.from.ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?;
-            let to = self.to.ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?;
+            let from = self
+                .from
+                .ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?;
+            let to = self
+                .to
+                .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?;
             if from >= to {
                 bail!("--from must be less than --to");
             }
@@ -1242,7 +1250,10 @@ mod tests {
 
         match cli.command {
             Commands::Strategy {
-                command: StrategyCommands::Backtest { command: StrategyBacktestCommands::SmaCrossover(args) },
+                command:
+                    StrategyCommands::Backtest {
+                        command: StrategyBacktestCommands::SmaCrossover(args),
+                    },
             } => {
                 assert_eq!(args.from, 1704067200);
                 assert_eq!(args.to, 1704067800);
@@ -1273,7 +1284,10 @@ mod tests {
 
         match cli.command {
             Commands::Strategy {
-                command: StrategyCommands::Run { command: StrategyRunCommands::SmaCrossover(args) },
+                command:
+                    StrategyCommands::Run {
+                        command: StrategyRunCommands::SmaCrossover(args),
+                    },
             } => {
                 args.validate().expect("validate should succeed");
                 assert_eq!(args.from, Some(1704067200));
