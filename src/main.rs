@@ -7,6 +7,7 @@ mod commands;
 mod core;
 mod domain;
 mod providers;
+mod scripting;
 
 use cli::{
     Cli, Commands, SourceCommands, StrategyBacktestCommands, StrategyCommands, StrategyRunCommands,
@@ -29,6 +30,7 @@ async fn main() -> Result<()> {
             SourceCommands::Candles(args) => commands::source::handle_candles(args).await?,
         },
         Commands::Study { command: study } => match study {
+            StudyCommands::Run(args) => commands::study::script::handle_run(args).await?,
             StudyCommands::Slippage(args) => commands::study::slippage::handle(args).await?,
             StudyCommands::Imbalance(args) => commands::study::imbalance::handle(args).await?,
             StudyCommands::Spread(args) => commands::study::spread::handle(args).await?,

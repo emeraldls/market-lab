@@ -45,6 +45,7 @@ pub enum SourceCommands {
 
 #[derive(Subcommand, Debug)]
 pub enum StudyCommands {
+    Run(CustomStudyRunArgs),
     Slippage(SlippageArgs),
     Imbalance(ImbalanceArgs),
     Spread(SpreadArgs),
@@ -73,6 +74,54 @@ pub enum StrategyRunCommands {
 #[derive(Subcommand, Debug)]
 pub enum StrategyBacktestCommands {
     SmaCrossover(BacktestSmaCrossoverArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct CustomStudyRunArgs {
+    pub script: String,
+    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
+    pub provider: CliProviderKind,
+    #[arg(long)]
+    pub exchange: String,
+    #[arg(long)]
+    pub symbol: String,
+    #[arg(long)]
+    pub timeframe: u32,
+    #[arg(long)]
+    pub from: u64,
+    #[arg(long)]
+    pub to: u64,
+    #[arg(long, default_value_t = false)]
+    pub stream: bool,
+    #[arg(long = "input")]
+    pub input: Vec<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+    #[arg(long, default_value_t = false)]
+    pub verbose: bool,
+}
+
+impl CustomStudyRunArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.script.trim().is_empty() {
+            bail!("script path is required");
+        }
+        if self.exchange.trim().is_empty() {
+            bail!("--exchange cannot be empty");
+        }
+        if !is_valid_symbol(&self.symbol) {
+            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        mmt_timeframe_from_seconds(self.timeframe)?;
+        if self.from >= self.to {
+            bail!("--from must be less than --to");
+        }
+        Ok(())
+    }
+
+    pub fn mmt_tf(&self) -> Result<&'static str> {
+        mmt_timeframe_from_seconds(self.timeframe)
+    }
 }
 
 #[derive(Clone, Debug, Args)]
@@ -1339,5 +1388,43 @@ mod tests {
         ])
         .expect_err("strategy run parse should fail");
         assert!(err.to_string().contains("--to"));
+    }
+
+    #[test]
+    fn parse_custom_study_run_command() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "study",
+            "run",
+            "./studies/buy-pressure.js",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "bybitf",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+            "--from",
+            "1704067200000",
+            "--to",
+            "1704067800000",
+            "--input",
+            "min_vbuy=50000",
+            "--output",
+            "json",
+        ])
+        .expect("custom study run parse should succeed");
+
+        match cli.command {
+            Commands::Study {
+                command: StudyCommands::Run(args),
+            } => {
+                assert_eq!(args.script, "./studies/buy-pressure.js");
+                assert_eq!(args.input, vec!["min_vbuy=50000"]);
+                args.validate().expect("validate should succeed");
+            }
+            _ => panic!("expected custom study run command"),
+        }
     }
 }
