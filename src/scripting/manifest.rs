@@ -79,7 +79,7 @@ impl StudyManifest {
     }
 
     pub fn supports_mode(&self, mode: StudyMode) -> bool {
-        self.modes.iter().any(|candidate| *candidate == mode)
+        self.modes.contains(&mode)
     }
 }
 
