@@ -10,21 +10,16 @@ use crate::domain::types::{CvdStudyResult, VdCandle, VdSeries};
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::ws_vd::MmtVdStream;
 
-use super::common::{StudyEnvelope, print_study_json};
+use super::common::{StudyDescriptor, StudyEnvelope, empty_meta, print_study_json};
 
 #[derive(Debug, Clone, Serialize)]
 struct CvdStreamPoint {
-    exchange: String,
-    symbol: String,
-    tf: String,
-    bucket: u8,
     ts_s: u64,
-    ts_ms: u64,
     candle_o: f64,
     candle_h: f64,
     candle_l: f64,
     candle_c: f64,
-    n: u64,
+    trades: u64,
     delta_step: f64,
     cvd_since_start: f64,
 }
@@ -60,7 +55,7 @@ pub async fn handle(args: CvdArgs) -> Result<()> {
     .await?;
 
     let result = to_cvd_result(series);
-    render(&result, args.output, args.verbose)
+    render(&args, &result, args.output, args.verbose)
 }
 
 async fn stream_cvd(args: CvdArgs) -> Result<()> {
@@ -89,17 +84,12 @@ async fn stream_cvd(args: CvdArgs) -> Result<()> {
                 let delta_step = prev_close.map(|p| c.c - p).unwrap_or(0.0);
                 let cvd_since_start = c.c - start_close.unwrap_or(c.c);
                 let point = CvdStreamPoint {
-                    exchange: args.exchange.to_lowercase(),
-                    symbol: args.symbol.to_lowercase().replace("usdt","usd"),
-                    tf: args.mmt_tf()?.to_string(),
-                    bucket: args.bucket,
                     ts_s: c.t,
-                    ts_ms: c.t * 1000,
                     candle_o: c.o,
                     candle_h: c.h,
                     candle_l: c.l,
                     candle_c: c.c,
-                    n: c.n,
+                    trades: c.n,
                     delta_step,
                     cvd_since_start,
                 };
@@ -107,10 +97,15 @@ async fn stream_cvd(args: CvdArgs) -> Result<()> {
                     r#type: "study.cvd.result".to_string(),
                     version: "1",
                     provider: "mmt",
-                    exchange: args.exchange.to_lowercase(),
-                    symbol: args.symbol.to_uppercase(),
+                    exchange: args.exchange.clone(),
+                    symbol: args.symbol.clone(),
                     ts_ms: c.t * 1000,
                     stream: true,
+                    study: StudyDescriptor {
+                        name: "cvd".to_string(),
+                        kind: "series",
+                        source: "builtin",
+                    },
                     inputs: CvdInputs {
                         timeframe_sec: args.timeframe,
                         bucket: args.bucket,
@@ -118,7 +113,7 @@ async fn stream_cvd(args: CvdArgs) -> Result<()> {
                         to: None,
                     },
                     metrics: point,
-                    meta: serde_json::json!({}),
+                    meta: empty_meta(),
                 };
                 match args.output {
                     OutputFormat::Json | OutputFormat::Jsonl => {
@@ -147,12 +142,6 @@ fn to_cvd_result(series: VdSeries) -> CvdStudyResult {
     let first_close = series.data.first().map(|x| x.c).unwrap_or(0.0);
     let last_close = series.data.last().map(|x| x.c).unwrap_or(0.0);
     CvdStudyResult {
-        exchange: series.exchange,
-        symbol: series.symbol,
-        tf: series.tf,
-        from: series.from,
-        to: series.to,
-        bucket: series.bucket,
         points: series.points,
         first_close,
         last_close,
@@ -161,33 +150,43 @@ fn to_cvd_result(series: VdSeries) -> CvdStudyResult {
     }
 }
 
-fn render(result: &CvdStudyResult, output: OutputFormat, verbose: bool) -> Result<()> {
+fn render(
+    args: &CvdArgs,
+    result: &CvdStudyResult,
+    output: OutputFormat,
+    verbose: bool,
+) -> Result<()> {
     let env = StudyEnvelope {
         r#type: "study.cvd.result".to_string(),
         version: "1",
         provider: "mmt",
-        exchange: result.exchange.to_lowercase(),
-        symbol: result.symbol.to_uppercase(),
-        ts_ms: result.to * 1000,
+        exchange: args.exchange.clone(),
+        symbol: args.symbol.clone(),
+        ts_ms: args.to.unwrap_or_else(|| args.from.unwrap_or_default()),
         stream: false,
+        study: StudyDescriptor {
+            name: "cvd".to_string(),
+            kind: "window",
+            source: "builtin",
+        },
         inputs: CvdInputs {
-            timeframe_sec: 0,
-            bucket: result.bucket,
-            from: Some(result.from),
-            to: Some(result.to),
+            timeframe_sec: args.timeframe,
+            bucket: args.bucket,
+            from: args.from,
+            to: args.to,
         },
         metrics: result.clone(),
-        meta: serde_json::json!({}),
+        meta: empty_meta(),
     };
     match output {
         OutputFormat::Terminal => {
             println!(
                 "{} CVD {} [{}-{}] bucket={} points={} first={} last={} delta={}",
-                result.symbol,
-                result.tf,
-                result.from,
-                result.to,
-                result.bucket,
+                env.symbol,
+                args.mmt_tf()?,
+                args.from.unwrap_or_default(),
+                args.to.unwrap_or_default(),
+                args.bucket,
                 result.points,
                 result.first_close,
                 result.last_close,

@@ -24,11 +24,6 @@ pub struct TopOfBook {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SlippageEstimate {
-    pub exchange: String,
-    pub symbol: String,
-    pub side: String,
-    pub notional: f64,
-    pub at: u64,
     pub avg_fill_price: f64,
     pub best_price: f64,
     pub slippage_abs: f64,
@@ -38,10 +33,6 @@ pub struct SlippageEstimate {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImbalanceEstimate {
-    pub exchange: String,
-    pub symbol: String,
-    pub at: u64,
-    pub depth: u16,
     pub bid_volume: f64,
     pub ask_volume: f64,
     pub imbalance: f64,
@@ -49,9 +40,6 @@ pub struct ImbalanceEstimate {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpreadEstimate {
-    pub exchange: String,
-    pub symbol: String,
-    pub at: u64,
     pub best_bid: f64,
     pub best_ask: f64,
     pub spread_abs: f64,
@@ -61,10 +49,6 @@ pub struct SpreadEstimate {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DepthEstimate {
-    pub exchange: String,
-    pub symbol: String,
-    pub at: u64,
-    pub levels: u16,
     pub bid_base: f64,
     pub ask_base: f64,
     pub bid_quote: f64,
@@ -74,10 +58,6 @@ pub struct DepthEstimate {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VampEstimate {
-    pub exchange: String,
-    pub symbol: String,
-    pub at: u64,
-    pub dollar_depth: f64,
     pub ask_vwap: f64,
     pub bid_vwap: f64,
     pub vamp: f64,
@@ -136,12 +116,6 @@ pub struct VdSeries {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CvdStudyResult {
-    pub exchange: String,
-    pub symbol: String,
-    pub tf: String,
-    pub from: u64,
-    pub to: u64,
-    pub bucket: u8,
     pub points: usize,
     pub first_close: f64,
     pub last_close: f64,

@@ -8,13 +8,12 @@ use crate::domain::types::DepthEstimate;
 use crate::providers::mmt::MmtProvider;
 use crate::providers::{MarketDataProvider, ProviderClient};
 
-use super::common::{StudyEnvelope, print_study_json, provider_name};
+use super::common::{StudyDescriptor, StudyEnvelope, empty_meta, print_study_json, provider_name};
 use super::realtime::{StreamRunConfig, run_mmt_realtime};
 
 #[derive(Clone, Debug, Serialize)]
 struct DepthInputs {
     levels: u16,
-    at: u64,
 }
 
 pub async fn handle(args: DepthArgs) -> Result<()> {
@@ -39,26 +38,23 @@ pub async fn handle(args: DepthArgs) -> Result<()> {
                 output: args.output,
             },
             move |snap| {
-                let metrics = estimate_depth(snap, snap.timestamp_ms, req.levels)?;
+                let metrics = estimate_depth(snap, req.levels)?;
                 Ok(to_envelope(
                     provider_name(req.provider),
                     &req.exchange,
                     &req.symbol,
                     snap.timestamp_ms,
                     true,
-                    DepthInputs {
-                        levels: req.levels,
-                        at: snap.timestamp_ms,
-                    },
+                    DepthInputs { levels: req.levels },
                     metrics,
                 ))
             },
             |out| {
                 format!(
                     "{} @ {} levels={} bid_quote={} ask_quote={} total_quote={}",
-                    out.metrics.symbol,
-                    out.metrics.at,
-                    out.metrics.levels,
+                    out.symbol,
+                    out.ts_ms,
+                    out.inputs.levels,
                     out.metrics.bid_quote,
                     out.metrics.ask_quote,
                     out.metrics.total_quote
@@ -94,17 +90,14 @@ pub async fn handle(args: DepthArgs) -> Result<()> {
         }
     };
 
-    let out = estimate_depth(&snapshot, snapshot.timestamp_ms, req.levels)?;
+    let out = estimate_depth(&snapshot, req.levels)?;
     let env = to_envelope(
         provider_name(req.provider),
         &req.exchange,
         &req.symbol,
         snapshot.timestamp_ms,
         false,
-        DepthInputs {
-            levels: req.levels,
-            at: 0,
-        },
+        DepthInputs { levels: req.levels },
         out,
     );
     render(&env, args.output, args.verbose)
@@ -112,7 +105,6 @@ pub async fn handle(args: DepthArgs) -> Result<()> {
 
 fn estimate_depth(
     book: &crate::domain::types::OrderBookSnapshot,
-    at: u64,
     levels: u16,
 ) -> Result<DepthEstimate> {
     if levels == 0 {
@@ -129,10 +121,6 @@ fn estimate_depth(
     let ask_quote: f64 = ask_slice.map(|l| l.price * l.quantity).sum();
 
     Ok(DepthEstimate {
-        exchange: book.exchange.clone(),
-        symbol: book.symbol.clone(),
-        at,
-        levels,
         bid_base,
         ask_base,
         bid_quote,
@@ -151,9 +139,9 @@ fn render(
             let out = &env.metrics;
             println!(
                 "{} @ {} levels={} bid_quote={} ask_quote={} total_quote={} bid_base={} ask_base={}",
-                out.symbol,
-                out.at,
-                out.levels,
+                env.symbol,
+                env.ts_ms,
+                env.inputs.levels,
                 out.bid_quote,
                 out.ask_quote,
                 out.total_quote,
@@ -182,12 +170,17 @@ fn to_envelope(
         r#type: "study.depth.result".to_string(),
         version: "1",
         provider,
-        exchange: exchange.to_lowercase(),
-        symbol: symbol.to_uppercase(),
+        exchange: exchange.to_string(),
+        symbol: symbol.to_string(),
         ts_ms: at,
         stream,
+        study: StudyDescriptor {
+            name: "depth".to_string(),
+            kind: "snapshot",
+            source: "builtin",
+        },
         inputs,
         metrics,
-        meta: serde_json::json!({}),
+        meta: empty_meta(),
     }
 }

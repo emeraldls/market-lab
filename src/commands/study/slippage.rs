@@ -8,7 +8,7 @@ use crate::domain::types::SlippageEstimate;
 use crate::providers::mmt::MmtProvider;
 use crate::providers::{MarketDataProvider, ProviderClient};
 
-use super::common::{StudyEnvelope, print_study_json, provider_name};
+use super::common::{StudyDescriptor, StudyEnvelope, empty_meta, print_study_json, provider_name};
 use super::realtime::{StreamRunConfig, run_mmt_realtime};
 
 #[derive(Clone, Debug, Serialize)]
@@ -16,7 +16,6 @@ struct SlippageInputs {
     side: String,
     notional: f64,
     depth: u16,
-    at: u64,
 }
 
 pub async fn handle(args: SlippageArgs) -> Result<()> {
@@ -41,7 +40,7 @@ pub async fn handle(args: SlippageArgs) -> Result<()> {
                 output: args.output,
             },
             move |snap| {
-                let metrics = estimate_slippage(snap, req.notional, snap.timestamp_ms, req.side)?;
+                let metrics = estimate_slippage(snap, req.notional, req.side)?;
                 Ok(to_envelope(
                     provider_name(req.provider),
                     &req.exchange,
@@ -49,10 +48,9 @@ pub async fn handle(args: SlippageArgs) -> Result<()> {
                     snap.timestamp_ms,
                     true,
                     SlippageInputs {
-                        side: metrics.side.clone(),
+                        side: side_name(req.side).to_string(),
                         notional: req.notional,
                         depth: req.depth,
-                        at: snap.timestamp_ms,
                     },
                     metrics,
                 ))
@@ -60,9 +58,9 @@ pub async fn handle(args: SlippageArgs) -> Result<()> {
             |out| {
                 format!(
                     "{} {} @ {}: avg_fill={} slippage_bps={}",
-                    out.metrics.symbol,
-                    out.metrics.side,
-                    out.metrics.at,
+                    out.symbol,
+                    out.inputs.side,
+                    out.ts_ms,
                     out.metrics.avg_fill_price,
                     out.metrics.slippage_bps
                 )
@@ -97,7 +95,7 @@ pub async fn handle(args: SlippageArgs) -> Result<()> {
         }
     };
 
-    let estimate = estimate_slippage(&snapshot, req.notional, snapshot.timestamp_ms, req.side)?;
+    let estimate = estimate_slippage(&snapshot, req.notional, req.side)?;
     let env = to_envelope(
         provider_name(req.provider),
         &req.exchange,
@@ -105,10 +103,9 @@ pub async fn handle(args: SlippageArgs) -> Result<()> {
         snapshot.timestamp_ms,
         false,
         SlippageInputs {
-            side: estimate.side.clone(),
+            side: side_name(req.side).to_string(),
             notional: req.notional,
             depth: req.depth,
-            at: 0,
         },
         estimate,
     );
@@ -126,9 +123,9 @@ fn render(
             let estimate = &env.metrics;
             println!(
                 "{} {} @ {}: avg_fill={} slippage_bps={}",
-                estimate.symbol,
-                estimate.side,
-                estimate.at,
+                env.symbol,
+                env.inputs.side,
+                env.ts_ms,
                 estimate.avg_fill_price,
                 estimate.slippage_bps
             );
@@ -155,20 +152,24 @@ fn to_envelope(
         r#type: "study.slippage.result".to_string(),
         version: "1",
         provider,
-        exchange: exchange.to_lowercase(),
-        symbol: symbol.to_uppercase(),
+        exchange: exchange.to_string(),
+        symbol: symbol.to_string(),
         ts_ms: at,
         stream,
+        study: StudyDescriptor {
+            name: "slippage".to_string(),
+            kind: "snapshot",
+            source: "builtin",
+        },
         inputs,
         metrics,
-        meta: serde_json::json!({}),
+        meta: empty_meta(),
     }
 }
 
 fn estimate_slippage(
     book: &crate::domain::types::OrderBookSnapshot,
     notional: f64,
-    at: u64,
     side: crate::domain::enums::Side,
 ) -> Result<SlippageEstimate> {
     let levels = match side {
@@ -221,18 +222,17 @@ fn estimate_slippage(
     };
 
     Ok(SlippageEstimate {
-        exchange: book.exchange.clone(),
-        symbol: book.symbol.clone(),
-        side: match side {
-            crate::domain::enums::Side::Buy => "buy".to_string(),
-            crate::domain::enums::Side::Sell => "sell".to_string(),
-        },
-        notional,
-        at,
         avg_fill_price,
         best_price,
         slippage_abs,
         slippage_bps,
         levels_consumed,
     })
+}
+
+fn side_name(side: crate::domain::enums::Side) -> &'static str {
+    match side {
+        crate::domain::enums::Side::Buy => "buy",
+        crate::domain::enums::Side::Sell => "sell",
+    }
 }

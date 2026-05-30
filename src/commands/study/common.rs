@@ -1,8 +1,16 @@
 use anyhow::Result;
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::cli::OutputFormat;
 use crate::domain::enums::ProviderKind;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StudyDescriptor {
+    pub name: String,
+    pub kind: &'static str,
+    pub source: &'static str,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StudyEnvelope<I, M>
@@ -17,14 +25,16 @@ where
     pub symbol: String,
     pub ts_ms: u64,
     pub stream: bool,
+    pub study: StudyDescriptor,
     pub inputs: I,
     pub metrics: M,
-    pub meta: serde_json::Value,
+    pub meta: Value,
 }
 
 #[derive(Debug, Serialize)]
-struct CompactStudyEnvelope<'a, M>
+struct CompactStudyEnvelope<'a, I, M>
 where
+    I: Serialize,
     M: Serialize,
 {
     r#type: &'a str,
@@ -34,6 +44,9 @@ where
     symbol: &'a str,
     ts_ms: u64,
     stream: bool,
+    study: &'a StudyDescriptor,
+    #[serde(skip_serializing_if = "is_empty_object")]
+    inputs: &'a I,
     metrics: &'a M,
 }
 
@@ -68,6 +81,8 @@ where
             symbol: &env.symbol,
             ts_ms: env.ts_ms,
             stream: env.stream,
+            study: &env.study,
+            inputs: &env.inputs,
             metrics: &env.metrics,
         };
         match output {
@@ -78,6 +93,17 @@ where
     }
 
     Ok(())
+}
+
+pub fn empty_meta() -> Value {
+    Value::Object(Default::default())
+}
+
+pub fn is_empty_object<T: Serialize>(value: &T) -> bool {
+    match serde_json::to_value(value) {
+        Ok(Value::Object(map)) => map.is_empty(),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -94,13 +120,19 @@ mod tests {
             symbol: "BTC/USDT".to_string(),
             ts_ms: 1,
             stream: false,
+            study: StudyDescriptor {
+                name: "spread".to_string(),
+                kind: "snapshot",
+                source: "builtin",
+            },
             inputs: serde_json::json!({"depth": 20}),
             metrics: serde_json::json!({"spread_bps": 1.2}),
-            meta: serde_json::json!({}),
+            meta: empty_meta(),
         };
         let v = serde_json::to_value(env).expect("serialize study envelope");
         assert_eq!(v["type"], "study.spread.result");
         assert_eq!(v["version"], "1");
+        assert_eq!(v["study"]["name"], "spread");
         assert!(v.get("inputs").is_some());
         assert!(v.get("metrics").is_some());
     }
@@ -115,7 +147,12 @@ mod tests {
             symbol: "BTC/USDT".to_string(),
             ts_ms: 1,
             stream: false,
-            inputs: serde_json::json!({"depth": 20}),
+            study: StudyDescriptor {
+                name: "spread".to_string(),
+                kind: "snapshot",
+                source: "builtin",
+            },
+            inputs: serde_json::json!({}),
             metrics: serde_json::json!({"spread_bps": 1.2}),
             meta: serde_json::json!({"debug": true}),
         };
@@ -127,11 +164,14 @@ mod tests {
             symbol: &env.symbol,
             ts_ms: env.ts_ms,
             stream: env.stream,
+            study: &env.study,
+            inputs: &env.inputs,
             metrics: &env.metrics,
         };
         let v = serde_json::to_value(compact).expect("serialize compact study envelope");
         assert!(v.get("inputs").is_none());
         assert!(v.get("meta").is_none());
         assert!(v.get("metrics").is_some());
+        assert!(v.get("study").is_some());
     }
 }

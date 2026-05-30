@@ -8,13 +8,12 @@ use crate::domain::types::SpreadEstimate;
 use crate::providers::mmt::MmtProvider;
 use crate::providers::{MarketDataProvider, ProviderClient};
 
-use super::common::{StudyEnvelope, print_study_json, provider_name};
+use super::common::{StudyDescriptor, StudyEnvelope, empty_meta, print_study_json, provider_name};
 use super::realtime::{StreamRunConfig, run_mmt_realtime};
 
 #[derive(Clone, Debug, Serialize)]
 struct SpreadInputs {
     depth: u16,
-    at: u64,
 }
 
 pub async fn handle(args: SpreadArgs) -> Result<()> {
@@ -39,25 +38,22 @@ pub async fn handle(args: SpreadArgs) -> Result<()> {
                 output: args.output,
             },
             move |snap| {
-                let metrics = estimate_spread(snap, snap.timestamp_ms)?;
+                let metrics = estimate_spread(snap)?;
                 Ok(to_envelope(
                     provider_name(req.provider),
                     &req.exchange,
                     &req.symbol,
                     snap.timestamp_ms,
                     true,
-                    SpreadInputs {
-                        depth: req.depth,
-                        at: snap.timestamp_ms,
-                    },
+                    SpreadInputs { depth: req.depth },
                     metrics,
                 ))
             },
             |out| {
                 format!(
                     "{} @ {} bid={} ask={} spread={} spread_bps={}",
-                    out.metrics.symbol,
-                    out.metrics.at,
+                    out.symbol,
+                    out.ts_ms,
                     out.metrics.best_bid,
                     out.metrics.best_ask,
                     out.metrics.spread_abs,
@@ -94,26 +90,20 @@ pub async fn handle(args: SpreadArgs) -> Result<()> {
         }
     };
 
-    let out = estimate_spread(&snapshot, snapshot.timestamp_ms)?;
+    let out = estimate_spread(&snapshot)?;
     let env = to_envelope(
         provider_name(req.provider),
         &req.exchange,
         &req.symbol,
         snapshot.timestamp_ms,
         false,
-        SpreadInputs {
-            depth: req.depth,
-            at: 0,
-        },
+        SpreadInputs { depth: req.depth },
         out,
     );
     render(&env, args.output, args.verbose)
 }
 
-fn estimate_spread(
-    book: &crate::domain::types::OrderBookSnapshot,
-    at: u64,
-) -> Result<SpreadEstimate> {
+fn estimate_spread(book: &crate::domain::types::OrderBookSnapshot) -> Result<SpreadEstimate> {
     let best_bid = book
         .bids
         .first()
@@ -134,9 +124,6 @@ fn estimate_spread(
     };
 
     Ok(SpreadEstimate {
-        exchange: book.exchange.clone(),
-        symbol: book.symbol.clone(),
-        at,
         best_bid,
         best_ask,
         spread_abs,
@@ -155,8 +142,8 @@ fn render(
             let out = &env.metrics;
             println!(
                 "{} @ {} bid={} ask={} spread={} spread_bps={} mid={}",
-                out.symbol,
-                out.at,
+                env.symbol,
+                env.ts_ms,
                 out.best_bid,
                 out.best_ask,
                 out.spread_abs,
@@ -185,12 +172,17 @@ fn to_envelope(
         r#type: "study.spread.result".to_string(),
         version: "1",
         provider,
-        exchange: exchange.to_lowercase(),
-        symbol: symbol.to_uppercase(),
+        exchange: exchange.to_string(),
+        symbol: symbol.to_string(),
         ts_ms: at,
         stream,
+        study: StudyDescriptor {
+            name: "spread".to_string(),
+            kind: "snapshot",
+            source: "builtin",
+        },
         inputs,
         metrics,
-        meta: serde_json::json!({}),
+        meta: empty_meta(),
     }
 }

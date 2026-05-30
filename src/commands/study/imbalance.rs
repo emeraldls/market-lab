@@ -8,13 +8,12 @@ use crate::domain::types::ImbalanceEstimate;
 use crate::providers::mmt::MmtProvider;
 use crate::providers::{MarketDataProvider, ProviderClient};
 
-use super::common::{StudyEnvelope, print_study_json, provider_name};
+use super::common::{StudyDescriptor, StudyEnvelope, empty_meta, print_study_json, provider_name};
 use super::realtime::{StreamRunConfig, run_mmt_realtime};
 
 #[derive(Clone, Debug, Serialize)]
 struct ImbalanceInputs {
     depth: u16,
-    at: u64,
 }
 
 pub async fn handle(args: ImbalanceArgs) -> Result<()> {
@@ -39,26 +38,23 @@ pub async fn handle(args: ImbalanceArgs) -> Result<()> {
                 output: args.output,
             },
             move |snap| {
-                let metrics = estimate_imbalance(snap, snap.timestamp_ms, req.depth)?;
+                let metrics = estimate_imbalance(snap, req.depth)?;
                 Ok(to_envelope(
                     provider_name(req.provider),
                     &req.exchange,
                     &req.symbol,
                     snap.timestamp_ms,
                     true,
-                    ImbalanceInputs {
-                        depth: req.depth,
-                        at: snap.timestamp_ms,
-                    },
+                    ImbalanceInputs { depth: req.depth },
                     metrics,
                 ))
             },
             |out| {
                 format!(
                     "{} @ {} depth={} imbalance={:.6} bid_vol={} ask_vol={}",
-                    out.metrics.symbol,
-                    out.metrics.at,
-                    out.metrics.depth,
+                    out.symbol,
+                    out.ts_ms,
+                    out.inputs.depth,
                     out.metrics.imbalance,
                     out.metrics.bid_volume,
                     out.metrics.ask_volume
@@ -94,17 +90,14 @@ pub async fn handle(args: ImbalanceArgs) -> Result<()> {
         }
     };
 
-    let estimate = estimate_imbalance(&snapshot, snapshot.timestamp_ms, req.depth)?;
+    let estimate = estimate_imbalance(&snapshot, req.depth)?;
     let env = to_envelope(
         provider_name(req.provider),
         &req.exchange,
         &req.symbol,
         snapshot.timestamp_ms,
         false,
-        ImbalanceInputs {
-            depth: req.depth,
-            at: 0,
-        },
+        ImbalanceInputs { depth: req.depth },
         estimate,
     );
     render(&env, args.output, args.verbose)
@@ -120,9 +113,9 @@ fn render(
             let estimate = &env.metrics;
             println!(
                 "{} @ {} depth={} imbalance={:.6} bid_vol={} ask_vol={}",
-                estimate.symbol,
-                estimate.at,
-                estimate.depth,
+                env.symbol,
+                env.ts_ms,
+                env.inputs.depth,
                 estimate.imbalance,
                 estimate.bid_volume,
                 estimate.ask_volume
@@ -149,19 +142,23 @@ fn to_envelope(
         r#type: "study.imbalance.result".to_string(),
         version: "1",
         provider,
-        exchange: exchange.to_lowercase(),
-        symbol: symbol.to_uppercase(),
+        exchange: exchange.to_string(),
+        symbol: symbol.to_string(),
         ts_ms: at,
         stream,
+        study: StudyDescriptor {
+            name: "imbalance".to_string(),
+            kind: "snapshot",
+            source: "builtin",
+        },
         inputs,
         metrics,
-        meta: serde_json::json!({}),
+        meta: empty_meta(),
     }
 }
 
 fn estimate_imbalance(
     book: &crate::domain::types::OrderBookSnapshot,
-    at: u64,
     depth: u16,
 ) -> Result<ImbalanceEstimate> {
     if depth == 0 {
@@ -180,10 +177,6 @@ fn estimate_imbalance(
     let imbalance = (bid_volume - ask_volume) / denom;
 
     Ok(ImbalanceEstimate {
-        exchange: book.exchange.clone(),
-        symbol: book.symbol.clone(),
-        at,
-        depth,
         bid_volume,
         ask_volume,
         imbalance,

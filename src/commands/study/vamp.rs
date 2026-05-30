@@ -8,12 +8,11 @@ use crate::domain::types::VampEstimate;
 use crate::providers::mmt::MmtProvider;
 use crate::providers::{MarketDataProvider, ProviderClient};
 
-use super::common::{StudyEnvelope, print_study_json, provider_name};
+use super::common::{StudyDescriptor, StudyEnvelope, empty_meta, print_study_json, provider_name};
 use super::realtime::{StreamRunConfig, run_mmt_realtime};
 
 #[derive(Clone, Debug, Serialize)]
 struct VampInputs {
-    at: u64,
     depth: u16,
     dollar_depth: f64,
 }
@@ -40,7 +39,7 @@ pub async fn handle(args: VampArgs) -> Result<()> {
                 output: args.output,
             },
             move |snap| {
-                let metrics = estimate_vamp(snap, snap.timestamp_ms, req.dollar_depth)?;
+                let metrics = estimate_vamp(snap, req.dollar_depth)?;
                 Ok(to_envelope(
                     provider_name(req.provider),
                     &req.exchange,
@@ -48,7 +47,6 @@ pub async fn handle(args: VampArgs) -> Result<()> {
                     snap.timestamp_ms,
                     true,
                     VampInputs {
-                        at: snap.timestamp_ms,
                         depth: req.depth,
                         dollar_depth: req.dollar_depth,
                     },
@@ -58,9 +56,9 @@ pub async fn handle(args: VampArgs) -> Result<()> {
             |out| {
                 format!(
                     "{} @ {} depth=${}: vamp={} (bid_vwap={}, ask_vwap={}) complete={} max_bid_quote={} max_ask_quote={}",
-                    out.metrics.symbol,
-                    out.metrics.at,
-                    out.metrics.dollar_depth,
+                    out.symbol,
+                    out.ts_ms,
+                    out.inputs.dollar_depth,
                     out.metrics.vamp,
                     out.metrics.bid_vwap,
                     out.metrics.ask_vwap,
@@ -97,7 +95,7 @@ pub async fn handle(args: VampArgs) -> Result<()> {
         }
     };
 
-    let out = estimate_vamp(&snapshot, snapshot.timestamp_ms, req.dollar_depth)?;
+    let out = estimate_vamp(&snapshot, req.dollar_depth)?;
     let env = to_envelope(
         provider_name(req.provider),
         &req.exchange,
@@ -105,7 +103,6 @@ pub async fn handle(args: VampArgs) -> Result<()> {
         snapshot.timestamp_ms,
         false,
         VampInputs {
-            at: 0,
             depth: req.depth,
             dollar_depth: req.dollar_depth,
         },
@@ -124,9 +121,9 @@ fn render(
             let out = &env.metrics;
             println!(
                 "{} @ {} depth=${}: vamp={} (bid_vwap={}, ask_vwap={}) complete={} max_bid_quote={} max_ask_quote={}",
-                out.symbol,
-                out.at,
-                out.dollar_depth,
+                env.symbol,
+                env.ts_ms,
+                env.inputs.dollar_depth,
                 out.vamp,
                 out.bid_vwap,
                 out.ask_vwap,
@@ -157,19 +154,23 @@ fn to_envelope(
         r#type: "study.vamp.result".to_string(),
         version: "1",
         provider,
-        exchange: exchange.to_lowercase(),
-        symbol: symbol.to_uppercase(),
+        exchange: exchange.to_string(),
+        symbol: symbol.to_string(),
         ts_ms: at,
         stream,
+        study: StudyDescriptor {
+            name: "vamp".to_string(),
+            kind: "snapshot",
+            source: "builtin",
+        },
         inputs,
         metrics,
-        meta: serde_json::json!({}),
+        meta: empty_meta(),
     }
 }
 
 fn estimate_vamp(
     book: &crate::domain::types::OrderBookSnapshot,
-    at: u64,
     dollar_depth: f64,
 ) -> Result<VampEstimate> {
     if dollar_depth <= 0.0 {
@@ -189,10 +190,6 @@ fn estimate_vamp(
     let complete = ask_fill.filled_quote >= dollar_depth && bid_fill.filled_quote >= dollar_depth;
 
     Ok(VampEstimate {
-        exchange: book.exchange.clone(),
-        symbol: book.symbol.clone(),
-        at,
-        dollar_depth,
         ask_vwap,
         bid_vwap,
         vamp,
