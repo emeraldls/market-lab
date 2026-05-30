@@ -1,11 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as AnyhowContext, Result, bail};
+use anyhow::{Context as AnyhowContext, Result};
 use rquickjs::{CatchResultExt, Context, Ctx, Function, Module, Object, Promise, Runtime, Value};
 use serde_json::Value as JsonValue;
 
-use super::manifest::{StudyManifest, StudyMode};
+use super::manifest::StudyManifest;
 
 pub struct StudyScript {
     pub path: PathBuf,
@@ -48,8 +48,8 @@ impl StudyScript {
                 .namespace()
                 .context("failed to read JS module namespace")?;
             let hook: Function = namespace
-                .get("onCandle")
-                .context("study source=candles requires export `onCandle`")?;
+                .get("onData")
+                .context("study scripts require export `onData(ctx, input)`")?;
 
             let script_ctx = Object::new(ctx.clone()).context("failed to create script ctx")?;
             let inputs_val = json_to_js(ctx.clone(), inputs)?;
@@ -65,7 +65,7 @@ impl StudyScript {
             let result: Value = hook
                 .call((script_ctx, input_val))
                 .catch(&ctx)
-                .map_err(|err| anyhow::anyhow!("onCandle failed: {}", err))?;
+                .map_err(|err| anyhow::anyhow!("onData failed: {}", err))?;
             let result_json = js_to_json(ctx.clone(), result)?;
             super::study::ScriptStudyOutput::from_json(result_json)
         })
@@ -95,9 +95,6 @@ fn inspect_manifest(path: &Path, source: &str) -> Result<StudyManifest> {
         let manifest: StudyManifest =
             serde_json::from_value(study_json).context("failed to decode `study` manifest")?;
         manifest.validate()?;
-        if !manifest.supports_mode(StudyMode::Window) {
-            bail!("phase 1 requires study.modes to include \"window\"");
-        }
         Ok(manifest)
     })
 }
@@ -159,7 +156,7 @@ export const study = {
   }
 };
 
-export function onCandle(ctx, input) {
+export function onData(ctx, input) {
   return { metrics: { count: input.candles.length, threshold: ctx.inputs.min_vbuy } };
 }
 "#,
@@ -185,7 +182,7 @@ export const study = {
   }
 };
 
-export function onCandle(ctx, input) {
+export function onData(ctx, input) {
   const filtered = input.candles.filter((c) => c.vb >= ctx.inputs.min_vbuy);
   return {
     metrics: {
@@ -225,7 +222,7 @@ export const study = {
   inputs: {}
 };
 
-export function onCandle(ctx, input) {
+export function onData(ctx, input) {
   return { metrics: { count: input.cande.length } };
 }
 "#,
@@ -238,8 +235,33 @@ export function onCandle(ctx, input) {
             .expect_err("script should fail");
         let message = err.to_string();
 
-        assert!(message.contains("onCandle failed"));
+        assert!(message.contains("onData failed"));
         assert!(message.contains("cande") || message.contains("undefined"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn requires_on_data_hook() {
+        let path = write_temp_script(
+            r#"
+export const study = {
+  name: "missing-hook",
+  version: "1",
+  source: "candles",
+  modes: ["window"],
+  inputs: {}
+};
+"#,
+            "missing-hook",
+        );
+
+        let script = StudyScript::load(&path).expect("load script");
+        let err = script
+            .run_candles_window(&json!({}), &json!([{ "c": 1.0 }]))
+            .expect_err("missing onData should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("onData(ctx, input)"));
         let _ = fs::remove_file(path);
     }
 }

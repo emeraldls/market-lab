@@ -191,4 +191,17 @@ mod tests {
         let err = manifest.validate().expect_err("reserved input should fail");
         assert!(err.to_string().contains("reserved"));
     }
+
+    #[test]
+    fn manifest_rejects_unknown_source() {
+        let err = serde_json::from_value::<StudyManifest>(serde_json::json!({
+            "name": "x",
+            "version": "1",
+            "source": "xyz",
+            "modes": ["window"]
+        }))
+        .expect_err("unknown source should fail");
+
+        assert!(err.to_string().contains("unknown variant"));
+    }
 }

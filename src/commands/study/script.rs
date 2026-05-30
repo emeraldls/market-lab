@@ -27,9 +27,6 @@ pub async fn handle_run(args: CustomStudyRunArgs) -> Result<()> {
     }
 
     let script = StudyScript::load(&args.script)?;
-    if !matches!(script.manifest.source, StudySource::Candles) {
-        bail!("phase 1 supports only custom studies with study.source = \"candles\"");
-    }
     if args.stream && !script.manifest.supports_mode(StudyMode::Stream) {
         bail!("study does not support stream mode");
     }
@@ -37,12 +34,22 @@ pub async fn handle_run(args: CustomStudyRunArgs) -> Result<()> {
         bail!("study does not support window mode");
     }
     if args.stream {
-        bail!("phase 1 custom studies do not execute stream mode yet");
+        bail!("custom study stream execution is not implemented yet");
     }
 
     let raw_inputs = parse_kv_inputs(&args.input)?;
     let resolved_inputs = resolve_inputs(&script.manifest, &raw_inputs)?;
 
+    match script.manifest.source {
+        StudySource::Candles => run_candles_window(args, script, resolved_inputs).await,
+    }
+}
+
+async fn run_candles_window(
+    args: CustomStudyRunArgs,
+    script: StudyScript,
+    resolved_inputs: Value,
+) -> Result<()> {
     let series = MmtProvider::candles(
         &args.exchange,
         &args.symbol,
