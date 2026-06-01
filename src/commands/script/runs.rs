@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -36,7 +37,7 @@ pub fn handle_list(args: ScriptRunsListArgs) -> Result<()> {
     reject_unsupported_output(args.output)?;
 
     let mut records = read_records()?;
-    records.sort_by(|a, b| b.started_at_ms.cmp(&a.started_at_ms));
+    records.sort_by_key(|record| Reverse(record.started_at_ms));
 
     if !args.all {
         records.truncate(args.limit);

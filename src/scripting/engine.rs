@@ -238,7 +238,7 @@ export function onData(ctx, input) {
 
         assert_eq!(execution.output.metrics["qualifying_candles"], 1);
         assert_eq!(execution.output.metrics["latest_close"], 2.0);
-        assert_eq!(execution.stats.heap_used_bytes.is_some(), true);
+        assert!(execution.stats.heap_used_bytes.is_some());
         let _ = fs::remove_file(path);
     }
 
