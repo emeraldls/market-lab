@@ -22,6 +22,7 @@ fn build_status(provider_health: ProviderHealth) -> SystemStatus {
             "inspect".to_string(),
             "replay".to_string(),
             "source".to_string(),
+            "script".to_string(),
             "study".to_string(),
             "strategy".to_string(),
             "health".to_string(),

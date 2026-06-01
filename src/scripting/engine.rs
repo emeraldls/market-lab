@@ -1,19 +1,23 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context as AnyhowContext, Result};
 use rquickjs::{CatchResultExt, Context, Ctx, Function, Module, Object, Promise, Runtime, Value};
 use serde_json::Value as JsonValue;
 
-use super::manifest::StudyManifest;
+use super::limits::default_limits;
+use super::manifest::ScriptManifest;
+use super::output::ScriptOutput;
+use super::telemetry::ScriptHookStats;
 
-pub struct StudyScript {
+pub struct Script {
     pub path: PathBuf,
-    pub manifest: StudyManifest,
+    pub manifest: ScriptManifest,
     source: String,
 }
 
-impl StudyScript {
+impl Script {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let source = fs::read_to_string(path)
@@ -30,11 +34,19 @@ impl StudyScript {
         &self,
         inputs: &JsonValue,
         candles: &JsonValue,
-    ) -> Result<super::study::ScriptStudyOutput> {
+    ) -> Result<ScriptExecution> {
+        let limits = default_limits();
         let rt = Runtime::new().context("failed to create QuickJS runtime")?;
+        rt.set_memory_limit(limits.heap_bytes);
+        rt.set_max_stack_size(limits.stack_bytes);
+        let hook_started = Instant::now();
+        rt.set_interrupt_handler(Some(Box::new(move || {
+            hook_started.elapsed().as_millis() as u64 > limits.hook_timeout_ms
+        })));
         let ctx = Context::full(&rt).context("failed to create QuickJS context")?;
 
-        ctx.with(|ctx| -> Result<super::study::ScriptStudyOutput> {
+        let started = Instant::now();
+        let output = ctx.with(|ctx| -> Result<ScriptOutput> {
             let module =
                 Module::declare(ctx.clone(), module_name(&self.path), self.source.as_str())
                     .context("failed to declare JS module")?;
@@ -49,7 +61,7 @@ impl StudyScript {
                 .context("failed to read JS module namespace")?;
             let hook: Function = namespace
                 .get("onData")
-                .context("study scripts require export `onData(ctx, input)`")?;
+                .context("scripts require export `onData(ctx, input)`")?;
 
             let script_ctx = Object::new(ctx.clone()).context("failed to create script ctx")?;
             let inputs_val = json_to_js(ctx.clone(), inputs)?;
@@ -67,16 +79,34 @@ impl StudyScript {
                 .catch(&ctx)
                 .map_err(|err| anyhow::anyhow!("onData failed: {}", err))?;
             let result_json = js_to_json(ctx.clone(), result)?;
-            super::study::ScriptStudyOutput::from_json(result_json)
+            ScriptOutput::from_json(result_json)
+        })?;
+
+        let memory_usage = rt.memory_usage();
+        Ok(ScriptExecution {
+            output,
+            stats: ScriptHookStats {
+                duration_ms: started.elapsed().as_millis() as u64,
+                heap_used_bytes: u64::try_from(memory_usage.memory_used_size).ok(),
+            },
         })
     }
 }
 
-fn inspect_manifest(path: &Path, source: &str) -> Result<StudyManifest> {
+#[derive(Debug)]
+pub struct ScriptExecution {
+    pub output: ScriptOutput,
+    pub stats: ScriptHookStats,
+}
+
+fn inspect_manifest(path: &Path, source: &str) -> Result<ScriptManifest> {
+    let limits = default_limits();
     let rt = Runtime::new().context("failed to create QuickJS runtime")?;
+    rt.set_memory_limit(limits.heap_bytes);
+    rt.set_max_stack_size(limits.stack_bytes);
     let ctx = Context::full(&rt).context("failed to create QuickJS context")?;
 
-    ctx.with(|ctx| -> Result<StudyManifest> {
+    ctx.with(|ctx| -> Result<ScriptManifest> {
         let module = Module::declare(ctx.clone(), module_name(path), source)
             .context("failed to declare JS module")?;
         let (module, promise) = module
@@ -88,12 +118,13 @@ fn inspect_manifest(path: &Path, source: &str) -> Result<StudyManifest> {
         let namespace = module
             .namespace()
             .context("failed to read JS module namespace")?;
-        let study_value: Value = namespace
-            .get("study")
-            .context("script has no `study` export")?;
-        let study_json = js_to_json(ctx.clone(), study_value)?;
-        let manifest: StudyManifest =
-            serde_json::from_value(study_json).context("failed to decode `study` manifest")?;
+        let manifest_value: Value = namespace
+            .get("script")
+            .or_else(|_| namespace.get("study"))
+            .context("script has no `script` export")?;
+        let manifest_json = js_to_json(ctx.clone(), manifest_value)?;
+        let manifest: ScriptManifest =
+            serde_json::from_value(manifest_json).context("failed to decode `script` manifest")?;
         manifest.validate()?;
         Ok(manifest)
     })
@@ -123,7 +154,7 @@ fn js_to_json<'js>(ctx: rquickjs::Ctx<'js>, value: Value<'js>) -> Result<JsonVal
 fn module_name(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("study.js")
+        .unwrap_or("script.js")
         .to_string()
 }
 
@@ -133,11 +164,11 @@ mod tests {
 
     use serde_json::json;
 
-    use super::StudyScript;
+    use super::Script;
 
     fn write_temp_script(contents: &str, stem: &str) -> std::path::PathBuf {
         let path =
-            std::env::temp_dir().join(format!("mlab-study-{}-{}.js", stem, std::process::id()));
+            std::env::temp_dir().join(format!("mlab-script-{}-{}.js", stem, std::process::id()));
         fs::write(&path, contents).expect("write temp script");
         path
     }
@@ -146,7 +177,7 @@ mod tests {
     fn loads_manifest_from_js_module() {
         let path = write_temp_script(
             r#"
-export const study = {
+export const script = {
   name: "buy-pressure-filter",
   version: "1",
   source: "candles",
@@ -163,7 +194,7 @@ export function onData(ctx, input) {
             "manifest",
         );
 
-        let script = StudyScript::load(&path).expect("load script");
+        let script = Script::load(&path).expect("load script");
         assert_eq!(script.manifest.name, "buy-pressure-filter");
         let _ = fs::remove_file(path);
     }
@@ -172,7 +203,7 @@ export function onData(ctx, input) {
     fn runs_candles_window_hook() {
         let path = write_temp_script(
             r#"
-export const study = {
+export const script = {
   name: "buy-pressure-filter",
   version: "1",
   source: "candles",
@@ -195,18 +226,19 @@ export function onData(ctx, input) {
             "run",
         );
 
-        let script = StudyScript::load(&path).expect("load script");
+        let script = Script::load(&path).expect("load script");
         let inputs = json!({ "min_vbuy": 150.0 });
         let candles = json!([
             { "t": 1, "o": 1.0, "h": 2.0, "l": 0.5, "c": 1.5, "vb": 100.0, "vs": 80.0, "tb": 10, "ts": 9 },
             { "t": 2, "o": 1.5, "h": 2.2, "l": 1.0, "c": 2.0, "vb": 200.0, "vs": 90.0, "tb": 12, "ts": 10 }
         ]);
-        let out = script
+        let execution = script
             .run_candles_window(&inputs, &candles)
             .expect("run script");
 
-        assert_eq!(out.metrics["qualifying_candles"], 1);
-        assert_eq!(out.metrics["latest_close"], 2.0);
+        assert_eq!(execution.output.metrics["qualifying_candles"], 1);
+        assert_eq!(execution.output.metrics["latest_close"], 2.0);
+        assert_eq!(execution.stats.heap_used_bytes.is_some(), true);
         let _ = fs::remove_file(path);
     }
 
@@ -214,8 +246,8 @@ export function onData(ctx, input) {
     fn reports_js_exception_message_from_hook() {
         let path = write_temp_script(
             r#"
-export const study = {
-  name: "bad-study",
+export const script = {
+  name: "bad-script",
   version: "1",
   source: "candles",
   modes: ["window"],
@@ -229,7 +261,7 @@ export function onData(ctx, input) {
             "bad",
         );
 
-        let script = StudyScript::load(&path).expect("load script");
+        let script = Script::load(&path).expect("load script");
         let err = script
             .run_candles_window(&json!({}), &json!([{ "c": 1.0 }]))
             .expect_err("script should fail");
@@ -244,7 +276,7 @@ export function onData(ctx, input) {
     fn requires_on_data_hook() {
         let path = write_temp_script(
             r#"
-export const study = {
+export const script = {
   name: "missing-hook",
   version: "1",
   source: "candles",
@@ -255,7 +287,7 @@ export const study = {
             "missing-hook",
         );
 
-        let script = StudyScript::load(&path).expect("load script");
+        let script = Script::load(&path).expect("load script");
         let err = script
             .run_candles_window(&json!({}), &json!([{ "c": 1.0 }]))
             .expect_err("missing onData should fail");

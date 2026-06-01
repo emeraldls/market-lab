@@ -27,6 +27,10 @@ pub enum Commands {
         #[command(subcommand)]
         command: StudyCommands,
     },
+    Script {
+        #[command(subcommand)]
+        command: ScriptCommands,
+    },
     Strategy {
         #[command(subcommand)]
         command: StrategyCommands,
@@ -45,13 +49,28 @@ pub enum SourceCommands {
 
 #[derive(Subcommand, Debug)]
 pub enum StudyCommands {
-    Run(CustomStudyRunArgs),
     Slippage(SlippageArgs),
     Imbalance(ImbalanceArgs),
     Spread(SpreadArgs),
     Depth(DepthArgs),
     Vamp(VampArgs),
     Cvd(CvdArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ScriptCommands {
+    Run(ScriptRunArgs),
+    Backtest(ScriptBacktestArgs),
+    Runs {
+        #[command(subcommand)]
+        command: ScriptRunHistoryCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ScriptRunHistoryCommands {
+    List(ScriptRunsListArgs),
+    Show(ScriptRunsShowArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -77,7 +96,48 @@ pub enum StrategyBacktestCommands {
 }
 
 #[derive(Clone, Debug, Args)]
-pub struct CustomStudyRunArgs {
+pub struct ScriptRunArgs {
+    pub script: String,
+    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
+    pub provider: CliProviderKind,
+    #[arg(long)]
+    pub exchange: Option<String>,
+    #[arg(long)]
+    pub symbol: Option<String>,
+    #[arg(long)]
+    pub timeframe: Option<u32>,
+    #[arg(long)]
+    pub from: Option<u64>,
+    #[arg(long)]
+    pub to: Option<u64>,
+    #[arg(long, default_value_t = false)]
+    pub stream: bool,
+    #[arg(long = "input")]
+    pub input: Vec<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+    #[arg(long, default_value_t = false)]
+    pub verbose: bool,
+}
+
+impl ScriptRunArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.script.trim().is_empty() {
+            bail!("script path is required");
+        }
+        Ok(())
+    }
+
+    pub fn mmt_tf(&self) -> Result<&'static str> {
+        let timeframe = self
+            .timeframe
+            .ok_or_else(|| anyhow::anyhow!("--timeframe is required for source=candles"))?;
+        mmt_timeframe_from_seconds(timeframe)
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ScriptBacktestArgs {
     pub script: String,
     #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
     pub provider: CliProviderKind,
@@ -91,8 +151,6 @@ pub struct CustomStudyRunArgs {
     pub from: u64,
     #[arg(long)]
     pub to: u64,
-    #[arg(long, default_value_t = false)]
-    pub stream: bool,
     #[arg(long = "input")]
     pub input: Vec<String>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
@@ -101,7 +159,7 @@ pub struct CustomStudyRunArgs {
     pub verbose: bool,
 }
 
-impl CustomStudyRunArgs {
+impl ScriptBacktestArgs {
     pub fn validate(&self) -> Result<()> {
         if self.script.trim().is_empty() {
             bail!("script path is required");
@@ -121,6 +179,41 @@ impl CustomStudyRunArgs {
 
     pub fn mmt_tf(&self) -> Result<&'static str> {
         mmt_timeframe_from_seconds(self.timeframe)
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ScriptRunsListArgs {
+    #[arg(long, default_value_t = 5)]
+    pub limit: usize,
+    #[arg(long, default_value_t = false)]
+    pub all: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl ScriptRunsListArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.limit == 0 {
+            bail!("--limit must be >= 1");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ScriptRunsShowArgs {
+    pub run: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl ScriptRunsShowArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.run.trim().is_empty() {
+            bail!("run id, file name, or path is required");
+        }
+        Ok(())
     }
 }
 
@@ -1391,12 +1484,72 @@ mod tests {
     }
 
     #[test]
-    fn parse_custom_study_run_command() {
+    fn parse_script_run_command() {
         let cli = Cli::try_parse_from([
             "mlab",
-            "study",
+            "script",
             "run",
             "./studies/buy-pressure.js",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "bybitf",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+            "--stream",
+            "--input",
+            "min_vbuy=50000",
+            "--output",
+            "json",
+        ])
+        .expect("script run parse should succeed");
+
+        match cli.command {
+            Commands::Script {
+                command: ScriptCommands::Run(args),
+            } => {
+                assert_eq!(args.script, "./studies/buy-pressure.js");
+                assert_eq!(args.exchange.as_deref(), Some("bybitf"));
+                assert_eq!(args.symbol.as_deref(), Some("BTC/USDT"));
+                assert_eq!(args.timeframe, Some(60));
+                assert!(args.stream);
+                assert_eq!(args.input, vec!["min_vbuy=50000"]);
+                args.validate().expect("validate should succeed");
+            }
+            _ => panic!("expected script run command"),
+        }
+    }
+
+    #[test]
+    fn parse_script_run_without_source_flags() {
+        let cli = Cli::try_parse_from(["mlab", "script", "run", "test/buy-pressure.js"])
+            .expect("script run should parse before source-specific validation");
+
+        match cli.command {
+            Commands::Script {
+                command: ScriptCommands::Run(args),
+            } => {
+                assert_eq!(args.script, "test/buy-pressure.js");
+                assert!(args.exchange.is_none());
+                assert!(args.symbol.is_none());
+                assert!(args.timeframe.is_none());
+                assert!(args.from.is_none());
+                assert!(args.to.is_none());
+                args.validate().expect("base validate should succeed");
+            }
+            _ => panic!("expected script run command"),
+        }
+    }
+
+    #[test]
+    fn parse_script_backtest_command() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "script",
+            "backtest",
+            "./scripts/sma-cross.js",
             "--provider",
             "mmt",
             "--exchange",
@@ -1410,21 +1563,62 @@ mod tests {
             "--to",
             "1704067800000",
             "--input",
-            "min_vbuy=50000",
+            "fast=20",
             "--output",
             "json",
         ])
-        .expect("custom study run parse should succeed");
+        .expect("script backtest parse should succeed");
 
         match cli.command {
-            Commands::Study {
-                command: StudyCommands::Run(args),
+            Commands::Script {
+                command: ScriptCommands::Backtest(args),
             } => {
-                assert_eq!(args.script, "./studies/buy-pressure.js");
-                assert_eq!(args.input, vec!["min_vbuy=50000"]);
+                assert_eq!(args.script, "./scripts/sma-cross.js");
+                assert_eq!(args.input, vec!["fast=20"]);
                 args.validate().expect("validate should succeed");
             }
-            _ => panic!("expected custom study run command"),
+            _ => panic!("expected script backtest command"),
+        }
+    }
+
+    #[test]
+    fn parse_script_runs_command() {
+        let cli = Cli::try_parse_from([
+            "mlab", "script", "runs", "list", "--limit", "10", "--output", "json",
+        ])
+        .expect("script runs list parse should succeed");
+
+        match cli.command {
+            Commands::Script {
+                command:
+                    ScriptCommands::Runs {
+                        command: ScriptRunHistoryCommands::List(args),
+                    },
+            } => {
+                assert_eq!(args.limit, 10);
+                assert!(matches!(args.output, OutputFormat::Json));
+                args.validate().expect("validate should succeed");
+            }
+            _ => panic!("expected script runs list command"),
+        }
+    }
+
+    #[test]
+    fn parse_script_show_command() {
+        let cli = Cli::try_parse_from(["mlab", "script", "runs", "show", "1780-script-run-test"])
+            .expect("script runs show parse should succeed");
+
+        match cli.command {
+            Commands::Script {
+                command:
+                    ScriptCommands::Runs {
+                        command: ScriptRunHistoryCommands::Show(args),
+                    },
+            } => {
+                assert_eq!(args.run, "1780-script-run-test");
+                args.validate().expect("validate should succeed");
+            }
+            _ => panic!("expected script runs show command"),
         }
     }
 }

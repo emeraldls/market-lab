@@ -10,8 +10,8 @@ mod providers;
 mod scripting;
 
 use cli::{
-    Cli, Commands, SourceCommands, StrategyBacktestCommands, StrategyCommands, StrategyRunCommands,
-    StudyCommands,
+    Cli, Commands, ScriptCommands, ScriptRunHistoryCommands, SourceCommands,
+    StrategyBacktestCommands, StrategyCommands, StrategyRunCommands, StudyCommands,
 };
 
 #[global_allocator]
@@ -30,13 +30,20 @@ async fn main() -> Result<()> {
             SourceCommands::Candles(args) => commands::source::handle_candles(args).await?,
         },
         Commands::Study { command: study } => match study {
-            StudyCommands::Run(args) => commands::study::script::handle_run(args).await?,
             StudyCommands::Slippage(args) => commands::study::slippage::handle(args).await?,
             StudyCommands::Imbalance(args) => commands::study::imbalance::handle(args).await?,
             StudyCommands::Spread(args) => commands::study::spread::handle(args).await?,
             StudyCommands::Depth(args) => commands::study::depth::handle(args).await?,
             StudyCommands::Vamp(args) => commands::study::vamp::handle(args).await?,
             StudyCommands::Cvd(args) => commands::study::cvd::handle(args).await?,
+        },
+        Commands::Script { command: script } => match script {
+            ScriptCommands::Run(args) => commands::script::run::handle(args).await?,
+            ScriptCommands::Backtest(args) => commands::script::backtest::handle(args).await?,
+            ScriptCommands::Runs { command } => match command {
+                ScriptRunHistoryCommands::List(args) => commands::script::runs::handle_list(args)?,
+                ScriptRunHistoryCommands::Show(args) => commands::script::runs::handle_show(args)?,
+            },
         },
         Commands::Strategy { command: strategy } => match strategy {
             StrategyCommands::Run { command } => match command {

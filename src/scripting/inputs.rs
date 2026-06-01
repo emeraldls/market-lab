@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use anyhow::{Result, bail};
 use serde_json::{Map, Value};
 
-use super::manifest::{InputType, StudyInputSchema, StudyManifest};
+use super::manifest::{InputType, ScriptInputSchema, ScriptManifest};
 
 pub fn parse_kv_inputs(values: &[String]) -> Result<BTreeMap<String, String>> {
     let mut parsed = BTreeMap::new();
@@ -22,12 +22,12 @@ pub fn parse_kv_inputs(values: &[String]) -> Result<BTreeMap<String, String>> {
 }
 
 pub fn resolve_inputs(
-    manifest: &StudyManifest,
+    manifest: &ScriptManifest,
     raw_inputs: &BTreeMap<String, String>,
 ) -> Result<Value> {
     for key in raw_inputs.keys() {
         if !manifest.inputs.contains_key(key) {
-            bail!("unknown study input `{key}`");
+            bail!("unknown script input `{key}`");
         }
     }
 
@@ -42,14 +42,14 @@ pub fn resolve_inputs(
             continue;
         }
         if schema.required {
-            bail!("missing required study input `{key}`");
+            bail!("missing required script input `{key}`");
         }
     }
 
     Ok(Value::Object(out))
 }
 
-fn coerce_value(raw: &str, schema: &StudyInputSchema) -> Result<Value> {
+fn coerce_value(raw: &str, schema: &ScriptInputSchema) -> Result<Value> {
     match schema.input_type {
         InputType::String => Ok(Value::String(raw.to_string())),
         InputType::Number => {
@@ -71,20 +71,20 @@ fn coerce_value(raw: &str, schema: &StudyInputSchema) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scripting::manifest::{StudyInputSchema, StudyManifest, StudyMode, StudySource};
+    use crate::scripting::manifest::{ScriptInputSchema, ScriptManifest, ScriptMode, ScriptSource};
 
     #[test]
     fn resolves_required_and_default_inputs() {
-        let manifest = StudyManifest {
+        let manifest = ScriptManifest {
             name: "buy-pressure".to_string(),
             version: "1".to_string(),
-            source: StudySource::Candles,
-            modes: vec![StudyMode::Window],
+            source: ScriptSource::Candles,
+            modes: vec![ScriptMode::Window],
             description: None,
             inputs: BTreeMap::from([
                 (
                     "min_vbuy".to_string(),
-                    StudyInputSchema {
+                    ScriptInputSchema {
                         input_type: InputType::Number,
                         required: true,
                         default: None,
@@ -93,7 +93,7 @@ mod tests {
                 ),
                 (
                     "enabled".to_string(),
-                    StudyInputSchema {
+                    ScriptInputSchema {
                         input_type: InputType::Boolean,
                         required: false,
                         default: Some(Value::Bool(true)),

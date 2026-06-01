@@ -5,13 +5,13 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum StudySource {
+pub enum ScriptSource {
     Candles,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum StudyMode {
+pub enum ScriptMode {
     Window,
     Stream,
 }
@@ -25,7 +25,7 @@ pub enum InputType {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct StudyInputSchema {
+pub struct ScriptInputSchema {
     #[serde(rename = "type")]
     pub input_type: InputType,
     #[serde(default)]
@@ -37,39 +37,39 @@ pub struct StudyInputSchema {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct StudyManifest {
+pub struct ScriptManifest {
     pub name: String,
     pub version: String,
-    pub source: StudySource,
-    pub modes: Vec<StudyMode>,
+    pub source: ScriptSource,
+    pub modes: Vec<ScriptMode>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
-    pub inputs: BTreeMap<String, StudyInputSchema>,
+    pub inputs: BTreeMap<String, ScriptInputSchema>,
 }
 
-impl StudyManifest {
+impl ScriptManifest {
     pub fn validate(&self) -> Result<()> {
         if self.name.trim().is_empty() {
-            bail!("study.name is required");
+            bail!("script.name is required");
         }
         if self.version.trim() != "1" {
-            bail!("study.version must be \"1\"");
+            bail!("script.version must be \"1\"");
         }
         if self.modes.is_empty() {
-            bail!("study.modes must not be empty");
+            bail!("script.modes must not be empty");
         }
         for key in self.inputs.keys() {
             if !is_valid_input_name(key) {
-                bail!("study.inputs key `{key}` must be snake_case");
+                bail!("script.inputs key `{key}` must be snake_case");
             }
             if is_reserved_input_name(key) {
-                bail!("study.inputs key `{key}` is reserved by Market Lab");
+                bail!("script.inputs key `{key}` is reserved by Market Lab");
             }
         }
         for (key, schema) in &self.inputs {
             if schema.required && schema.default.is_some() {
-                bail!("study.inputs.{key} cannot be required and also have a default");
+                bail!("script.inputs.{key} cannot be required and also have a default");
             }
             if let Some(default) = &schema.default {
                 validate_default_value(key, &schema.input_type, default)?;
@@ -78,7 +78,7 @@ impl StudyManifest {
         Ok(())
     }
 
-    pub fn supports_mode(&self, mode: StudyMode) -> bool {
+    pub fn supports_mode(&self, mode: ScriptMode) -> bool {
         self.modes.contains(&mode)
     }
 }
@@ -123,7 +123,7 @@ fn validate_default_value(
         InputType::Boolean => value.is_boolean(),
     };
     if !ok {
-        bail!("study.inputs.{key}.default does not match declared type");
+        bail!("script.inputs.{key}.default does not match declared type");
     }
     Ok(())
 }
@@ -134,11 +134,11 @@ mod tests {
 
     #[test]
     fn manifest_requires_name() {
-        let manifest = StudyManifest {
+        let manifest = ScriptManifest {
             name: String::new(),
             version: "1".to_string(),
-            source: StudySource::Candles,
-            modes: vec![StudyMode::Window],
+            source: ScriptSource::Candles,
+            modes: vec![ScriptMode::Window],
             description: None,
             inputs: BTreeMap::new(),
         };
@@ -150,18 +150,18 @@ mod tests {
         let mut inputs = BTreeMap::new();
         inputs.insert(
             "min-vbuy".to_string(),
-            StudyInputSchema {
+            ScriptInputSchema {
                 input_type: InputType::Number,
                 required: true,
                 default: None,
                 description: None,
             },
         );
-        let manifest = StudyManifest {
+        let manifest = ScriptManifest {
             name: "x".to_string(),
             version: "1".to_string(),
-            source: StudySource::Candles,
-            modes: vec![StudyMode::Window],
+            source: ScriptSource::Candles,
+            modes: vec![ScriptMode::Window],
             description: None,
             inputs,
         };
@@ -173,18 +173,18 @@ mod tests {
         let mut inputs = BTreeMap::new();
         inputs.insert(
             "timeframe".to_string(),
-            StudyInputSchema {
+            ScriptInputSchema {
                 input_type: InputType::Number,
                 required: true,
                 default: None,
                 description: None,
             },
         );
-        let manifest = StudyManifest {
+        let manifest = ScriptManifest {
             name: "x".to_string(),
             version: "1".to_string(),
-            source: StudySource::Candles,
-            modes: vec![StudyMode::Window],
+            source: ScriptSource::Candles,
+            modes: vec![ScriptMode::Window],
             description: None,
             inputs,
         };
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn manifest_rejects_unknown_source() {
-        let err = serde_json::from_value::<StudyManifest>(serde_json::json!({
+        let err = serde_json::from_value::<ScriptManifest>(serde_json::json!({
             "name": "x",
             "version": "1",
             "source": "xyz",

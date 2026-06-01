@@ -3,7 +3,6 @@ pub mod cvd;
 pub mod depth;
 pub mod imbalance;
 pub mod realtime;
-pub mod script;
 pub mod slippage;
 pub mod spread;
 pub mod vamp;
