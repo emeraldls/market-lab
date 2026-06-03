@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::limits::SCRIPT_MAX_LOOKBACK_CANDLES;
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum ScriptSource {
     Candles,
@@ -28,7 +28,7 @@ pub enum InputType {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ScriptInputSchema {
+pub struct ScriptParamSchema {
     #[serde(rename = "type")]
     pub input_type: InputType,
     #[serde(default)]
@@ -43,14 +43,16 @@ pub struct ScriptInputSchema {
 pub struct ScriptManifest {
     pub name: String,
     pub version: String,
-    pub source: ScriptSource,
+    pub sources: Vec<ScriptSource>,
     pub modes: Vec<ScriptMode>,
+    #[serde(default)]
+    pub clock: Option<ScriptSource>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
     pub lookback: Option<usize>,
     #[serde(default)]
-    pub inputs: BTreeMap<String, ScriptInputSchema>,
+    pub params: BTreeMap<ScriptSource, BTreeMap<String, ScriptParamSchema>>,
 }
 
 impl ScriptManifest {
@@ -61,8 +63,16 @@ impl ScriptManifest {
         if self.version.trim() != "1" {
             bail!("script.version must be \"1\"");
         }
+        if self.sources.is_empty() {
+            bail!("script.sources must not be empty");
+        }
         if self.modes.is_empty() {
             bail!("script.modes must not be empty");
+        }
+        if let Some(clock) = &self.clock
+            && !self.sources.contains(clock)
+        {
+            bail!("script.clock must be one of script.sources");
         }
         if matches!(self.lookback, Some(0)) {
             bail!("script.lookback must be >= 1");
@@ -72,20 +82,40 @@ impl ScriptManifest {
         {
             bail!("script.lookback must be <= {SCRIPT_MAX_LOOKBACK_CANDLES}");
         }
-        for key in self.inputs.keys() {
-            if !is_valid_input_name(key) {
-                bail!("script.inputs key `{key}` must be snake_case");
-            }
-            if is_reserved_input_name(key) {
-                bail!("script.inputs key `{key}` is reserved by Market Lab");
+        for source in self.params.keys() {
+            if !self.sources.contains(source) {
+                bail!("script.params contains source not listed in script.sources");
             }
         }
-        for (key, schema) in &self.inputs {
-            if schema.required && schema.default.is_some() {
-                bail!("script.inputs.{key} cannot be required and also have a default");
+        for (source, params) in &self.params {
+            for key in params.keys() {
+                if !is_valid_param_name(key) {
+                    bail!(
+                        "script.params.{} key `{key}` must be snake_case",
+                        source.as_str()
+                    );
+                }
+                if is_reserved_param_name(key) {
+                    bail!(
+                        "script.params.{} key `{key}` is reserved by Market Lab",
+                        source.as_str()
+                    );
+                }
             }
-            if let Some(default) = &schema.default {
-                validate_default_value(key, &schema.input_type, default)?;
+            for (key, schema) in params {
+                if schema.required && schema.default.is_some() {
+                    bail!(
+                        "script.params.{}.{key} cannot be required and also have a default",
+                        source.as_str()
+                    );
+                }
+                if let Some(default) = &schema.default {
+                    validate_default_value(
+                        &format!("{}.{key}", source.as_str()),
+                        &schema.input_type,
+                        default,
+                    )?;
+                }
             }
         }
         Ok(())
@@ -94,9 +124,30 @@ impl ScriptManifest {
     pub fn supports_mode(&self, mode: ScriptMode) -> bool {
         self.modes.contains(&mode)
     }
+
+    pub fn clock_source(&self) -> &ScriptSource {
+        self.clock.as_ref().unwrap_or(&self.sources[0])
+    }
+
+    pub fn source_names(&self) -> String {
+        self.sources
+            .iter()
+            .map(ScriptSource::as_str)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
-const RESERVED_INPUT_NAMES: &[&str] = &[
+impl ScriptSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScriptSource::Candles => "candles",
+            ScriptSource::Orderbook => "orderbook",
+        }
+    }
+}
+
+const RESERVED_PARAM_NAMES: &[&str] = &[
     "at",
     "bucket",
     "buffer_size",
@@ -114,11 +165,11 @@ const RESERVED_INPUT_NAMES: &[&str] = &[
     "verbose",
 ];
 
-fn is_reserved_input_name(name: &str) -> bool {
-    RESERVED_INPUT_NAMES.contains(&name)
+fn is_reserved_param_name(name: &str) -> bool {
+    RESERVED_PARAM_NAMES.contains(&name)
 }
 
-fn is_valid_input_name(name: &str) -> bool {
+fn is_valid_param_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .chars()
@@ -136,7 +187,7 @@ fn validate_default_value(
         InputType::Boolean => value.is_boolean(),
     };
     if !ok {
-        bail!("script.inputs.{key}.default does not match declared type");
+        bail!("script.params.{key}.default does not match declared type");
     }
     Ok(())
 }
@@ -150,61 +201,70 @@ mod tests {
         let manifest = ScriptManifest {
             name: String::new(),
             version: "1".to_string(),
-            source: ScriptSource::Candles,
+            sources: vec![ScriptSource::Candles],
             modes: vec![ScriptMode::Window],
+            clock: None,
             description: None,
             lookback: None,
-            inputs: BTreeMap::new(),
+            params: BTreeMap::new(),
         };
         assert!(manifest.validate().is_err());
     }
 
     #[test]
-    fn manifest_rejects_bad_input_name() {
-        let mut inputs = BTreeMap::new();
-        inputs.insert(
-            "min-vbuy".to_string(),
-            ScriptInputSchema {
-                input_type: InputType::Number,
-                required: true,
-                default: None,
-                description: None,
-            },
+    fn manifest_rejects_bad_param_name() {
+        let mut params = BTreeMap::new();
+        params.insert(
+            ScriptSource::Candles,
+            BTreeMap::from([(
+                "min-vbuy".to_string(),
+                ScriptParamSchema {
+                    input_type: InputType::Number,
+                    required: true,
+                    default: None,
+                    description: None,
+                },
+            )]),
         );
         let manifest = ScriptManifest {
             name: "x".to_string(),
             version: "1".to_string(),
-            source: ScriptSource::Candles,
+            sources: vec![ScriptSource::Candles],
             modes: vec![ScriptMode::Window],
+            clock: None,
             description: None,
             lookback: None,
-            inputs,
+            params,
         };
         assert!(manifest.validate().is_err());
     }
 
     #[test]
-    fn manifest_rejects_reserved_input_name() {
-        let mut inputs = BTreeMap::new();
-        inputs.insert(
-            "timeframe".to_string(),
-            ScriptInputSchema {
-                input_type: InputType::Number,
-                required: true,
-                default: None,
-                description: None,
-            },
+    fn manifest_rejects_reserved_param_name() {
+        let mut params = BTreeMap::new();
+        params.insert(
+            ScriptSource::Candles,
+            BTreeMap::from([(
+                "timeframe".to_string(),
+                ScriptParamSchema {
+                    input_type: InputType::Number,
+                    required: true,
+                    default: None,
+                    description: None,
+                },
+            )]),
         );
         let manifest = ScriptManifest {
             name: "x".to_string(),
             version: "1".to_string(),
-            source: ScriptSource::Candles,
+            sources: vec![ScriptSource::Candles],
             modes: vec![ScriptMode::Window],
+            clock: None,
             description: None,
             lookback: None,
-            inputs,
+            params,
         };
-        let err = manifest.validate().expect_err("reserved input should fail");
+        let err = manifest.validate().expect_err("reserved param should fail");
         assert!(err.to_string().contains("reserved"));
     }
 
@@ -213,7 +273,7 @@ mod tests {
         let err = serde_json::from_value::<ScriptManifest>(serde_json::json!({
             "name": "x",
             "version": "1",
-            "source": "xyz",
+            "sources": ["xyz"],
             "modes": ["window"]
         }))
         .expect_err("unknown source should fail");
@@ -222,15 +282,31 @@ mod tests {
     }
 
     #[test]
+    fn manifest_rejects_clock_outside_sources() {
+        let manifest = ScriptManifest {
+            name: "x".to_string(),
+            version: "1".to_string(),
+            sources: vec![ScriptSource::Candles],
+            modes: vec![ScriptMode::Window],
+            clock: Some(ScriptSource::Orderbook),
+            description: None,
+            lookback: None,
+            params: BTreeMap::new(),
+        };
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
     fn manifest_rejects_zero_lookback() {
         let manifest = ScriptManifest {
             name: "x".to_string(),
             version: "1".to_string(),
-            source: ScriptSource::Candles,
+            sources: vec![ScriptSource::Candles],
             modes: vec![ScriptMode::Window],
+            clock: None,
             description: None,
             lookback: Some(0),
-            inputs: BTreeMap::new(),
+            params: BTreeMap::new(),
         };
 
         let err = manifest.validate().expect_err("zero lookback should fail");
@@ -242,11 +318,12 @@ mod tests {
         let manifest = ScriptManifest {
             name: "x".to_string(),
             version: "1".to_string(),
-            source: ScriptSource::Candles,
+            sources: vec![ScriptSource::Candles],
             modes: vec![ScriptMode::Window],
+            clock: None,
             description: None,
             lookback: Some(SCRIPT_MAX_LOOKBACK_CANDLES + 1),
-            inputs: BTreeMap::new(),
+            params: BTreeMap::new(),
         };
 
         let err = manifest.validate().expect_err("large lookback should fail");

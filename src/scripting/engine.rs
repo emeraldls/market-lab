@@ -33,7 +33,7 @@ impl Script {
         })
     }
 
-    pub fn start_session(&self, inputs: &JsonValue) -> Result<ScriptSession> {
+    pub fn start_session(&self, params: &JsonValue) -> Result<ScriptSession> {
         let limits = default_limits();
         let rt = Runtime::new().context("failed to create QuickJS runtime")?;
         rt.set_memory_limit(limits.heap_bytes);
@@ -71,10 +71,10 @@ impl Script {
                 .context("scripts require export `onData(ctx, input)`")?;
 
             let script_ctx = Object::new(ctx.clone()).context("failed to create script ctx")?;
-            let inputs_val = json_to_js(ctx.clone(), inputs)?;
+            let params_val = json_to_js(ctx.clone(), params)?;
             script_ctx
-                .set("inputs", inputs_val)
-                .context("failed to assign ctx.inputs")?;
+                .set("params", params_val)
+                .context("failed to assign ctx.params")?;
             attach_study_helpers(ctx.clone(), &script_ctx)?;
 
             let globals = ctx.globals();
@@ -112,20 +112,30 @@ impl ScriptSession {
         self.cancelled.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub fn run_candles_window(&self, candles: &JsonValue) -> Result<ScriptExecution> {
         let input_payload = serde_json::json!({
             "mode": "window",
-            "candles": candles,
+            "candles": {
+                "candles": candles,
+            },
         });
         self.run_with_input(input_payload)
     }
 
+    #[cfg(test)]
     pub fn run_orderbook_window(&self, books: &JsonValue) -> Result<ScriptExecution> {
         let input_payload = serde_json::json!({
             "mode": "window",
-            "books": books,
+            "orderbook": {
+                "books": books,
+            },
         });
         self.run_with_input(input_payload)
+    }
+
+    pub fn run_window(&self, payload: JsonValue) -> Result<ScriptExecution> {
+        self.run_with_input(payload)
     }
 
     fn run_with_input(&self, input_payload: JsonValue) -> Result<ScriptExecution> {
@@ -277,15 +287,17 @@ mod tests {
 export const script = {
   name: "buy-pressure-filter",
   version: "1",
-  source: "candles",
+  sources: ["candles"],
   modes: ["window"],
-  inputs: {
-    min_vbuy: { type: "number", required: true }
+  params: {
+    candles: {
+      min_vbuy: { type: "number", required: true }
+    }
   }
 };
 
 export function onData(ctx, input) {
-  return { metrics: { count: input.candles.length, threshold: ctx.inputs.min_vbuy } };
+  return { metrics: { count: input.candles.candles.length, threshold: ctx.params.candles.min_vbuy } };
 }
 "#,
             "manifest",
@@ -303,13 +315,13 @@ export function onData(ctx, input) {
 export const study = {
   name: "legacy-study",
   version: "1",
-  source: "candles",
+  sources: ["candles"],
   modes: ["window"],
-  inputs: {}
+  params: {}
 };
 
 export function onData(ctx, input) {
-  return { metrics: { candles: input.candles.length } };
+  return { metrics: { candles: input.candles.candles.length } };
 }
 "#,
             "legacy-study",
@@ -333,19 +345,21 @@ export function onData(ctx, input) {
 export const script = {
   name: "buy-pressure-filter",
   version: "1",
-  source: "candles",
+  sources: ["candles"],
   modes: ["window"],
-  inputs: {
-    min_vbuy: { type: "number", required: true }
+  params: {
+    candles: {
+      min_vbuy: { type: "number", required: true }
+    }
   }
 };
 
 export function onData(ctx, input) {
-  const filtered = input.candles.filter((c) => c.vb >= ctx.inputs.min_vbuy);
+  const filtered = input.candles.candles.filter((c) => c.vb >= ctx.params.candles.min_vbuy);
   return {
     metrics: {
       qualifying_candles: filtered.length,
-      latest_close: input.candles[input.candles.length - 1].c
+      latest_close: input.candles.candles[input.candles.candles.length - 1].c
     }
   };
 }
@@ -354,7 +368,7 @@ export function onData(ctx, input) {
         );
 
         let script = Script::load(&path).expect("load script");
-        let inputs = json!({ "min_vbuy": 150.0 });
+        let inputs = json!({ "candles": { "min_vbuy": 150.0 } });
         let candles = json!([
             { "t": 1, "o": 1.0, "h": 2.0, "l": 0.5, "c": 1.5, "vb": 100.0, "vs": 80.0, "tb": 10, "ts": 9 },
             { "t": 2, "o": 1.5, "h": 2.2, "l": 1.0, "c": 2.0, "vb": 200.0, "vs": 90.0, "tb": 12, "ts": 10 }
@@ -375,15 +389,15 @@ export function onData(ctx, input) {
 export const script = {
   name: "helper-script",
   version: "1",
-  source: "candles",
+  sources: ["candles"],
   modes: ["window"],
-  inputs: {}
+  params: {}
 };
 
 export function onData(ctx, input) {
-  const sma = ctx.study.sma(input.candles, { field: "c", window: 3 });
-  const ema = ctx.study.ema(input.candles, { field: "c", window: 3 });
-  const cvd = ctx.study.cvd(input.candles);
+  const sma = ctx.study.sma(input.candles.candles, { field: "c", window: 3 });
+  const ema = ctx.study.ema(input.candles.candles, { field: "c", window: 3 });
+  const cvd = ctx.study.cvd(input.candles.candles);
   return {
     metrics: {
       sma_latest: sma.latest,
@@ -425,13 +439,13 @@ export function onData(ctx, input) {
 export const script = {
   name: "bad-helper-script",
   version: "1",
-  source: "candles",
+  sources: ["candles"],
   modes: ["window"],
-  inputs: {}
+  params: {}
 };
 
 export function onData(ctx, input) {
-  return { metrics: ctx.study.sma(input.candles, { field: "missing", window: 2 }) };
+  return { metrics: ctx.study.sma(input.candles.candles, { field: "missing", window: 2 }) };
 }
 "#,
             "bad-helper",
@@ -456,13 +470,13 @@ export function onData(ctx, input) {
 export const script = {
   name: "orderbook-helper-script",
   version: "1",
-  source: "orderbook",
+  sources: ["orderbook"],
   modes: ["window"],
-  inputs: {}
+  params: {}
 };
 
 export function onData(ctx, input) {
-  const book = input.books[input.books.length - 1];
+  const book = input.orderbook.books[input.orderbook.books.length - 1];
   const spread = ctx.study.spread(book);
   const depth = ctx.study.depth(book, { levels: 2 });
   const imbalance = ctx.study.imbalance(book, { depth: 2 });
@@ -530,18 +544,18 @@ export function onData(ctx, input) {
 export const script = {
   name: "orderbook-window-script",
   version: "1",
-  source: "orderbook",
+  sources: ["orderbook"],
   modes: ["window"],
-  inputs: {}
+  params: {}
 };
 
 export function onData(ctx, input) {
-  const latest = input.books[input.books.length - 1];
+  const latest = input.orderbook.books[input.orderbook.books.length - 1];
   const spread = ctx.study.spread(latest);
   return {
     metrics: {
       mode: input.mode,
-      books: input.books.length,
+      books: input.orderbook.books.length,
       latest_ts: latest.timestamp_ms,
       spread_bps: spread.spread_bps
     },
@@ -597,9 +611,9 @@ export function onData(ctx, input) {
 export const script = {
   name: "stateful-script",
   version: "1",
-  source: "candles",
+  sources: ["candles"],
   modes: ["window"],
-  inputs: {}
+  params: {}
 };
 
 let calls = 0;
@@ -609,7 +623,7 @@ export function onData(ctx, input) {
   return {
     metrics: {
       calls,
-      candles: input.candles.length
+      candles: input.candles.candles.length
     }
   };
 }
@@ -639,9 +653,9 @@ export function onData(ctx, input) {
 export const script = {
   name: "bad-script",
   version: "1",
-  source: "candles",
+  sources: ["candles"],
   modes: ["window"],
-  inputs: {}
+  params: {}
 };
 
 export function onData(ctx, input) {
@@ -670,13 +684,13 @@ export function onData(ctx, input) {
 export const script = {
   name: "cancel-script",
   version: "1",
-  source: "candles",
+  sources: ["candles"],
   modes: ["window"],
-  inputs: {}
+  params: {}
 };
 
 export function onData(ctx, input) {
-  return { metrics: { candles: input.candles.length } };
+  return { metrics: { candles: input.candles.candles.length } };
 }
 "#,
             "cancel",
@@ -699,9 +713,9 @@ export function onData(ctx, input) {
 export const script = {
   name: "missing-hook",
   version: "1",
-  source: "candles",
+  sources: ["candles"],
   modes: ["window"],
-  inputs: {}
+  params: {}
 };
 "#,
             "missing-hook",
@@ -726,20 +740,20 @@ export const script = {
 export const script = {
   name: "payload-bench",
   version: "1",
-  source: "candles",
+  sources: ["candles"],
   modes: ["window"],
-  inputs: {}
+  params: {}
 };
 
 export function onData(ctx, input) {
   let total = 0;
-  for (const candle of input.candles) {
+  for (const candle of input.candles.candles) {
     total += candle.c;
   }
   return {
     metrics: {
-      candles: input.candles.length,
-      avg_close: total / input.candles.length
+      candles: input.candles.candles.length,
+      avg_close: total / input.candles.candles.length
     }
   };
 }

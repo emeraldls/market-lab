@@ -2,7 +2,6 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::scripting::engine::Script;
-use crate::scripting::manifest::ScriptSource;
 use crate::scripting::telemetry::{
     ScriptReportScript, ScriptRuntimeReport, ScriptRuntimeReportBuilder, write_runtime_report,
 };
@@ -20,21 +19,14 @@ pub(crate) struct ScriptInputs {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ScriptDescriptor {
     pub(crate) name: String,
-    pub(crate) source: &'static str,
-}
-
-pub(crate) fn source_name(source: &ScriptSource) -> &'static str {
-    match source {
-        ScriptSource::Candles => "candles",
-        ScriptSource::Orderbook => "orderbook",
-    }
+    pub(crate) sources: Vec<&'static str>,
 }
 
 pub(crate) fn report_script(script: &Script) -> ScriptReportScript {
     ScriptReportScript {
         name: script.manifest.name.clone(),
         path: script.path.display().to_string(),
-        source: source_name(&script.manifest.source).to_string(),
+        source: script.manifest.source_names(),
     }
 }
 

@@ -1,16 +1,18 @@
 export const script = {
   name: "buy-dip-threshold",
   version: "1",
-  source: "candles",
+  sources: ["candles"],
   modes: ["window"],
-  inputs: {
-    drop_bps: { type: "number", required: false, default: 20 },
-    notional: { type: "number", required: false, default: 1000 }
+  params: {
+    candles: {
+      drop_bps: { type: "number", required: false, default: 20 },
+      notional: { type: "number", required: false, default: 1000 }
+    }
   }
 }
 
 export function onData(ctx, input) {
-  const candles = input.candles
+  const candles = input.candles.candles
   const latest = candles[candles.length - 1]
 
   if (candles.length < 2) {
@@ -22,14 +24,14 @@ export function onData(ctx, input) {
 
   const prev = candles[candles.length - 2]
   const moveBps = ((latest.c - prev.c) / Math.max(Math.abs(prev.c), 1)) * 10000
-  const triggered = moveBps <= -ctx.inputs.drop_bps
+  const triggered = moveBps <= -ctx.params.candles.drop_bps
 
   return {
     metrics: {
       prev_close: prev.c,
       close: latest.c,
       move_bps: moveBps,
-      threshold_bps: ctx.inputs.drop_bps
+      threshold_bps: ctx.params.candles.drop_bps
     },
     signal: {
       event: triggered ? "dip" : "no_dip",
@@ -42,7 +44,7 @@ export function onData(ctx, input) {
           type: "order",
           side: "buy",
           order_type: "market",
-          notional: ctx.inputs.notional
+          notional: ctx.params.candles.notional
         }
       : {}
   }

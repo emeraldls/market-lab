@@ -1,22 +1,24 @@
 export const script = {
   name: "buy-pressure-filter",
   version: "1",
-  source: "candles",
+  sources: ["candles"],
   modes: ["window", "stream"],
-  inputs: {
-    min_vbuy: { type: "number", required: false, default: 0 },
-    min_delta: { type: "number", required: false, default: 0 }
+  params: {
+    candles: {
+      min_vbuy: { type: "number", required: false, default: 0 },
+      min_delta: { type: "number", required: false, default: 0 }
+    }
   }
 }
 
 function candlesFrom(input) {
-  return input.mode === "stream" ? [input.candle] : input.candles
+  return input.mode === "stream" ? [input.candle] : input.candles.candles
 }
 
 export function onData(ctx, input) {
   const candles = candlesFrom(input)
   const filtered = candles.filter((c) => {
-    return c.vb >= ctx.inputs.min_vbuy && c.vb - c.vs >= ctx.inputs.min_delta
+    return c.vb >= ctx.params.candles.min_vbuy && c.vb - c.vs >= ctx.params.candles.min_delta
   })
   const latest = candles[candles.length - 1]
 

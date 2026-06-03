@@ -1,13 +1,13 @@
 export const script = {
   name: "candle-summary",
   version: "1",
-  source: "candles",
+  sources: ["candles"],
   modes: ["window", "stream"],
-  inputs: {}
+  params: {}
 }
 
 function candlesFrom(input) {
-  return input.mode === "stream" ? [input.candle] : input.candles
+  return input.mode === "stream" ? [input.candle] : input.candles.candles
 }
 
 export function onData(ctx, input) {

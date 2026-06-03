@@ -1,31 +1,27 @@
 export const script = {
   name: "custom-sma-cross",
   version: "1",
-  source: "candles",
+  sources: ["candles"],
   modes: ["window"],
-  inputs: {
-    fast: { type: "number", required: false, default: 4 },
-    slow: { type: "number", required: false, default: 11 },
-    notional: { type: "number", required: false, default: 1000 }
+  lookback: 12,
+  params: {
+    candles: {
+      fast: { type: "number", required: false, default: 4 },
+      slow: { type: "number", required: false, default: 11 },
+      notional: { type: "number", required: false, default: 1000 }
+    }
   }
 }
 
-function sma(values, size) {
-  if (values.length < size) return null
-  const slice = values.slice(values.length - size)
-  return slice.reduce((sum, value) => sum + value, 0) / size
-}
-
 export function onData(ctx, input) {
-  const fastSize = Math.trunc(ctx.inputs.fast)
-  const slowSize = Math.trunc(ctx.inputs.slow)
-  const closes = input.candles.map((c) => c.c)
-  const latest = input.candles[input.candles.length - 1]
+  const fastSize = Math.trunc(ctx.params.candles.fast)
+  const slowSize = Math.trunc(ctx.params.candles.slow)
+  const latest = input.candles.candles[input.candles.candles.length - 1]
 
-  if (closes.length < slowSize + 1) {
+  if (input.candles.candles.length < slowSize + 1) {
     return {
       metrics: {
-        candles: closes.length,
+        candles: input.candles.candles.length,
         close: latest.c,
         ready: false
       },
@@ -38,11 +34,12 @@ export function onData(ctx, input) {
     }
   }
 
-  const prevCloses = closes.slice(0, closes.length - 1)
-  const prevFast = sma(prevCloses, fastSize)
-  const prevSlow = sma(prevCloses, slowSize)
-  const currFast = sma(closes, fastSize)
-  const currSlow = sma(closes, slowSize)
+  const fast = ctx.study.sma(input.candles.candles, { field: "c", window: fastSize })
+  const slow = ctx.study.sma(input.candles.candles, { field: "c", window: slowSize })
+  const prevFast = fast.previous
+  const prevSlow = slow.previous
+  const currFast = fast.latest
+  const currSlow = slow.latest
   const crossUp = prevFast <= prevSlow && currFast > currSlow
   const crossDown = prevFast >= prevSlow && currFast < currSlow
   const side = crossUp ? "buy" : crossDown ? "sell" : "neutral"
@@ -50,7 +47,7 @@ export function onData(ctx, input) {
 
   return {
     metrics: {
-      candles: closes.length,
+      candles: input.candles.candles.length,
       close: latest.c,
       prev_fast: prevFast,
       prev_slow: prevSlow,
@@ -68,7 +65,7 @@ export function onData(ctx, input) {
           type: "order",
           side,
           order_type: "market",
-          notional: ctx.inputs.notional
+          notional: ctx.params.candles.notional
         }
       : {}
   }

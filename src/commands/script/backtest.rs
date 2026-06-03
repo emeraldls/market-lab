@@ -1,21 +1,24 @@
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 use std::fmt;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use crate::cli::{OutputFormat, ScriptBacktestArgs};
+use crate::cli::{OutputFormat, ScriptBacktestArgs, mmt_timeframe_from_seconds};
 use crate::commands::script::{
     ScriptDescriptor, ScriptInputs, report_builder, write_report_best_effort,
     write_running_report_best_effort,
 };
 use crate::commands::study::common::{is_empty_object, provider_name};
 use crate::domain::enums::ProviderKind;
-use crate::domain::types::OrderBookSnapshot;
+use crate::domain::types::{OhlcvtCandle, OrderBookSnapshot};
 use crate::providers::mmt::MmtProvider;
 use crate::scripting::engine::Script;
-use crate::scripting::inputs::{parse_kv_inputs, resolve_inputs};
+use crate::scripting::inputs::{
+    SourceConfigs, parse_param_values, parse_source_configs, resolve_params,
+    validate_source_configs,
+};
 use crate::scripting::limits::SCRIPT_DEFAULT_LOOKBACK_CANDLES;
 use crate::scripting::manifest::{ScriptMode, ScriptSource};
 use tokio::task::JoinHandle;
@@ -33,7 +36,7 @@ where
     ts_ms: u64,
     script: ScriptDescriptor,
     window: ScriptWindow,
-    inputs: I,
+    params: I,
     performance: ScriptBacktestPerformance,
     latest_output: ScriptBacktestLatestOutput,
     meta: Value,
@@ -53,7 +56,7 @@ where
     script: &'a ScriptDescriptor,
     performance: &'a ScriptBacktestPerformance,
     #[serde(skip_serializing_if = "is_empty_object")]
-    inputs: &'a I,
+    params: &'a I,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,6 +78,12 @@ struct ScriptBacktestLatestOutput {
     metrics: Value,
     signal: Value,
     intent: Value,
+}
+
+#[derive(Default)]
+struct BacktestData {
+    candles: Option<Vec<OhlcvtCandle>>,
+    orderbooks: Option<Vec<OrderBookSnapshot>>,
 }
 
 pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
@@ -101,16 +110,30 @@ pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
         return Err(err);
     }
 
-    let raw_inputs = match parse_kv_inputs(&args.input) {
-        Ok(raw_inputs) => raw_inputs,
+    let source_configs = match parse_source_configs(&args.source) {
+        Ok(configs) => configs,
         Err(err) => {
             let runtime_report = report.finish_error(&err);
             write_report_best_effort(&runtime_report);
             return Err(err);
         }
     };
-    let resolved_inputs = match resolve_inputs(&script.manifest, &raw_inputs) {
-        Ok(resolved_inputs) => resolved_inputs,
+    if let Err(err) = validate_source_configs(&script.manifest, &source_configs) {
+        let runtime_report = report.finish_error(&err);
+        write_report_best_effort(&runtime_report);
+        return Err(err);
+    }
+
+    let raw_params = match parse_param_values(&args.param) {
+        Ok(raw_params) => raw_params,
+        Err(err) => {
+            let runtime_report = report.finish_error(&err);
+            write_report_best_effort(&runtime_report);
+            return Err(err);
+        }
+    };
+    let resolved_params = match resolve_params(&script.manifest, &raw_params) {
+        Ok(resolved_params) => resolved_params,
         Err(err) => {
             let runtime_report = report.finish_error(&err);
             write_report_best_effort(&runtime_report);
@@ -118,14 +141,7 @@ pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
         }
     };
 
-    let result = match script.manifest.source {
-        ScriptSource::Candles => {
-            backtest_candles_window(args, script, resolved_inputs, &mut report).await
-        }
-        ScriptSource::Orderbook => {
-            backtest_orderbook_window(args, script, resolved_inputs, &mut report).await
-        }
-    };
+    let result = backtest_window(args, script, source_configs, resolved_params, &mut report).await;
     let runtime_report = match &result {
         Ok(_) => report.finish_ok(),
         Err(err) if err.is::<ScriptCancelled>() => report.finish_cancelled(),
@@ -135,48 +151,21 @@ pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
     result
 }
 
-async fn backtest_candles_window(
+async fn backtest_window(
     args: ScriptBacktestArgs,
     script: Script,
-    resolved_inputs: Value,
+    source_configs: SourceConfigs,
+    resolved_params: Value,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
 ) -> Result<()> {
-    let fetch_started = Instant::now();
-    let mut cancel = Box::pin(tokio::signal::ctrl_c());
-    report.set_phase("fetching_candles");
-    write_running_report_best_effort(report);
-    eprintln!(
-        "fetching candles exchange={} symbol={} tf={} from={} to={}",
-        args.exchange, args.symbol, args.timeframe, args.from, args.to
-    );
-    let candles_future = MmtProvider::candles(
-        &args.exchange,
-        &args.symbol,
-        args.mmt_tf()?,
-        args.from,
-        args.to,
-    );
-    let series = tokio::select! {
-        result = candles_future => result?,
-        _ = &mut cancel => {
-            report.set_phase("cancelled");
-            return Err(ScriptCancelled.into());
-        }
-    };
-    eprintln!(
-        "fetched {} candles in {}ms",
-        series.data.len(),
-        fetch_started.elapsed().as_millis()
-    );
-    report.set_progress(
-        "candles_fetched",
-        series.data.len() as u64,
-        series.data.len() as u64,
-    );
-    write_running_report_best_effort(report);
-
-    if series.data.len() < 2 {
-        bail!("script backtest requires at least 2 candles");
+    let data = fetch_sources(&args, &script, &source_configs, report).await?;
+    let clock = script.manifest.clock_source().clone();
+    let clock_len = clock_len(&clock, &data)?;
+    if clock_len < 2 {
+        bail!(
+            "script backtest requires at least 2 {} records",
+            clock.as_str()
+        );
     }
 
     let mut returns = Vec::new();
@@ -184,7 +173,7 @@ async fn backtest_candles_window(
     let mut position = 0.0_f64;
     let mut saw_strategy_like_output = false;
     let mut latest_output = None;
-    let session = script.start_session(&resolved_inputs)?;
+    let session = script.start_session(&resolved_params)?;
     let cancel_handle = session.cancel_handle();
     let _cancel_task = AbortOnDrop(tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -192,31 +181,32 @@ async fn backtest_candles_window(
         }
     }));
 
-    let lookback = effective_lookback(&script, &resolved_inputs);
+    let lookback = effective_lookback(&script, &resolved_params);
     eprintln!(
-        "running script={} candles={} lookback={}",
+        "running script={} sources={} clock={} records={} lookback={}",
         script.manifest.name,
-        series.data.len(),
+        script.manifest.source_names(),
+        clock.as_str(),
+        clock_len,
         lookback
     );
-    report.set_progress("executing_hooks", 0, (series.data.len() - 1) as u64);
+    report.set_progress("executing_hooks", 0, (clock_len - 1) as u64);
     write_running_report_best_effort(report);
 
-    for idx in 0..(series.data.len() - 1) {
+    for idx in 0..(clock_len - 1) {
         if session.is_cancelled() {
-            report.set_progress("cancelled", idx as u64, (series.data.len() - 1) as u64);
+            report.set_progress("cancelled", idx as u64, (clock_len - 1) as u64);
             return Err(ScriptCancelled.into());
         }
 
-        let from_idx = idx.saturating_add(1).saturating_sub(lookback);
-        let candles_json = serde_json::to_value(&series.data[from_idx..=idx])
-            .context("failed to encode candles")?;
-        let execution = match session.run_candles_window(&candles_json) {
+        let cutoff = clock_ts_ms(&clock, &data, idx)?;
+        let payload = build_window_payload(&script, &data, &clock, idx, cutoff, lookback)?;
+        let execution = match session.run_window(payload) {
             Ok(execution) => execution,
             Err(err) => {
                 report.record_hook_failure();
                 if session.is_cancelled() {
-                    report.set_progress("cancelled", idx as u64, (series.data.len() - 1) as u64);
+                    report.set_progress("cancelled", idx as u64, (clock_len - 1) as u64);
                     return Err(ScriptCancelled.into());
                 }
                 return Err(err);
@@ -234,23 +224,23 @@ async fn backtest_candles_window(
             position = next_position;
         }
 
-        let curr = series.data[idx].c;
-        let next = series.data[idx + 1].c;
-        let denom = curr.abs().max(1.0);
-        returns.push(position * ((next - curr) / denom));
+        let curr = clock_price(&clock, &data, idx)?;
+        let next = clock_price(&clock, &data, idx + 1)?;
+        returns.push(position * ((next - curr) / curr.abs().max(1.0)));
         latest_output = Some(ScriptBacktestLatestOutput {
             metrics: output.metrics,
             signal: output.signal,
             intent: output.intent,
         });
 
-        if (idx + 1) % 500 == 0 || idx + 2 == series.data.len() {
-            eprintln!("processed {}/{} candles", idx + 1, series.data.len() - 1);
-            report.set_progress(
-                "executing_hooks",
-                (idx + 1) as u64,
-                (series.data.len() - 1) as u64,
+        if (idx + 1) % 500 == 0 || idx + 2 == clock_len {
+            eprintln!(
+                "processed {}/{} {} records",
+                idx + 1,
+                clock_len - 1,
+                clock.as_str()
             );
+            report.set_progress("executing_hooks", (idx + 1) as u64, (clock_len - 1) as u64);
             write_running_report_best_effort(report);
         }
     }
@@ -259,209 +249,245 @@ async fn backtest_candles_window(
         bail!("script backtest requires strategy-like output: return `signal` or `intent`");
     }
 
-    let performance = ScriptBacktestPerformance {
-        trades,
-        sharpe: sharpe(&returns),
-        max_drawdown: max_drawdown(&returns),
-    };
+    let timeframe_sec = source_configs
+        .get(&clock)
+        .and_then(|config| config.timeframe)
+        .unwrap_or_default();
     let result = ScriptBacktestResult {
         r#type: "script.backtest.result",
         version: "1",
         provider: provider_name(args.provider.into()),
         exchange: args.exchange.clone(),
         symbol: args.symbol.clone(),
-        ts_ms: series.to,
+        ts_ms: clock_ts_ms(&clock, &data, clock_len - 1).unwrap_or(args.to),
         script: ScriptDescriptor {
             name: script.manifest.name.clone(),
-            source: "candles",
+            sources: script
+                .manifest
+                .sources
+                .iter()
+                .map(ScriptSource::as_str)
+                .collect(),
         },
         window: ScriptWindow {
             from: args.from,
             to: args.to,
-            timeframe_sec: args.timeframe,
+            timeframe_sec,
         },
-        inputs: ScriptInputs {
-            values: resolved_inputs,
+        params: ScriptInputs {
+            values: resolved_params,
         },
-        performance,
+        performance: ScriptBacktestPerformance {
+            trades,
+            sharpe: sharpe(&returns),
+            max_drawdown: max_drawdown(&returns),
+        },
         latest_output: latest_output.unwrap_or(ScriptBacktestLatestOutput {
-            metrics: serde_json::json!({}),
-            signal: serde_json::json!({}),
-            intent: serde_json::json!({}),
+            metrics: json!({}),
+            signal: json!({}),
+            intent: json!({}),
         }),
-        meta: serde_json::json!({}),
+        meta: json!({
+            "clock": clock.as_str(),
+            "source_data": {
+                "orderbook": "flat_heatmap_hd"
+            }
+        }),
     };
 
     render_backtest(&result, args.output, args.verbose)
 }
 
-async fn backtest_orderbook_window(
-    args: ScriptBacktestArgs,
-    script: Script,
-    resolved_inputs: Value,
+async fn fetch_sources(
+    args: &ScriptBacktestArgs,
+    script: &Script,
+    source_configs: &SourceConfigs,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
-) -> Result<()> {
-    let fetch_started = Instant::now();
+) -> Result<BacktestData> {
+    let mut data = BacktestData::default();
     let mut cancel = Box::pin(tokio::signal::ctrl_c());
-    report.set_phase("fetching_orderbooks");
-    write_running_report_best_effort(report);
-    eprintln!(
-        "fetching orderbooks exchange={} symbol={} tf={} from={} to={} depth={}",
-        args.exchange, args.symbol, args.timeframe, args.from, args.to, args.depth
-    );
-    let books_future = MmtProvider::historical_orderbooks(
-        &args.exchange,
-        &args.symbol,
-        args.mmt_tf()?,
-        args.from,
-        args.to,
-        args.depth,
-    );
-    let series = tokio::select! {
-        result = books_future => result?,
-        _ = &mut cancel => {
-            report.set_phase("cancelled");
-            return Err(ScriptCancelled.into());
-        }
-    };
-    eprintln!(
-        "fetched {} orderbooks in {}ms",
-        series.len(),
-        fetch_started.elapsed().as_millis()
-    );
-    report.set_progress(
-        "orderbooks_fetched",
-        series.len() as u64,
-        series.len() as u64,
-    );
-    write_running_report_best_effort(report);
 
-    if series.len() < 2 {
-        bail!("script backtest requires at least 2 orderbook snapshots");
-    }
-
-    let mut returns = Vec::new();
-    let mut trades = 0_usize;
-    let mut position = 0.0_f64;
-    let mut saw_strategy_like_output = false;
-    let mut latest_output = None;
-    let session = script.start_session(&resolved_inputs)?;
-    let cancel_handle = session.cancel_handle();
-    let _cancel_task = AbortOnDrop(tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            cancel_handle.store(true, Ordering::Relaxed);
-        }
-    }));
-
-    let lookback = effective_lookback(&script, &resolved_inputs);
-    eprintln!(
-        "running script={} orderbooks={} lookback={}",
-        script.manifest.name,
-        series.len(),
-        lookback
-    );
-    report.set_progress("executing_hooks", 0, (series.len() - 1) as u64);
-    write_running_report_best_effort(report);
-
-    for idx in 0..(series.len() - 1) {
-        if session.is_cancelled() {
-            report.set_progress("cancelled", idx as u64, (series.len() - 1) as u64);
-            return Err(ScriptCancelled.into());
-        }
-
-        let from_idx = idx.saturating_add(1).saturating_sub(lookback);
-        let books_json = serde_json::to_value(&series[from_idx..=idx])
-            .context("failed to encode orderbook snapshots")?;
-        let execution = match session.run_orderbook_window(&books_json) {
-            Ok(execution) => execution,
-            Err(err) => {
-                report.record_hook_failure();
-                if session.is_cancelled() {
-                    report.set_progress("cancelled", idx as u64, (series.len() - 1) as u64);
-                    return Err(ScriptCancelled.into());
-                }
-                return Err(err);
+    for source in &script.manifest.sources {
+        let config = source_configs
+            .get(source)
+            .ok_or_else(|| anyhow::anyhow!("missing source config for {}", source.as_str()))?;
+        match source {
+            ScriptSource::Candles => {
+                let timeframe = config.require_timeframe(source)?;
+                let tf = mmt_timeframe_from_seconds(timeframe)?;
+                let started = Instant::now();
+                report.set_phase("fetching_candles");
+                write_running_report_best_effort(report);
+                eprintln!(
+                    "fetching candles exchange={} symbol={} tf={} from={} to={}",
+                    args.exchange, args.symbol, timeframe, args.from, args.to
+                );
+                let future =
+                    MmtProvider::candles(&args.exchange, &args.symbol, tf, args.from, args.to);
+                let series = tokio::select! {
+                    result = future => result?,
+                    _ = &mut cancel => {
+                        report.set_phase("cancelled");
+                        return Err(ScriptCancelled.into());
+                    }
+                };
+                eprintln!(
+                    "fetched {} candles in {}ms",
+                    series.data.len(),
+                    started.elapsed().as_millis()
+                );
+                report.set_progress(
+                    "candles_fetched",
+                    series.data.len() as u64,
+                    series.data.len() as u64,
+                );
+                write_running_report_best_effort(report);
+                data.candles = Some(series.data);
             }
-        };
-        report.record_hook(&execution.stats);
-        let output = execution.output;
-
-        if !is_empty_json_object(&output.signal) || !is_empty_json_object(&output.intent) {
-            saw_strategy_like_output = true;
-        }
-
-        if let Some(next_position) = position_from_output(&output.signal, &output.intent) {
-            trades += 1;
-            position = next_position;
-        }
-
-        let curr = book_mid(&series[idx])?;
-        let next = book_mid(&series[idx + 1])?;
-        let denom = curr.abs().max(1.0);
-        returns.push(position * ((next - curr) / denom));
-        latest_output = Some(ScriptBacktestLatestOutput {
-            metrics: output.metrics,
-            signal: output.signal,
-            intent: output.intent,
-        });
-
-        if (idx + 1) % 500 == 0 || idx + 2 == series.len() {
-            eprintln!("processed {}/{} orderbooks", idx + 1, series.len() - 1);
-            report.set_progress(
-                "executing_hooks",
-                (idx + 1) as u64,
-                (series.len() - 1) as u64,
-            );
-            write_running_report_best_effort(report);
+            ScriptSource::Orderbook => {
+                let timeframe = config.require_timeframe(source)?;
+                let tf = mmt_timeframe_from_seconds(timeframe)?;
+                let depth = config.depth_or_default();
+                let started = Instant::now();
+                report.set_phase("fetching_orderbooks");
+                write_running_report_best_effort(report);
+                eprintln!(
+                    "fetching orderbooks exchange={} symbol={} tf={} from={} to={} depth={}",
+                    args.exchange, args.symbol, timeframe, args.from, args.to, depth
+                );
+                let future = MmtProvider::historical_orderbooks(
+                    &args.exchange,
+                    &args.symbol,
+                    tf,
+                    args.from,
+                    args.to,
+                    depth,
+                );
+                let series = tokio::select! {
+                    result = future => result?,
+                    _ = &mut cancel => {
+                        report.set_phase("cancelled");
+                        return Err(ScriptCancelled.into());
+                    }
+                };
+                eprintln!(
+                    "fetched {} orderbooks in {}ms",
+                    series.len(),
+                    started.elapsed().as_millis()
+                );
+                report.set_progress(
+                    "orderbooks_fetched",
+                    series.len() as u64,
+                    series.len() as u64,
+                );
+                write_running_report_best_effort(report);
+                data.orderbooks = Some(series);
+            }
         }
     }
 
-    if !saw_strategy_like_output {
-        bail!("script backtest requires strategy-like output: return `signal` or `intent`");
+    Ok(data)
+}
+
+fn build_window_payload(
+    script: &Script,
+    data: &BacktestData,
+    clock: &ScriptSource,
+    clock_idx: usize,
+    cutoff_ms: u64,
+    lookback: usize,
+) -> Result<Value> {
+    let mut root = Map::new();
+    root.insert("mode".to_string(), Value::String("window".to_string()));
+
+    for source in &script.manifest.sources {
+        match source {
+            ScriptSource::Candles => {
+                let candles = data.candles.as_ref().context("candles data not loaded")?;
+                let end = if source == clock {
+                    clock_idx + 1
+                } else {
+                    upper_bound_by_ts(candles, cutoff_ms, candle_ts_ms)
+                };
+                let start = end.saturating_sub(lookback);
+                let slice = serde_json::to_value(&candles[start..end])?;
+                root.insert("candles".to_string(), json!({ "candles": slice }));
+            }
+            ScriptSource::Orderbook => {
+                let books = data
+                    .orderbooks
+                    .as_ref()
+                    .context("orderbook data not loaded")?;
+                let end = if source == clock {
+                    clock_idx + 1
+                } else {
+                    upper_bound_by_ts(books, cutoff_ms, |book| book.timestamp_ms)
+                };
+                let start = end.saturating_sub(lookback);
+                let slice = serde_json::to_value(&books[start..end])?;
+                root.insert("orderbook".to_string(), json!({ "books": slice }));
+            }
+        }
     }
 
-    let performance = ScriptBacktestPerformance {
-        trades,
-        sharpe: sharpe(&returns),
-        max_drawdown: max_drawdown(&returns),
-    };
-    let ts_ms = series
-        .last()
-        .map(|book| book.timestamp_ms)
-        .unwrap_or(args.to);
-    let result = ScriptBacktestResult {
-        r#type: "script.backtest.result",
-        version: "1",
-        provider: provider_name(args.provider.into()),
-        exchange: args.exchange.clone(),
-        symbol: args.symbol.clone(),
-        ts_ms,
-        script: ScriptDescriptor {
-            name: script.manifest.name.clone(),
-            source: "orderbook",
-        },
-        window: ScriptWindow {
-            from: args.from,
-            to: args.to,
-            timeframe_sec: args.timeframe,
-        },
-        inputs: ScriptInputs {
-            values: resolved_inputs,
-        },
-        performance,
-        latest_output: latest_output.unwrap_or(ScriptBacktestLatestOutput {
-            metrics: serde_json::json!({}),
-            signal: serde_json::json!({}),
-            intent: serde_json::json!({}),
-        }),
-        meta: serde_json::json!({
-            "source_data": "flat_heatmap_hd",
-            "book_kind": "binned",
-            "depth": args.depth
-        }),
-    };
+    Ok(Value::Object(root))
+}
 
-    render_backtest(&result, args.output, args.verbose)
+fn upper_bound_by_ts<T>(items: &[T], cutoff_ms: u64, ts: impl Fn(&T) -> u64) -> usize {
+    items
+        .iter()
+        .position(|item| ts(item) > cutoff_ms)
+        .unwrap_or(items.len())
+}
+
+fn clock_len(clock: &ScriptSource, data: &BacktestData) -> Result<usize> {
+    match clock {
+        ScriptSource::Candles => Ok(data
+            .candles
+            .as_ref()
+            .context("candles data not loaded")?
+            .len()),
+        ScriptSource::Orderbook => Ok(data
+            .orderbooks
+            .as_ref()
+            .context("orderbook data not loaded")?
+            .len()),
+    }
+}
+
+fn clock_ts_ms(clock: &ScriptSource, data: &BacktestData, idx: usize) -> Result<u64> {
+    match clock {
+        ScriptSource::Candles => Ok(candle_ts_ms(
+            &data.candles.as_ref().context("candles data not loaded")?[idx],
+        )),
+        ScriptSource::Orderbook => Ok(data
+            .orderbooks
+            .as_ref()
+            .context("orderbook data not loaded")?[idx]
+            .timestamp_ms),
+    }
+}
+
+fn clock_price(clock: &ScriptSource, data: &BacktestData, idx: usize) -> Result<f64> {
+    match clock {
+        ScriptSource::Candles => {
+            Ok(data.candles.as_ref().context("candles data not loaded")?[idx].c)
+        }
+        ScriptSource::Orderbook => book_mid(
+            &data
+                .orderbooks
+                .as_ref()
+                .context("orderbook data not loaded")?[idx],
+        ),
+    }
+}
+
+fn candle_ts_ms(candle: &OhlcvtCandle) -> u64 {
+    if candle.t < 10_000_000_000 {
+        candle.t * 1000
+    } else {
+        candle.t
+    }
 }
 
 fn book_mid(book: &OrderBookSnapshot) -> Result<f64> {
@@ -478,14 +504,18 @@ fn book_mid(book: &OrderBookSnapshot) -> Result<f64> {
     Ok((bid + ask) / 2.0)
 }
 
-fn effective_lookback(script: &Script, resolved_inputs: &Value) -> usize {
+fn effective_lookback(script: &Script, resolved_params: &Value) -> usize {
     if let Some(lookback) = script.manifest.lookback {
         return lookback;
     }
 
-    resolved_inputs
-        .get("lookback")
-        .and_then(Value::as_f64)
+    resolved_params
+        .as_object()
+        .and_then(|params| {
+            params
+                .values()
+                .find_map(|source| source.get("lookback").and_then(Value::as_f64))
+        })
         .filter(|value| value.is_finite() && *value >= 1.0)
         .map(|value| value.floor() as usize)
         .unwrap_or(SCRIPT_DEFAULT_LOOKBACK_CANDLES)
@@ -590,7 +620,7 @@ where
             ts_ms: result.ts_ms,
             script: &result.script,
             performance: &result.performance,
-            inputs: &result.inputs,
+            params: &result.params,
         };
         match output {
             OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&compact)?),

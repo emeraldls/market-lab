@@ -105,17 +105,15 @@ pub struct ScriptRunArgs {
     #[arg(long)]
     pub symbol: Option<String>,
     #[arg(long)]
-    pub timeframe: Option<u32>,
-    #[arg(long, default_value_t = 100)]
-    pub depth: u16,
-    #[arg(long)]
     pub from: Option<u64>,
     #[arg(long)]
     pub to: Option<u64>,
     #[arg(long, default_value_t = false)]
     pub stream: bool,
-    #[arg(long = "input")]
-    pub input: Vec<String>,
+    #[arg(long = "source")]
+    pub source: Vec<String>,
+    #[arg(long = "param")]
+    pub param: Vec<String>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
     #[arg(long, default_value_t = false)]
@@ -127,17 +125,7 @@ impl ScriptRunArgs {
         if self.script.trim().is_empty() {
             bail!("script path is required");
         }
-        if self.depth == 0 {
-            bail!("--depth must be >= 1");
-        }
         Ok(())
-    }
-
-    pub fn mmt_tf(&self) -> Result<&'static str> {
-        let timeframe = self
-            .timeframe
-            .ok_or_else(|| anyhow::anyhow!("--timeframe is required for source=candles"))?;
-        mmt_timeframe_from_seconds(timeframe)
     }
 }
 
@@ -151,15 +139,13 @@ pub struct ScriptBacktestArgs {
     #[arg(long)]
     pub symbol: String,
     #[arg(long)]
-    pub timeframe: u32,
-    #[arg(long)]
     pub from: u64,
     #[arg(long)]
     pub to: u64,
-    #[arg(long, default_value_t = 100)]
-    pub depth: u16,
-    #[arg(long = "input")]
-    pub input: Vec<String>,
+    #[arg(long = "source")]
+    pub source: Vec<String>,
+    #[arg(long = "param")]
+    pub param: Vec<String>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
     #[arg(long, default_value_t = false)]
@@ -177,18 +163,10 @@ impl ScriptBacktestArgs {
         if !is_valid_symbol(&self.symbol) {
             bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
-        mmt_timeframe_from_seconds(self.timeframe)?;
         if self.from >= self.to {
             bail!("--from must be less than --to");
         }
-        if self.depth == 0 {
-            bail!("--depth must be >= 1");
-        }
         Ok(())
-    }
-
-    pub fn mmt_tf(&self) -> Result<&'static str> {
-        mmt_timeframe_from_seconds(self.timeframe)
     }
 }
 
@@ -982,7 +960,7 @@ fn is_valid_symbol(symbol: &str) -> bool {
     }
 }
 
-fn mmt_timeframe_from_seconds(seconds: u32) -> Result<&'static str> {
+pub(crate) fn mmt_timeframe_from_seconds(seconds: u32) -> Result<&'static str> {
     match seconds {
         60 => Ok("1m"),
         300 => Ok("5m"),
@@ -1506,11 +1484,11 @@ mod tests {
             "bybitf",
             "--symbol",
             "BTC/USDT",
-            "--timeframe",
-            "60",
+            "--source",
+            "candles:timeframe=60",
             "--stream",
-            "--input",
-            "min_vbuy=50000",
+            "--param",
+            "candles:min_vbuy=50000",
             "--output",
             "json",
         ])
@@ -1523,9 +1501,9 @@ mod tests {
                 assert_eq!(args.script, "./studies/buy-pressure.js");
                 assert_eq!(args.exchange.as_deref(), Some("bybitf"));
                 assert_eq!(args.symbol.as_deref(), Some("BTC/USDT"));
-                assert_eq!(args.timeframe, Some(60));
                 assert!(args.stream);
-                assert_eq!(args.input, vec!["min_vbuy=50000"]);
+                assert_eq!(args.source, vec!["candles:timeframe=60"]);
+                assert_eq!(args.param, vec!["candles:min_vbuy=50000"]);
                 args.validate().expect("validate should succeed");
             }
             _ => panic!("expected script run command"),
@@ -1544,7 +1522,6 @@ mod tests {
                 assert_eq!(args.script, "test/buy-pressure.js");
                 assert!(args.exchange.is_none());
                 assert!(args.symbol.is_none());
-                assert!(args.timeframe.is_none());
                 assert!(args.from.is_none());
                 assert!(args.to.is_none());
                 args.validate().expect("base validate should succeed");
@@ -1566,14 +1543,14 @@ mod tests {
             "bybitf",
             "--symbol",
             "BTC/USDT",
-            "--timeframe",
-            "60",
             "--from",
             "1704067200000",
             "--to",
             "1704067800000",
-            "--input",
-            "fast=20",
+            "--source",
+            "candles:timeframe=60",
+            "--param",
+            "candles:fast=20",
             "--output",
             "json",
         ])
@@ -1584,7 +1561,8 @@ mod tests {
                 command: ScriptCommands::Backtest(args),
             } => {
                 assert_eq!(args.script, "./scripts/sma-cross.js");
-                assert_eq!(args.input, vec!["fast=20"]);
+                assert_eq!(args.source, vec!["candles:timeframe=60"]);
+                assert_eq!(args.param, vec!["candles:fast=20"]);
                 args.validate().expect("validate should succeed");
             }
             _ => panic!("expected script backtest command"),
