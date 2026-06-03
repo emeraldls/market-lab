@@ -3,10 +3,13 @@ use std::collections::BTreeMap;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::limits::SCRIPT_MAX_LOOKBACK_CANDLES;
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ScriptSource {
     Candles,
+    Orderbook,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -45,6 +48,8 @@ pub struct ScriptManifest {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
+    pub lookback: Option<usize>,
+    #[serde(default)]
     pub inputs: BTreeMap<String, ScriptInputSchema>,
 }
 
@@ -58,6 +63,14 @@ impl ScriptManifest {
         }
         if self.modes.is_empty() {
             bail!("script.modes must not be empty");
+        }
+        if matches!(self.lookback, Some(0)) {
+            bail!("script.lookback must be >= 1");
+        }
+        if let Some(lookback) = self.lookback
+            && lookback > SCRIPT_MAX_LOOKBACK_CANDLES
+        {
+            bail!("script.lookback must be <= {SCRIPT_MAX_LOOKBACK_CANDLES}");
         }
         for key in self.inputs.keys() {
             if !is_valid_input_name(key) {
@@ -140,6 +153,7 @@ mod tests {
             source: ScriptSource::Candles,
             modes: vec![ScriptMode::Window],
             description: None,
+            lookback: None,
             inputs: BTreeMap::new(),
         };
         assert!(manifest.validate().is_err());
@@ -163,6 +177,7 @@ mod tests {
             source: ScriptSource::Candles,
             modes: vec![ScriptMode::Window],
             description: None,
+            lookback: None,
             inputs,
         };
         assert!(manifest.validate().is_err());
@@ -186,6 +201,7 @@ mod tests {
             source: ScriptSource::Candles,
             modes: vec![ScriptMode::Window],
             description: None,
+            lookback: None,
             inputs,
         };
         let err = manifest.validate().expect_err("reserved input should fail");
@@ -203,5 +219,37 @@ mod tests {
         .expect_err("unknown source should fail");
 
         assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn manifest_rejects_zero_lookback() {
+        let manifest = ScriptManifest {
+            name: "x".to_string(),
+            version: "1".to_string(),
+            source: ScriptSource::Candles,
+            modes: vec![ScriptMode::Window],
+            description: None,
+            lookback: Some(0),
+            inputs: BTreeMap::new(),
+        };
+
+        let err = manifest.validate().expect_err("zero lookback should fail");
+        assert!(err.to_string().contains("lookback"));
+    }
+
+    #[test]
+    fn manifest_rejects_lookback_above_max() {
+        let manifest = ScriptManifest {
+            name: "x".to_string(),
+            version: "1".to_string(),
+            source: ScriptSource::Candles,
+            modes: vec![ScriptMode::Window],
+            description: None,
+            lookback: Some(SCRIPT_MAX_LOOKBACK_CANDLES + 1),
+            inputs: BTreeMap::new(),
+        };
+
+        let err = manifest.validate().expect_err("large lookback should fail");
+        assert!(err.to_string().contains("lookback"));
     }
 }

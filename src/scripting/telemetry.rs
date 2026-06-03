@@ -56,6 +56,10 @@ pub struct ScriptRuntimeReport {
     pub ended_at_ms: u64,
     pub duration_ms: u64,
     pub status: ScriptRuntimeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<ScriptRuntimeProgress>,
     pub limits: ScriptRuntimeLimits,
     pub runtime: ScriptRuntimeMetrics,
     pub error: Option<ScriptRuntimeError>,
@@ -71,8 +75,16 @@ pub struct ScriptReportScript {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScriptRuntimeStatus {
+    Running,
     Ok,
     Error,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScriptRuntimeProgress {
+    pub current: u64,
+    pub total: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,6 +112,8 @@ pub struct ScriptRuntimeReportBuilder {
     started_at_ms: u64,
     limits: ScriptRuntimeLimits,
     telemetry: ScriptHookTelemetry,
+    phase: Option<String>,
+    progress: Option<ScriptRuntimeProgress>,
 }
 
 impl ScriptRuntimeReportBuilder {
@@ -119,7 +133,19 @@ impl ScriptRuntimeReportBuilder {
             started_at_ms: now_ms(),
             limits: default_limits(),
             telemetry: ScriptHookTelemetry::default(),
+            phase: Some("started".to_string()),
+            progress: None,
         }
+    }
+
+    pub fn set_phase(&mut self, phase: impl Into<String>) {
+        self.phase = Some(phase.into());
+        self.progress = None;
+    }
+
+    pub fn set_progress(&mut self, phase: impl Into<String>, current: u64, total: u64) {
+        self.phase = Some(phase.into());
+        self.progress = Some(ScriptRuntimeProgress { current, total });
     }
 
     pub fn record_hook(&mut self, stats: &ScriptHookStats) {
@@ -144,8 +170,30 @@ impl ScriptRuntimeReportBuilder {
         )
     }
 
+    pub fn finish_cancelled(self) -> ScriptRuntimeReport {
+        self.finish(
+            ScriptRuntimeStatus::Cancelled,
+            Some(ScriptRuntimeError {
+                kind: "cancelled",
+                message: "script run cancelled by user".to_string(),
+            }),
+        )
+    }
+
+    pub fn snapshot_running(&self) -> ScriptRuntimeReport {
+        self.snapshot(ScriptRuntimeStatus::Running, None)
+    }
+
     fn finish(
         self,
+        status: ScriptRuntimeStatus,
+        error: Option<ScriptRuntimeError>,
+    ) -> ScriptRuntimeReport {
+        self.snapshot(status, error)
+    }
+
+    fn snapshot(
+        &self,
         status: ScriptRuntimeStatus,
         error: Option<ScriptRuntimeError>,
     ) -> ScriptRuntimeReport {
@@ -153,15 +201,17 @@ impl ScriptRuntimeReportBuilder {
         ScriptRuntimeReport {
             r#type: "script.runtime.report",
             version: "1",
-            script: self.script,
-            command: self.command,
-            provider: self.provider,
-            exchange: self.exchange,
-            symbol: self.symbol,
+            script: self.script.clone(),
+            command: self.command.clone(),
+            provider: self.provider.clone(),
+            exchange: self.exchange.clone(),
+            symbol: self.symbol.clone(),
             started_at_ms: self.started_at_ms,
             ended_at_ms,
             duration_ms: ended_at_ms.saturating_sub(self.started_at_ms),
             status,
+            phase: self.phase.clone(),
+            progress: self.progress.clone(),
             limits: self.limits,
             runtime: ScriptRuntimeMetrics {
                 engine: "quickjs",

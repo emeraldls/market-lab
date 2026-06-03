@@ -43,6 +43,7 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
 
     let result = match script.manifest.source {
         ScriptSource::Candles => validate_candles_run(&args, &script),
+        ScriptSource::Orderbook => validate_orderbook_run(&args, &script),
     };
     let runtime_report = match &result {
         Ok(_) => report.finish_ok(),
@@ -50,6 +51,28 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
     };
     write_report_best_effort(&runtime_report);
     result
+}
+
+fn validate_orderbook_run(args: &ScriptRunArgs, script: &Script) -> Result<()> {
+    if args.from.is_some() || args.to.is_some() {
+        bail!(
+            "--from/--to are not allowed with script run; use script backtest for historical orderbook data"
+        );
+    }
+    if args.timeframe.is_some() {
+        bail!("--timeframe is not used with source=orderbook stream");
+    }
+    if !args.stream {
+        bail!("script run for source=orderbook requires --stream");
+    }
+    if !script.manifest.supports_mode(ScriptMode::Stream) {
+        bail!("script does not support stream mode");
+    }
+
+    require_non_empty(args.exchange.as_deref(), "--exchange")?;
+    require_symbol(args.symbol.as_deref())?;
+
+    bail!("script stream execution is not implemented yet")
 }
 
 fn validate_candles_run(args: &ScriptRunArgs, script: &Script) -> Result<()> {
@@ -75,7 +98,7 @@ fn validate_candles_run(args: &ScriptRunArgs, script: &Script) -> Result<()> {
 }
 
 fn require_non_empty<'a>(value: Option<&'a str>, flag: &str) -> Result<&'a str> {
-    let value = value.ok_or_else(|| anyhow::anyhow!("{flag} is required for source=candles"))?;
+    let value = value.ok_or_else(|| anyhow::anyhow!("{flag} is required"))?;
     if value.trim().is_empty() {
         bail!("{flag} cannot be empty");
     }

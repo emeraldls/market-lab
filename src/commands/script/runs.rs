@@ -23,6 +23,9 @@ struct ScriptRunRecord {
     exchange: Option<String>,
     symbol: Option<String>,
     status: Option<String>,
+    phase: Option<String>,
+    progress_current: Option<u64>,
+    progress_total: Option<u64>,
     duration_ms: Option<u64>,
     hooks_called: Option<u64>,
     hook_failures: Option<u64>,
@@ -124,6 +127,9 @@ fn record_from_json(path: PathBuf, json: &Value) -> Result<ScriptRunRecord> {
         exchange: get_string(json, &["exchange"]),
         symbol: get_string(json, &["symbol"]),
         status: get_string(json, &["status"]),
+        phase: get_string(json, &["phase"]),
+        progress_current: get_u64(json, &["progress", "current"]),
+        progress_total: get_u64(json, &["progress", "total"]),
         duration_ms: get_u64(json, &["duration_ms"]),
         hooks_called: get_u64(json, &["runtime", "hooks_called"]),
         hook_failures: get_u64(json, &["runtime", "hook_failures"]),
@@ -195,9 +201,11 @@ fn print_list_terminal(records: &[ScriptRunRecord], all: bool, limit: usize) {
             record.script_name.as_deref().unwrap_or("unknown-script")
         );
         println!(
-            "   time={} duration={} hooks={} failures={} heap={}",
+            "   time={} duration={} phase={} progress={} hooks={} failures={} heap={}",
             format_ts_ms(record.started_at_ms),
             format_duration(record.duration_ms),
+            record.phase.as_deref().unwrap_or("n/a"),
+            format_progress(record.progress_current, record.progress_total),
             format_optional_u64(record.hooks_called),
             format_optional_u64(record.hook_failures),
             format_memory(record.max_heap_used_bytes)
@@ -231,6 +239,14 @@ fn print_show_terminal(path: &Path, json: &Value) {
             .unwrap_or("unknown")
     );
     println!("status: {}", display_string(json, &["status"]));
+    println!("phase: {}", display_string(json, &["phase"]));
+    println!(
+        "progress: {}",
+        format_progress(
+            get_u64(json, &["progress", "current"]),
+            get_u64(json, &["progress", "total"])
+        )
+    );
     println!("command: {}", display_string(json, &["command"]));
     println!("script: {}", display_string(json, &["script", "name"]));
     println!("source: {}", display_string(json, &["script", "source"]));
@@ -388,6 +404,17 @@ fn format_duration(value: Option<u64>) -> String {
         Some(ms) if ms < 60_000 => format!("{:.2}s", ms as f64 / 1_000.0),
         Some(ms) => format!("{:.2}m", ms as f64 / 60_000.0),
         None => "n/a".to_string(),
+    }
+}
+
+fn format_progress(current: Option<u64>, total: Option<u64>) -> String {
+    match (current, total) {
+        (Some(current), Some(total)) if total > 0 => {
+            let pct = (current as f64 / total as f64) * 100.0;
+            format!("{current}/{total} ({pct:.1}%)")
+        }
+        (Some(current), Some(total)) => format!("{current}/{total}"),
+        _ => "n/a".to_string(),
     }
 }
 

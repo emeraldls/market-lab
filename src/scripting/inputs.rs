@@ -81,6 +81,7 @@ mod tests {
             source: ScriptSource::Candles,
             modes: vec![ScriptMode::Window],
             description: None,
+            lookback: None,
             inputs: BTreeMap::from([
                 (
                     "min_vbuy".to_string(),

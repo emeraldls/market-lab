@@ -1,17 +1,24 @@
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::Value;
+use std::fmt;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use crate::cli::{OutputFormat, ScriptBacktestArgs};
 use crate::commands::script::{
     ScriptDescriptor, ScriptInputs, report_builder, write_report_best_effort,
+    write_running_report_best_effort,
 };
 use crate::commands::study::common::{is_empty_object, provider_name};
 use crate::domain::enums::ProviderKind;
+use crate::domain::types::OrderBookSnapshot;
 use crate::providers::mmt::MmtProvider;
 use crate::scripting::engine::Script;
 use crate::scripting::inputs::{parse_kv_inputs, resolve_inputs};
+use crate::scripting::limits::SCRIPT_DEFAULT_LOOKBACK_CANDLES;
 use crate::scripting::manifest::{ScriptMode, ScriptSource};
+use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone, Serialize)]
 struct ScriptBacktestResult<I>
@@ -115,9 +122,13 @@ pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
         ScriptSource::Candles => {
             backtest_candles_window(args, script, resolved_inputs, &mut report).await
         }
+        ScriptSource::Orderbook => {
+            backtest_orderbook_window(args, script, resolved_inputs, &mut report).await
+        }
     };
     let runtime_report = match &result {
         Ok(_) => report.finish_ok(),
+        Err(err) if err.is::<ScriptCancelled>() => report.finish_cancelled(),
         Err(err) => report.finish_error(err),
     };
     write_report_best_effort(&runtime_report);
@@ -130,14 +141,39 @@ async fn backtest_candles_window(
     resolved_inputs: Value,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
 ) -> Result<()> {
-    let series = MmtProvider::candles(
+    let fetch_started = Instant::now();
+    let mut cancel = Box::pin(tokio::signal::ctrl_c());
+    report.set_phase("fetching_candles");
+    write_running_report_best_effort(report);
+    eprintln!(
+        "fetching candles exchange={} symbol={} tf={} from={} to={}",
+        args.exchange, args.symbol, args.timeframe, args.from, args.to
+    );
+    let candles_future = MmtProvider::candles(
         &args.exchange,
         &args.symbol,
         args.mmt_tf()?,
         args.from,
         args.to,
-    )
-    .await?;
+    );
+    let series = tokio::select! {
+        result = candles_future => result?,
+        _ = &mut cancel => {
+            report.set_phase("cancelled");
+            return Err(ScriptCancelled.into());
+        }
+    };
+    eprintln!(
+        "fetched {} candles in {}ms",
+        series.data.len(),
+        fetch_started.elapsed().as_millis()
+    );
+    report.set_progress(
+        "candles_fetched",
+        series.data.len() as u64,
+        series.data.len() as u64,
+    );
+    write_running_report_best_effort(report);
 
     if series.data.len() < 2 {
         bail!("script backtest requires at least 2 candles");
@@ -148,14 +184,41 @@ async fn backtest_candles_window(
     let mut position = 0.0_f64;
     let mut saw_strategy_like_output = false;
     let mut latest_output = None;
+    let session = script.start_session(&resolved_inputs)?;
+    let cancel_handle = session.cancel_handle();
+    let _cancel_task = AbortOnDrop(tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            cancel_handle.store(true, Ordering::Relaxed);
+        }
+    }));
+
+    let lookback = effective_lookback(&script, &resolved_inputs);
+    eprintln!(
+        "running script={} candles={} lookback={}",
+        script.manifest.name,
+        series.data.len(),
+        lookback
+    );
+    report.set_progress("executing_hooks", 0, (series.data.len() - 1) as u64);
+    write_running_report_best_effort(report);
 
     for idx in 0..(series.data.len() - 1) {
-        let candles_json =
-            serde_json::to_value(&series.data[..=idx]).context("failed to encode candles")?;
-        let execution = match script.run_candles_window(&resolved_inputs, &candles_json) {
+        if session.is_cancelled() {
+            report.set_progress("cancelled", idx as u64, (series.data.len() - 1) as u64);
+            return Err(ScriptCancelled.into());
+        }
+
+        let from_idx = idx.saturating_add(1).saturating_sub(lookback);
+        let candles_json = serde_json::to_value(&series.data[from_idx..=idx])
+            .context("failed to encode candles")?;
+        let execution = match session.run_candles_window(&candles_json) {
             Ok(execution) => execution,
             Err(err) => {
                 report.record_hook_failure();
+                if session.is_cancelled() {
+                    report.set_progress("cancelled", idx as u64, (series.data.len() - 1) as u64);
+                    return Err(ScriptCancelled.into());
+                }
                 return Err(err);
             }
         };
@@ -180,6 +243,16 @@ async fn backtest_candles_window(
             signal: output.signal,
             intent: output.intent,
         });
+
+        if (idx + 1) % 500 == 0 || idx + 2 == series.data.len() {
+            eprintln!("processed {}/{} candles", idx + 1, series.data.len() - 1);
+            report.set_progress(
+                "executing_hooks",
+                (idx + 1) as u64,
+                (series.data.len() - 1) as u64,
+            );
+            write_running_report_best_effort(report);
+        }
     }
 
     if !saw_strategy_like_output {
@@ -220,6 +293,222 @@ async fn backtest_candles_window(
     };
 
     render_backtest(&result, args.output, args.verbose)
+}
+
+async fn backtest_orderbook_window(
+    args: ScriptBacktestArgs,
+    script: Script,
+    resolved_inputs: Value,
+    report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
+) -> Result<()> {
+    let fetch_started = Instant::now();
+    let mut cancel = Box::pin(tokio::signal::ctrl_c());
+    report.set_phase("fetching_orderbooks");
+    write_running_report_best_effort(report);
+    eprintln!(
+        "fetching orderbooks exchange={} symbol={} tf={} from={} to={} depth={}",
+        args.exchange, args.symbol, args.timeframe, args.from, args.to, args.depth
+    );
+    let books_future = MmtProvider::historical_orderbooks(
+        &args.exchange,
+        &args.symbol,
+        args.mmt_tf()?,
+        args.from,
+        args.to,
+        args.depth,
+    );
+    let series = tokio::select! {
+        result = books_future => result?,
+        _ = &mut cancel => {
+            report.set_phase("cancelled");
+            return Err(ScriptCancelled.into());
+        }
+    };
+    eprintln!(
+        "fetched {} orderbooks in {}ms",
+        series.len(),
+        fetch_started.elapsed().as_millis()
+    );
+    report.set_progress(
+        "orderbooks_fetched",
+        series.len() as u64,
+        series.len() as u64,
+    );
+    write_running_report_best_effort(report);
+
+    if series.len() < 2 {
+        bail!("script backtest requires at least 2 orderbook snapshots");
+    }
+
+    let mut returns = Vec::new();
+    let mut trades = 0_usize;
+    let mut position = 0.0_f64;
+    let mut saw_strategy_like_output = false;
+    let mut latest_output = None;
+    let session = script.start_session(&resolved_inputs)?;
+    let cancel_handle = session.cancel_handle();
+    let _cancel_task = AbortOnDrop(tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            cancel_handle.store(true, Ordering::Relaxed);
+        }
+    }));
+
+    let lookback = effective_lookback(&script, &resolved_inputs);
+    eprintln!(
+        "running script={} orderbooks={} lookback={}",
+        script.manifest.name,
+        series.len(),
+        lookback
+    );
+    report.set_progress("executing_hooks", 0, (series.len() - 1) as u64);
+    write_running_report_best_effort(report);
+
+    for idx in 0..(series.len() - 1) {
+        if session.is_cancelled() {
+            report.set_progress("cancelled", idx as u64, (series.len() - 1) as u64);
+            return Err(ScriptCancelled.into());
+        }
+
+        let from_idx = idx.saturating_add(1).saturating_sub(lookback);
+        let books_json = serde_json::to_value(&series[from_idx..=idx])
+            .context("failed to encode orderbook snapshots")?;
+        let execution = match session.run_orderbook_window(&books_json) {
+            Ok(execution) => execution,
+            Err(err) => {
+                report.record_hook_failure();
+                if session.is_cancelled() {
+                    report.set_progress("cancelled", idx as u64, (series.len() - 1) as u64);
+                    return Err(ScriptCancelled.into());
+                }
+                return Err(err);
+            }
+        };
+        report.record_hook(&execution.stats);
+        let output = execution.output;
+
+        if !is_empty_json_object(&output.signal) || !is_empty_json_object(&output.intent) {
+            saw_strategy_like_output = true;
+        }
+
+        if let Some(next_position) = position_from_output(&output.signal, &output.intent) {
+            trades += 1;
+            position = next_position;
+        }
+
+        let curr = book_mid(&series[idx])?;
+        let next = book_mid(&series[idx + 1])?;
+        let denom = curr.abs().max(1.0);
+        returns.push(position * ((next - curr) / denom));
+        latest_output = Some(ScriptBacktestLatestOutput {
+            metrics: output.metrics,
+            signal: output.signal,
+            intent: output.intent,
+        });
+
+        if (idx + 1) % 500 == 0 || idx + 2 == series.len() {
+            eprintln!("processed {}/{} orderbooks", idx + 1, series.len() - 1);
+            report.set_progress(
+                "executing_hooks",
+                (idx + 1) as u64,
+                (series.len() - 1) as u64,
+            );
+            write_running_report_best_effort(report);
+        }
+    }
+
+    if !saw_strategy_like_output {
+        bail!("script backtest requires strategy-like output: return `signal` or `intent`");
+    }
+
+    let performance = ScriptBacktestPerformance {
+        trades,
+        sharpe: sharpe(&returns),
+        max_drawdown: max_drawdown(&returns),
+    };
+    let ts_ms = series
+        .last()
+        .map(|book| book.timestamp_ms)
+        .unwrap_or(args.to);
+    let result = ScriptBacktestResult {
+        r#type: "script.backtest.result",
+        version: "1",
+        provider: provider_name(args.provider.into()),
+        exchange: args.exchange.clone(),
+        symbol: args.symbol.clone(),
+        ts_ms,
+        script: ScriptDescriptor {
+            name: script.manifest.name.clone(),
+            source: "orderbook",
+        },
+        window: ScriptWindow {
+            from: args.from,
+            to: args.to,
+            timeframe_sec: args.timeframe,
+        },
+        inputs: ScriptInputs {
+            values: resolved_inputs,
+        },
+        performance,
+        latest_output: latest_output.unwrap_or(ScriptBacktestLatestOutput {
+            metrics: serde_json::json!({}),
+            signal: serde_json::json!({}),
+            intent: serde_json::json!({}),
+        }),
+        meta: serde_json::json!({
+            "source_data": "flat_heatmap_hd",
+            "book_kind": "binned",
+            "depth": args.depth
+        }),
+    };
+
+    render_backtest(&result, args.output, args.verbose)
+}
+
+fn book_mid(book: &OrderBookSnapshot) -> Result<f64> {
+    let bid = book
+        .bids
+        .first()
+        .map(|level| level.price)
+        .context("orderbook snapshot has no bids")?;
+    let ask = book
+        .asks
+        .first()
+        .map(|level| level.price)
+        .context("orderbook snapshot has no asks")?;
+    Ok((bid + ask) / 2.0)
+}
+
+fn effective_lookback(script: &Script, resolved_inputs: &Value) -> usize {
+    if let Some(lookback) = script.manifest.lookback {
+        return lookback;
+    }
+
+    resolved_inputs
+        .get("lookback")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 1.0)
+        .map(|value| value.floor() as usize)
+        .unwrap_or(SCRIPT_DEFAULT_LOOKBACK_CANDLES)
+        .min(SCRIPT_DEFAULT_LOOKBACK_CANDLES)
+}
+
+#[derive(Debug)]
+struct ScriptCancelled;
+
+impl fmt::Display for ScriptCancelled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("script run cancelled by user")
+    }
+}
+
+impl std::error::Error for ScriptCancelled {}
+
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn position_from_output(signal: &Value, intent: &Value) -> Option<f64> {

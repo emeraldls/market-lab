@@ -106,6 +106,8 @@ pub struct ScriptRunArgs {
     pub symbol: Option<String>,
     #[arg(long)]
     pub timeframe: Option<u32>,
+    #[arg(long, default_value_t = 100)]
+    pub depth: u16,
     #[arg(long)]
     pub from: Option<u64>,
     #[arg(long)]
@@ -124,6 +126,9 @@ impl ScriptRunArgs {
     pub fn validate(&self) -> Result<()> {
         if self.script.trim().is_empty() {
             bail!("script path is required");
+        }
+        if self.depth == 0 {
+            bail!("--depth must be >= 1");
         }
         Ok(())
     }
@@ -151,6 +156,8 @@ pub struct ScriptBacktestArgs {
     pub from: u64,
     #[arg(long)]
     pub to: u64,
+    #[arg(long, default_value_t = 100)]
+    pub depth: u16,
     #[arg(long = "input")]
     pub input: Vec<String>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
@@ -173,6 +180,9 @@ impl ScriptBacktestArgs {
         mmt_timeframe_from_seconds(self.timeframe)?;
         if self.from >= self.to {
             bail!("--from must be less than --to");
+        }
+        if self.depth == 0 {
+            bail!("--depth must be >= 1");
         }
         Ok(())
     }

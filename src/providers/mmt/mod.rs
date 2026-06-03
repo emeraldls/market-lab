@@ -41,6 +41,17 @@ impl MmtProvider {
         fetch_orderbook_snapshot(exchange, symbol, depth).await
     }
 
+    pub async fn historical_orderbooks(
+        exchange: &str,
+        symbol: &str,
+        tf: &str,
+        from: u64,
+        to: u64,
+        depth: u16,
+    ) -> Result<Vec<OrderBookSnapshot>> {
+        fetch_flat_heatmap_hd_series(exchange, symbol, tf, from, to, depth).await
+    }
+
     pub async fn vd(
         exchange: &str,
         symbol: &str,
@@ -377,6 +388,63 @@ async fn fetch_flat_heatmap_hd_snapshot(
         point,
         depth,
     ))
+}
+
+async fn fetch_flat_heatmap_hd_series(
+    exchange: &str,
+    symbol: &str,
+    tf: &str,
+    from: u64,
+    to: u64,
+    depth: u16,
+) -> Result<Vec<OrderBookSnapshot>> {
+    let api_key = mmt_api_key()?;
+    let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
+    let exchange = exchange.trim().to_lowercase();
+    let from_s = normalize_to_seconds(from);
+    let to_s = normalize_to_seconds(to);
+
+    let url = format!("{MMT_BASE_URL}/flat_heatmap_hd");
+    let resp = Client::new()
+        .get(url)
+        .timeout(std::time::Duration::from_secs(MMT_HTTP_TIMEOUT_SECS))
+        .header("X-API-Key", api_key)
+        .query(&[
+            ("exchange", exchange.as_str()),
+            ("symbol", normalized_symbol.as_str()),
+            ("tf", tf),
+            ("from", &from_s.to_string()),
+            ("to", &to_s.to_string()),
+        ])
+        .send()
+        .await
+        .context("failed to call MMT /flat_heatmap_hd")?;
+
+    let status = resp.status();
+    let body: Value = resp
+        .json()
+        .await
+        .context("failed to decode MMT /flat_heatmap_hd response")?;
+
+    if !status.is_success() {
+        bail!(
+            "MMT /flat_heatmap_hd returned HTTP {} body={}",
+            status,
+            body
+        );
+    }
+
+    let parsed: FlatHeatmapHdResponse =
+        serde_json::from_value(body).context("invalid /flat_heatmap_hd payload shape")?;
+    if parsed.data.is_empty() {
+        bail!("/flat_heatmap_hd returned no data points");
+    }
+
+    Ok(parsed
+        .data
+        .iter()
+        .map(|point| heatmap_point_to_snapshot(&parsed.exchange, &parsed.symbol, point, depth))
+        .collect())
 }
 
 fn pick_point_at_or_before(points: &[HeatmapPoint], at_seconds: u64) -> Option<&HeatmapPoint> {
