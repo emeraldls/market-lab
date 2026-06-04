@@ -7,7 +7,7 @@ export const script = {
 }
 
 function candlesFrom(input) {
-  return input.mode === "stream" ? [input.candle] : input.candles.candles
+  return input.mode === "stream" ? [input.candles.candle] : input.candles.candles
 }
 
 export function onData(ctx, input) {

@@ -108,8 +108,6 @@ pub struct ScriptRunArgs {
     pub from: Option<u64>,
     #[arg(long)]
     pub to: Option<u64>,
-    #[arg(long, default_value_t = false)]
-    pub stream: bool,
     #[arg(long = "source")]
     pub source: Vec<String>,
     #[arg(long = "param")]
@@ -1486,7 +1484,6 @@ mod tests {
             "BTC/USDT",
             "--source",
             "candles:timeframe=60",
-            "--stream",
             "--param",
             "candles:min_vbuy=50000",
             "--output",
@@ -1501,7 +1498,6 @@ mod tests {
                 assert_eq!(args.script, "./studies/buy-pressure.js");
                 assert_eq!(args.exchange.as_deref(), Some("bybitf"));
                 assert_eq!(args.symbol.as_deref(), Some("BTC/USDT"));
-                assert!(args.stream);
                 assert_eq!(args.source, vec!["candles:timeframe=60"]);
                 assert_eq!(args.param, vec!["candles:min_vbuy=50000"]);
                 args.validate().expect("validate should succeed");

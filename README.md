@@ -31,3 +31,7 @@ cargo run -- source orderbook \
 ## License
 
 AGPL-3.0. See [LICENSE](./LICENSE).
+
+
+- fix performance issues in scripting, create single runtime
+- expose built in functions to scripting

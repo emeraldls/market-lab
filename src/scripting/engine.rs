@@ -138,6 +138,10 @@ impl ScriptSession {
         self.run_with_input(payload)
     }
 
+    pub fn run_stream(&self, payload: JsonValue) -> Result<ScriptExecution> {
+        self.run_with_input(payload)
+    }
+
     fn run_with_input(&self, input_payload: JsonValue) -> Result<ScriptExecution> {
         let started = Instant::now();
         {
@@ -643,6 +647,64 @@ export function onData(ctx, input) {
         assert_eq!(first.output.metrics["calls"], 1);
         assert_eq!(second.output.metrics["calls"], 2);
         assert_eq!(second.output.metrics["candles"], 2);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn runs_candle_stream_hook() {
+        let path = write_temp_script(
+            r#"
+export const script = {
+  name: "stream-script",
+  version: "1",
+  sources: ["candles"],
+  modes: ["stream"],
+  params: {}
+};
+
+let calls = 0;
+
+export function onData(ctx, input) {
+  calls += 1;
+  return {
+    metrics: {
+      calls,
+      close: input.candles.candle.c
+    },
+    signal: {
+      event: "tick",
+      side: "neutral",
+      triggered: false
+    }
+  };
+}
+"#,
+            "stream",
+        );
+
+        let script = Script::load(&path).expect("load script");
+        let session = script.start_session(&json!({})).expect("start session");
+        let first = session
+            .run_stream(json!({
+                "mode": "stream",
+                "candles": {
+                    "candle": { "t": 1, "o": 1.0, "h": 1.0, "l": 1.0, "c": 10.0, "vb": 1.0, "vs": 1.0, "tb": 1, "ts": 1 }
+                }
+            }))
+            .expect("first stream run");
+        let second = session
+            .run_stream(json!({
+                "mode": "stream",
+                "candles": {
+                    "candle": { "t": 2, "o": 1.0, "h": 1.0, "l": 1.0, "c": 11.0, "vb": 1.0, "vs": 1.0, "tb": 1, "ts": 1 }
+                }
+            }))
+            .expect("second stream run");
+
+        assert_eq!(first.output.metrics["calls"], 1);
+        assert_eq!(first.output.metrics["close"], 10.0);
+        assert_eq!(second.output.metrics["calls"], 2);
+        assert_eq!(second.output.metrics["close"], 11.0);
         let _ = fs::remove_file(path);
     }
 
