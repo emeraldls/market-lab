@@ -216,16 +216,24 @@ fn format_terminal_summary(env: &SourceEnvelope<Vec<OrderbookItem>>) -> String {
     });
 
     match (best_bid, best_ask) {
-        (Some(b), Some(a)) => format!(
-            "ts={} bid={:.2}x{:.4} ask={:.2}x{:.4} spread={:.4} items={}",
-            env.ts_ms,
-            b.price,
-            b.size,
-            a.price,
-            a.size,
-            a.price - b.price,
-            env.data.len()
-        ),
+        (Some(b), Some(a)) => {
+            let mid = (a.price + b.price) / 2.0;
+            let spread_bps = if mid > 0.0 {
+                ((a.price - b.price) / mid) * 10_000.0
+            } else {
+                0.0
+            };
+            format!(
+                "ts={} bid={:.2}x{:.4} ask={:.2}x{:.4} spread={:.4}bps items={}",
+                env.ts_ms,
+                b.price,
+                b.size,
+                a.price,
+                a.size,
+                spread_bps,
+                env.data.len()
+            )
+        }
         _ => format!("ts={} items={}", env.ts_ms, env.data.len()),
     }
 }

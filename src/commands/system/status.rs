@@ -25,6 +25,7 @@ fn build_status(provider_health: ProviderHealth) -> SystemStatus {
             "script".to_string(),
             "study".to_string(),
             "strategy".to_string(),
+            "auth".to_string(),
             "health".to_string(),
             "status".to_string(),
         ],
@@ -32,6 +33,8 @@ fn build_status(provider_health: ProviderHealth) -> SystemStatus {
             "orderbook".to_string(),
             "candles".to_string(),
             "vd".to_string(),
+            "oi".to_string(),
+            "volumes".to_string(),
         ],
         studies: vec![
             "spread".to_string(),

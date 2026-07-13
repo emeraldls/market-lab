@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 
 use crate::domain::enums::{BookMode, ProviderKind, Side};
 use crate::domain::requests::{
@@ -10,6 +11,7 @@ use crate::domain::requests::{
 #[derive(Parser, Debug)]
 #[command(name = "mlab")]
 #[command(version, about = "Deterministic market replay CLI", long_about = None)]
+#[command(args_override_self = true)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -38,6 +40,28 @@ pub enum Commands {
     Health(HealthArgs),
     Status(StatusArgs),
     Upgrade(UpgradeArgs),
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuthCommands {
+    Set(AuthProviderArgs),
+    Status,
+    Remove(AuthProviderArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct AuthProviderArgs {
+    #[arg(value_enum)]
+    pub provider: AuthProvider,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum AuthProvider {
+    Mmt,
 }
 
 #[derive(Subcommand, Debug)]
@@ -45,6 +69,8 @@ pub enum SourceCommands {
     Orderbook(SourceOrderbookArgs),
     Vd(SourceVdArgs),
     Candles(SourceCandlesArgs),
+    Oi(SourceOiArgs),
+    Volumes(SourceVolumesArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -98,6 +124,8 @@ pub enum StrategyBacktestCommands {
 #[derive(Clone, Debug, Args)]
 pub struct ScriptRunArgs {
     pub script: String,
+    #[arg(long)]
+    pub config: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
     pub provider: CliProviderKind,
     #[arg(long)]
@@ -130,6 +158,8 @@ impl ScriptRunArgs {
 #[derive(Clone, Debug, Args)]
 pub struct ScriptBacktestArgs {
     pub script: String,
+    #[arg(long)]
+    pub config: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
     pub provider: CliProviderKind,
     #[arg(long)]
@@ -144,6 +174,8 @@ pub struct ScriptBacktestArgs {
     pub source: Vec<String>,
     #[arg(long = "param")]
     pub param: Vec<String>,
+    #[arg(long, default_value_t = 1.0)]
+    pub leverage: f64,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
     #[arg(long, default_value_t = false)]
@@ -163,6 +195,9 @@ impl ScriptBacktestArgs {
         }
         if self.from >= self.to {
             bail!("--from must be less than --to");
+        }
+        if !self.leverage.is_finite() || self.leverage <= 0.0 {
+            bail!("--leverage must be > 0");
         }
         Ok(())
     }
@@ -357,6 +392,139 @@ impl SourceCandlesArgs {
 
     pub fn mmt_tf(&self) -> Result<&'static str> {
         mmt_timeframe_from_seconds(self.timeframe)
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct SourceOiArgs {
+    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
+    pub provider: CliProviderKind,
+    #[arg(long)]
+    pub exchange: String,
+    #[arg(long)]
+    pub symbol: String,
+    #[arg(long)]
+    pub timeframe: u32,
+    #[arg(long)]
+    pub from: Option<u64>,
+    #[arg(long)]
+    pub to: Option<u64>,
+    #[arg(long, default_value_t = false)]
+    pub stream: bool,
+    #[arg(long, default_value_t = 50)]
+    pub buffer_size: u16,
+    #[arg(long, default_value_t = 1000)]
+    pub interval_ms: u64,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl SourceOiArgs {
+    pub fn validate(&self) -> Result<()> {
+        TimeframeSourceValidation {
+            exchange: &self.exchange,
+            symbol: &self.symbol,
+            timeframe: self.timeframe,
+            from: self.from,
+            to: self.to,
+            stream: self.stream,
+            buffer_size: self.buffer_size,
+            interval_ms: self.interval_ms,
+        }
+        .validate()
+    }
+
+    pub fn mmt_tf(&self) -> Result<&'static str> {
+        mmt_timeframe_from_seconds(self.timeframe)
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct SourceVolumesArgs {
+    #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
+    pub provider: CliProviderKind,
+    #[arg(long)]
+    pub exchange: String,
+    #[arg(long)]
+    pub symbol: String,
+    #[arg(long)]
+    pub timeframe: u32,
+    #[arg(long)]
+    pub from: Option<u64>,
+    #[arg(long)]
+    pub to: Option<u64>,
+    #[arg(long, default_value_t = false)]
+    pub stream: bool,
+    #[arg(long, default_value_t = 50)]
+    pub buffer_size: u16,
+    #[arg(long, default_value_t = 1000)]
+    pub interval_ms: u64,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl SourceVolumesArgs {
+    pub fn validate(&self) -> Result<()> {
+        TimeframeSourceValidation {
+            exchange: &self.exchange,
+            symbol: &self.symbol,
+            timeframe: self.timeframe,
+            from: self.from,
+            to: self.to,
+            stream: self.stream,
+            buffer_size: self.buffer_size,
+            interval_ms: self.interval_ms,
+        }
+        .validate()
+    }
+
+    pub fn mmt_tf(&self) -> Result<&'static str> {
+        mmt_timeframe_from_seconds(self.timeframe)
+    }
+}
+
+struct TimeframeSourceValidation<'a> {
+    exchange: &'a str,
+    symbol: &'a str,
+    timeframe: u32,
+    from: Option<u64>,
+    to: Option<u64>,
+    stream: bool,
+    buffer_size: u16,
+    interval_ms: u64,
+}
+
+impl TimeframeSourceValidation<'_> {
+    fn validate(&self) -> Result<()> {
+        if self.exchange.trim().is_empty() {
+            bail!("--exchange cannot be empty");
+        }
+        if !is_valid_symbol(self.symbol) {
+            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        mmt_timeframe_from_seconds(self.timeframe)?;
+        if self.stream {
+            if self.from.is_some() || self.to.is_some() {
+                bail!("--from/--to are not allowed with --stream");
+            }
+        } else {
+            let from = self
+                .from
+                .ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?;
+            let to = self
+                .to
+                .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?;
+            if from >= to {
+                bail!("--from must be less than --to");
+            }
+        }
+        if self.buffer_size == 0 {
+            bail!("--buffer-size must be >= 1");
+        }
+        if self.interval_ms == 0 {
+            bail!("--interval-ms must be >= 1");
+        }
+        Ok(())
     }
 }
 
@@ -1034,6 +1202,29 @@ mod tests {
     use clap::Parser;
 
     #[test]
+    fn parse_auth_commands() {
+        let set =
+            Cli::try_parse_from(["mlab", "auth", "set", "mmt"]).expect("auth set should parse");
+        assert!(matches!(
+            set.command,
+            Commands::Auth {
+                command: AuthCommands::Set(AuthProviderArgs {
+                    provider: AuthProvider::Mmt
+                })
+            }
+        ));
+
+        let status =
+            Cli::try_parse_from(["mlab", "auth", "status"]).expect("auth status should parse");
+        assert!(matches!(
+            status.command,
+            Commands::Auth {
+                command: AuthCommands::Status
+            }
+        ));
+    }
+
+    #[test]
     fn parse_inspect_command() {
         let cli = Cli::try_parse_from([
             "market-lab",
@@ -1203,6 +1394,76 @@ mod tests {
                 assert_eq!(args.to, Some(1704067800));
             }
             _ => panic!("expected source candles command"),
+        }
+    }
+
+    #[test]
+    fn parse_source_oi_command() {
+        let cli = Cli::try_parse_from([
+            "market-lab",
+            "source",
+            "oi",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "binancef",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+            "--from",
+            "1704067200",
+            "--to",
+            "1704067800",
+            "--output",
+            "json",
+        ])
+        .expect("source oi parse should succeed");
+
+        match cli.command {
+            Commands::Source {
+                command: SourceCommands::Oi(args),
+            } => {
+                assert_eq!(args.timeframe, 60);
+                assert_eq!(args.from, Some(1704067200));
+                assert_eq!(args.to, Some(1704067800));
+            }
+            _ => panic!("expected source oi command"),
+        }
+    }
+
+    #[test]
+    fn parse_source_volumes_command() {
+        let cli = Cli::try_parse_from([
+            "market-lab",
+            "source",
+            "volumes",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "binancef",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+            "--from",
+            "1704067200",
+            "--to",
+            "1704067800",
+            "--output",
+            "json",
+        ])
+        .expect("source volumes parse should succeed");
+
+        match cli.command {
+            Commands::Source {
+                command: SourceCommands::Volumes(args),
+            } => {
+                assert_eq!(args.timeframe, 60);
+                assert_eq!(args.from, Some(1704067200));
+                assert_eq!(args.to, Some(1704067800));
+            }
+            _ => panic!("expected source volumes command"),
         }
     }
 
@@ -1547,6 +1808,8 @@ mod tests {
             "candles:timeframe=60",
             "--param",
             "candles:fast=20",
+            "--leverage",
+            "5",
             "--output",
             "json",
         ])
@@ -1559,10 +1822,25 @@ mod tests {
                 assert_eq!(args.script, "./scripts/sma-cross.js");
                 assert_eq!(args.source, vec!["candles:timeframe=60"]);
                 assert_eq!(args.param, vec!["candles:fast=20"]);
+                assert_eq!(args.leverage, 5.0);
                 args.validate().expect("validate should succeed");
             }
             _ => panic!("expected script backtest command"),
         }
+    }
+
+    #[test]
+    fn reject_script_run_with_leverage() {
+        let err = Cli::try_parse_from([
+            "mlab",
+            "script",
+            "run",
+            "./scripts/sma-cross.js",
+            "--leverage",
+            "5",
+        ])
+        .expect_err("script run should not accept backtest leverage");
+        assert!(err.to_string().contains("--leverage"));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use crate::cli::{ImbalanceArgs, OutputFormat};
 use crate::domain::enums::ProviderKind;
 use crate::domain::requests::InspectRequest;
 use crate::domain::types::ImbalanceEstimate;
+use crate::functions;
 use crate::providers::mmt::MmtProvider;
 use crate::providers::{MarketDataProvider, ProviderClient};
 
@@ -38,7 +39,7 @@ pub async fn handle(args: ImbalanceArgs) -> Result<()> {
                 output: args.output,
             },
             move |snap| {
-                let metrics = estimate_imbalance(snap, req.depth)?;
+                let metrics = functions::imbalance(snap, req.depth)?;
                 Ok(to_envelope(
                     provider_name(req.provider),
                     &req.exchange,
@@ -90,7 +91,7 @@ pub async fn handle(args: ImbalanceArgs) -> Result<()> {
         }
     };
 
-    let estimate = estimate_imbalance(&snapshot, req.depth)?;
+    let estimate = functions::imbalance(&snapshot, req.depth)?;
     let env = to_envelope(
         provider_name(req.provider),
         &req.exchange,
@@ -155,30 +156,4 @@ fn to_envelope(
         metrics,
         meta: empty_meta(),
     }
-}
-
-fn estimate_imbalance(
-    book: &crate::domain::types::OrderBookSnapshot,
-    depth: u16,
-) -> Result<ImbalanceEstimate> {
-    if depth == 0 {
-        bail!("depth must be >= 1");
-    }
-
-    let n = depth as usize;
-    let bid_volume: f64 = book.bids.iter().take(n).map(|l| l.quantity).sum();
-    let ask_volume: f64 = book.asks.iter().take(n).map(|l| l.quantity).sum();
-    let denom = bid_volume + ask_volume;
-
-    if denom <= 0.0 {
-        bail!("empty book volumes at requested depth");
-    }
-
-    let imbalance = (bid_volume - ask_volume) / denom;
-
-    Ok(ImbalanceEstimate {
-        bid_volume,
-        ask_volume,
-        imbalance,
-    })
 }

@@ -6,6 +6,8 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::credentials::mmt_api_key;
+
 const MMT_WS_URL: &str = "wss://eu-central-1.mmt.gg/api/v1/ws";
 
 type WsStream =
@@ -26,7 +28,7 @@ impl MmtWsClient {
             });
         }
 
-        let api_key = std::env::var("MMT_API_KEY").context("MMT_API_KEY is required for stream")?;
+        let api_key = mmt_api_key()?;
         let ws_url = format!("{MMT_WS_URL}?api_key={}", api_key);
         let (ws_stream, _) = connect_async(ws_url)
             .await

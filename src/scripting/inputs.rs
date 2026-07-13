@@ -9,6 +9,7 @@ use super::manifest::{InputType, ScriptManifest, ScriptParamSchema, ScriptSource
 pub struct SourceConfig {
     pub timeframe: Option<u32>,
     pub depth: Option<u16>,
+    pub bucket: Option<u8>,
 }
 
 impl SourceConfig {
@@ -23,6 +24,12 @@ impl SourceConfig {
 
     pub fn depth_or_default(&self) -> u16 {
         self.depth.unwrap_or(100)
+    }
+
+    pub fn require_bucket(&self, source: &ScriptSource) -> Result<u8> {
+        self.bucket.ok_or_else(|| {
+            anyhow::anyhow!("--source {}:bucket=<1..=11> is required", source.as_str())
+        })
     }
 }
 
@@ -45,6 +52,18 @@ pub fn parse_source_configs(values: &[String]) -> Result<SourceConfigs> {
                 }
                 (ScriptSource::Orderbook, "depth") => {
                     config.depth = Some(parse_positive_u16(&raw_value, "depth")?);
+                }
+                (ScriptSource::Vd, "timeframe") => {
+                    config.timeframe = Some(parse_positive_u32(&raw_value, "timeframe")?);
+                }
+                (ScriptSource::Vd, "bucket") => {
+                    config.bucket = Some(parse_bucket(&raw_value)?);
+                }
+                (ScriptSource::Oi, "timeframe") => {
+                    config.timeframe = Some(parse_positive_u32(&raw_value, "timeframe")?);
+                }
+                (ScriptSource::Volumes, "timeframe") => {
+                    config.timeframe = Some(parse_positive_u32(&raw_value, "timeframe")?);
                 }
                 _ => bail!("unknown --source {}:{}", source.as_str(), key),
             }
@@ -82,6 +101,52 @@ pub fn validate_source_configs(manifest: &ScriptManifest, configs: &SourceConfig
                 if config.depth_or_default() == 0 {
                     bail!("--source orderbook:depth must be >= 1");
                 }
+            }
+            ScriptSource::Vd => {
+                config.require_timeframe(source)?;
+                config.require_bucket(source)?;
+            }
+            ScriptSource::Oi | ScriptSource::Volumes => {
+                config.require_timeframe(source)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn validate_source_configs_for_run(
+    manifest: &ScriptManifest,
+    configs: &SourceConfigs,
+) -> Result<()> {
+    for source in configs.keys() {
+        if !manifest.sources.contains(source) {
+            bail!(
+                "--source {} is not listed in script.sources",
+                source.as_str()
+            );
+        }
+    }
+
+    for source in &manifest.sources {
+        let config = configs
+            .get(source)
+            .ok_or_else(|| anyhow::anyhow!("missing --source config for {}", source.as_str()))?;
+        match source {
+            ScriptSource::Candles => {
+                config.require_timeframe(source)?;
+            }
+            ScriptSource::Orderbook => {
+                if config.depth_or_default() == 0 {
+                    bail!("--source orderbook:depth must be >= 1");
+                }
+            }
+            ScriptSource::Vd => {
+                config.require_timeframe(source)?;
+                config.require_bucket(source)?;
+            }
+            ScriptSource::Oi | ScriptSource::Volumes => {
+                config.require_timeframe(source)?;
             }
         }
     }
@@ -161,6 +226,9 @@ fn parse_source(source: &str) -> Result<ScriptSource> {
     match source {
         "candles" => Ok(ScriptSource::Candles),
         "orderbook" => Ok(ScriptSource::Orderbook),
+        "vd" => Ok(ScriptSource::Vd),
+        "oi" => Ok(ScriptSource::Oi),
+        "volumes" => Ok(ScriptSource::Volumes),
         _ => bail!("unknown script source `{source}`"),
     }
 }
@@ -181,6 +249,16 @@ fn parse_positive_u16(raw: &str, key: &str) -> Result<u16> {
         .map_err(|_| anyhow::anyhow!("expected positive integer for {key}, got `{raw}`"))?;
     if parsed == 0 {
         bail!("{key} must be >= 1");
+    }
+    Ok(parsed)
+}
+
+fn parse_bucket(raw: &str) -> Result<u8> {
+    let parsed: u8 = raw
+        .parse()
+        .map_err(|_| anyhow::anyhow!("expected integer bucket 1..=11, got `{raw}`"))?;
+    if !(1..=11).contains(&parsed) {
+        bail!("bucket must be in range 1..=11");
     }
     Ok(parsed)
 }
@@ -207,7 +285,7 @@ fn coerce_value(raw: &str, schema: &ScriptParamSchema) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scripting::manifest::{ScriptManifest, ScriptMode, ScriptParamSchema};
+    use crate::scripting::manifest::{ScriptManifest, ScriptParamSchema};
 
     #[test]
     fn resolves_required_and_default_params() {
@@ -215,7 +293,7 @@ mod tests {
             name: "buy-pressure".to_string(),
             version: "1".to_string(),
             sources: vec![ScriptSource::Candles],
-            modes: vec![ScriptMode::Window],
+            modes: vec![],
             clock: None,
             description: None,
             lookback: None,
@@ -257,9 +335,17 @@ mod tests {
             "candles:timeframe=60".to_string(),
             "orderbook:timeframe=60".to_string(),
             "orderbook:depth=50".to_string(),
+            "vd:timeframe=60".to_string(),
+            "vd:bucket=1".to_string(),
+            "oi:timeframe=60".to_string(),
+            "volumes:timeframe=60".to_string(),
         ])
         .unwrap();
         assert_eq!(configs[&ScriptSource::Candles].timeframe, Some(60));
         assert_eq!(configs[&ScriptSource::Orderbook].depth, Some(50));
+        assert_eq!(configs[&ScriptSource::Vd].timeframe, Some(60));
+        assert_eq!(configs[&ScriptSource::Vd].bucket, Some(1));
+        assert_eq!(configs[&ScriptSource::Oi].timeframe, Some(60));
+        assert_eq!(configs[&ScriptSource::Volumes].timeframe, Some(60));
     }
 }

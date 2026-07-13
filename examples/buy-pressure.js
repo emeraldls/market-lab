@@ -2,7 +2,6 @@ export const script = {
   name: "buy-pressure-filter",
   version: "1",
   sources: ["candles"],
-  modes: ["window", "stream"],
   params: {
     candles: {
       min_vbuy: { type: "number", required: false, default: 0 },

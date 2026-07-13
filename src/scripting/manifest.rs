@@ -10,6 +10,9 @@ use super::limits::SCRIPT_MAX_LOOKBACK_CANDLES;
 pub enum ScriptSource {
     Candles,
     Orderbook,
+    Vd,
+    Oi,
+    Volumes,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -44,6 +47,7 @@ pub struct ScriptManifest {
     pub name: String,
     pub version: String,
     pub sources: Vec<ScriptSource>,
+    #[serde(default)]
     pub modes: Vec<ScriptMode>,
     #[serde(default)]
     pub clock: Option<ScriptSource>,
@@ -65,9 +69,6 @@ impl ScriptManifest {
         }
         if self.sources.is_empty() {
             bail!("script.sources must not be empty");
-        }
-        if self.modes.is_empty() {
-            bail!("script.modes must not be empty");
         }
         if let Some(clock) = &self.clock
             && !self.sources.contains(clock)
@@ -121,10 +122,6 @@ impl ScriptManifest {
         Ok(())
     }
 
-    pub fn supports_mode(&self, mode: ScriptMode) -> bool {
-        self.modes.contains(&mode)
-    }
-
     pub fn clock_source(&self) -> &ScriptSource {
         self.clock.as_ref().unwrap_or(&self.sources[0])
     }
@@ -143,6 +140,9 @@ impl ScriptSource {
         match self {
             ScriptSource::Candles => "candles",
             ScriptSource::Orderbook => "orderbook",
+            ScriptSource::Vd => "vd",
+            ScriptSource::Oi => "oi",
+            ScriptSource::Volumes => "volumes",
         }
     }
 }
@@ -279,6 +279,19 @@ mod tests {
         .expect_err("unknown source should fail");
 
         assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn manifest_allows_missing_modes() {
+        let manifest = serde_json::from_value::<ScriptManifest>(serde_json::json!({
+            "name": "x",
+            "version": "1",
+            "sources": ["candles"]
+        }))
+        .expect("modes should be optional");
+
+        assert!(manifest.modes.is_empty());
+        manifest.validate().expect("manifest should validate");
     }
 
     #[test]

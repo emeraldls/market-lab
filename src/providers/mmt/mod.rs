@@ -3,11 +3,12 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::credentials::mmt_api_key;
 use crate::domain::enums::BookMode;
 use crate::domain::requests::{InspectRequest, ReplayRequest};
 use crate::domain::types::{
-    CandleSeries, OhlcvtCandle, OrderBookLevel, OrderBookSnapshot, ProviderHealth, TopOfBook,
-    VdCandle, VdSeries,
+    CandleSeries, OhlcvtCandle, OiCandle, OiSeries, OrderBookLevel, OrderBookSnapshot,
+    ProviderHealth, TopOfBook, VdCandle, VdSeries, VolumeProfile, VolumeProfileSeries,
 };
 
 pub mod utils;
@@ -19,7 +20,6 @@ pub mod ws_vd;
 use utils::{normalize_symbol_for_mmt, normalize_to_ms, normalize_to_seconds, parse_levels};
 
 const MMT_BASE_URL: &str = "https://eu-central-1.mmt.gg/api/v1";
-const MMT_API_KEY_ENV: &str = "MMT_API_KEY";
 const MMT_HTTP_TIMEOUT_SECS: u64 = 8;
 
 pub struct MmtProvider;
@@ -157,6 +157,108 @@ impl MmtProvider {
         })
     }
 
+    pub async fn oi(
+        exchange: &str,
+        symbol: &str,
+        tf: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<OiSeries> {
+        let api_key = mmt_api_key()?;
+        let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
+        let exchange = exchange.trim().to_lowercase();
+        let from_s = normalize_to_seconds(from);
+        let to_s = normalize_to_seconds(to);
+
+        let url = format!("{MMT_BASE_URL}/oi");
+        let resp = Client::new()
+            .get(url)
+            .timeout(std::time::Duration::from_secs(MMT_HTTP_TIMEOUT_SECS))
+            .header("X-API-Key", api_key)
+            .query(&[
+                ("exchange", exchange.as_str()),
+                ("symbol", normalized_symbol.as_str()),
+                ("tf", tf),
+                ("from", &from_s.to_string()),
+                ("to", &to_s.to_string()),
+            ])
+            .send()
+            .await
+            .context("failed to call MMT /oi")?;
+
+        let status = resp.status();
+        let body: Value = resp
+            .json()
+            .await
+            .context("failed to decode MMT /oi response")?;
+        if !status.is_success() {
+            bail!("MMT /oi returned HTTP {} body={}", status, body);
+        }
+
+        let parsed: OiResponse =
+            serde_json::from_value(body).context("invalid /oi payload shape")?;
+        Ok(OiSeries {
+            exchange: parsed.exchange,
+            symbol: parsed.symbol,
+            tf: parsed.tf,
+            from: normalize_to_ms(parsed.from),
+            to: normalize_to_ms(parsed.to),
+            points: parsed.points,
+            data: parsed.data,
+        })
+    }
+
+    pub async fn volumes(
+        exchange: &str,
+        symbol: &str,
+        tf: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<VolumeProfileSeries> {
+        let api_key = mmt_api_key()?;
+        let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
+        let exchange = exchange.trim().to_lowercase();
+        let from_s = normalize_to_seconds(from);
+        let to_s = normalize_to_seconds(to);
+
+        let url = format!("{MMT_BASE_URL}/volumes");
+        let resp = Client::new()
+            .get(url)
+            .timeout(std::time::Duration::from_secs(MMT_HTTP_TIMEOUT_SECS))
+            .header("X-API-Key", api_key)
+            .query(&[
+                ("exchange", exchange.as_str()),
+                ("symbol", normalized_symbol.as_str()),
+                ("tf", tf),
+                ("from", &from_s.to_string()),
+                ("to", &to_s.to_string()),
+            ])
+            .send()
+            .await
+            .context("failed to call MMT /volumes")?;
+
+        let status = resp.status();
+        let body: Value = resp
+            .json()
+            .await
+            .context("failed to decode MMT /volumes response")?;
+        if !status.is_success() {
+            bail!("MMT /volumes returned HTTP {} body={}", status, body);
+        }
+
+        let parsed: VolumesResponse =
+            serde_json::from_value(body).context("invalid /volumes payload shape")?;
+        Ok(VolumeProfileSeries {
+            exchange: parsed.exchange,
+            symbol: parsed.symbol,
+            tf: parsed.tf,
+            from: normalize_to_ms(parsed.from),
+            to: normalize_to_ms(parsed.to),
+            points: parsed.points,
+            data: parsed.data,
+        })
+    }
+
     pub async fn replay(_req: &ReplayRequest) -> Result<Vec<TopOfBook>> {
         bail!("MMT replay is not implemented yet")
     }
@@ -214,6 +316,28 @@ struct CandleResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct OiResponse {
+    data: Vec<OiCandle>,
+    exchange: String,
+    symbol: String,
+    tf: String,
+    from: u64,
+    to: u64,
+    points: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct VolumesResponse {
+    data: Vec<VolumeProfile>,
+    exchange: String,
+    symbol: String,
+    tf: String,
+    from: u64,
+    to: u64,
+    points: usize,
+}
+
+#[derive(Debug, Deserialize)]
 struct FlatHeatmapHdResponse {
     exchange: String,
     symbol: String,
@@ -227,15 +351,6 @@ struct HeatmapPoint {
     s: Vec<f64>,
     si: usize,
     minp: f64,
-}
-
-fn mmt_api_key() -> Result<String> {
-    let api_key = std::env::var(MMT_API_KEY_ENV)
-        .with_context(|| format!("{MMT_API_KEY_ENV} is required when --provider mmt"))?;
-    if api_key.trim().is_empty() {
-        bail!("{MMT_API_KEY_ENV} is set but empty");
-    }
-    Ok(api_key)
 }
 
 async fn fetch_orderbook_snapshot(

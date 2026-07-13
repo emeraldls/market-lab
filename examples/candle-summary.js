@@ -2,7 +2,6 @@ export const script = {
   name: "candle-summary",
   version: "1",
   sources: ["candles"],
-  modes: ["window", "stream"],
   params: {}
 }
 

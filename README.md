@@ -11,7 +11,7 @@ cargo run -- --help
 If you are using `mmt`:
 
 ```bash
-export MMT_API_KEY=your_key
+mlab auth set mmt
 ```
 
 Example:

@@ -2,7 +2,6 @@ export const script = {
   name: "custom-sma-cross",
   version: "1",
   sources: ["candles"],
-  modes: ["window"],
   lookback: 12,
   params: {
     candles: {

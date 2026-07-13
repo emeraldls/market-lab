@@ -5,6 +5,7 @@ use crate::cli::{OutputFormat, SlippageArgs};
 use crate::domain::enums::ProviderKind;
 use crate::domain::requests::InspectRequest;
 use crate::domain::types::SlippageEstimate;
+use crate::functions;
 use crate::providers::mmt::MmtProvider;
 use crate::providers::{MarketDataProvider, ProviderClient};
 
@@ -40,7 +41,7 @@ pub async fn handle(args: SlippageArgs) -> Result<()> {
                 output: args.output,
             },
             move |snap| {
-                let metrics = estimate_slippage(snap, req.notional, req.side)?;
+                let metrics = functions::slippage(snap, req.notional, req.side)?;
                 Ok(to_envelope(
                     provider_name(req.provider),
                     &req.exchange,
@@ -95,7 +96,7 @@ pub async fn handle(args: SlippageArgs) -> Result<()> {
         }
     };
 
-    let estimate = estimate_slippage(&snapshot, req.notional, req.side)?;
+    let estimate = functions::slippage(&snapshot, req.notional, req.side)?;
     let env = to_envelope(
         provider_name(req.provider),
         &req.exchange,
@@ -165,69 +166,6 @@ fn to_envelope(
         metrics,
         meta: empty_meta(),
     }
-}
-
-fn estimate_slippage(
-    book: &crate::domain::types::OrderBookSnapshot,
-    notional: f64,
-    side: crate::domain::enums::Side,
-) -> Result<SlippageEstimate> {
-    let levels = match side {
-        crate::domain::enums::Side::Buy => &book.asks,
-        crate::domain::enums::Side::Sell => &book.bids,
-    };
-
-    if levels.is_empty() {
-        bail!("orderbook side is empty");
-    }
-
-    let best_price = levels[0].price;
-    let mut remaining_quote = notional;
-    let mut total_base = 0.0_f64;
-    let mut total_quote = 0.0_f64;
-    let mut levels_consumed = 0_u16;
-
-    for level in levels {
-        if remaining_quote <= 0.0 {
-            break;
-        }
-
-        let level_quote_capacity = level.price * level.quantity;
-        let take_quote = remaining_quote.min(level_quote_capacity);
-        let take_base = take_quote / level.price;
-
-        total_quote += take_quote;
-        total_base += take_base;
-        remaining_quote -= take_quote;
-        levels_consumed += 1;
-    }
-
-    if remaining_quote > 0.0 {
-        bail!("insufficient depth to fill notional={notional}");
-    }
-
-    if total_base <= 0.0 {
-        bail!("computed base fill is zero");
-    }
-
-    let avg_fill_price = total_quote / total_base;
-    let slippage_abs = match side {
-        crate::domain::enums::Side::Buy => avg_fill_price - best_price,
-        crate::domain::enums::Side::Sell => best_price - avg_fill_price,
-    };
-    let slippage_bps = if best_price > 0.0 {
-        (slippage_abs / best_price) * 10_000.0
-    } else {
-        0.0
-    };
-
-    Ok(SlippageEstimate {
-        avg_fill_price,
-        best_price,
-        slippage_abs,
-        slippage_bps,
-        levels_consumed,
-    })
 }
 
 fn side_name(side: crate::domain::enums::Side) -> &'static str {

@@ -5,6 +5,7 @@ use crate::cli::{DepthArgs, OutputFormat};
 use crate::domain::enums::ProviderKind;
 use crate::domain::requests::InspectRequest;
 use crate::domain::types::DepthEstimate;
+use crate::functions;
 use crate::providers::mmt::MmtProvider;
 use crate::providers::{MarketDataProvider, ProviderClient};
 
@@ -38,7 +39,7 @@ pub async fn handle(args: DepthArgs) -> Result<()> {
                 output: args.output,
             },
             move |snap| {
-                let metrics = estimate_depth(snap, req.levels)?;
+                let metrics = functions::depth(snap, req.levels)?;
                 Ok(to_envelope(
                     provider_name(req.provider),
                     &req.exchange,
@@ -90,7 +91,7 @@ pub async fn handle(args: DepthArgs) -> Result<()> {
         }
     };
 
-    let out = estimate_depth(&snapshot, req.levels)?;
+    let out = functions::depth(&snapshot, req.levels)?;
     let env = to_envelope(
         provider_name(req.provider),
         &req.exchange,
@@ -101,32 +102,6 @@ pub async fn handle(args: DepthArgs) -> Result<()> {
         out,
     );
     render(&env, args.output, args.verbose)
-}
-
-fn estimate_depth(
-    book: &crate::domain::types::OrderBookSnapshot,
-    levels: u16,
-) -> Result<DepthEstimate> {
-    if levels == 0 {
-        bail!("levels must be >= 1");
-    }
-
-    let n = levels as usize;
-    let bid_slice = book.bids.iter().take(n);
-    let ask_slice = book.asks.iter().take(n);
-
-    let bid_base: f64 = bid_slice.clone().map(|l| l.quantity).sum();
-    let ask_base: f64 = ask_slice.clone().map(|l| l.quantity).sum();
-    let bid_quote: f64 = bid_slice.map(|l| l.price * l.quantity).sum();
-    let ask_quote: f64 = ask_slice.map(|l| l.price * l.quantity).sum();
-
-    Ok(DepthEstimate {
-        bid_base,
-        ask_base,
-        bid_quote,
-        ask_quote,
-        total_quote: bid_quote + ask_quote,
-    })
 }
 
 fn render(

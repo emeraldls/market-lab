@@ -7,6 +7,7 @@ use serde::Serialize;
 
 use crate::cli::{CvdArgs, OutputFormat};
 use crate::domain::types::{CvdStudyResult, VdCandle, VdSeries};
+use crate::functions;
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::ws_vd::MmtVdStream;
 
@@ -54,7 +55,7 @@ pub async fn handle(args: CvdArgs) -> Result<()> {
     )
     .await?;
 
-    let result = to_cvd_result(series);
+    let result = to_cvd_result(series, args.bucket)?;
     render(&args, &result, args.output, args.verbose)
 }
 
@@ -64,8 +65,7 @@ async fn stream_cvd(args: CvdArgs) -> Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest: Option<VdCandle> = None;
     let mut buf: VecDeque<String> = VecDeque::with_capacity(args.buffer_size as usize);
-    let mut prev_close: Option<f64> = None;
-    let mut start_close: Option<f64> = None;
+    let mut cvd = functions::CvdAccumulator::default();
 
     loop {
         tokio::select! {
@@ -78,11 +78,9 @@ async fn stream_cvd(args: CvdArgs) -> Result<()> {
             }
             _ = ticker.tick() => {
                 let Some(c) = latest.as_ref() else { continue; };
-                if start_close.is_none() {
-                    start_close = Some(c.c);
-                }
-                let delta_step = prev_close.map(|p| c.c - p).unwrap_or(0.0);
-                let cvd_since_start = c.c - start_close.unwrap_or(c.c);
+                let cvd_point = cvd.update(c);
+                let delta_step = cvd_point.delta;
+                let cvd_since_start = cvd_point.cumulative;
                 let point = CvdStreamPoint {
                     ts_s: c.t,
                     candle_o: c.o,
@@ -130,7 +128,6 @@ async fn stream_cvd(args: CvdArgs) -> Result<()> {
                     }
                     OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
                 }
-                prev_close = Some(c.c);
             }
         }
     }
@@ -138,16 +135,8 @@ async fn stream_cvd(args: CvdArgs) -> Result<()> {
     Ok(())
 }
 
-fn to_cvd_result(series: VdSeries) -> CvdStudyResult {
-    let first_close = series.data.first().map(|x| x.c).unwrap_or(0.0);
-    let last_close = series.data.last().map(|x| x.c).unwrap_or(0.0);
-    CvdStudyResult {
-        points: series.points,
-        first_close,
-        last_close,
-        delta: last_close - first_close,
-        candles: series.data,
-    }
+fn to_cvd_result(series: VdSeries, bucket: u8) -> Result<CvdStudyResult> {
+    functions::cvd_summary(series.data, bucket)
 }
 
 fn render(

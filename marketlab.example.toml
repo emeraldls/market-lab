@@ -1,0 +1,26 @@
+version = 1
+
+[market]
+provider = "mmt"
+exchange = "hyperliquid"
+symbol = "HYPE/USDT"
+
+[output]
+format = "terminal"
+verbose = false
+
+[sources.candles]
+timeframe = 60
+
+[script]
+path = "./examples/dip-tp-positions.js"
+
+[script.params.candles]
+drop_bps = 20
+take_profit_bps = 50
+notional = 1000
+
+[backtest]
+from = 1780497965372
+to = 1780618018000
+leverage = 5

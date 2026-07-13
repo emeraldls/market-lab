@@ -115,6 +115,47 @@ pub struct VdSeries {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OiCandle {
+    pub t: u64,
+    pub o: f64,
+    pub h: f64,
+    pub l: f64,
+    pub c: f64,
+    pub n: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OiSeries {
+    pub exchange: String,
+    pub symbol: String,
+    pub tf: String,
+    pub from: u64,
+    pub to: u64,
+    pub points: usize,
+    pub data: Vec<OiCandle>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VolumeProfile {
+    pub t: u64,
+    pub p: Vec<f64>,
+    pub b: Vec<f64>,
+    pub s: Vec<f64>,
+    pub pg: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VolumeProfileSeries {
+    pub exchange: String,
+    pub symbol: String,
+    pub tf: String,
+    pub from: u64,
+    pub to: u64,
+    pub points: usize,
+    pub data: Vec<VolumeProfile>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CvdStudyResult {
     pub points: usize,
     pub first_close: f64,

@@ -5,6 +5,7 @@ use crate::cli::{OutputFormat, SpreadArgs};
 use crate::domain::enums::ProviderKind;
 use crate::domain::requests::InspectRequest;
 use crate::domain::types::SpreadEstimate;
+use crate::functions;
 use crate::providers::mmt::MmtProvider;
 use crate::providers::{MarketDataProvider, ProviderClient};
 
@@ -38,7 +39,7 @@ pub async fn handle(args: SpreadArgs) -> Result<()> {
                 output: args.output,
             },
             move |snap| {
-                let metrics = estimate_spread(snap)?;
+                let metrics = functions::spread(snap)?;
                 Ok(to_envelope(
                     provider_name(req.provider),
                     &req.exchange,
@@ -51,13 +52,13 @@ pub async fn handle(args: SpreadArgs) -> Result<()> {
             },
             |out| {
                 format!(
-                    "{} @ {} bid={} ask={} spread={} spread_bps={}",
+                    "{} @ {} bid={} ask={} spread={:.4}bps mid={}",
                     out.symbol,
                     out.ts_ms,
                     out.metrics.best_bid,
                     out.metrics.best_ask,
-                    out.metrics.spread_abs,
-                    out.metrics.spread_bps
+                    out.metrics.spread_bps,
+                    out.metrics.mid
                 )
             },
             |out, output| {
@@ -90,7 +91,7 @@ pub async fn handle(args: SpreadArgs) -> Result<()> {
         }
     };
 
-    let out = estimate_spread(&snapshot)?;
+    let out = functions::spread(&snapshot)?;
     let env = to_envelope(
         provider_name(req.provider),
         &req.exchange,
@@ -103,35 +104,6 @@ pub async fn handle(args: SpreadArgs) -> Result<()> {
     render(&env, args.output, args.verbose)
 }
 
-fn estimate_spread(book: &crate::domain::types::OrderBookSnapshot) -> Result<SpreadEstimate> {
-    let best_bid = book
-        .bids
-        .first()
-        .map(|x| x.price)
-        .ok_or_else(|| anyhow::anyhow!("bids are empty"))?;
-    let best_ask = book
-        .asks
-        .first()
-        .map(|x| x.price)
-        .ok_or_else(|| anyhow::anyhow!("asks are empty"))?;
-
-    let spread_abs = best_ask - best_bid;
-    let mid = (best_ask + best_bid) / 2.0;
-    let spread_bps = if mid > 0.0 {
-        (spread_abs / mid) * 10_000.0
-    } else {
-        0.0
-    };
-
-    Ok(SpreadEstimate {
-        best_bid,
-        best_ask,
-        spread_abs,
-        spread_bps,
-        mid,
-    })
-}
-
 fn render(
     env: &StudyEnvelope<SpreadInputs, SpreadEstimate>,
     output: OutputFormat,
@@ -141,14 +113,8 @@ fn render(
         OutputFormat::Terminal => {
             let out = &env.metrics;
             println!(
-                "{} @ {} bid={} ask={} spread={} spread_bps={} mid={}",
-                env.symbol,
-                env.ts_ms,
-                out.best_bid,
-                out.best_ask,
-                out.spread_abs,
-                out.spread_bps,
-                out.mid
+                "{} @ {} bid={} ask={} spread={:.4}bps mid={}",
+                env.symbol, env.ts_ms, out.best_bid, out.best_ask, out.spread_bps, out.mid
             );
         }
         OutputFormat::Json | OutputFormat::Jsonl => print_study_json(env, output, verbose)?,

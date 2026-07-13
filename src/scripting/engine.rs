@@ -401,15 +401,11 @@ export const script = {
 export function onData(ctx, input) {
   const sma = ctx.study.sma(input.candles.candles, { field: "c", window: 3 });
   const ema = ctx.study.ema(input.candles.candles, { field: "c", window: 3 });
-  const cvd = ctx.study.cvd(input.candles.candles);
   return {
     metrics: {
       sma_latest: sma.latest,
       sma_previous: sma.previous,
-      ema_latest: ema.latest,
-      cvd_latest: cvd.latest,
-      cvd_delta: cvd.delta,
-      cvd_points: cvd.points.length
+      ema_latest: ema.latest
     }
   };
 }
@@ -430,9 +426,94 @@ export function onData(ctx, input) {
         assert_eq!(execution.output.metrics["sma_latest"], 30.0);
         assert_eq!(execution.output.metrics["sma_previous"], 20.0);
         assert_eq!(execution.output.metrics["ema_latest"], 30.0);
-        assert_eq!(execution.output.metrics["cvd_latest"], 120.0);
-        assert_eq!(execution.output.metrics["cvd_delta"], 120.0);
-        assert_eq!(execution.output.metrics["cvd_points"], 4);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn exposes_cvd_helper_for_vd_candles_to_js() {
+        let path = write_temp_script(
+            r#"
+export const script = {
+  name: "vd-cvd-helper",
+  version: "1",
+  sources: ["vd"],
+  params: {}
+};
+
+export function onData(ctx, input) {
+  const cvd = ctx.study.cvd(input.vd.candles, { bucket: input.vd.bucket });
+  const single = ctx.study.cvd(input.vd.candles[input.vd.candles.length - 1], { bucket: input.vd.bucket });
+  return {
+    metrics: {
+      bucket: cvd.bucket,
+      latest: cvd.latest,
+      previous: cvd.previous,
+      delta: cvd.delta,
+      points: cvd.points.length,
+      single_delta: single.delta
+    }
+  };
+}
+"#,
+            "vd-cvd-helper",
+        );
+
+        let script = Script::load(&path).expect("load script");
+        let session = script.start_session(&json!({})).expect("start session");
+        let vd = json!([
+            { "t": 1, "o": 100.0, "h": 115.0, "l": 95.0, "c": 110.0, "n": 10 },
+            { "t": 2, "o": 110.0, "h": 135.0, "l": 108.0, "c": 130.0, "n": 20 },
+            { "t": 3, "o": 130.0, "h": 140.0, "l": 120.0, "c": 125.0, "n": 30 }
+        ]);
+        let execution = session
+            .run_window(json!({
+                "mode": "window",
+                "vd": {
+                    "candles": vd,
+                    "bucket": 7,
+                    "timeframe_sec": 60
+                }
+            }))
+            .expect("run script");
+
+        assert_eq!(execution.output.metrics["bucket"], 7);
+        assert_eq!(execution.output.metrics["latest"], 25.0);
+        assert_eq!(execution.output.metrics["previous"], 30.0);
+        assert_eq!(execution.output.metrics["delta"], 25.0);
+        assert_eq!(execution.output.metrics["points"], 3);
+        assert_eq!(execution.output.metrics["single_delta"], -5.0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn cvd_helper_rejects_candle_rows() {
+        let path = write_temp_script(
+            r#"
+export const script = {
+  name: "bad-cvd-helper",
+  version: "1",
+  sources: ["candles"],
+  params: {}
+};
+
+export function onData(ctx, input) {
+  return {
+    metrics: ctx.study.cvd(input.candles.candles, { bucket: 1 })
+  };
+}
+"#,
+            "bad-cvd-helper",
+        );
+
+        let script = Script::load(&path).expect("load script");
+        let session = script.start_session(&json!({})).expect("start session");
+        let err = session
+            .run_candles_window(&json!([
+                { "t": 1, "o": 1.0, "h": 1.0, "l": 1.0, "c": 10.0, "vb": 100.0, "vs": 80.0, "tb": 1, "ts": 1 }
+            ]))
+            .expect_err("cvd must reject non-vd candles");
+
+        assert!(err.to_string().contains("MMT VD candle"));
         let _ = fs::remove_file(path);
     }
 
@@ -605,6 +686,59 @@ export function onData(ctx, input) {
                 .as_f64()
                 .is_some_and(|value| value > 0.0)
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn runs_vd_window_hook() {
+        let path = write_temp_script(
+            r#"
+export const script = {
+  name: "vd-window-script",
+  version: "1",
+  sources: ["vd"],
+  params: {}
+};
+
+export function onData(ctx, input) {
+  const latest = input.vd.candles[input.vd.candles.length - 1];
+  return {
+    metrics: {
+      mode: input.mode,
+      candles: input.vd.candles.length,
+      latest_close: latest.c,
+      trades: input.vd.candles.reduce((sum, candle) => sum + candle.n, 0)
+    },
+    signal: {
+      triggered: true,
+      side: "buy"
+    }
+  };
+}
+"#,
+            "vd-window",
+        );
+
+        let candles = json!([
+            { "t": 1, "o": 1.0, "h": 2.0, "l": 0.5, "c": 1.5, "n": 10 },
+            { "t": 2, "o": 1.5, "h": 2.2, "l": 1.0, "c": 2.0, "n": 12 }
+        ]);
+        let script = Script::load(&path).expect("load script");
+        let session = script.start_session(&json!({})).expect("start session");
+        let execution = session
+            .run_window(json!({
+                "mode": "window",
+                "vd": {
+                    "candles": candles
+                }
+            }))
+            .expect("run script");
+
+        assert_eq!(execution.output.metrics["mode"], "window");
+        assert_eq!(execution.output.metrics["candles"], 2);
+        assert_eq!(execution.output.metrics["latest_close"], 2.0);
+        assert_eq!(execution.output.metrics["trades"], 22);
+        assert_eq!(execution.output.signal["side"], "buy");
         let _ = fs::remove_file(path);
     }
 

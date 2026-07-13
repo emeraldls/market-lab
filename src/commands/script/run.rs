@@ -11,15 +11,17 @@ use crate::commands::script::{
     write_running_report_best_effort,
 };
 use crate::commands::source::common::render_terminal;
+use crate::core::orderbook::OrderBookState;
 use crate::domain::enums::ProviderKind;
-use crate::domain::types::OhlcvtCandle;
-use crate::providers::mmt::ws_candles::MmtCandlesStream;
+use crate::domain::types::{OhlcvtCandle, OiCandle, OrderBookSnapshot, VdCandle, VolumeProfile};
+use crate::providers::mmt::utils::{normalize_symbol_for_mmt, normalize_to_ms, parse_levels};
+use crate::providers::mmt::ws_client::MmtWsClient;
 use crate::scripting::engine::Script;
 use crate::scripting::inputs::{
     SourceConfigs, parse_param_values, parse_source_configs, resolve_params,
-    validate_source_configs,
+    validate_source_configs_for_run,
 };
-use crate::scripting::manifest::{ScriptMode, ScriptSource};
+use crate::scripting::manifest::ScriptSource;
 
 #[derive(Debug, Clone, Serialize)]
 struct ScriptRunResult<I>
@@ -64,6 +66,34 @@ struct ScriptRunOutput {
     meta: Value,
 }
 
+#[derive(Debug, Clone, Default)]
+struct LiveState {
+    candles: Option<OhlcvtCandle>,
+    orderbook: Option<OrderBookSnapshot>,
+    vd: Option<VdCandle>,
+    oi: Option<OiCandle>,
+    volumes: Option<VolumeProfile>,
+}
+
+#[derive(Debug, Clone)]
+enum LiveUpdate {
+    Candles(OhlcvtCandle),
+    Orderbook(OrderBookSnapshot),
+    Vd(VdCandle),
+    Oi(OiCandle),
+    Volumes(VolumeProfile),
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct ScriptRunSummary {
+    updates: u64,
+    signals: u64,
+    intents: u64,
+    hook_failures: u64,
+    last_ts_ms: Option<u64>,
+    latest_output: Option<ScriptRunOutput>,
+}
+
 pub async fn handle(args: ScriptRunArgs) -> Result<()> {
     args.validate()?;
     if !matches!(args.provider.into(), ProviderKind::Mmt) {
@@ -101,36 +131,27 @@ async fn run(
             "--from/--to are not allowed with script run; use script backtest for historical data"
         );
     }
-    if !script.manifest.supports_mode(ScriptMode::Stream) {
-        bail!("script does not support stream mode");
-    }
-
     let exchange = require_non_empty(args.exchange.as_deref(), "--exchange")?.to_string();
     let symbol = require_symbol(args.symbol.as_deref())?.to_string();
 
     let source_configs = parse_source_configs(&args.source)?;
-    validate_source_configs(&script.manifest, &source_configs)?;
+    validate_source_configs_for_run(&script.manifest, &source_configs)?;
     let raw_params = parse_param_values(&args.param)?;
     let resolved_params = resolve_params(&script.manifest, &raw_params)?;
 
-    match script.manifest.sources.as_slice() {
-        [ScriptSource::Candles] => {
-            stream_candles(
-                args,
-                script,
-                source_configs,
-                resolved_params,
-                exchange,
-                symbol,
-                report,
-            )
-            .await
-        }
-        _ => bail!("script run currently supports only sources=[\"candles\"]"),
-    }
+    stream_sources(
+        args,
+        script,
+        source_configs,
+        resolved_params,
+        exchange,
+        symbol,
+        report,
+    )
+    .await
 }
 
-async fn stream_candles(
+async fn stream_sources(
     args: ScriptRunArgs,
     script: Script,
     source_configs: SourceConfigs,
@@ -139,15 +160,12 @@ async fn stream_candles(
     symbol: String,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
 ) -> Result<()> {
-    let config = source_configs
-        .get(&ScriptSource::Candles)
-        .context("missing source config for candles")?;
-    let timeframe = config.require_timeframe(&ScriptSource::Candles)?;
-    let tf = mmt_timeframe_from_seconds(timeframe)?;
-
-    report.set_phase("connecting_candles_stream");
+    report.set_phase("connecting_streams");
     write_running_report_best_effort(report);
-    let mut stream = MmtCandlesStream::connect(&exchange, &symbol, tf).await?;
+
+    let ws = MmtWsClient::shared().await?;
+    subscribe_sources(&ws, &script, &source_configs, &exchange, &symbol).await?;
+
     let session = script.start_session(&resolved_params)?;
     let cancel_handle = session.cancel_handle();
     let _cancel_task = tokio::spawn(async move {
@@ -157,30 +175,44 @@ async fn stream_candles(
     });
     let mut rendered = VecDeque::with_capacity(50);
     let mut hooks = 0_u64;
+    let mut summary = ScriptRunSummary::default();
+    let mut live_state = LiveState::default();
+    let mut orderbook_state = orderbook_state(&source_configs);
 
-    report.set_phase("streaming_candles");
+    report.set_phase("streaming_sources");
     write_running_report_best_effort(report);
 
     loop {
         if session.is_cancelled() {
             report.set_phase("cancelled");
+            render_run_summary(&summary, args.output, args.verbose)?;
             return Err(ScriptCancelled.into());
         }
 
-        let candle = tokio::select! {
-            result = stream.next_candle() => result?,
+        let update = tokio::select! {
+            update = next_live_update(&ws, &source_configs, &mut orderbook_state) => {
+                let Some(update) = update? else { continue; };
+                update
+            }
             _ = tokio::signal::ctrl_c() => {
                 report.set_phase("cancelled");
+                render_run_summary(&summary, args.output, args.verbose)?;
                 return Err(ScriptCancelled.into());
             }
         };
-        let payload = candle_stream_payload(&candle)?;
+
+        let source = update.source();
+        let ts_ms = update.ts_ms();
+        live_state.apply(update);
+        let payload = live_stream_payload(source, &live_state, &source_configs)?;
         let execution = match session.run_stream(payload) {
             Ok(execution) => execution,
             Err(err) => {
                 report.record_hook_failure();
+                summary.hook_failures += 1;
                 if session.is_cancelled() {
                     report.set_phase("cancelled");
+                    render_run_summary(&summary, args.output, args.verbose)?;
                     return Err(ScriptCancelled.into());
                 }
                 return Err(err);
@@ -188,7 +220,7 @@ async fn stream_candles(
         };
         hooks += 1;
         report.record_hook(&execution.stats);
-        report.set_progress("streaming_candles", hooks, hooks);
+        report.set_progress("streaming_sources", hooks, hooks);
         write_running_report_best_effort(report);
 
         let result = ScriptRunResult {
@@ -197,7 +229,7 @@ async fn stream_candles(
             provider: "mmt",
             exchange: exchange.clone(),
             symbol: symbol.clone(),
-            ts_ms: candle.t * 1000,
+            ts_ms,
             stream: true,
             script: ScriptDescriptor {
                 name: script.manifest.name.clone(),
@@ -218,17 +250,363 @@ async fn stream_candles(
                 meta: execution.output.meta,
             },
         };
+        summary.record(&result);
         render_stream_result(&result, args.output, args.verbose, &mut rendered)?;
     }
 }
 
-fn candle_stream_payload(candle: &OhlcvtCandle) -> Result<Value> {
-    Ok(json!({
-        "mode": "stream",
-        "candles": {
-            "candle": candle,
+async fn subscribe_sources(
+    ws: &MmtWsClient,
+    script: &Script,
+    source_configs: &SourceConfigs,
+    exchange: &str,
+    symbol: &str,
+) -> Result<()> {
+    let exchange = exchange.to_lowercase();
+    let symbol = normalize_symbol_for_mmt(symbol)?;
+    for source in &script.manifest.sources {
+        match source {
+            ScriptSource::Candles => {
+                let tf = source_configs
+                    .get(source)
+                    .context("missing source config for candles")?
+                    .require_timeframe(source)
+                    .and_then(mmt_timeframe_from_seconds)?;
+                ws.subscribe(json!({
+                    "type": "subscribe",
+                    "channel": "candles",
+                    "exchange": exchange.as_str(),
+                    "symbol": symbol.as_str(),
+                    "tf": tf,
+                }))
+                .await
+                .context("failed to subscribe to candles channel")?;
+            }
+            ScriptSource::Orderbook => {
+                ws.subscribe(json!({
+                    "type": "subscribe",
+                    "channel": "depth",
+                    "exchange": exchange.as_str(),
+                    "symbol": symbol.as_str(),
+                }))
+                .await
+                .context("failed to subscribe to depth channel")?;
+            }
+            ScriptSource::Vd => {
+                let config = source_configs
+                    .get(source)
+                    .context("missing source config for vd")?;
+                let tf = config
+                    .require_timeframe(source)
+                    .and_then(mmt_timeframe_from_seconds)?;
+                let bucket = config.require_bucket(source)?;
+                ws.subscribe(json!({
+                    "type": "subscribe",
+                    "channel": "vd",
+                    "exchange": exchange.as_str(),
+                    "symbol": symbol.as_str(),
+                    "tf": tf,
+                    "bucket": bucket,
+                }))
+                .await
+                .context("failed to subscribe to vd channel")?;
+            }
+            ScriptSource::Oi => {
+                let tf = source_configs
+                    .get(source)
+                    .context("missing source config for oi")?
+                    .require_timeframe(source)
+                    .and_then(mmt_timeframe_from_seconds)?;
+                ws.subscribe(json!({
+                    "type": "subscribe",
+                    "channel": "oi",
+                    "exchange": exchange.as_str(),
+                    "symbol": symbol.as_str(),
+                    "tf": tf,
+                }))
+                .await
+                .context("failed to subscribe to oi channel")?;
+            }
+            ScriptSource::Volumes => {
+                let tf = source_configs
+                    .get(source)
+                    .context("missing source config for volumes")?
+                    .require_timeframe(source)
+                    .and_then(mmt_timeframe_from_seconds)?;
+                ws.subscribe(json!({
+                    "type": "subscribe",
+                    "channel": "volumes",
+                    "exchange": exchange.as_str(),
+                    "symbol": symbol.as_str(),
+                    "tf": tf,
+                }))
+                .await
+                .context("failed to subscribe to volumes channel")?;
+            }
         }
-    }))
+    }
+    Ok(())
+}
+
+fn orderbook_state(source_configs: &SourceConfigs) -> Option<OrderBookState> {
+    source_configs.get(&ScriptSource::Orderbook).map(|config| {
+        let state_cap = (config.depth_or_default() as usize)
+            .saturating_mul(10)
+            .clamp(100, 10_000);
+        OrderBookState::with_max_levels_per_side(state_cap)
+    })
+}
+
+async fn next_live_update(
+    ws: &MmtWsClient,
+    source_configs: &SourceConfigs,
+    orderbook_state: &mut Option<OrderBookState>,
+) -> Result<Option<LiveUpdate>> {
+    let Some(value) = ws.next_json().await? else {
+        bail!("websocket closed by server");
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if value.get("type").and_then(Value::as_str) == Some("subscribed") {
+        return Ok(None);
+    }
+    if value.get("type").and_then(Value::as_str) != Some("data") {
+        return Ok(None);
+    }
+
+    match value.get("channel").and_then(Value::as_str) {
+        Some("candles") => {
+            let payload = value.get("data").context("candles payload missing data")?;
+            let candle: OhlcvtCandle =
+                serde_json::from_value(payload.clone()).context("invalid candles candle shape")?;
+            Ok(Some(LiveUpdate::Candles(candle)))
+        }
+        Some("vd") => {
+            let payload = value.get("data").context("vd payload missing data")?;
+            let candle: VdCandle =
+                serde_json::from_value(payload.clone()).context("invalid vd candle shape")?;
+            Ok(Some(LiveUpdate::Vd(candle)))
+        }
+        Some("oi") => {
+            let payload = value.get("data").context("oi payload missing data")?;
+            let candle: OiCandle =
+                serde_json::from_value(payload.clone()).context("invalid oi candle shape")?;
+            Ok(Some(LiveUpdate::Oi(candle)))
+        }
+        Some("volumes") => {
+            let payload = value.get("data").context("volumes payload missing data")?;
+            let profile: VolumeProfile =
+                serde_json::from_value(payload.clone()).context("invalid volumes profile shape")?;
+            Ok(Some(LiveUpdate::Volumes(profile)))
+        }
+        Some("depth") => {
+            let Some(state) = orderbook_state.as_mut() else {
+                return Ok(None);
+            };
+            let depth = source_configs
+                .get(&ScriptSource::Orderbook)
+                .map(|config| config.depth_or_default())
+                .unwrap_or(100);
+            Ok(parse_depth_update(value, state, depth)?.map(LiveUpdate::Orderbook))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn parse_depth_update(
+    value: Value,
+    state: &mut OrderBookState,
+    depth: u16,
+) -> Result<Option<OrderBookSnapshot>> {
+    let exchange = value
+        .get("exchange")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let symbol = value
+        .get("symbol")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let payload = value.get("data").unwrap_or(&value);
+    let ts_ms = payload
+        .get("t")
+        .and_then(Value::as_u64)
+        .map(normalize_to_ms)
+        .context("depth payload missing t timestamp")?;
+    let seq = payload.get("seq").and_then(Value::as_u64);
+    let is_snapshot = payload
+        .get("snapshot")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let bids = parse_levels(payload.get("b").or_else(|| payload.get("bids")))?;
+    let asks = parse_levels(payload.get("a").or_else(|| payload.get("asks")))?;
+
+    if is_snapshot {
+        state.apply_snapshot(exchange, symbol, ts_ms, bids, asks, seq);
+    } else {
+        state.apply_delta(ts_ms, bids, asks, seq);
+    }
+
+    Ok(state.snapshot(depth))
+}
+
+impl LiveUpdate {
+    fn source(&self) -> ScriptSource {
+        match self {
+            LiveUpdate::Candles(_) => ScriptSource::Candles,
+            LiveUpdate::Orderbook(_) => ScriptSource::Orderbook,
+            LiveUpdate::Vd(_) => ScriptSource::Vd,
+            LiveUpdate::Oi(_) => ScriptSource::Oi,
+            LiveUpdate::Volumes(_) => ScriptSource::Volumes,
+        }
+    }
+
+    fn ts_ms(&self) -> u64 {
+        match self {
+            LiveUpdate::Candles(candle) => candle.t * 1000,
+            LiveUpdate::Orderbook(snapshot) => snapshot.timestamp_ms,
+            LiveUpdate::Vd(candle) => candle.t * 1000,
+            LiveUpdate::Oi(candle) => candle.t * 1000,
+            LiveUpdate::Volumes(profile) => profile.t * 1000,
+        }
+    }
+}
+
+impl LiveState {
+    fn apply(&mut self, update: LiveUpdate) {
+        match update {
+            LiveUpdate::Candles(candle) => self.candles = Some(candle),
+            LiveUpdate::Orderbook(snapshot) => self.orderbook = Some(snapshot),
+            LiveUpdate::Vd(candle) => self.vd = Some(candle),
+            LiveUpdate::Oi(candle) => self.oi = Some(candle),
+            LiveUpdate::Volumes(profile) => self.volumes = Some(profile),
+        }
+    }
+}
+
+impl ScriptRunSummary {
+    fn record(&mut self, result: &ScriptRunResult<ScriptInputs>) {
+        self.updates += 1;
+        self.last_ts_ms = Some(result.ts_ms);
+        if !is_empty_json_value_object(&result.output.signal) {
+            self.signals += 1;
+        }
+        if !is_empty_json_value_object(&result.output.intent) {
+            self.intents += 1;
+        }
+        self.latest_output = Some(result.output.clone());
+    }
+}
+
+fn render_run_summary(
+    summary: &ScriptRunSummary,
+    output: OutputFormat,
+    verbose: bool,
+) -> Result<()> {
+    match output {
+        OutputFormat::Terminal => {
+            println!();
+            println!("script run summary");
+            println!("------------------");
+            println!("status: cancelled");
+            println!("updates: {}", summary.updates);
+            println!("signals: {}", summary.signals);
+            println!("intents: {}", summary.intents);
+            println!("hook failures: {}", summary.hook_failures);
+            if let Some(ts_ms) = summary.last_ts_ms {
+                println!("last ts: {ts_ms}");
+            }
+            if verbose && let Some(output) = &summary.latest_output {
+                println!("latest_output: {}", serde_json::to_string_pretty(output)?);
+            }
+        }
+        OutputFormat::Json | OutputFormat::Jsonl => {
+            let value = json!({
+                "type": "script.run.summary",
+                "version": "1",
+                "status": "cancelled",
+                "summary": summary
+            });
+            if matches!(output, OutputFormat::Json) {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!("{}", serde_json::to_string(&value)?);
+            }
+        }
+        OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
+    }
+    Ok(())
+}
+
+fn live_stream_payload(
+    source: ScriptSource,
+    state: &LiveState,
+    source_configs: &SourceConfigs,
+) -> Result<Value> {
+    let mut payload = serde_json::Map::new();
+    payload.insert("mode".to_string(), Value::String("stream".to_string()));
+    payload.insert(
+        "source".to_string(),
+        Value::String(source.as_str().to_string()),
+    );
+
+    if let Some(candle) = &state.candles {
+        payload.insert(
+            "candles".to_string(),
+            json!({
+                "candle": candle,
+            }),
+        );
+    }
+    if let Some(snapshot) = &state.orderbook {
+        payload.insert(
+            "orderbook".to_string(),
+            json!({
+                "snapshot": snapshot,
+            }),
+        );
+    }
+    if let Some(candle) = &state.vd {
+        let config = source_configs
+            .get(&ScriptSource::Vd)
+            .context("missing source config for vd")?;
+        payload.insert(
+            "vd".to_string(),
+            json!({
+                "candle": candle,
+                "bucket": config.require_bucket(&ScriptSource::Vd)?,
+                "timeframe_sec": config.require_timeframe(&ScriptSource::Vd)?,
+            }),
+        );
+    }
+    if let Some(candle) = &state.oi {
+        let config = source_configs
+            .get(&ScriptSource::Oi)
+            .context("missing source config for oi")?;
+        payload.insert(
+            "oi".to_string(),
+            json!({
+                "candle": candle,
+                "timeframe_sec": config.require_timeframe(&ScriptSource::Oi)?,
+            }),
+        );
+    }
+    if let Some(profile) = &state.volumes {
+        let config = source_configs
+            .get(&ScriptSource::Volumes)
+            .context("missing source config for volumes")?;
+        payload.insert(
+            "volumes".to_string(),
+            json!({
+                "profile": profile,
+                "timeframe_sec": config.require_timeframe(&ScriptSource::Volumes)?,
+            }),
+        );
+    }
+
+    Ok(Value::Object(payload))
 }
 
 fn render_stream_result(
@@ -305,6 +683,10 @@ where
     serde_json::to_value(value)
         .map(|value| matches!(value, Value::Object(map) if map.is_empty()))
         .unwrap_or(false)
+}
+
+fn is_empty_json_value_object(value: &Value) -> bool {
+    matches!(value, Value::Object(map) if map.is_empty())
 }
 
 #[derive(Debug)]

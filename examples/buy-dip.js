@@ -2,7 +2,6 @@ export const script = {
   name: "buy-dip-threshold",
   version: "1",
   sources: ["candles"],
-  modes: ["window"],
   params: {
     candles: {
       drop_bps: { type: "number", required: false, default: 20 },
@@ -11,14 +10,41 @@ export const script = {
   }
 }
 
+let previousStreamCandle = null
+
+function candlesForMode(input) {
+  if (input.mode === "window") {
+    return input.candles.candles
+  }
+
+  if (input.mode === "stream") {
+    const latest = input.candles.candle
+    const candles = previousStreamCandle ? [previousStreamCandle, latest] : [latest]
+    previousStreamCandle = latest
+    return candles
+  }
+
+  throw new Error(`unsupported input.mode: ${input.mode}`)
+}
+
 export function onData(ctx, input) {
-  const candles = input.candles.candles
+  const candles = candlesForMode(input)
   const latest = candles[candles.length - 1]
 
   if (candles.length < 2) {
     return {
-      metrics: { candles: candles.length, close: latest.c },
-      signal: { event: "warmup", side: "neutral", triggered: false }
+      metrics: {
+        mode: input.mode,
+        candles: candles.length,
+        close: latest.c,
+        threshold_bps: ctx.params.candles.drop_bps
+      },
+      signal: {
+        event: "warmup",
+        side: "neutral",
+        triggered: false,
+        reason: input.mode === "stream" ? "waiting for previous candle" : "not enough candles"
+      }
     }
   }
 
@@ -28,6 +54,7 @@ export function onData(ctx, input) {
 
   return {
     metrics: {
+      mode: input.mode,
       prev_close: prev.c,
       close: latest.c,
       move_bps: moveBps,
@@ -41,11 +68,11 @@ export function onData(ctx, input) {
     },
     intent: triggered
       ? {
-          type: "order",
-          side: "buy",
-          order_type: "market",
-          notional: ctx.params.candles.notional
-        }
+        type: "order",
+        side: "buy",
+        order_type: "market",
+        notional: ctx.params.candles.notional
+      }
       : {}
   }
 }

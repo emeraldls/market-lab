@@ -4,6 +4,7 @@ use crate::domain::types::{OrderBookLevel, OrderBookSnapshot};
 
 #[derive(Default)]
 pub struct OrderBookState {
+    initialized: bool,
     exchange: String,
     symbol: String,
     timestamp_ms: u64,
@@ -38,6 +39,7 @@ impl OrderBookState {
         self.sort();
         self.clamp_levels();
         self.seq = seq;
+        self.initialized = true;
     }
 
     pub fn apply_delta(
@@ -47,6 +49,10 @@ impl OrderBookState {
         ask_updates: Vec<OrderBookLevel>,
         seq: Option<u64>,
     ) {
+        if !self.initialized {
+            return;
+        }
+
         self.timestamp_ms = timestamp_ms;
         for lvl in bid_updates {
             upsert_level(&mut self.bids, lvl, true);
@@ -60,7 +66,7 @@ impl OrderBookState {
     }
 
     pub fn snapshot(&self, depth: u16) -> Option<OrderBookSnapshot> {
-        if self.bids.is_empty() || self.asks.is_empty() {
+        if !self.initialized || self.bids.is_empty() || self.asks.is_empty() {
             return None;
         }
 

@@ -22,3 +22,6 @@ tar = "0.4.44"
 semver = "1.0.27"
 rquickjs = "0.11.0"
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
+keyring = { version = "3.6.3", features = ["apple-native", "sync-secret-service"] }
+rpassword = "7.4.0"
+toml = "1.1.2"

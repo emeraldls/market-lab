@@ -4,13 +4,16 @@ use mimalloc::MiMalloc;
 
 mod cli;
 mod commands;
+mod config;
 mod core;
+mod credentials;
 mod domain;
+mod functions;
 mod providers;
 mod scripting;
 
 use cli::{
-    Cli, Commands, ScriptCommands, ScriptRunHistoryCommands, SourceCommands,
+    AuthCommands, Cli, Commands, ScriptCommands, ScriptRunHistoryCommands, SourceCommands,
     StrategyBacktestCommands, StrategyCommands, StrategyRunCommands, StudyCommands,
 };
 
@@ -19,7 +22,8 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let args = config::expand_args(std::env::args_os())?;
+    let cli = Cli::parse_from(args);
 
     match cli.command {
         Commands::Inspect(args) => commands::market::inspect::handle(args).await?,
@@ -28,6 +32,8 @@ async fn main() -> Result<()> {
             SourceCommands::Orderbook(args) => commands::source::handle_orderbook(args).await?,
             SourceCommands::Vd(args) => commands::source::handle_vd(args).await?,
             SourceCommands::Candles(args) => commands::source::handle_candles(args).await?,
+            SourceCommands::Oi(args) => commands::source::handle_oi(args).await?,
+            SourceCommands::Volumes(args) => commands::source::handle_volumes(args).await?,
         },
         Commands::Study { command: study } => match study {
             StudyCommands::Slippage(args) => commands::study::slippage::handle(args).await?,
@@ -60,6 +66,11 @@ async fn main() -> Result<()> {
         Commands::Health(args) => commands::system::health::handle(args).await?,
         Commands::Status(args) => commands::system::status::handle(args).await?,
         Commands::Upgrade(args) => commands::system::upgrade::handle(args).await?,
+        Commands::Auth { command } => match command {
+            AuthCommands::Set(args) => credentials::handle_set(args)?,
+            AuthCommands::Status => credentials::handle_status()?,
+            AuthCommands::Remove(args) => credentials::handle_remove(args)?,
+        },
     }
 
     Ok(())
