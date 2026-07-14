@@ -4,6 +4,7 @@ use crate::domain::enums::ProviderKind;
 use crate::domain::requests::{InspectRequest, ReplayRequest};
 use crate::domain::types::{OrderBookSnapshot, ProviderHealth, TopOfBook};
 
+pub mod bulk;
 pub mod marketlab_cloud;
 pub mod mmt;
 

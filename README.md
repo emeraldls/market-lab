@@ -14,6 +14,14 @@ If you are using `mmt`:
 mlab auth set mmt
 ```
 
+To connect BULK execution, Market Lab generates an agent wallet locally and
+uses the main wallet private key once to authorize it. The main wallet key is
+never stored; only the generated agent credential is saved in the OS keychain.
+
+```bash
+mlab auth set bulk
+```
+
 Example:
 
 ```bash

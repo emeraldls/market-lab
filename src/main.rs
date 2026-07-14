@@ -67,9 +67,9 @@ async fn main() -> Result<()> {
         Commands::Status(args) => commands::system::status::handle(args).await?,
         Commands::Upgrade(args) => commands::system::upgrade::handle(args).await?,
         Commands::Auth { command } => match command {
-            AuthCommands::Set(args) => credentials::handle_set(args)?,
+            AuthCommands::Set(args) => credentials::handle_set(args).await?,
             AuthCommands::Status => credentials::handle_status()?,
-            AuthCommands::Remove(args) => credentials::handle_remove(args)?,
+            AuthCommands::Remove(args) => credentials::handle_remove(args).await?,
         },
     }
 

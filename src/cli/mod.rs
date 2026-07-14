@@ -62,6 +62,7 @@ pub struct AuthProviderArgs {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum AuthProvider {
     Mmt,
+    Bulk,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1220,6 +1221,17 @@ mod tests {
             status.command,
             Commands::Auth {
                 command: AuthCommands::Status
+            }
+        ));
+
+        let bulk =
+            Cli::try_parse_from(["mlab", "auth", "set", "bulk"]).expect("bulk auth should parse");
+        assert!(matches!(
+            bulk.command,
+            Commands::Auth {
+                command: AuthCommands::Set(AuthProviderArgs {
+                    provider: AuthProvider::Bulk
+                })
             }
         ));
     }
