@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub enum ProviderKind {
     MarketLab,
     Mmt,
+    Bulk,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

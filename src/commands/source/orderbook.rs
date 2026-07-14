@@ -7,6 +7,8 @@ use serde::Serialize;
 use crate::cli::{OutputFormat, SourceOrderbookArgs};
 use crate::domain::enums::ProviderKind;
 use crate::domain::types::{OrderBookLevel, OrderBookSnapshot};
+use crate::providers::bulk::market_data::BulkProvider;
+use crate::providers::bulk::ws::BulkOrderBookStream;
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::ws::MmtDepthStream;
 
@@ -21,17 +23,22 @@ struct OrderbookItem {
 
 pub async fn handle(args: SourceOrderbookArgs) -> Result<()> {
     args.validate()?;
-
-    if !matches!(args.provider.into(), ProviderKind::Mmt) {
-        bail!("source orderbook currently supports only --provider mmt");
+    match args.provider.into() {
+        ProviderKind::Mmt => handle_mmt(args).await,
+        ProviderKind::Bulk => handle_bulk(args).await,
+        ProviderKind::MarketLab => {
+            bail!("source orderbook does not support --provider market-lab")
+        }
     }
+}
 
+async fn handle_mmt(args: SourceOrderbookArgs) -> Result<()> {
     if args.stream {
-        return stream_orderbook(args).await;
+        return stream_mmt_orderbook(args).await;
     }
 
-    let snap = MmtProvider::live_orderbook(&args.exchange, &args.symbol, args.depth).await?;
-    let env = build_orderbook_envelope(&snap, &args, false)?;
+    let snap = MmtProvider::live_orderbook(args.exchange_name()?, &args.symbol, args.depth).await?;
+    let env = build_orderbook_envelope(&snap, &args, "mmt", false)?;
     render_json_or_terminal(
         &env,
         &args.output,
@@ -40,14 +47,33 @@ pub async fn handle(args: SourceOrderbookArgs) -> Result<()> {
     )
 }
 
-async fn stream_orderbook(args: SourceOrderbookArgs) -> Result<()> {
+async fn handle_bulk(args: SourceOrderbookArgs) -> Result<()> {
+    if args.stream {
+        if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("stream mode currently supports only --output terminal|json|jsonl");
+        }
+        return stream_bulk_orderbook(args).await;
+    }
+
+    let snap = BulkProvider::live_orderbook(&args.symbol, args.depth, None).await?;
+    let env = build_orderbook_envelope(&snap, &args, "bulk", false)?;
+    render_json_or_terminal(
+        &env,
+        &args.output,
+        format_terminal_summary,
+        "source orderbook",
+    )
+}
+
+async fn stream_mmt_orderbook(args: SourceOrderbookArgs) -> Result<()> {
     if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
         bail!("stream mode currently supports only --output terminal|json|jsonl");
     }
 
     let state_cap = (args.depth as usize).saturating_mul(10).clamp(100, 10_000);
+    let exchange = args.exchange_name()?.to_string();
     let mut stream =
-        MmtDepthStream::connect(&args.exchange, &args.symbol, args.depth, state_cap).await?;
+        MmtDepthStream::connect(&exchange, &args.symbol, args.depth, state_cap).await?;
 
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest: Option<OrderBookSnapshot> = None;
@@ -64,7 +90,7 @@ async fn stream_orderbook(args: SourceOrderbookArgs) -> Result<()> {
             }
             _ = ticker.tick() => {
                 let Some(snap) = latest.as_ref() else { continue; };
-                let env = build_orderbook_envelope(snap, &args, true)?;
+                let env = build_orderbook_envelope(snap, &args, "mmt", true)?;
                 match args.output {
                     OutputFormat::Json | OutputFormat::Jsonl => println!("{}", serde_json::to_string(&env)?),
                     OutputFormat::Terminal => {
@@ -82,9 +108,45 @@ async fn stream_orderbook(args: SourceOrderbookArgs) -> Result<()> {
     Ok(())
 }
 
+async fn stream_bulk_orderbook(args: SourceOrderbookArgs) -> Result<()> {
+    let state_cap = (args.depth as usize).saturating_mul(10).clamp(100, 10_000);
+    let mut stream = BulkOrderBookStream::connect(&args.symbol, args.depth, state_cap).await?;
+    let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
+    let mut latest: Option<OrderBookSnapshot> = None;
+    let mut buf: VecDeque<String> = VecDeque::with_capacity(args.buffer_size as usize);
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\nstream stopped");
+                break;
+            }
+            snapshot = stream.next_snapshot() => {
+                latest = Some(snapshot?);
+            }
+            _ = ticker.tick() => {
+                let Some(snapshot) = latest.as_ref() else { continue; };
+                let env = build_orderbook_envelope(snapshot, &args, "bulk", true)?;
+                match args.output {
+                    OutputFormat::Json | OutputFormat::Jsonl => println!("{}", serde_json::to_string(&env)?),
+                    OutputFormat::Terminal => {
+                        let line = format_terminal_summary(&env);
+                        if buf.len() >= args.buffer_size as usize { buf.pop_front(); }
+                        buf.push_back(line);
+                        render_terminal("market-lab source BULK orderbook stream", &buf)?;
+                    }
+                    OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn build_orderbook_envelope(
     snap: &OrderBookSnapshot,
     args: &SourceOrderbookArgs,
+    provider: &'static str,
     stream: bool,
 ) -> Result<SourceEnvelope<Vec<OrderbookItem>>> {
     let bids = filter_levels(&snap.bids, args.min_size, args.max_size)?;
@@ -124,7 +186,7 @@ fn build_orderbook_envelope(
             "source.orderbook.snapshot".to_string()
         },
         version: "1",
-        provider: "mmt",
+        provider,
         exchange: snap.exchange.clone(),
         symbol: snap.symbol.clone(),
         ts_ms: snap.timestamp_ms,

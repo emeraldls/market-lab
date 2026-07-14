@@ -54,6 +54,7 @@ pub fn provider_name(kind: ProviderKind) -> &'static str {
     match kind {
         ProviderKind::Mmt => "mmt",
         ProviderKind::MarketLab => "marketlab",
+        ProviderKind::Bulk => "bulk",
     }
 }
 

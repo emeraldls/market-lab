@@ -26,6 +26,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse_from(args);
 
     match cli.command {
+        Commands::Markets(args) => commands::markets::handle(args)?,
         Commands::Inspect(args) => commands::market::inspect::handle(args).await?,
         Commands::Replay(args) => commands::market::replay::handle(args).await?,
         Commands::Source { command: source } => match source {
@@ -34,6 +35,8 @@ async fn main() -> Result<()> {
             SourceCommands::Candles(args) => commands::source::handle_candles(args).await?,
             SourceCommands::Oi(args) => commands::source::handle_oi(args).await?,
             SourceCommands::Volumes(args) => commands::source::handle_volumes(args).await?,
+            SourceCommands::Stats(args) => commands::source::handle_stats(args).await?,
+            SourceCommands::Funding(args) => commands::source::handle_funding(args).await?,
         },
         Commands::Study { command: study } => match study {
             StudyCommands::Slippage(args) => commands::study::slippage::handle(args).await?,

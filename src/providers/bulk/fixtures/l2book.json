@@ -1,0 +1,9 @@
+{
+  "updateType": "snapshot",
+  "symbol": "BTC-USD",
+  "levels": [
+    [{"px": 64536.7, "sz": 0.0075, "n": 3}],
+    [{"px": 64536.75, "sz": 22.75, "n": 58}]
+  ],
+  "timestamp": 1784055043011554637
+}

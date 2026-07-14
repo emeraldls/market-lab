@@ -6,6 +6,9 @@ use serde::Serialize;
 
 use crate::cli::{OutputFormat, SourceVdArgs};
 use crate::domain::enums::ProviderKind;
+use crate::domain::types::VolumeDeltaTick;
+use crate::providers::bulk::catalog;
+use crate::providers::bulk::ws::BulkTradesStream;
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::ws_vd::MmtVdStream;
 
@@ -25,19 +28,23 @@ struct VdStreamItem {
 
 pub async fn handle(args: SourceVdArgs) -> Result<()> {
     args.validate()?;
-    if !matches!(args.provider.into(), ProviderKind::Mmt) {
-        bail!("source vd currently supports only --provider mmt");
-    }
-
-    if args.stream {
-        if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
-            bail!("stream mode currently supports only --output terminal|json|jsonl");
+    match args.provider.into() {
+        ProviderKind::Mmt => handle_mmt(args).await,
+        ProviderKind::Bulk => stream_bulk_vd(args).await,
+        ProviderKind::MarketLab => {
+            bail!("source vd does not support --provider market-lab")
         }
-        return stream_vd(args).await;
+    }
+}
+
+async fn handle_mmt(args: SourceVdArgs) -> Result<()> {
+    if args.stream {
+        ensure_stream_output(args.output)?;
+        return stream_mmt_vd(args).await;
     }
 
     let series = MmtProvider::vd(
-        &args.exchange,
+        args.exchange_name()?,
         &args.symbol,
         args.mmt_tf()?,
         args.from
@@ -93,9 +100,17 @@ pub async fn handle(args: SourceVdArgs) -> Result<()> {
     Ok(())
 }
 
-async fn stream_vd(args: SourceVdArgs) -> Result<()> {
+fn ensure_stream_output(output: OutputFormat) -> Result<()> {
+    if matches!(output, OutputFormat::Csv | OutputFormat::Parquet) {
+        bail!("stream mode currently supports only --output terminal|json|jsonl");
+    }
+    Ok(())
+}
+
+async fn stream_mmt_vd(args: SourceVdArgs) -> Result<()> {
+    let exchange = args.exchange_name()?.to_string();
     let mut stream =
-        MmtVdStream::connect(&args.exchange, &args.symbol, args.mmt_tf()?, args.bucket).await?;
+        MmtVdStream::connect(&exchange, &args.symbol, args.mmt_tf()?, args.bucket).await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest: Option<crate::domain::types::VdCandle> = None;
     let mut buf: VecDeque<String> = VecDeque::with_capacity(args.buffer_size as usize);
@@ -132,8 +147,8 @@ async fn stream_vd(args: SourceVdArgs) -> Result<()> {
                     r#type: "source.vd.stream".to_string(),
                     version: "1",
                     provider: "mmt",
-                    exchange: args.exchange.to_lowercase(),
-                    symbol: args.symbol.to_lowercase().replace("usdt","usd"),
+                    exchange: exchange.to_lowercase(),
+                    symbol: args.symbol.to_uppercase(),
                     ts_ms: c.t * 1000,
                     stream: true,
                     data: item,
@@ -169,4 +184,140 @@ async fn stream_vd(args: SourceVdArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn stream_bulk_vd(args: SourceVdArgs) -> Result<()> {
+    ensure_stream_output(args.output)?;
+    let market = catalog::market(&args.symbol)?;
+    let internal_symbol = market.internal_symbol.clone();
+    let mut stream = BulkTradesStream::connect(&args.symbol).await?;
+    let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
+    let mut latest: Option<VolumeDeltaTick> = None;
+    let mut cumulative_delta = 0.0;
+    let mut buf: VecDeque<String> = VecDeque::with_capacity(args.buffer_size as usize);
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\nstream stopped");
+                break;
+            }
+            trades = stream.next_trades() => {
+                let trades = trades?;
+                if let Some(delta) = volume_delta_from_trades(&trades, &mut cumulative_delta, &internal_symbol) {
+                    latest = Some(delta);
+                }
+            }
+            _ = ticker.tick() => {
+                let Some(delta) = latest.as_ref() else { continue; };
+                let env = SourceEnvelope {
+                    r#type: "source.vd.trades.stream".to_string(),
+                    version: "1",
+                    provider: "bulk",
+                    exchange: "bulk".to_string(),
+                    symbol: internal_symbol.clone(),
+                    ts_ms: delta.timestamp_ms,
+                    stream: true,
+                    data: delta.clone(),
+                    meta: SourceMeta {
+                        depth: None,
+                        min_size: None,
+                        max_size: None,
+                        price_group: None,
+                        interval_ms: Some(args.interval_ms),
+                        timeframe: None,
+                        bucket: None,
+                        from: None,
+                        to: None,
+                    },
+                };
+
+                match args.output {
+                    OutputFormat::Json | OutputFormat::Jsonl => {
+                        println!("{}", serde_json::to_string(&env)?)
+                    }
+                    OutputFormat::Terminal => {
+                        let line = format!(
+                            "ts_ms={} delta={} cumulative_delta={}",
+                            delta.timestamp_ms, delta.delta, delta.cumulative_delta
+                        );
+                        if buf.len() >= args.buffer_size as usize { buf.pop_front(); }
+                        buf.push_back(line);
+                        render_terminal("market-lab source BULK live volume delta", &buf)?;
+                    }
+                    OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn volume_delta_from_trades(
+    trades: &[crate::domain::types::TradeTick],
+    cumulative_delta: &mut f64,
+    internal_symbol: &str,
+) -> Option<VolumeDeltaTick> {
+    if trades.is_empty() {
+        return None;
+    }
+    let delta = trades
+        .iter()
+        .map(|trade| {
+            if trade.taker_buy {
+                trade.size
+            } else {
+                -trade.size
+            }
+        })
+        .sum::<f64>();
+    *cumulative_delta += delta;
+    Some(VolumeDeltaTick {
+        exchange: "bulk".to_string(),
+        symbol: internal_symbol.to_string(),
+        timestamp_ms: trades
+            .iter()
+            .map(|trade| trade.timestamp_ms)
+            .max()
+            .unwrap_or(0),
+        delta,
+        cumulative_delta: *cumulative_delta,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::types::TradeTick;
+
+    #[test]
+    fn derives_side_signed_live_volume_delta() {
+        let trades = vec![
+            TradeTick {
+                exchange: "bulk".to_string(),
+                symbol: "BTC/USDT".to_string(),
+                timestamp_ms: 1_700_000_000_000,
+                price: 100_000.0,
+                size: 0.15,
+                taker_buy: true,
+            },
+            TradeTick {
+                exchange: "bulk".to_string(),
+                symbol: "BTC/USDT".to_string(),
+                timestamp_ms: 1_700_000_000_001,
+                price: 100_001.0,
+                size: 0.05,
+                taker_buy: false,
+            },
+        ];
+        let mut cumulative = 1.0;
+        let delta = volume_delta_from_trades(&trades, &mut cumulative, "BTC/USDT")
+            .expect("non-empty trades yield a delta");
+
+        assert!((delta.delta - 0.10).abs() < f64::EPSILON);
+        assert!((delta.cumulative_delta - 1.10).abs() < f64::EPSILON);
+        assert_eq!(delta.timestamp_ms, 1_700_000_000_001);
+        assert_eq!(delta.symbol, "BTC/USDT");
+    }
 }

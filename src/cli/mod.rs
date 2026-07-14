@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -19,6 +19,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    Markets(MarketsArgs),
     Inspect(InspectArgs),
     Replay(ReplayArgs),
     Source {
@@ -44,6 +45,21 @@ pub enum Commands {
         #[command(subcommand)]
         command: AuthCommands,
     },
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct MarketsArgs {
+    #[arg(long, value_enum, default_value_t = MarketCatalogProvider::Bulk)]
+    pub provider: MarketCatalogProvider,
+    #[arg(long)]
+    pub symbol: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum MarketCatalogProvider {
+    Bulk,
 }
 
 #[derive(Subcommand, Debug)]
@@ -72,6 +88,8 @@ pub enum SourceCommands {
     Candles(SourceCandlesArgs),
     Oi(SourceOiArgs),
     Volumes(SourceVolumesArgs),
+    Stats(SourceStatsArgs),
+    Funding(SourceFundingArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -152,6 +170,17 @@ impl ScriptRunArgs {
         if self.script.trim().is_empty() {
             bail!("script path is required");
         }
+        if let Some(from) = self.from {
+            validate_millisecond_timestamp(from, "--from")?;
+        }
+        if let Some(to) = self.to {
+            validate_millisecond_timestamp(to, "--to")?;
+        }
+        if let (Some(from), Some(to)) = (self.from, self.to)
+            && from >= to
+        {
+            bail!("--from must be less than --to");
+        }
         Ok(())
     }
 }
@@ -194,6 +223,8 @@ impl ScriptBacktestArgs {
         if !is_valid_symbol(&self.symbol) {
             bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
+        validate_millisecond_timestamp(self.from, "--from")?;
+        validate_millisecond_timestamp(self.to, "--to")?;
         if self.from >= self.to {
             bail!("--from must be less than --to");
         }
@@ -243,12 +274,12 @@ impl ScriptRunsShowArgs {
 pub struct SourceVdArgs {
     #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
     pub provider: CliProviderKind,
-    #[arg(long)]
-    pub exchange: String,
+    #[arg(long, required_if_eq("provider", "mmt"))]
+    pub exchange: Option<String>,
     #[arg(long)]
     pub symbol: String,
     #[arg(long)]
-    pub timeframe: u32,
+    pub timeframe: Option<u32>,
     #[arg(long)]
     pub from: Option<u64>,
     #[arg(long)]
@@ -267,13 +298,21 @@ pub struct SourceVdArgs {
 
 impl SourceVdArgs {
     pub fn validate(&self) -> Result<()> {
-        if self.exchange.trim().is_empty() {
-            bail!("--exchange cannot be empty");
+        validate_source_identity(self.provider, self.exchange.as_deref(), &self.symbol)?;
+        if matches!(self.provider, CliProviderKind::Bulk) {
+            if !self.stream {
+                bail!("BULK volume delta is derived from live trades and requires --stream");
+            }
+            if self.timeframe.is_some() || self.from.is_some() || self.to.is_some() {
+                bail!("BULK live volume delta does not use --timeframe/--from/--to");
+            }
+        } else {
+            mmt_timeframe_from_seconds(
+                self.timeframe.ok_or_else(|| {
+                    anyhow::anyhow!("--timeframe is required for MMT volume delta")
+                })?,
+            )?;
         }
-        if !is_valid_symbol(&self.symbol) {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
-        mmt_timeframe_from_seconds(self.timeframe)?;
         if self.stream {
             if self.from.is_some() || self.to.is_some() {
                 bail!("--from/--to are not allowed with --stream");
@@ -285,6 +324,8 @@ impl SourceVdArgs {
             let to = self
                 .to
                 .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?;
+            validate_millisecond_timestamp(from, "--from")?;
+            validate_millisecond_timestamp(to, "--to")?;
             if from >= to {
                 bail!("--from must be less than --to");
             }
@@ -302,7 +343,14 @@ impl SourceVdArgs {
     }
 
     pub fn mmt_tf(&self) -> Result<&'static str> {
-        mmt_timeframe_from_seconds(self.timeframe)
+        mmt_timeframe_from_seconds(
+            self.timeframe
+                .ok_or_else(|| anyhow::anyhow!("--timeframe is required for MMT volume delta"))?,
+        )
+    }
+
+    pub fn exchange_name(&self) -> Result<&str> {
+        source_exchange(self.provider, self.exchange.as_deref())
     }
 }
 
@@ -338,8 +386,8 @@ pub struct CvdArgs {
 pub struct SourceCandlesArgs {
     #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
     pub provider: CliProviderKind,
-    #[arg(long)]
-    pub exchange: String,
+    #[arg(long, required_if_eq("provider", "mmt"))]
+    pub exchange: Option<String>,
     #[arg(long)]
     pub symbol: String,
     #[arg(long)]
@@ -360,39 +408,26 @@ pub struct SourceCandlesArgs {
 
 impl SourceCandlesArgs {
     pub fn validate(&self) -> Result<()> {
-        if self.exchange.trim().is_empty() {
-            bail!("--exchange cannot be empty");
+        TimeframeSourceValidation {
+            provider: self.provider,
+            exchange: self.exchange.as_deref(),
+            symbol: &self.symbol,
+            timeframe: self.timeframe,
+            from: self.from,
+            to: self.to,
+            stream: self.stream,
+            buffer_size: self.buffer_size,
+            interval_ms: self.interval_ms,
         }
-        if !is_valid_symbol(&self.symbol) {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
-        mmt_timeframe_from_seconds(self.timeframe)?;
-        if self.stream {
-            if self.from.is_some() || self.to.is_some() {
-                bail!("--from/--to are not allowed with --stream");
-            }
-        } else {
-            let from = self
-                .from
-                .ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?;
-            let to = self
-                .to
-                .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?;
-            if from >= to {
-                bail!("--from must be less than --to");
-            }
-        }
-        if self.buffer_size == 0 {
-            bail!("--buffer-size must be >= 1");
-        }
-        if self.interval_ms == 0 {
-            bail!("--interval-ms must be >= 1");
-        }
-        Ok(())
+        .validate()
     }
 
-    pub fn mmt_tf(&self) -> Result<&'static str> {
-        mmt_timeframe_from_seconds(self.timeframe)
+    pub fn timeframe_name(&self) -> Result<&'static str> {
+        provider_timeframe_from_seconds(self.provider, self.timeframe)
+    }
+
+    pub fn exchange_name(&self) -> Result<&str> {
+        source_exchange(self.provider, self.exchange.as_deref())
     }
 }
 
@@ -400,12 +435,12 @@ impl SourceCandlesArgs {
 pub struct SourceOiArgs {
     #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
     pub provider: CliProviderKind,
-    #[arg(long)]
-    pub exchange: String,
+    #[arg(long, required_if_eq("provider", "mmt"))]
+    pub exchange: Option<String>,
     #[arg(long)]
     pub symbol: String,
     #[arg(long)]
-    pub timeframe: u32,
+    pub timeframe: Option<u32>,
     #[arg(long)]
     pub from: Option<u64>,
     #[arg(long)]
@@ -422,21 +457,40 @@ pub struct SourceOiArgs {
 
 impl SourceOiArgs {
     pub fn validate(&self) -> Result<()> {
-        TimeframeSourceValidation {
-            exchange: &self.exchange,
-            symbol: &self.symbol,
-            timeframe: self.timeframe,
-            from: self.from,
-            to: self.to,
-            stream: self.stream,
-            buffer_size: self.buffer_size,
-            interval_ms: self.interval_ms,
+        validate_source_identity(self.provider, self.exchange.as_deref(), &self.symbol)?;
+        if matches!(self.provider, CliProviderKind::Bulk) {
+            if self.timeframe.is_some() || self.from.is_some() || self.to.is_some() {
+                bail!("BULK open interest is current/live only; omit --timeframe/--from/--to");
+            }
+        } else {
+            let timeframe = self
+                .timeframe
+                .ok_or_else(|| anyhow::anyhow!("--timeframe is required for MMT open interest"))?;
+            TimeframeSourceValidation {
+                provider: self.provider,
+                exchange: self.exchange.as_deref(),
+                symbol: &self.symbol,
+                timeframe,
+                from: self.from,
+                to: self.to,
+                stream: self.stream,
+                buffer_size: self.buffer_size,
+                interval_ms: self.interval_ms,
+            }
+            .validate()?;
         }
-        .validate()
+        validate_stream_controls(self.buffer_size, self.interval_ms)
     }
 
     pub fn mmt_tf(&self) -> Result<&'static str> {
-        mmt_timeframe_from_seconds(self.timeframe)
+        mmt_timeframe_from_seconds(
+            self.timeframe
+                .ok_or_else(|| anyhow::anyhow!("--timeframe is required for MMT open interest"))?,
+        )
+    }
+
+    pub fn exchange_name(&self) -> Result<&str> {
+        source_exchange(self.provider, self.exchange.as_deref())
     }
 }
 
@@ -444,8 +498,8 @@ impl SourceOiArgs {
 pub struct SourceVolumesArgs {
     #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
     pub provider: CliProviderKind,
-    #[arg(long)]
-    pub exchange: String,
+    #[arg(long, required_if_eq("provider", "mmt"))]
+    pub exchange: Option<String>,
     #[arg(long)]
     pub symbol: String,
     #[arg(long)]
@@ -467,7 +521,8 @@ pub struct SourceVolumesArgs {
 impl SourceVolumesArgs {
     pub fn validate(&self) -> Result<()> {
         TimeframeSourceValidation {
-            exchange: &self.exchange,
+            provider: self.provider,
+            exchange: self.exchange.as_deref(),
             symbol: &self.symbol,
             timeframe: self.timeframe,
             from: self.from,
@@ -479,13 +534,18 @@ impl SourceVolumesArgs {
         .validate()
     }
 
-    pub fn mmt_tf(&self) -> Result<&'static str> {
-        mmt_timeframe_from_seconds(self.timeframe)
+    pub fn timeframe_name(&self) -> Result<&'static str> {
+        provider_timeframe_from_seconds(self.provider, self.timeframe)
+    }
+
+    pub fn exchange_name(&self) -> Result<&str> {
+        source_exchange(self.provider, self.exchange.as_deref())
     }
 }
 
 struct TimeframeSourceValidation<'a> {
-    exchange: &'a str,
+    provider: CliProviderKind,
+    exchange: Option<&'a str>,
     symbol: &'a str,
     timeframe: u32,
     from: Option<u64>,
@@ -497,13 +557,8 @@ struct TimeframeSourceValidation<'a> {
 
 impl TimeframeSourceValidation<'_> {
     fn validate(&self) -> Result<()> {
-        if self.exchange.trim().is_empty() {
-            bail!("--exchange cannot be empty");
-        }
-        if !is_valid_symbol(self.symbol) {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
-        mmt_timeframe_from_seconds(self.timeframe)?;
+        validate_source_identity(self.provider, self.exchange, self.symbol)?;
+        provider_timeframe_from_seconds(self.provider, self.timeframe)?;
         if self.stream {
             if self.from.is_some() || self.to.is_some() {
                 bail!("--from/--to are not allowed with --stream");
@@ -515,17 +570,13 @@ impl TimeframeSourceValidation<'_> {
             let to = self
                 .to
                 .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?;
+            validate_millisecond_timestamp(from, "--from")?;
+            validate_millisecond_timestamp(to, "--to")?;
             if from >= to {
                 bail!("--from must be less than --to");
             }
         }
-        if self.buffer_size == 0 {
-            bail!("--buffer-size must be >= 1");
-        }
-        if self.interval_ms == 0 {
-            bail!("--interval-ms must be >= 1");
-        }
-        Ok(())
+        validate_stream_controls(self.buffer_size, self.interval_ms)
     }
 }
 
@@ -549,6 +600,8 @@ impl CvdArgs {
             let to = self
                 .to
                 .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?;
+            validate_millisecond_timestamp(from, "--from")?;
+            validate_millisecond_timestamp(to, "--to")?;
             if from >= to {
                 bail!("--from must be less than --to");
             }
@@ -574,8 +627,8 @@ impl CvdArgs {
 pub struct SourceOrderbookArgs {
     #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
     pub provider: CliProviderKind,
-    #[arg(long)]
-    pub exchange: String,
+    #[arg(long, required_if_eq("provider", "mmt"))]
+    pub exchange: Option<String>,
     #[arg(long)]
     pub symbol: String,
     #[arg(long, default_value_t = 100)]
@@ -598,12 +651,7 @@ pub struct SourceOrderbookArgs {
 
 impl SourceOrderbookArgs {
     pub fn validate(&self) -> Result<()> {
-        if self.exchange.trim().is_empty() {
-            bail!("--exchange cannot be empty");
-        }
-        if !is_valid_symbol(&self.symbol) {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
+        validate_source_identity(self.provider, self.exchange.as_deref(), &self.symbol)?;
         if self.depth == 0 {
             bail!("--depth must be >= 1");
         }
@@ -624,6 +672,85 @@ impl SourceOrderbookArgs {
             bail!("--min-size cannot be greater than --max-size");
         }
         Ok(())
+    }
+
+    pub fn exchange_name(&self) -> Result<&str> {
+        source_exchange(self.provider, self.exchange.as_deref())
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct SourceStatsArgs {
+    #[arg(long, value_enum, default_value_t = CliProviderKind::Bulk)]
+    pub provider: CliProviderKind,
+    #[arg(long)]
+    pub symbol: Option<String>,
+    #[arg(long, default_value = "1d")]
+    pub period: String,
+    #[arg(long, default_value_t = false)]
+    pub stream: bool,
+    #[arg(long, default_value_t = 50)]
+    pub buffer_size: u16,
+    #[arg(long, default_value_t = 1000)]
+    pub interval_ms: u64,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl SourceStatsArgs {
+    pub fn validate(&self) -> Result<()> {
+        if !matches!(self.provider, CliProviderKind::Bulk) {
+            bail!("source stats currently supports only --provider bulk");
+        }
+        if let Some(symbol) = &self.symbol
+            && !is_valid_symbol(symbol)
+        {
+            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        if !matches!(
+            self.period.as_str(),
+            "1d" | "7d" | "30d" | "90d" | "1y" | "all"
+        ) {
+            bail!("--period must be one of 1d,7d,30d,90d,1y,all");
+        }
+        if self.stream && self.symbol.is_none() {
+            bail!("--symbol is required when streaming BULK statistics");
+        }
+        if self.stream && matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("stream mode currently supports only --output terminal|json|jsonl");
+        }
+        validate_stream_controls(self.buffer_size, self.interval_ms)
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct SourceFundingArgs {
+    #[arg(long, value_enum, default_value_t = CliProviderKind::Bulk)]
+    pub provider: CliProviderKind,
+    #[arg(long)]
+    pub symbol: String,
+    #[arg(long, default_value_t = false)]
+    pub stream: bool,
+    #[arg(long, default_value_t = 50)]
+    pub buffer_size: u16,
+    #[arg(long, default_value_t = 1000)]
+    pub interval_ms: u64,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl SourceFundingArgs {
+    pub fn validate(&self) -> Result<()> {
+        if !matches!(self.provider, CliProviderKind::Bulk) {
+            bail!("source funding currently supports only --provider bulk");
+        }
+        if !is_valid_symbol(&self.symbol) {
+            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        if self.stream && matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("stream mode currently supports only --output terminal|json|jsonl");
+        }
+        validate_stream_controls(self.buffer_size, self.interval_ms)
     }
 }
 
@@ -677,6 +804,7 @@ impl InspectArgs {
         if !is_valid_symbol(&self.symbol) {
             bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
+        validate_millisecond_timestamp(self.at, "--at")?;
         if self.depth == 0 {
             bail!("--depth must be >= 1");
         }
@@ -721,6 +849,8 @@ impl ReplayArgs {
         if !is_valid_symbol(&self.symbol) {
             bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
+        validate_millisecond_timestamp(self.from, "--from")?;
+        validate_millisecond_timestamp(self.to, "--to")?;
         if self.from >= self.to {
             bail!("--from must be less than --to");
         }
@@ -1000,6 +1130,9 @@ impl RunSmaCrossoverArgs {
         if self.buffer_size == 0 {
             bail!("--buffer-size must be >= 1");
         }
+        if let Some(from) = self.from {
+            validate_millisecond_timestamp(from, "--from")?;
+        }
         Ok(())
     }
 }
@@ -1048,6 +1181,8 @@ impl BacktestSmaCrossoverArgs {
         if self.confirm_bars < 1 {
             bail!("--confirm-bars must be >= 1");
         }
+        validate_millisecond_timestamp(self.from, "--from")?;
+        validate_millisecond_timestamp(self.to, "--to")?;
         if self.from >= self.to {
             bail!("--from must be less than --to");
         }
@@ -1127,6 +1262,64 @@ fn is_valid_symbol(symbol: &str) -> bool {
     }
 }
 
+fn validate_source_identity(
+    provider: CliProviderKind,
+    exchange: Option<&str>,
+    symbol: &str,
+) -> Result<()> {
+    source_exchange(provider, exchange)?;
+    if !is_valid_symbol(symbol) {
+        bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+    }
+    Ok(())
+}
+
+fn source_exchange(provider: CliProviderKind, exchange: Option<&str>) -> Result<&str> {
+    if matches!(provider, CliProviderKind::Bulk) {
+        if let Some(exchange) = exchange
+            && !exchange.eq_ignore_ascii_case("bulk")
+        {
+            bail!("--exchange must be omitted or set to `bulk` with --provider bulk");
+        }
+        return Ok("bulk");
+    }
+
+    let exchange = exchange.context("--exchange is required for this provider")?;
+    if exchange.trim().is_empty() {
+        bail!("--exchange cannot be empty");
+    }
+    Ok(exchange)
+}
+
+fn provider_timeframe_from_seconds(
+    provider: CliProviderKind,
+    seconds: u32,
+) -> Result<&'static str> {
+    match provider {
+        CliProviderKind::Bulk => {
+            crate::providers::bulk::market_data::timeframe_from_seconds(seconds)
+        }
+        CliProviderKind::Mmt | CliProviderKind::MarketLab => mmt_timeframe_from_seconds(seconds),
+    }
+}
+
+fn validate_stream_controls(buffer_size: u16, interval_ms: u64) -> Result<()> {
+    if buffer_size == 0 {
+        bail!("--buffer-size must be >= 1");
+    }
+    if interval_ms == 0 {
+        bail!("--interval-ms must be >= 1");
+    }
+    Ok(())
+}
+
+fn validate_millisecond_timestamp(timestamp: u64, flag: &str) -> Result<()> {
+    if !(10_000_000_000..10_000_000_000_000).contains(&timestamp) {
+        bail!("{flag} must be a millisecond timestamp");
+    }
+    Ok(())
+}
+
 pub(crate) fn mmt_timeframe_from_seconds(seconds: u32) -> Result<&'static str> {
     match seconds {
         60 => Ok("1m"),
@@ -1147,6 +1340,7 @@ pub(crate) fn mmt_timeframe_from_seconds(seconds: u32) -> Result<&'static str> {
 pub enum CliProviderKind {
     MarketLab,
     Mmt,
+    Bulk,
 }
 
 impl From<CliProviderKind> for ProviderKind {
@@ -1154,6 +1348,7 @@ impl From<CliProviderKind> for ProviderKind {
         match value {
             CliProviderKind::MarketLab => ProviderKind::MarketLab,
             CliProviderKind::Mmt => ProviderKind::Mmt,
+            CliProviderKind::Bulk => ProviderKind::Bulk,
         }
     }
 }
@@ -1201,6 +1396,29 @@ pub enum OutputFormat {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn parse_bulk_markets_command() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "markets",
+            "--provider",
+            "bulk",
+            "--symbol",
+            "BTC/USDT",
+            "--json",
+        ])
+        .expect("markets command should parse");
+
+        match cli.command {
+            Commands::Markets(args) => {
+                assert!(matches!(args.provider, MarketCatalogProvider::Bulk));
+                assert_eq!(args.symbol.as_deref(), Some("BTC/USDT"));
+                assert!(args.json);
+            }
+            _ => panic!("expected markets command"),
+        }
+    }
 
     #[test]
     fn parse_auth_commands() {
@@ -1275,9 +1493,9 @@ mod tests {
             "--timeframe",
             "60",
             "--from",
-            "1704067200",
+            "1704067200000",
             "--to",
-            "1704067800",
+            "1704067800000",
             "--bucket",
             "1",
             "--output",
@@ -1290,9 +1508,9 @@ mod tests {
                 command: SourceCommands::Vd(args),
             } => {
                 assert_eq!(args.bucket, 1);
-                assert_eq!(args.timeframe, 60);
-                assert_eq!(args.from, Some(1704067200));
-                assert_eq!(args.to, Some(1704067800));
+                assert_eq!(args.timeframe, Some(60));
+                assert_eq!(args.from, Some(1704067200000));
+                assert_eq!(args.to, Some(1704067800000));
             }
             _ => panic!("expected source vd command"),
         }
@@ -1313,9 +1531,9 @@ mod tests {
             "--timeframe",
             "60",
             "--from",
-            "1704067200",
+            "1704067200000",
             "--to",
-            "1704067800",
+            "1704067800000",
             "--bucket",
             "1",
             "--output",
@@ -1329,8 +1547,8 @@ mod tests {
             } => {
                 assert_eq!(args.bucket, 1);
                 assert_eq!(args.timeframe, 60);
-                assert_eq!(args.from, Some(1704067200));
-                assert_eq!(args.to, Some(1704067800));
+                assert_eq!(args.from, Some(1704067200000));
+                assert_eq!(args.to, Some(1704067800000));
             }
             _ => panic!("expected study cvd command"),
         }
@@ -1354,9 +1572,9 @@ mod tests {
             "1",
             "--stream",
             "--from",
-            "1704067200",
+            "1704067200000",
             "--to",
-            "1704067800",
+            "1704067800000",
         ])
         .expect("parse should succeed");
 
@@ -1389,9 +1607,9 @@ mod tests {
             "--timeframe",
             "60",
             "--from",
-            "1704067200",
+            "1704067200000",
             "--to",
-            "1704067800",
+            "1704067800000",
             "--output",
             "json",
         ])
@@ -1402,8 +1620,8 @@ mod tests {
                 command: SourceCommands::Candles(args),
             } => {
                 assert_eq!(args.timeframe, 60);
-                assert_eq!(args.from, Some(1704067200));
-                assert_eq!(args.to, Some(1704067800));
+                assert_eq!(args.from, Some(1704067200000));
+                assert_eq!(args.to, Some(1704067800000));
             }
             _ => panic!("expected source candles command"),
         }
@@ -1424,9 +1642,9 @@ mod tests {
             "--timeframe",
             "60",
             "--from",
-            "1704067200",
+            "1704067200000",
             "--to",
-            "1704067800",
+            "1704067800000",
             "--output",
             "json",
         ])
@@ -1436,9 +1654,9 @@ mod tests {
             Commands::Source {
                 command: SourceCommands::Oi(args),
             } => {
-                assert_eq!(args.timeframe, 60);
-                assert_eq!(args.from, Some(1704067200));
-                assert_eq!(args.to, Some(1704067800));
+                assert_eq!(args.timeframe, Some(60));
+                assert_eq!(args.from, Some(1704067200000));
+                assert_eq!(args.to, Some(1704067800000));
             }
             _ => panic!("expected source oi command"),
         }
@@ -1459,9 +1677,9 @@ mod tests {
             "--timeframe",
             "60",
             "--from",
-            "1704067200",
+            "1704067200000",
             "--to",
-            "1704067800",
+            "1704067800000",
             "--output",
             "json",
         ])
@@ -1472,8 +1690,8 @@ mod tests {
                 command: SourceCommands::Volumes(args),
             } => {
                 assert_eq!(args.timeframe, 60);
-                assert_eq!(args.from, Some(1704067200));
-                assert_eq!(args.to, Some(1704067800));
+                assert_eq!(args.from, Some(1704067200000));
+                assert_eq!(args.to, Some(1704067800000));
             }
             _ => panic!("expected source volumes command"),
         }
@@ -1495,9 +1713,9 @@ mod tests {
             "60",
             "--stream",
             "--from",
-            "1704067200",
+            "1704067200000",
             "--to",
-            "1704067800",
+            "1704067800000",
         ])
         .expect("parse should succeed");
 
@@ -1647,6 +1865,98 @@ mod tests {
     }
 
     #[test]
+    fn bulk_market_data_sources_do_not_require_exchange_or_mmt_auth() {
+        let candles = Cli::try_parse_from([
+            "mlab",
+            "source",
+            "candles",
+            "--provider",
+            "bulk",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+            "--from",
+            "1704067200000",
+            "--to",
+            "1704067800000",
+        ])
+        .expect("standalone BULK candles should parse");
+        match candles.command {
+            Commands::Source {
+                command: SourceCommands::Candles(args),
+            } => {
+                assert!(args.exchange.is_none());
+                args.validate().expect("standalone BULK candles validate");
+            }
+            _ => panic!("expected BULK candles command"),
+        }
+
+        let stats = Cli::try_parse_from([
+            "mlab",
+            "source",
+            "stats",
+            "--provider",
+            "bulk",
+            "--symbol",
+            "BTC/USDT",
+        ])
+        .expect("BULK stats should parse");
+        assert!(matches!(
+            stats.command,
+            Commands::Source {
+                command: SourceCommands::Stats(_)
+            }
+        ));
+
+        let funding = Cli::try_parse_from([
+            "mlab",
+            "source",
+            "funding",
+            "--provider",
+            "bulk",
+            "--symbol",
+            "BTC/USDT",
+        ])
+        .expect("BULK funding should parse");
+        assert!(matches!(
+            funding.command,
+            Commands::Source {
+                command: SourceCommands::Funding(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_seconds_at_the_market_lab_boundary() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "source",
+            "candles",
+            "--provider",
+            "bulk",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+            "--from",
+            "1704067200",
+            "--to",
+            "1704067800",
+        ])
+        .expect("syntax should parse before unit validation");
+        match cli.command {
+            Commands::Source {
+                command: SourceCommands::Candles(args),
+            } => {
+                let error = args.validate().expect_err("seconds must be rejected");
+                assert!(error.to_string().contains("millisecond timestamp"));
+            }
+            _ => panic!("expected BULK candles command"),
+        }
+    }
+
+    #[test]
     fn parse_strategy_sma_crossover_window_command() {
         let cli = Cli::try_parse_from([
             "market-lab",
@@ -1662,9 +1972,9 @@ mod tests {
             "--timeframe",
             "60",
             "--from",
-            "1704067200",
+            "1704067200000",
             "--to",
-            "1704067800",
+            "1704067800000",
             "--fast",
             "20",
             "--slow",
@@ -1679,8 +1989,8 @@ mod tests {
                         command: StrategyBacktestCommands::SmaCrossover(args),
                     },
             } => {
-                assert_eq!(args.from, 1704067200);
-                assert_eq!(args.to, 1704067800);
+                assert_eq!(args.from, 1704067200000);
+                assert_eq!(args.to, 1704067800000);
             }
             _ => panic!("expected strategy backtest sma-crossover command"),
         }
@@ -1702,7 +2012,7 @@ mod tests {
             "--timeframe",
             "60",
             "--from",
-            "1704067200",
+            "1704067200000",
         ])
         .expect("strategy run parse should succeed");
 
@@ -1714,7 +2024,7 @@ mod tests {
                     },
             } => {
                 args.validate().expect("validate should succeed");
-                assert_eq!(args.from, Some(1704067200));
+                assert_eq!(args.from, Some(1704067200000));
             }
             _ => panic!("expected strategy run sma-crossover command"),
         }

@@ -8,6 +8,7 @@ pub mod bulk;
 pub mod marketlab_cloud;
 pub mod mmt;
 
+use bulk::market_data::BulkProvider;
 use marketlab_cloud::MarketLabProvider;
 use mmt::MmtProvider;
 
@@ -20,6 +21,7 @@ pub trait MarketDataProvider {
 pub enum ProviderClient {
     MarketLab,
     Mmt,
+    Bulk,
 }
 
 impl ProviderClient {
@@ -27,6 +29,7 @@ impl ProviderClient {
         match kind {
             ProviderKind::MarketLab => Self::MarketLab,
             ProviderKind::Mmt => Self::Mmt,
+            ProviderKind::Bulk => Self::Bulk,
         }
     }
 }
@@ -36,6 +39,7 @@ impl MarketDataProvider for ProviderClient {
         match self {
             Self::MarketLab => MarketLabProvider::inspect(req).await,
             Self::Mmt => MmtProvider::inspect(req).await,
+            Self::Bulk => BulkProvider::inspect_historical().await,
         }
     }
 
@@ -43,6 +47,7 @@ impl MarketDataProvider for ProviderClient {
         match self {
             Self::MarketLab => MarketLabProvider::replay(req).await,
             Self::Mmt => MmtProvider::replay(req).await,
+            Self::Bulk => BulkProvider::replay_historical().await,
         }
     }
 
@@ -50,6 +55,7 @@ impl MarketDataProvider for ProviderClient {
         match self {
             Self::MarketLab => MarketLabProvider::health().await,
             Self::Mmt => MmtProvider::health().await,
+            Self::Bulk => BulkProvider::health().await,
         }
     }
 }

@@ -5,6 +5,11 @@ use bulk_keychain::{Keypair, Pubkey, SignedTransaction, Signer};
 use reqwest::Client;
 use serde_json::Value;
 
+pub mod catalog;
+pub mod client;
+pub mod market_data;
+pub mod ws;
+
 const DEFAULT_BULK_API_URL: &str = "https://exchange-api.bulk.trade/api/v1";
 const BULK_HTTP_TIMEOUT_SECS: u64 = 10;
 

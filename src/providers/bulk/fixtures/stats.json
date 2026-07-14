@@ -1,0 +1,26 @@
+{
+  "timestamp": 1784056178873,
+  "period": "1d",
+  "volume": {"totalUsd": 37417729.31814742},
+  "openInterest": {"totalUsd": 301567735.6783174},
+  "funding": {
+    "rates": {
+      "BTC-USD": {
+        "current": 0.00013515715297358137,
+        "annualized": 1.1839766600485726
+      }
+    }
+  },
+  "markets": [
+    {
+      "symbol": "BTC-USD",
+      "volume": 579.8016176880816,
+      "quoteVolume": 37417729.31814742,
+      "openInterest": 4672.896865729985,
+      "fundingRate": 0.00013515715297358137,
+      "fundingRateAnnualized": 1.1839766600485726,
+      "lastPrice": 64535.4,
+      "markPrice": 64535.5
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "symbol": "BTC-USD",
+  "priceChange": 279.0,
+  "priceChangePercent": 0.4323,
+  "lastPrice": 64535.4,
+  "highPrice": 64943.0,
+  "lowPrice": 64166.1,
+  "volume": 579.8016176880816,
+  "quoteVolume": 37417729.31814742,
+  "markPrice": 64535.5,
+  "oraclePrice": 64524.87,
+  "openInterest": 4672.896865729985,
+  "fundingRate": 0.00013515715297358137,
+  "regime": 10,
+  "regimeDt": 404,
+  "regimeVol": 2.9335,
+  "regimeMv": 0.0,
+  "fairBookPx": 64524.87,
+  "fairVol": 2.9485,
+  "fairBias": 0.0,
+  "timestamp": 1784056184006000000
+}
