@@ -10,25 +10,22 @@ export const script = {
   }
 }
 
-let previousStreamCandle = null
-
-function candlesForMode(input) {
+function candlesForMode(input, history) {
   if (input.mode === "window") {
     return input.candles.candles
   }
 
   if (input.mode === "stream") {
-    const latest = input.candles.candle
-    const candles = previousStreamCandle ? [previousStreamCandle, latest] : [latest]
-    previousStreamCandle = latest
-    return candles
+    const current = history.source("candles", 0)
+    const previous = history.source("candles", 1)
+    return previous ? [previous, current] : [current]
   }
 
   throw new Error(`unsupported input.mode: ${input.mode}`)
 }
 
-export function onData(ctx, input) {
-  const candles = candlesForMode(input)
+export function onData(ctx, input, history) {
+  const candles = candlesForMode(input, history)
   const latest = candles[candles.length - 1]
 
   if (candles.length < 2) {

@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +17,52 @@ use super::manifest::ScriptManifest;
 use super::output::ScriptOutput;
 use super::studies::attach_study_helpers;
 use super::telemetry::ScriptHookStats;
+
+const MIN_STREAM_HISTORY_RECORDS: usize = 2;
+
+#[derive(Debug)]
+struct SourceHistory {
+    capacity: usize,
+    records: BTreeMap<String, VecDeque<JsonValue>>,
+    identities: BTreeMap<String, u64>,
+}
+
+impl SourceHistory {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(MIN_STREAM_HISTORY_RECORDS),
+            records: BTreeMap::new(),
+            identities: BTreeMap::new(),
+        }
+    }
+
+    fn record(&mut self, source: String, value: JsonValue, identity: Option<u64>) {
+        let records = self.records.entry(source.clone()).or_default();
+        let replaces_current = identity.is_some()
+            && self.identities.get(&source) == identity.as_ref()
+            && !records.is_empty();
+
+        if replaces_current {
+            records[0] = value;
+            return;
+        }
+
+        records.push_front(value);
+        records.truncate(self.capacity);
+        if let Some(identity) = identity {
+            self.identities.insert(source, identity);
+        } else {
+            self.identities.remove(&source);
+        }
+    }
+
+    fn source(&self, source: &str, offset: usize) -> Option<JsonValue> {
+        self.records
+            .get(source)
+            .and_then(|records| records.get(offset))
+            .cloned()
+    }
+}
 
 pub struct Script {
     pub path: PathBuf,
@@ -68,6 +115,9 @@ impl Script {
         })));
         let ctx = Context::full(&rt).context("failed to create QuickJS context")?;
         let commands: ScriptCommandBuffer = Arc::new(Mutex::new(Vec::new()));
+        let history = Arc::new(Mutex::new(SourceHistory::new(
+            self.manifest.lookback.unwrap_or(MIN_STREAM_HISTORY_RECORDS),
+        )));
 
         ctx.with(|ctx| -> Result<()> {
             let module =
@@ -84,7 +134,7 @@ impl Script {
                 .context("failed to read JS module namespace")?;
             let hook: Function = namespace
                 .get("onData")
-                .context("scripts require export `onData(ctx, input)`")?;
+                .context("scripts require export `onData(ctx, input, history)`")?;
             let execution_hook: Option<Function> = namespace
                 .get("onExecution")
                 .context("failed to inspect optional onExecution hook")?;
@@ -96,6 +146,7 @@ impl Script {
                 .context("failed to assign ctx.params")?;
             attach_study_helpers(ctx.clone(), &script_ctx)?;
             attach_execution_helpers(ctx.clone(), &script_ctx, &execution, &commands)?;
+            let history_helper = attach_history_helper(ctx.clone(), Arc::clone(&history))?;
 
             let globals = ctx.globals();
             globals
@@ -104,6 +155,9 @@ impl Script {
             globals
                 .set("__mlab_ctx", script_ctx)
                 .context("failed to store script ctx")?;
+            globals
+                .set("__mlab_history", history_helper)
+                .context("failed to store history helper")?;
             if let Some(execution_hook) = execution_hook {
                 globals
                     .set("__mlab_onExecution", execution_hook)
@@ -118,6 +172,7 @@ impl Script {
             hook_started,
             cancelled,
             commands,
+            history,
         })
     }
 }
@@ -128,6 +183,7 @@ pub struct ScriptSession {
     hook_started: Arc<Mutex<Instant>>,
     cancelled: Arc<AtomicBool>,
     commands: ScriptCommandBuffer,
+    history: Arc<Mutex<SourceHistory>>,
 }
 
 impl ScriptSession {
@@ -147,7 +203,7 @@ impl ScriptSession {
                 "candles": candles,
             },
         });
-        self.run_with_input(input_payload)
+        self.run_on_data(input_payload)
     }
 
     #[cfg(test)]
@@ -158,15 +214,20 @@ impl ScriptSession {
                 "books": books,
             },
         });
-        self.run_with_input(input_payload)
+        self.run_on_data(input_payload)
     }
 
     pub fn run_window(&self, payload: JsonValue) -> Result<ScriptExecution> {
-        self.run_with_input(payload)
+        self.run_on_data(payload)
     }
 
     pub fn run_stream(&self, payload: JsonValue) -> Result<ScriptExecution> {
-        self.run_with_input(payload)
+        let (source, record, identity) = stream_history_entry(&payload)?;
+        self.history
+            .lock()
+            .map_err(|_| anyhow::anyhow!("script source history lock poisoned"))?
+            .record(source, record, identity);
+        self.run_on_data(payload)
     }
 
     pub fn run_execution_event(&self, event: JsonValue) -> Result<Option<ScriptExecution>> {
@@ -179,12 +240,12 @@ impl ScriptSession {
         if !has_hook {
             return Ok(None);
         }
-        self.run_hook("__mlab_onExecution", "onExecution", event)
+        self.run_hook("__mlab_onExecution", "onExecution", event, false)
             .map(Some)
     }
 
-    fn run_with_input(&self, input_payload: JsonValue) -> Result<ScriptExecution> {
-        self.run_hook("__mlab_onData", "onData", input_payload)
+    fn run_on_data(&self, input_payload: JsonValue) -> Result<ScriptExecution> {
+        self.run_hook("__mlab_onData", "onData", input_payload, true)
     }
 
     fn run_hook(
@@ -192,6 +253,7 @@ impl ScriptSession {
         global_name: &str,
         display_name: &str,
         input_payload: JsonValue,
+        include_history: bool,
     ) -> Result<ScriptExecution> {
         let started = Instant::now();
         {
@@ -212,10 +274,18 @@ impl ScriptSession {
                 .get("__mlab_ctx")
                 .context("failed to read script ctx")?;
             let input_val = json_to_js(ctx.clone(), &input_payload)?;
-            let result: Value = hook
-                .call((script_ctx, input_val))
-                .catch(&ctx)
-                .map_err(|err| anyhow::anyhow!("{display_name} failed: {}", err))?;
+            let result: Value = if include_history {
+                let history: Object = globals
+                    .get("__mlab_history")
+                    .context("failed to read history helper")?;
+                hook.call((script_ctx, input_val, history))
+                    .catch(&ctx)
+                    .map_err(|err| anyhow::anyhow!("{display_name} failed: {}", err))?
+            } else {
+                hook.call((script_ctx, input_val))
+                    .catch(&ctx)
+                    .map_err(|err| anyhow::anyhow!("{display_name} failed: {}", err))?
+            };
             let result_json = js_to_json_or_null(ctx.clone(), result)?;
             ScriptOutput::from_json(result_json)
         });
@@ -325,6 +395,114 @@ fn js_to_json_or_null<'js>(ctx: rquickjs::Ctx<'js>, value: Value<'js>) -> Result
     }
 }
 
+fn attach_history_helper<'js>(
+    ctx: Ctx<'js>,
+    history: Arc<Mutex<SourceHistory>>,
+) -> Result<Object<'js>> {
+    let native = Function::new(ctx.clone(), move |source: String, offset: usize| {
+        native_history_source(&history, &source, offset)
+    })
+    .context("failed to create native history function")?;
+    ctx.globals()
+        .set("__mlab_history_source", native)
+        .context("failed to expose native history function")?;
+    ctx.eval(HISTORY_HELPER_JS)
+        .context("failed to create history helper")
+}
+
+fn native_history_source(
+    history: &Arc<Mutex<SourceHistory>>,
+    source: &str,
+    offset: usize,
+) -> String {
+    let response = match history.lock() {
+        Ok(history) => match history.source(source, offset) {
+            Some(value) => serde_json::json!({ "found": true, "value": value }),
+            None => serde_json::json!({ "found": false }),
+        },
+        Err(_) => serde_json::json!({ "error": "script source history lock poisoned" }),
+    };
+    serde_json::to_string(&response).expect("history response must serialize")
+}
+
+fn stream_history_entry(input: &JsonValue) -> Result<(String, JsonValue, Option<u64>)> {
+    let selector = input
+        .get("source")
+        .and_then(JsonValue::as_str)
+        .context("stream input.source is required for source history")?;
+    let source = input
+        .get("source_type")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_else(|| {
+            selector
+                .split_once('@')
+                .map_or(selector, |(source, _)| source)
+        });
+    let current = input.get("data");
+    let record = match source {
+        "candles" => current
+            .and_then(|value| value.get("candle"))
+            .or_else(|| input.pointer("/candles/candle")),
+        "orderbook" => current
+            .and_then(|value| value.get("snapshot"))
+            .or_else(|| input.pointer("/orderbook/snapshot")),
+        "vd" => current
+            .and_then(|value| value.get("record").or_else(|| value.get("candle")))
+            .or_else(|| input.pointer("/vd/record"))
+            .or_else(|| input.pointer("/vd/candle")),
+        "oi" => current
+            .and_then(|value| value.get("record").or_else(|| value.get("candle")))
+            .or_else(|| input.pointer("/oi/record"))
+            .or_else(|| input.pointer("/oi/candle")),
+        "volumes" => current
+            .and_then(|value| value.get("record").or_else(|| value.get("profile")))
+            .or_else(|| input.pointer("/volumes/record"))
+            .or_else(|| input.pointer("/volumes/profile")),
+        _ => anyhow::bail!("unknown stream input.source `{selector}`"),
+    }
+    .with_context(|| format!("stream input has no current {source} record"))?;
+
+    let replaces_same_timestamp = match source {
+        "candles" | "volumes" => true,
+        "vd" => record.get("delta").is_none(),
+        "oi" => record.get("mark_price").is_none(),
+        "orderbook" => false,
+        _ => unreachable!(),
+    };
+    let identity = replaces_same_timestamp
+        .then(|| record.get("t").and_then(JsonValue::as_u64))
+        .flatten();
+
+    Ok((selector.to_string(), record.clone(), identity))
+}
+
+const HISTORY_HELPER_JS: &str = r#"
+(() => {
+  const deepFreeze = (value) => {
+    if (value && typeof value === "object" && !Object.isFrozen(value)) {
+      Object.freeze(value);
+      for (const child of Object.values(value)) deepFreeze(child);
+    }
+    return value;
+  };
+
+  return Object.freeze({
+    source(name, offset = 0) {
+      if (typeof name !== "string" || name.length === 0) {
+        throw new TypeError("history.source name must be a non-empty string");
+      }
+      if (!Number.isSafeInteger(offset) || offset < 0) {
+        throw new RangeError("history.source offset must be a non-negative integer");
+      }
+
+      const response = JSON.parse(globalThis.__mlab_history_source(name, offset));
+      if (response.error) throw new Error(response.error);
+      return response.found ? deepFreeze(response.value) : undefined;
+    }
+  });
+})()
+"#;
+
 fn module_name(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -385,7 +563,7 @@ export const script = {
   }
 };
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   return { metrics: { count: input.candles.candles.length, threshold: ctx.params.candles.min_vbuy } };
 }
 "#,
@@ -409,7 +587,7 @@ export const study = {
   params: {}
 };
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   return { metrics: { candles: input.candles.candles.length } };
 }
 "#,
@@ -443,7 +621,7 @@ export const script = {
   }
 };
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   const filtered = input.candles.candles.filter((c) => c.vb >= ctx.params.candles.min_vbuy);
   return {
     metrics: {
@@ -483,7 +661,7 @@ export const script = {
   params: {}
 };
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   const sma = ctx.study.sma(input.candles.candles, { field: "c", window: 3 });
   const ema = ctx.study.ema(input.candles.candles, { field: "c", window: 3 });
   return {
@@ -525,7 +703,7 @@ export const script = {
   params: {}
 };
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   const cvd = ctx.study.cvd(input.vd.candles, { bucket: input.vd.bucket });
   const single = ctx.study.cvd(input.vd.candles[input.vd.candles.length - 1], { bucket: input.vd.bucket });
   return {
@@ -581,7 +759,7 @@ export const script = {
   params: {}
 };
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   return {
     metrics: ctx.study.cvd(input.candles.candles, { bucket: 1 })
   };
@@ -614,7 +792,7 @@ export const script = {
   params: {}
 };
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   return { metrics: ctx.study.sma(input.candles.candles, { field: "missing", window: 2 }) };
 }
 "#,
@@ -645,7 +823,7 @@ export const script = {
   params: {}
 };
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   const book = input.orderbook.books[input.orderbook.books.length - 1];
   const spread = ctx.study.spread(book);
   const depth = ctx.study.depth(book, { levels: 2 });
@@ -719,7 +897,7 @@ export const script = {
   params: {}
 };
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   const latest = input.orderbook.books[input.orderbook.books.length - 1];
   const spread = ctx.study.spread(latest);
   return {
@@ -785,7 +963,7 @@ export const script = {
   params: {}
 };
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   const latest = input.vd.candles[input.vd.candles.length - 1];
   return {
     metrics: {
@@ -841,7 +1019,7 @@ export const script = {
 
 let calls = 0;
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   calls += 1;
   return {
     metrics: {
@@ -883,7 +1061,7 @@ export const script = {
 
 let calls = 0;
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   calls += 1;
   return {
     metrics: {
@@ -906,6 +1084,7 @@ export function onData(ctx, input) {
         let first = session
             .run_stream(json!({
                 "mode": "stream",
+                "source": "candles",
                 "candles": {
                     "candle": { "t": 1, "o": 1.0, "h": 1.0, "l": 1.0, "c": 10.0, "vb": 1.0, "vs": 1.0, "tb": 1, "ts": 1 }
                 }
@@ -914,6 +1093,7 @@ export function onData(ctx, input) {
         let second = session
             .run_stream(json!({
                 "mode": "stream",
+                "source": "candles",
                 "candles": {
                     "candle": { "t": 2, "o": 1.0, "h": 1.0, "l": 1.0, "c": 11.0, "vb": 1.0, "vs": 1.0, "tb": 1, "ts": 1 }
                 }
@@ -924,6 +1104,243 @@ export function onData(ctx, input) {
         assert_eq!(first.output.metrics["close"], 10.0);
         assert_eq!(second.output.metrics["calls"], 2);
         assert_eq!(second.output.metrics["close"], 11.0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn stream_history_exposes_bounded_current_and_previous_records() {
+        let path = write_temp_script(
+            r#"
+export const script = {
+  name: "stream-history",
+  version: "1",
+  sources: ["candles"],
+  modes: ["stream"],
+  params: {}
+};
+
+export function onData(ctx, input, history) {
+  const current = history.source("candles", 0);
+  const previous = history.source("candles", 1);
+  return {
+    metrics: {
+      current: current.c,
+      previous: previous?.c ?? null,
+      out_of_range: history.source("candles", 2) === undefined,
+      frozen: Object.isFrozen(current)
+    }
+  };
+}
+"#,
+            "stream-history",
+        );
+
+        let script = Script::load(&path).expect("load script");
+        let session = script.start_session(&json!({})).expect("start session");
+        let first = session
+            .run_stream(json!({
+                "mode": "stream",
+                "source": "candles",
+                "candles": { "candle": { "t": 1, "c": 10.0 } }
+            }))
+            .expect("first stream run");
+        let second = session
+            .run_stream(json!({
+                "mode": "stream",
+                "source": "candles",
+                "candles": { "candle": { "t": 2, "c": 11.0 } }
+            }))
+            .expect("second stream run");
+        let third = session
+            .run_stream(json!({
+                "mode": "stream",
+                "source": "candles",
+                "candles": { "candle": { "t": 3, "c": 12.0 } }
+            }))
+            .expect("third stream run");
+
+        assert_eq!(first.output.metrics["current"], 10.0);
+        assert!(first.output.metrics["previous"].is_null());
+        assert_eq!(second.output.metrics["current"], 11.0);
+        assert_eq!(second.output.metrics["previous"], 10.0);
+        assert_eq!(third.output.metrics["current"], 12.0);
+        assert_eq!(third.output.metrics["previous"], 11.0);
+        assert_eq!(third.output.metrics["out_of_range"], true);
+        assert_eq!(third.output.metrics["frozen"], true);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn stream_history_replaces_the_current_bar_with_the_same_timestamp() {
+        let path = write_temp_script(
+            r#"
+export const script = {
+  name: "stream-history-bar-replacement",
+  version: "1",
+  sources: ["candles"],
+  modes: ["stream"],
+  params: {}
+};
+
+export function onData(ctx, input, history) {
+  return {
+    metrics: {
+      current: history.source("candles", 0).c,
+      previous: history.source("candles", 1)?.c ?? null
+    }
+  };
+}
+"#,
+            "stream-history-bar-replacement",
+        );
+
+        let script = Script::load(&path).expect("load script");
+        let session = script.start_session(&json!({})).expect("start session");
+        session
+            .run_stream(json!({
+                "mode": "stream",
+                "source": "candles",
+                "candles": { "candle": { "t": 1, "c": 10.0 } }
+            }))
+            .expect("first stream run");
+        let replacement = session
+            .run_stream(json!({
+                "mode": "stream",
+                "source": "candles",
+                "candles": { "candle": { "t": 1, "c": 10.5 } }
+            }))
+            .expect("replacement stream run");
+        let next = session
+            .run_stream(json!({
+                "mode": "stream",
+                "source": "candles",
+                "candles": { "candle": { "t": 2, "c": 11.0 } }
+            }))
+            .expect("next stream run");
+
+        assert_eq!(replacement.output.metrics["current"], 10.5);
+        assert!(replacement.output.metrics["previous"].is_null());
+        assert_eq!(next.output.metrics["current"], 11.0);
+        assert_eq!(next.output.metrics["previous"], 10.5);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn stream_history_is_independent_for_each_source() {
+        let path = write_temp_script(
+            r#"
+export const script = {
+  name: "stream-history-sources",
+  version: "1",
+  sources: ["candles", "orderbook"],
+  modes: ["stream"],
+  params: {}
+};
+
+export function onData(ctx, input, history) {
+  return {
+    metrics: {
+      candle: history.source("candles", 0)?.c ?? null,
+      previous_candle: history.source("candles", 1)?.c ?? null,
+      book_ts: history.source("orderbook", 0)?.timestamp_ms ?? null
+    }
+  };
+}
+"#,
+            "stream-history-sources",
+        );
+
+        let script = Script::load(&path).expect("load script");
+        let session = script.start_session(&json!({})).expect("start session");
+        session
+            .run_stream(json!({
+                "mode": "stream",
+                "source": "candles",
+                "candles": { "candle": { "t": 1, "c": 10.0 } }
+            }))
+            .expect("candle stream run");
+        let book = session
+            .run_stream(json!({
+                "mode": "stream",
+                "source": "orderbook",
+                "orderbook": {
+                    "snapshot": { "timestamp_ms": 2, "bids": [], "asks": [] }
+                }
+            }))
+            .expect("orderbook stream run");
+        let candle = session
+            .run_stream(json!({
+                "mode": "stream",
+                "source": "candles",
+                "candles": { "candle": { "t": 3, "c": 11.0 } }
+            }))
+            .expect("second candle stream run");
+
+        assert_eq!(book.output.metrics["candle"], 10.0);
+        assert_eq!(book.output.metrics["book_ts"], 2);
+        assert_eq!(candle.output.metrics["candle"], 11.0);
+        assert_eq!(candle.output.metrics["previous_candle"], 10.0);
+        assert_eq!(candle.output.metrics["book_ts"], 2);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn stream_history_is_independent_for_exchange_qualified_sources() {
+        let path = write_temp_script(
+            r#"
+export const script = {
+  name: "stream-history-exchanges",
+  version: "1",
+  sources: ["candles"],
+  modes: ["stream"],
+  params: {}
+};
+
+export function onData(ctx, input, history) {
+  return {
+    metrics: {
+      binance: history.source("candles@binancef", 0)?.c ?? null,
+      previous_binance: history.source("candles@binancef", 1)?.c ?? null,
+      okx: history.source("candles@okx", 0)?.c ?? null
+    }
+  };
+}
+"#,
+            "stream-history-exchanges",
+        );
+
+        let script = Script::load(&path).expect("load script");
+        let session = script.start_session(&json!({})).expect("start session");
+        session
+            .run_stream(json!({
+                "mode": "stream",
+                "source": "candles@binancef",
+                "source_type": "candles",
+                "data": { "candle": { "t": 1, "c": 10.0 } }
+            }))
+            .expect("first binance stream run");
+        let okx = session
+            .run_stream(json!({
+                "mode": "stream",
+                "source": "candles@okx",
+                "source_type": "candles",
+                "data": { "candle": { "t": 1, "c": 20.0 } }
+            }))
+            .expect("okx stream run");
+        let binance = session
+            .run_stream(json!({
+                "mode": "stream",
+                "source": "candles@binancef",
+                "source_type": "candles",
+                "data": { "candle": { "t": 2, "c": 11.0 } }
+            }))
+            .expect("second binance stream run");
+
+        assert_eq!(okx.output.metrics["binance"], 10.0);
+        assert_eq!(okx.output.metrics["okx"], 20.0);
+        assert_eq!(binance.output.metrics["binance"], 11.0);
+        assert_eq!(binance.output.metrics["previous_binance"], 10.0);
+        assert_eq!(binance.output.metrics["okx"], 20.0);
         let _ = fs::remove_file(path);
     }
 
@@ -939,7 +1356,7 @@ export const script = {
   params: {}
 };
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   return { metrics: { count: input.cande.length } };
 }
 "#,
@@ -970,7 +1387,7 @@ export const script = {
   params: {}
 };
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   return { metrics: { candles: input.candles.candles.length } };
 }
 "#,
@@ -1009,7 +1426,7 @@ export const script = {
         };
         let message = err.to_string();
 
-        assert!(message.contains("onData(ctx, input)"));
+        assert!(message.contains("onData(ctx, input, history)"));
         let _ = fs::remove_file(path);
     }
 
@@ -1025,7 +1442,7 @@ export const script = {
   params: {}
 };
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   ctx.trade({
     key: "entry-1",
     side: "long",
@@ -1057,7 +1474,11 @@ export function onExecution(ctx, event) {
             )
             .expect("start execution session");
         let execution = session
-            .run_stream(json!({ "mode": "stream", "candles": { "candles": [] } }))
+            .run_stream(json!({
+                "mode": "stream",
+                "source": "candles",
+                "candles": { "candle": { "t": 1, "c": 1.0 } }
+            }))
             .expect("run onData");
         assert!(execution.output.metrics.as_object().unwrap().is_empty());
         assert_eq!(execution.commands.len(), 1);
@@ -1097,7 +1518,7 @@ export const script = {
   params: {}
 };
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   let total = 0;
   for (const candle of input.candles.candles) {
     total += candle.c;

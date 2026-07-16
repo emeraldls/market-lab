@@ -5,12 +5,12 @@ export const script = {
   params: {}
 }
 
-function candlesFrom(input) {
-  return input.mode === "stream" ? [input.candles.candle] : input.candles.candles
+function candlesFrom(input, history) {
+  return input.mode === "stream" ? [history.source("candles", 0)] : input.candles.candles
 }
 
-export function onData(ctx, input) {
-  const candles = candlesFrom(input)
+export function onData(ctx, input, history) {
+  const candles = candlesFrom(input, history)
   const latest = candles[candles.length - 1]
   const first = candles[0]
   const high = Math.max(...candles.map((c) => c.h))

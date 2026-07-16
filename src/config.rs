@@ -407,6 +407,8 @@ mod tests {
     use clap::Parser;
 
     use crate::cli::{Cli, Commands, ScriptCommands};
+    use crate::scripting::inputs::{parse_source_configs, validate_source_configs};
+    use crate::scripting::manifest::{ScriptManifest, ScriptSource};
 
     #[test]
     fn cli_values_override_config_values() {
@@ -474,6 +476,87 @@ leverage = 2
     }
 
     #[test]
+    fn expands_exchange_qualified_script_sources_without_global_exchange() {
+        let dir =
+            std::env::temp_dir().join(format!("mlab-multi-exchange-config-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create config test directory");
+        let path = dir.join("marketlab.toml");
+        fs::write(
+            &path,
+            r#"
+version = 1
+
+[market]
+provider = "mmt"
+symbol = "BTC/USDT"
+
+[script]
+path = "strategy.js"
+
+[sources."candles@okx"]
+timeframe = 60
+
+[sources."orderbook@binancef"]
+depth = 20
+timeframe = 60
+
+[backtest]
+from = 1780000000000
+to = 1780003600000
+"#,
+        )
+        .expect("write config");
+
+        let expanded = expand_args(
+            [
+                "mlab",
+                "script",
+                "backtest",
+                "--config",
+                path.to_str().expect("utf8 path"),
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .expect("expand args");
+        let cli = Cli::try_parse_from(expanded).expect("parse expanded args");
+
+        match cli.command {
+            Commands::Script {
+                command: ScriptCommands::Backtest(args),
+            } => {
+                assert_eq!(args.exchange, None);
+                assert_eq!(args.symbol, "BTC/USDT");
+                assert_eq!(
+                    args.source,
+                    vec![
+                        "candles@okx:timeframe=60",
+                        "orderbook@binancef:depth=20",
+                        "orderbook@binancef:timeframe=60"
+                    ]
+                );
+                args.validate()
+                    .expect("qualified sources should not require --exchange");
+                let configs = parse_source_configs(&args.source, None)
+                    .expect("parse qualified sources from TOML");
+                let manifest = ScriptManifest {
+                    name: "toml-multi-exchange".to_string(),
+                    version: "1".to_string(),
+                    sources: vec![ScriptSource::Candles, ScriptSource::Orderbook],
+                    modes: vec![],
+                    clock: None,
+                    description: None,
+                    lookback: None,
+                    params: BTreeMap::new(),
+                };
+                validate_source_configs(&manifest, &configs)
+                    .expect("qualified TOML sources should fully validate");
+            }
+            _ => panic!("expected script backtest"),
+        }
+    }
+
+    #[test]
     fn expands_trade_config_and_keeps_cli_precedence() {
         let dir = std::env::temp_dir().join(format!("mlab-trade-config-{}", std::process::id()));
         fs::create_dir_all(&dir).expect("create config test directory");
@@ -530,5 +613,4 @@ format = "json"
             _ => panic!("expected trade long"),
         }
     }
-
 }

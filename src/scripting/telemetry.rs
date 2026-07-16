@@ -143,6 +143,10 @@ impl ScriptRuntimeReportBuilder {
         self.progress = None;
     }
 
+    pub fn set_exchange(&mut self, exchange: Option<String>) {
+        self.exchange = exchange;
+    }
+
     pub fn set_progress(&mut self, phase: impl Into<String>, current: u64, total: u64) {
         self.phase = Some(phase.into());
         self.progress = Some(ScriptRuntimeProgress { current, total });

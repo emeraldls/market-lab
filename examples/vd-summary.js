@@ -9,7 +9,7 @@ export const script = {
   }
 }
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   if (input.mode !== "window") {
     throw new Error(`unsupported input.mode: ${input.mode}`)
   }

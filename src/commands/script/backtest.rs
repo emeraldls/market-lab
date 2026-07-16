@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -22,8 +22,9 @@ use crate::scripting::execution::{
     ScriptOrderRef, ScriptTradeRequest,
 };
 use crate::scripting::inputs::{
-    SourceConfigs, parse_param_values, parse_source_configs, populate_source_defaults,
-    resolve_params, validate_bulk_source_configs, validate_source_configs,
+    SourceConfig, SourceConfigs, first_source_config, parse_param_values, parse_source_configs,
+    populate_source_defaults, resolve_params, source_exchange_label, validate_bulk_source_configs,
+    validate_source_configs,
 };
 use crate::scripting::limits::SCRIPT_DEFAULT_LOOKBACK_CANDLES;
 use crate::scripting::manifest::ScriptSource;
@@ -31,6 +32,8 @@ use crate::scripting::market_data::{
     ScriptCandle, ScriptOpenInterest, ScriptVolume, ScriptVolumeDelta,
 };
 use tokio::task::JoinHandle;
+
+use super::run::default_script_exchange;
 
 #[derive(Debug, Clone, Serialize)]
 struct ScriptBacktestResult<I>
@@ -241,11 +244,15 @@ struct ScriptBacktestLatestOutput {
 
 #[derive(Default)]
 struct BacktestData {
-    candles: Option<Vec<ScriptCandle>>,
-    orderbooks: Option<Vec<OrderBookSnapshot>>,
-    vd: Option<Vec<ScriptVolumeDelta>>,
-    oi: Option<Vec<ScriptOpenInterest>>,
-    volumes: Option<Vec<ScriptVolume>>,
+    series: BTreeMap<String, BacktestSeries>,
+}
+
+enum BacktestSeries {
+    Candles(Vec<ScriptCandle>),
+    Orderbooks(Vec<OrderBookSnapshot>),
+    Vd(Vec<ScriptVolumeDelta>),
+    Oi(Vec<ScriptOpenInterest>),
+    Volumes(Vec<ScriptVolume>),
 }
 
 pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
@@ -258,14 +265,16 @@ pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
     }
 
     let script = Script::load(&args.script)?;
+    let provider: ProviderKind = args.provider.into();
+    let default_exchange = default_script_exchange(provider, args.exchange.as_deref())?;
     let mut report = report_builder(
         "script.backtest",
         &script,
-        Some(provider_name(args.provider.into()).to_string()),
-        Some(args.exchange_name()?.to_string()),
+        Some(provider_name(provider).to_string()),
+        default_exchange.clone(),
         Some(args.symbol.clone()),
     );
-    let mut source_configs = match parse_source_configs(&args.source) {
+    let mut source_configs = match parse_source_configs(&args.source, default_exchange.as_deref()) {
         Ok(configs) => configs,
         Err(err) => {
             let runtime_report = report.finish_error(&err);
@@ -276,7 +285,7 @@ pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
     let source_validation = match args.provider.into() {
         ProviderKind::Mmt => validate_source_configs(&script.manifest, &source_configs),
         ProviderKind::Bulk => {
-            populate_source_defaults(&script.manifest, &mut source_configs);
+            populate_source_defaults(&script.manifest, &mut source_configs, "bulk");
             validate_bulk_source_configs(&script.manifest, &source_configs, true)
         }
         ProviderKind::MarketLab => unreachable!(),
@@ -286,6 +295,7 @@ pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
         write_report_best_effort(&runtime_report);
         return Err(err);
     }
+    report.set_exchange(Some(source_exchange_label(&source_configs)));
 
     let raw_params = match parse_param_values(&args.param) {
         Ok(raw_params) => raw_params,
@@ -322,12 +332,12 @@ async fn backtest_window(
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
 ) -> Result<()> {
     let data = fetch_sources(&args, &script, &source_configs, report).await?;
-    let clock = script.manifest.clock_source().clone();
+    let clock = first_source_config(&source_configs, script.manifest.clock_source())?.clone();
     let clock_len = clock_len(&clock, &data)?;
     if clock_len < 2 {
         bail!(
             "script backtest requires at least 2 {} records",
-            clock.as_str()
+            clock.selector
         );
     }
 
@@ -359,7 +369,7 @@ async fn backtest_window(
         "running script={} sources={} clock={} records={} lookback={}",
         script.manifest.name,
         script.manifest.source_names(),
-        clock.as_str(),
+        clock.selector,
         clock_len,
         lookback
     );
@@ -383,11 +393,9 @@ async fn backtest_window(
             &mut next_position_id,
         )?;
         let payload = build_window_payload(WindowPayloadContext {
-            script: &script,
             data: &data,
             source_configs: &source_configs,
             provider: provider_name(args.provider.into()),
-            exchange: args.exchange_name()?,
             symbol: &args.symbol,
             clock: &clock,
             clock_idx: idx,
@@ -466,7 +474,7 @@ async fn backtest_window(
                 "processed {}/{} {} records",
                 idx + 1,
                 clock_len - 1,
-                clock.as_str()
+                clock.selector
             );
             report.set_progress("executing_hooks", (idx + 1) as u64, (clock_len - 1) as u64);
             write_running_report_best_effort(report);
@@ -480,7 +488,7 @@ async fn backtest_window(
     }
 
     let timeframe_sec = source_configs
-        .get(&clock)
+        .get(&clock.selector)
         .and_then(|config| config.timeframe)
         .unwrap_or_default();
     let mark_ts_ms = clock_ts_ms(&clock, &data, clock_len - 1).unwrap_or(args.to);
@@ -502,7 +510,7 @@ async fn backtest_window(
         r#type: "script.backtest.result",
         version: "1",
         provider: provider_name(args.provider.into()),
-        exchange: args.exchange_name()?.to_string(),
+        exchange: clock.exchange.clone(),
         symbol: args.symbol.clone(),
         ts_ms: mark_ts_ms,
         script: ScriptDescriptor {
@@ -532,7 +540,7 @@ async fn backtest_window(
             intent: json!({}),
         }),
         meta: json!({
-            "clock": clock.as_str(),
+            "clock": clock.selector,
             "source_data": {
                 "orderbook": "flat_heatmap_hd"
             }
@@ -544,31 +552,30 @@ async fn backtest_window(
 
 async fn fetch_sources(
     args: &ScriptBacktestArgs,
-    script: &Script,
+    _script: &Script,
     source_configs: &SourceConfigs,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
 ) -> Result<BacktestData> {
     match args.provider.into() {
-        ProviderKind::Mmt => fetch_mmt_sources(args, script, source_configs, report).await,
-        ProviderKind::Bulk => fetch_bulk_sources(args, script, source_configs, report).await,
+        ProviderKind::Mmt => fetch_mmt_sources(args, source_configs, report).await,
+        ProviderKind::Bulk => fetch_bulk_sources(args, source_configs, report).await,
         ProviderKind::MarketLab => bail!("script backtest supports --provider mmt|bulk"),
     }
 }
 
 async fn fetch_mmt_sources(
     args: &ScriptBacktestArgs,
-    script: &Script,
     source_configs: &SourceConfigs,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
 ) -> Result<BacktestData> {
     let mut data = BacktestData::default();
     let mut cancel = Box::pin(tokio::signal::ctrl_c());
-    let exchange = args.exchange_name()?;
+    let mut configs = source_configs.values().collect::<Vec<_>>();
+    configs.sort_by_key(|config| config.position);
 
-    for source in &script.manifest.sources {
-        let config = source_configs
-            .get(source)
-            .ok_or_else(|| anyhow::anyhow!("missing source config for {}", source.as_str()))?;
+    for config in configs {
+        let source = &config.source;
+        let exchange = config.exchange.as_str();
         match source {
             ScriptSource::Candles => {
                 let timeframe = config.require_timeframe(source)?;
@@ -599,12 +606,15 @@ async fn fetch_mmt_sources(
                     series.data.len() as u64,
                 );
                 write_running_report_best_effort(report);
-                data.candles = Some(
-                    series
-                        .data
-                        .into_iter()
-                        .map(ScriptCandle::from_mmt)
-                        .collect(),
+                data.series.insert(
+                    config.selector.clone(),
+                    BacktestSeries::Candles(
+                        series
+                            .data
+                            .into_iter()
+                            .map(ScriptCandle::from_mmt)
+                            .collect(),
+                    ),
                 );
             }
             ScriptSource::Orderbook => {
@@ -644,7 +654,8 @@ async fn fetch_mmt_sources(
                     series.len() as u64,
                 );
                 write_running_report_best_effort(report);
-                data.orderbooks = Some(series);
+                data.series
+                    .insert(config.selector.clone(), BacktestSeries::Orderbooks(series));
             }
             ScriptSource::Vd => {
                 let timeframe = config.require_timeframe(source)?;
@@ -677,12 +688,15 @@ async fn fetch_mmt_sources(
                     series.data.len() as u64,
                 );
                 write_running_report_best_effort(report);
-                data.vd = Some(
-                    series
-                        .data
-                        .into_iter()
-                        .map(ScriptVolumeDelta::from_mmt)
-                        .collect(),
+                data.series.insert(
+                    config.selector.clone(),
+                    BacktestSeries::Vd(
+                        series
+                            .data
+                            .into_iter()
+                            .map(ScriptVolumeDelta::from_mmt)
+                            .collect(),
+                    ),
                 );
             }
             ScriptSource::Oi => {
@@ -714,12 +728,15 @@ async fn fetch_mmt_sources(
                     series.data.len() as u64,
                 );
                 write_running_report_best_effort(report);
-                data.oi = Some(
-                    series
-                        .data
-                        .into_iter()
-                        .map(ScriptOpenInterest::from_mmt)
-                        .collect(),
+                data.series.insert(
+                    config.selector.clone(),
+                    BacktestSeries::Oi(
+                        series
+                            .data
+                            .into_iter()
+                            .map(ScriptOpenInterest::from_mmt)
+                            .collect(),
+                    ),
                 );
             }
             ScriptSource::Volumes => {
@@ -751,12 +768,15 @@ async fn fetch_mmt_sources(
                     series.data.len() as u64,
                 );
                 write_running_report_best_effort(report);
-                data.volumes = Some(
-                    series
-                        .data
-                        .into_iter()
-                        .map(ScriptVolume::from_mmt)
-                        .collect(),
+                data.series.insert(
+                    config.selector.clone(),
+                    BacktestSeries::Volumes(
+                        series
+                            .data
+                            .into_iter()
+                            .map(ScriptVolume::from_mmt)
+                            .collect(),
+                    ),
                 );
             }
         }
@@ -767,17 +787,16 @@ async fn fetch_mmt_sources(
 
 async fn fetch_bulk_sources(
     args: &ScriptBacktestArgs,
-    script: &Script,
     source_configs: &SourceConfigs,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
 ) -> Result<BacktestData> {
     let mut data = BacktestData::default();
     let mut cancel = Box::pin(tokio::signal::ctrl_c());
 
-    for source in &script.manifest.sources {
-        let config = source_configs
-            .get(source)
-            .ok_or_else(|| anyhow::anyhow!("missing source config for {}", source.as_str()))?;
+    let mut configs = source_configs.values().collect::<Vec<_>>();
+    configs.sort_by_key(|config| config.position);
+    for config in configs {
+        let source = &config.source;
         let timeframe = config.require_timeframe(source)?;
         let interval = crate::providers::bulk::market_data::timeframe_from_seconds(timeframe)?;
         let phase = match source {
@@ -812,21 +831,27 @@ async fn fetch_bulk_sources(
         let points = series.data.len();
         match source {
             ScriptSource::Candles => {
-                data.candles = Some(
-                    series
-                        .data
-                        .into_iter()
-                        .map(ScriptCandle::from_bulk)
-                        .collect(),
+                data.series.insert(
+                    config.selector.clone(),
+                    BacktestSeries::Candles(
+                        series
+                            .data
+                            .into_iter()
+                            .map(ScriptCandle::from_bulk)
+                            .collect(),
+                    ),
                 );
             }
             ScriptSource::Volumes => {
-                data.volumes = Some(
-                    series
-                        .data
-                        .into_iter()
-                        .map(ScriptVolume::from_bulk_candle)
-                        .collect(),
+                data.series.insert(
+                    config.selector.clone(),
+                    BacktestSeries::Volumes(
+                        series
+                            .data
+                            .into_iter()
+                            .map(ScriptVolume::from_bulk_candle)
+                            .collect(),
+                    ),
                 );
             }
             ScriptSource::Orderbook | ScriptSource::Vd | ScriptSource::Oi => unreachable!(),
@@ -848,13 +873,11 @@ async fn fetch_bulk_sources(
 }
 
 struct WindowPayloadContext<'a> {
-    script: &'a Script,
     data: &'a BacktestData,
     source_configs: &'a SourceConfigs,
     provider: &'a str,
-    exchange: &'a str,
     symbol: &'a str,
-    clock: &'a ScriptSource,
+    clock: &'a SourceConfig,
     clock_idx: usize,
     cutoff_ms: u64,
     lookback: usize,
@@ -870,115 +893,98 @@ fn build_window_payload(ctx: WindowPayloadContext<'_>) -> Result<Value> {
     );
     root.insert(
         "exchange".to_string(),
-        Value::String(ctx.exchange.to_string()),
+        Value::String(ctx.clock.exchange.clone()),
     );
     root.insert("symbol".to_string(), Value::String(ctx.symbol.to_string()));
+    root.insert(
+        "clock".to_string(),
+        Value::String(ctx.clock.selector.clone()),
+    );
 
-    for source in &ctx.script.manifest.sources {
-        match source {
-            ScriptSource::Candles => {
-                let candles = ctx
-                    .data
-                    .candles
-                    .as_ref()
-                    .context("candles data not loaded")?;
-                let end = if source == ctx.clock {
+    let mut sources = Map::new();
+    let mut configs = ctx.source_configs.values().collect::<Vec<_>>();
+    configs.sort_by_key(|config| config.position);
+    for config in configs {
+        let series = ctx
+            .data
+            .series
+            .get(&config.selector)
+            .with_context(|| format!("{} data not loaded", config.selector))?;
+        let envelope = match (config.source.clone(), series) {
+            (ScriptSource::Candles, BacktestSeries::Candles(candles)) => {
+                let end = if config.selector == ctx.clock.selector {
                     ctx.clock_idx + 1
                 } else {
                     upper_bound_by_ts(candles, ctx.cutoff_ms, candle_ts_ms)
                 };
                 let start = end.saturating_sub(ctx.lookback);
-                let slice = serde_json::to_value(&candles[start..end])?;
-                root.insert("candles".to_string(), json!({ "candles": slice }));
+                json!({ "candles": &candles[start..end] })
             }
-            ScriptSource::Orderbook => {
-                let books = ctx
-                    .data
-                    .orderbooks
-                    .as_ref()
-                    .context("orderbook data not loaded")?;
-                let end = if source == ctx.clock {
+            (ScriptSource::Orderbook, BacktestSeries::Orderbooks(books)) => {
+                let end = if config.selector == ctx.clock.selector {
                     ctx.clock_idx + 1
                 } else {
                     upper_bound_by_ts(books, ctx.cutoff_ms, |book| book.timestamp_ms)
                 };
                 let start = end.saturating_sub(ctx.lookback);
-                let slice = serde_json::to_value(&books[start..end])?;
-                root.insert("orderbook".to_string(), json!({ "books": slice }));
+                json!({ "books": &books[start..end] })
             }
-            ScriptSource::Vd => {
-                let config = ctx
-                    .source_configs
-                    .get(source)
-                    .context("missing source config for vd")?;
-                let candles = ctx.data.vd.as_ref().context("vd data not loaded")?;
-                let end = if source == ctx.clock {
+            (ScriptSource::Vd, BacktestSeries::Vd(candles)) => {
+                let end = if config.selector == ctx.clock.selector {
                     ctx.clock_idx + 1
                 } else {
                     upper_bound_by_ts(candles, ctx.cutoff_ms, vd_ts_ms)
                 };
                 let start = end.saturating_sub(ctx.lookback);
-                let slice = serde_json::to_value(&candles[start..end])?;
-                root.insert(
-                    "vd".to_string(),
-                    json!({
-                        "candles": slice.clone(),
-                        "records": slice,
-                        "bucket": config.require_bucket(source)?,
-                        "timeframe_sec": config.require_timeframe(source)?,
-                    }),
-                );
+                let slice = &candles[start..end];
+                json!({
+                    "candles": slice,
+                    "records": slice,
+                    "bucket": config.require_bucket(&config.source)?,
+                    "timeframe_sec": config.require_timeframe(&config.source)?,
+                })
             }
-            ScriptSource::Oi => {
-                let config = ctx
-                    .source_configs
-                    .get(source)
-                    .context("missing source config for oi")?;
-                let candles = ctx.data.oi.as_ref().context("oi data not loaded")?;
-                let end = if source == ctx.clock {
+            (ScriptSource::Oi, BacktestSeries::Oi(candles)) => {
+                let end = if config.selector == ctx.clock.selector {
                     ctx.clock_idx + 1
                 } else {
                     upper_bound_by_ts(candles, ctx.cutoff_ms, oi_ts_ms)
                 };
                 let start = end.saturating_sub(ctx.lookback);
-                let slice = serde_json::to_value(&candles[start..end])?;
-                root.insert(
-                    "oi".to_string(),
-                    json!({
-                        "candles": slice.clone(),
-                        "records": slice,
-                        "timeframe_sec": config.require_timeframe(source)?,
-                    }),
-                );
+                let slice = &candles[start..end];
+                json!({
+                    "candles": slice,
+                    "records": slice,
+                    "timeframe_sec": config.require_timeframe(&config.source)?,
+                })
             }
-            ScriptSource::Volumes => {
-                let config = ctx
-                    .source_configs
-                    .get(source)
-                    .context("missing source config for volumes")?;
-                let profiles = ctx
-                    .data
-                    .volumes
-                    .as_ref()
-                    .context("volumes data not loaded")?;
-                let end = if source == ctx.clock {
+            (ScriptSource::Volumes, BacktestSeries::Volumes(profiles)) => {
+                let end = if config.selector == ctx.clock.selector {
                     ctx.clock_idx + 1
                 } else {
                     upper_bound_by_ts(profiles, ctx.cutoff_ms, volume_ts_ms)
                 };
                 let start = end.saturating_sub(ctx.lookback);
-                let slice = serde_json::to_value(&profiles[start..end])?;
-                root.insert(
-                    "volumes".to_string(),
-                    json!({
-                        "profiles": slice.clone(),
-                        "records": slice,
-                        "timeframe_sec": config.require_timeframe(source)?,
-                    }),
-                );
+                let slice = &profiles[start..end];
+                json!({
+                    "profiles": slice,
+                    "records": slice,
+                    "timeframe_sec": config.require_timeframe(&config.source)?,
+                })
             }
+            _ => bail!("{} data type does not match its source", config.selector),
+        };
+        sources.insert(config.selector.clone(), envelope.clone());
+        let same_kind = ctx
+            .source_configs
+            .values()
+            .filter(|candidate| candidate.source == config.source)
+            .count();
+        if same_kind == 1 {
+            root.insert(config.source.as_str().to_string(), envelope);
         }
     }
+    root.insert("sources".to_string(), Value::Object(sources));
 
     let mark_price = clock_price(ctx.clock, ctx.data, ctx.clock_idx)?;
     let open_positions =
@@ -995,69 +1001,55 @@ fn upper_bound_by_ts<T>(items: &[T], cutoff_ms: u64, ts: impl Fn(&T) -> u64) -> 
         .unwrap_or(items.len())
 }
 
-fn clock_len(clock: &ScriptSource, data: &BacktestData) -> Result<usize> {
-    match clock {
-        ScriptSource::Candles => Ok(data
-            .candles
-            .as_ref()
-            .context("candles data not loaded")?
-            .len()),
-        ScriptSource::Orderbook => Ok(data
-            .orderbooks
-            .as_ref()
-            .context("orderbook data not loaded")?
-            .len()),
-        ScriptSource::Vd => Ok(data.vd.as_ref().context("vd data not loaded")?.len()),
-        ScriptSource::Oi => Ok(data.oi.as_ref().context("oi data not loaded")?.len()),
-        ScriptSource::Volumes => Ok(data
-            .volumes
-            .as_ref()
-            .context("volumes data not loaded")?
-            .len()),
+fn clock_len(clock: &SourceConfig, data: &BacktestData) -> Result<usize> {
+    match data.series.get(&clock.selector) {
+        Some(BacktestSeries::Candles(items)) => Ok(items.len()),
+        Some(BacktestSeries::Orderbooks(items)) => Ok(items.len()),
+        Some(BacktestSeries::Vd(items)) => Ok(items.len()),
+        Some(BacktestSeries::Oi(items)) => Ok(items.len()),
+        Some(BacktestSeries::Volumes(items)) => Ok(items.len()),
+        None => bail!("{} data not loaded", clock.selector),
     }
 }
 
-fn clock_ts_ms(clock: &ScriptSource, data: &BacktestData, idx: usize) -> Result<u64> {
-    match clock {
-        ScriptSource::Candles => Ok(candle_ts_ms(
-            &data.candles.as_ref().context("candles data not loaded")?[idx],
-        )),
-        ScriptSource::Orderbook => Ok(data
-            .orderbooks
-            .as_ref()
-            .context("orderbook data not loaded")?[idx]
-            .timestamp_ms),
-        ScriptSource::Vd => Ok(vd_ts_ms(
-            &data.vd.as_ref().context("vd data not loaded")?[idx],
-        )),
-        ScriptSource::Oi => Ok(oi_ts_ms(
-            &data.oi.as_ref().context("oi data not loaded")?[idx],
-        )),
-        ScriptSource::Volumes => Ok(volume_ts_ms(
-            &data.volumes.as_ref().context("volumes data not loaded")?[idx],
-        )),
+fn clock_ts_ms(clock: &SourceConfig, data: &BacktestData, idx: usize) -> Result<u64> {
+    match data.series.get(&clock.selector) {
+        Some(BacktestSeries::Candles(items)) => Ok(candle_ts_ms(&items[idx])),
+        Some(BacktestSeries::Orderbooks(items)) => Ok(items[idx].timestamp_ms),
+        Some(BacktestSeries::Vd(items)) => Ok(vd_ts_ms(&items[idx])),
+        Some(BacktestSeries::Oi(items)) => Ok(oi_ts_ms(&items[idx])),
+        Some(BacktestSeries::Volumes(items)) => Ok(volume_ts_ms(&items[idx])),
+        None => bail!("{} data not loaded", clock.selector),
     }
 }
 
-fn clock_price(clock: &ScriptSource, data: &BacktestData, idx: usize) -> Result<f64> {
-    match clock {
-        ScriptSource::Candles => {
-            Ok(data.candles.as_ref().context("candles data not loaded")?[idx].c)
-        }
-        ScriptSource::Orderbook => book_mid(
-            &data
-                .orderbooks
-                .as_ref()
-                .context("orderbook data not loaded")?[idx],
-        ),
-        ScriptSource::Vd => {
-            let record = &data.vd.as_ref().context("vd data not loaded")?[idx];
+fn clock_price(clock: &SourceConfig, data: &BacktestData, idx: usize) -> Result<f64> {
+    match data.series.get(&clock.selector) {
+        Some(BacktestSeries::Candles(items)) => Ok(items[idx].c),
+        Some(BacktestSeries::Orderbooks(items)) => book_mid(&items[idx]),
+        Some(BacktestSeries::Vd(items)) => {
+            let record = &items[idx];
             Ok(record.c.unwrap_or(record.value))
         }
-        ScriptSource::Oi => Ok(data.oi.as_ref().context("oi data not loaded")?[idx].c),
-        ScriptSource::Volumes => data.volumes.as_ref().context("volumes data not loaded")?[idx]
+        Some(BacktestSeries::Oi(items)) => Ok(items[idx].c),
+        Some(BacktestSeries::Volumes(items)) => items[idx]
             .reference_price()
             .context("volume record has no reference price"),
+        None => bail!("{} data not loaded", clock.selector),
+    }
+}
+
+fn clock_candle<'a>(
+    clock: &SourceConfig,
+    data: &'a BacktestData,
+    idx: usize,
+) -> Result<&'a ScriptCandle> {
+    match data.series.get(&clock.selector) {
+        Some(BacktestSeries::Candles(items)) => items
+            .get(idx)
+            .with_context(|| format!("{} record {idx} is out of range", clock.selector)),
+        Some(_) => bail!("{} is not candle data", clock.selector),
+        None => bail!("{} data not loaded", clock.selector),
     }
 }
 
@@ -1280,7 +1272,7 @@ fn cancel_script_order(
 }
 
 fn fill_pending_script_orders(
-    clock: &ScriptSource,
+    clock: &SourceConfig,
     data: &BacktestData,
     idx: usize,
     script_orders: &mut HashMap<String, SimulatedScriptOrder>,
@@ -1318,7 +1310,7 @@ fn fill_pending_script_orders(
 }
 
 fn limit_order_touched(
-    clock: &ScriptSource,
+    clock: &SourceConfig,
     data: &BacktestData,
     idx: usize,
     request: &ScriptTradeRequest,
@@ -1326,8 +1318,8 @@ fn limit_order_touched(
 ) -> Result<bool> {
     use crate::domain::execution::PositionDirection;
 
-    if *clock == ScriptSource::Candles {
-        let candle = &data.candles.as_ref().context("candles data not loaded")?[idx];
+    if clock.source == ScriptSource::Candles {
+        let candle = clock_candle(clock, data, idx)?;
         return Ok(match request.side {
             PositionDirection::Long => candle.l <= limit,
             PositionDirection::Short => candle.h >= limit,
@@ -1413,7 +1405,7 @@ fn validate_script_protection(request: &ScriptTradeRequest, entry_price: f64) ->
 }
 
 fn apply_protective_triggers(
-    clock: &ScriptSource,
+    clock: &SourceConfig,
     data: &BacktestData,
     idx: usize,
     open_trades: &mut Vec<OpenTrade>,
@@ -1445,7 +1437,7 @@ fn apply_protective_triggers(
 }
 
 fn protective_trigger(
-    clock: &ScriptSource,
+    clock: &SourceConfig,
     data: &BacktestData,
     idx: usize,
     open: &OpenTrade,
@@ -1453,8 +1445,8 @@ fn protective_trigger(
     if idx <= open.entry_idx {
         return Ok(None);
     }
-    let (low, high) = if *clock == ScriptSource::Candles {
-        let candle = &data.candles.as_ref().context("candles data not loaded")?[idx];
+    let (low, high) = if clock.source == ScriptSource::Candles {
+        let candle = clock_candle(clock, data, idx)?;
         (candle.l, candle.h)
     } else {
         let price = clock_price(clock, data, idx)?;
@@ -2035,6 +2027,24 @@ fn max_drawdown(returns: &[f64]) -> Option<f64> {
 mod tests {
     use super::*;
 
+    fn candle_clock() -> SourceConfig {
+        SourceConfig {
+            selector: "candles".to_string(),
+            source: ScriptSource::Candles,
+            exchange: "binancef".to_string(),
+            position: 0,
+            timeframe: Some(60),
+            depth: None,
+            bucket: None,
+        }
+    }
+
+    fn candle_data(candles: Vec<ScriptCandle>) -> BacktestData {
+        BacktestData {
+            series: BTreeMap::from([("candles".to_string(), BacktestSeries::Candles(candles))]),
+        }
+    }
+
     fn candle(idx: usize, open: f64, high: f64, low: f64, close: f64) -> ScriptCandle {
         ScriptCandle {
             t: 1_780_000_000_000 + idx as u64 * 60_000,
@@ -2071,6 +2081,53 @@ mod tests {
             notional: Some(1_000.0),
             position_id: position_id.map(ToString::to_string),
         }
+    }
+
+    #[test]
+    fn window_payload_keeps_same_kind_exchanges_separate() {
+        let configs = parse_source_configs(
+            &[
+                "candles@binancef:timeframe=60".to_string(),
+                "candles@okx:timeframe=60".to_string(),
+            ],
+            None,
+        )
+        .expect("parse source configs");
+        let clock = &configs["candles@binancef"];
+        let data = BacktestData {
+            series: BTreeMap::from([
+                (
+                    "candles@binancef".to_string(),
+                    BacktestSeries::Candles(vec![candle(0, 10.0, 10.0, 10.0, 10.0)]),
+                ),
+                (
+                    "candles@okx".to_string(),
+                    BacktestSeries::Candles(vec![candle(0, 20.0, 20.0, 20.0, 20.0)]),
+                ),
+            ]),
+        };
+
+        let payload = build_window_payload(WindowPayloadContext {
+            data: &data,
+            source_configs: &configs,
+            provider: "mmt",
+            symbol: "BTC/USDT",
+            clock,
+            clock_idx: 0,
+            cutoff_ms: clock_ts_ms(clock, &data, 0).unwrap(),
+            lookback: 2,
+            open_trades: &[],
+        })
+        .expect("build window payload");
+
+        assert_eq!(payload["clock"], "candles@binancef");
+        assert_eq!(payload["exchange"], "binancef");
+        assert_eq!(
+            payload["sources"]["candles@binancef"]["candles"][0]["c"],
+            10.0
+        );
+        assert_eq!(payload["sources"]["candles@okx"]["candles"][0]["c"], 20.0);
+        assert!(payload.get("candles").is_none());
     }
 
     #[test]
@@ -2148,13 +2205,11 @@ mod tests {
 
     #[test]
     fn script_limit_order_cannot_fill_on_its_submission_bar() {
-        let data = BacktestData {
-            candles: Some(vec![
-                candle(0, 100.0, 105.0, 85.0, 100.0),
-                candle(1, 100.0, 101.0, 89.0, 95.0),
-            ]),
-            ..BacktestData::default()
-        };
+        let data = candle_data(vec![
+            candle(0, 100.0, 105.0, 85.0, 100.0),
+            candle(1, 100.0, 101.0, 89.0, 95.0),
+        ]);
+        let clock = candle_clock();
         let mut orders = HashMap::new();
         let mut open = Vec::new();
         let mut next_position_id = 1;
@@ -2167,7 +2222,7 @@ mod tests {
                 "order": { "type": "limit", "price": 90, "tif": "gtc" }
             }))],
             0,
-            data.candles.as_ref().unwrap()[0].t,
+            clock_ts_ms(&clock, &data, 0).unwrap(),
             100.0,
             &mut orders,
             &mut open,
@@ -2177,7 +2232,7 @@ mod tests {
         assert_eq!(submitted, 1);
 
         fill_pending_script_orders(
-            &ScriptSource::Candles,
+            &clock,
             &data,
             0,
             &mut orders,
@@ -2188,7 +2243,7 @@ mod tests {
         assert!(open.is_empty());
 
         fill_pending_script_orders(
-            &ScriptSource::Candles,
+            &clock,
             &data,
             1,
             &mut orders,
@@ -2203,13 +2258,11 @@ mod tests {
 
     #[test]
     fn simulated_oco_uses_stop_when_both_triggers_touch_same_candle() {
-        let data = BacktestData {
-            candles: Some(vec![
-                candle(0, 100.0, 105.0, 95.0, 100.0),
-                candle(1, 100.0, 125.0, 85.0, 105.0),
-            ]),
-            ..BacktestData::default()
-        };
+        let data = candle_data(vec![
+            candle(0, 100.0, 105.0, 95.0, 100.0),
+            candle(1, 100.0, 125.0, 85.0, 105.0),
+        ]);
+        let clock = candle_clock();
         let mut orders = HashMap::new();
         let mut open = Vec::new();
         let mut closed = Vec::new();
@@ -2225,7 +2278,7 @@ mod tests {
                 "tp": 120
             }))],
             0,
-            data.candles.as_ref().unwrap()[0].t,
+            clock_ts_ms(&clock, &data, 0).unwrap(),
             100.0,
             &mut orders,
             &mut open,
@@ -2233,7 +2286,7 @@ mod tests {
         )
         .expect("fill market order");
 
-        apply_protective_triggers(&ScriptSource::Candles, &data, 1, &mut open, &mut closed)
+        apply_protective_triggers(&clock, &data, 1, &mut open, &mut closed)
             .expect("apply protection");
         assert!(open.is_empty());
         assert_eq!(closed.len(), 1);

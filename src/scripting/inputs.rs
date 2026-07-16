@@ -7,14 +7,30 @@ use crate::providers::bulk::market_data::timeframe_from_seconds as bulk_timefram
 
 use super::manifest::{InputType, ScriptManifest, ScriptParamSchema, ScriptSource};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceConfig {
+    pub selector: String,
+    pub source: ScriptSource,
+    pub exchange: String,
+    pub position: usize,
     pub timeframe: Option<u32>,
     pub depth: Option<u16>,
     pub bucket: Option<u8>,
 }
 
 impl SourceConfig {
+    fn new(selector: String, source: ScriptSource, exchange: String, position: usize) -> Self {
+        Self {
+            selector,
+            source,
+            exchange,
+            position,
+            timeframe: None,
+            depth: None,
+            bucket: None,
+        }
+    }
+
     pub fn require_timeframe(&self, source: &ScriptSource) -> Result<u32> {
         self.timeframe.ok_or_else(|| {
             anyhow::anyhow!(
@@ -35,43 +51,53 @@ impl SourceConfig {
     }
 }
 
-pub type SourceConfigs = BTreeMap<ScriptSource, SourceConfig>;
+pub type SourceConfigs = BTreeMap<String, SourceConfig>;
 pub type RawScopedValues = BTreeMap<ScriptSource, BTreeMap<String, String>>;
 
-pub fn parse_source_configs(values: &[String]) -> Result<SourceConfigs> {
-    let raw = parse_scoped_values(values, "--source")?;
+pub fn parse_source_configs(
+    values: &[String],
+    default_exchange: Option<&str>,
+) -> Result<SourceConfigs> {
     let mut configs = SourceConfigs::new();
 
-    for (source, entries) in raw {
-        let mut config = SourceConfig::default();
-        for (key, raw_value) in entries {
-            match (source.clone(), key.as_str()) {
-                (ScriptSource::Candles, "timeframe") => {
-                    config.timeframe = Some(parse_positive_u32(&raw_value, "timeframe")?);
-                }
-                (ScriptSource::Orderbook, "timeframe") => {
-                    config.timeframe = Some(parse_positive_u32(&raw_value, "timeframe")?);
-                }
-                (ScriptSource::Orderbook, "depth") => {
-                    config.depth = Some(parse_positive_u16(&raw_value, "depth")?);
-                }
-                (ScriptSource::Vd, "timeframe") => {
-                    config.timeframe = Some(parse_positive_u32(&raw_value, "timeframe")?);
-                }
-                (ScriptSource::Vd, "bucket") => {
-                    config.bucket = Some(parse_bucket(&raw_value)?);
-                }
-                (ScriptSource::Oi, "timeframe") => {
-                    config.timeframe = Some(parse_positive_u32(&raw_value, "timeframe")?);
-                }
-                (ScriptSource::Volumes, "timeframe") => {
-                    config.timeframe = Some(parse_positive_u32(&raw_value, "timeframe")?);
-                }
-                _ => bail!("unknown --source {}:{}", source.as_str(), key),
-            }
+    for (position, value) in values.iter().enumerate() {
+        let Some((scope_key, raw_value)) = value.split_once('=') else {
+            bail!("--source must use source:key=value, got `{value}`");
+        };
+        let Some((selector_raw, key)) = scope_key.split_once(':') else {
+            bail!("--source must use source:key=value, got `{value}`");
+        };
+        if key.trim().is_empty() {
+            bail!("--source key cannot be empty");
         }
-        configs.insert(source, config);
+        let (selector, source, exchange) = parse_source_selector(selector_raw, default_exchange)?;
+        let config = configs.entry(selector.clone()).or_insert_with(|| {
+            SourceConfig::new(selector.clone(), source.clone(), exchange.clone(), position)
+        });
+        let duplicate = match (source.clone(), key) {
+            (ScriptSource::Candles, "timeframe")
+            | (ScriptSource::Orderbook, "timeframe")
+            | (ScriptSource::Vd, "timeframe")
+            | (ScriptSource::Oi, "timeframe")
+            | (ScriptSource::Volumes, "timeframe") => config
+                .timeframe
+                .replace(parse_positive_u32(raw_value, "timeframe")?)
+                .is_some(),
+            (ScriptSource::Orderbook, "depth") => config
+                .depth
+                .replace(parse_positive_u16(raw_value, "depth")?)
+                .is_some(),
+            (ScriptSource::Vd, "bucket") => {
+                config.bucket.replace(parse_bucket(raw_value)?).is_some()
+            }
+            _ => bail!("unknown --source {selector}:{key}"),
+        };
+        if duplicate {
+            bail!("duplicate --source {selector}:{key}");
+        }
     }
+
+    reject_duplicate_resolved_sources(&configs)?;
 
     Ok(configs)
 }
@@ -80,10 +106,56 @@ pub fn parse_param_values(values: &[String]) -> Result<RawScopedValues> {
     parse_scoped_values(values, "--param")
 }
 
-pub fn populate_source_defaults(manifest: &ScriptManifest, configs: &mut SourceConfigs) {
+pub fn populate_source_defaults(
+    manifest: &ScriptManifest,
+    configs: &mut SourceConfigs,
+    exchange: &str,
+) {
     for source in &manifest.sources {
-        configs.entry(source.clone()).or_default();
+        let selector = source.as_str().to_string();
+        let position = configs.len();
+        configs.entry(selector.clone()).or_insert_with(|| {
+            SourceConfig::new(selector, source.clone(), exchange.to_string(), position)
+        });
     }
+}
+
+pub fn source_config<'a>(
+    configs: &'a SourceConfigs,
+    source: &ScriptSource,
+) -> Result<&'a SourceConfig> {
+    let mut matching = configs.values().filter(|config| &config.source == source);
+    let config = matching
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing source config for {}", source.as_str()))?;
+    if matching.next().is_some() {
+        bail!(
+            "multiple {} source configs require a selector",
+            source.as_str()
+        );
+    }
+    Ok(config)
+}
+
+pub fn first_source_config<'a>(
+    configs: &'a SourceConfigs,
+    source: &ScriptSource,
+) -> Result<&'a SourceConfig> {
+    configs
+        .values()
+        .filter(|config| &config.source == source)
+        .min_by_key(|config| config.position)
+        .ok_or_else(|| anyhow::anyhow!("missing source config for {}", source.as_str()))
+}
+
+pub fn source_exchange_label(configs: &SourceConfigs) -> String {
+    let mut exchanges = configs
+        .values()
+        .map(|config| config.exchange.as_str())
+        .collect::<Vec<_>>();
+    exchanges.sort_unstable();
+    exchanges.dedup();
+    exchanges.join(",")
 }
 
 pub fn validate_bulk_source_configs(
@@ -91,18 +163,32 @@ pub fn validate_bulk_source_configs(
     configs: &SourceConfigs,
     historical: bool,
 ) -> Result<()> {
-    for source in configs.keys() {
-        if !manifest.sources.contains(source) {
+    for config in configs.values() {
+        if !manifest.sources.contains(&config.source) {
             bail!(
                 "--source {} is not listed in script.sources",
-                source.as_str()
+                config.selector
+            );
+        }
+        if config.exchange != "bulk" {
+            bail!(
+                "BULK script source {} must use exchange `bulk`",
+                config.selector
             );
         }
     }
 
     for source in &manifest.sources {
-        let config = configs
-            .get(source)
+        let matching = configs
+            .values()
+            .filter(|config| &config.source == source)
+            .collect::<Vec<_>>();
+        if matching.len() > 1 {
+            bail!("BULK supports only one {} script source", source.as_str());
+        }
+        let config = matching
+            .first()
+            .copied()
             .ok_or_else(|| anyhow::anyhow!("missing source config for {}", source.as_str()))?;
         match source {
             ScriptSource::Candles | ScriptSource::Volumes => {
@@ -142,35 +228,38 @@ pub fn validate_bulk_source_configs(
 }
 
 pub fn validate_source_configs(manifest: &ScriptManifest, configs: &SourceConfigs) -> Result<()> {
-    for source in configs.keys() {
-        if !manifest.sources.contains(source) {
+    for config in configs.values() {
+        if !manifest.sources.contains(&config.source) {
             bail!(
                 "--source {} is not listed in script.sources",
-                source.as_str()
+                config.selector
             );
         }
     }
 
     for source in &manifest.sources {
-        let config = configs
-            .get(source)
-            .ok_or_else(|| anyhow::anyhow!("missing --source config for {}", source.as_str()))?;
-        match source {
+        if !configs.values().any(|config| &config.source == source) {
+            bail!("missing --source config for {}", source.as_str());
+        }
+    }
+
+    for config in configs.values() {
+        match &config.source {
             ScriptSource::Candles => {
-                config.require_timeframe(source)?;
+                config.require_timeframe(&config.source)?;
             }
             ScriptSource::Orderbook => {
-                config.require_timeframe(source)?;
+                config.require_timeframe(&config.source)?;
                 if config.depth_or_default() == 0 {
-                    bail!("--source orderbook:depth must be >= 1");
+                    bail!("--source {}:depth must be >= 1", config.selector);
                 }
             }
             ScriptSource::Vd => {
-                config.require_timeframe(source)?;
-                config.require_bucket(source)?;
+                config.require_timeframe(&config.source)?;
+                config.require_bucket(&config.source)?;
             }
             ScriptSource::Oi | ScriptSource::Volumes => {
-                config.require_timeframe(source)?;
+                config.require_timeframe(&config.source)?;
             }
         }
     }
@@ -182,34 +271,37 @@ pub fn validate_source_configs_for_run(
     manifest: &ScriptManifest,
     configs: &SourceConfigs,
 ) -> Result<()> {
-    for source in configs.keys() {
-        if !manifest.sources.contains(source) {
+    for config in configs.values() {
+        if !manifest.sources.contains(&config.source) {
             bail!(
                 "--source {} is not listed in script.sources",
-                source.as_str()
+                config.selector
             );
         }
     }
 
     for source in &manifest.sources {
-        let config = configs
-            .get(source)
-            .ok_or_else(|| anyhow::anyhow!("missing --source config for {}", source.as_str()))?;
-        match source {
+        if !configs.values().any(|config| &config.source == source) {
+            bail!("missing --source config for {}", source.as_str());
+        }
+    }
+
+    for config in configs.values() {
+        match &config.source {
             ScriptSource::Candles => {
-                config.require_timeframe(source)?;
+                config.require_timeframe(&config.source)?;
             }
             ScriptSource::Orderbook => {
                 if config.depth_or_default() == 0 {
-                    bail!("--source orderbook:depth must be >= 1");
+                    bail!("--source {}:depth must be >= 1", config.selector);
                 }
             }
             ScriptSource::Vd => {
-                config.require_timeframe(source)?;
-                config.require_bucket(source)?;
+                config.require_timeframe(&config.source)?;
+                config.require_bucket(&config.source)?;
             }
             ScriptSource::Oi | ScriptSource::Volumes => {
-                config.require_timeframe(source)?;
+                config.require_timeframe(&config.source)?;
             }
         }
     }
@@ -294,6 +386,58 @@ fn parse_source(source: &str) -> Result<ScriptSource> {
         "volumes" => Ok(ScriptSource::Volumes),
         _ => bail!("unknown script source `{source}`"),
     }
+}
+
+fn parse_source_selector(
+    raw: &str,
+    default_exchange: Option<&str>,
+) -> Result<(String, ScriptSource, String)> {
+    let (source_raw, explicit_exchange) = match raw.split_once('@') {
+        Some((source, exchange)) => (source, Some(exchange)),
+        None => (raw, None),
+    };
+    let source = parse_source(source_raw)?;
+    let exchange = explicit_exchange
+        .or(default_exchange)
+        .ok_or_else(|| {
+            anyhow::anyhow!("--source {raw} requires --exchange or an @exchange qualifier")
+        })?
+        .trim()
+        .to_ascii_lowercase();
+    validate_exchange_name(&exchange)?;
+    let selector = if explicit_exchange.is_some() {
+        format!("{}@{exchange}", source.as_str())
+    } else {
+        source.as_str().to_string()
+    };
+    Ok((selector, source, exchange))
+}
+
+fn validate_exchange_name(exchange: &str) -> Result<()> {
+    if exchange.is_empty()
+        || !exchange
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        bail!("script source exchange `{exchange}` must use letters, numbers, `-`, or `_`");
+    }
+    Ok(())
+}
+
+fn reject_duplicate_resolved_sources(configs: &SourceConfigs) -> Result<()> {
+    let values = configs.values().collect::<Vec<_>>();
+    for (idx, left) in values.iter().enumerate() {
+        for right in values.iter().skip(idx + 1) {
+            if left.source == right.source && left.exchange == right.exchange {
+                bail!(
+                    "duplicate script source {} for exchange {}",
+                    left.source.as_str(),
+                    left.exchange
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_positive_u32(raw: &str, key: &str) -> Result<u32> {
@@ -394,22 +538,84 @@ mod tests {
 
     #[test]
     fn parses_source_config() {
-        let configs = parse_source_configs(&[
-            "candles:timeframe=60".to_string(),
-            "orderbook:timeframe=60".to_string(),
-            "orderbook:depth=50".to_string(),
-            "vd:timeframe=60".to_string(),
-            "vd:bucket=1".to_string(),
-            "oi:timeframe=60".to_string(),
-            "volumes:timeframe=60".to_string(),
-        ])
+        let configs = parse_source_configs(
+            &[
+                "candles:timeframe=60".to_string(),
+                "orderbook:timeframe=60".to_string(),
+                "orderbook:depth=50".to_string(),
+                "vd:timeframe=60".to_string(),
+                "vd:bucket=1".to_string(),
+                "oi:timeframe=60".to_string(),
+                "volumes:timeframe=60".to_string(),
+            ],
+            Some("binancef"),
+        )
         .unwrap();
-        assert_eq!(configs[&ScriptSource::Candles].timeframe, Some(60));
-        assert_eq!(configs[&ScriptSource::Orderbook].depth, Some(50));
-        assert_eq!(configs[&ScriptSource::Vd].timeframe, Some(60));
-        assert_eq!(configs[&ScriptSource::Vd].bucket, Some(1));
-        assert_eq!(configs[&ScriptSource::Oi].timeframe, Some(60));
-        assert_eq!(configs[&ScriptSource::Volumes].timeframe, Some(60));
+        assert_eq!(configs["candles"].exchange, "binancef");
+        assert_eq!(configs["candles"].timeframe, Some(60));
+        assert_eq!(configs["orderbook"].depth, Some(50));
+        assert_eq!(configs["vd"].timeframe, Some(60));
+        assert_eq!(configs["vd"].bucket, Some(1));
+        assert_eq!(configs["oi"].timeframe, Some(60));
+        assert_eq!(configs["volumes"].timeframe, Some(60));
+    }
+
+    #[test]
+    fn parses_exchange_qualified_source_configs_without_a_global_exchange() {
+        let configs = parse_source_configs(
+            &[
+                "vd@hyperliquid:timeframe=60".to_string(),
+                "vd@hyperliquid:bucket=1".to_string(),
+                "orderbook@binancef:depth=20".to_string(),
+                "candles@okx:timeframe=60".to_string(),
+            ],
+            None,
+        )
+        .expect("qualified sources should parse");
+
+        assert_eq!(configs["vd@hyperliquid"].exchange, "hyperliquid");
+        assert_eq!(configs["vd@hyperliquid"].bucket, Some(1));
+        assert_eq!(configs["orderbook@binancef"].depth, Some(20));
+        assert_eq!(configs["candles@okx"].timeframe, Some(60));
+    }
+
+    #[test]
+    fn validates_multiple_exchanges_for_the_same_manifest_source() {
+        let manifest = ScriptManifest {
+            name: "cross-exchange".to_string(),
+            version: "1".to_string(),
+            sources: vec![ScriptSource::Candles],
+            modes: vec![],
+            clock: None,
+            description: None,
+            lookback: None,
+            params: BTreeMap::new(),
+        };
+        let configs = parse_source_configs(
+            &[
+                "candles@binancef:timeframe=60".to_string(),
+                "candles@okx:timeframe=60".to_string(),
+            ],
+            None,
+        )
+        .expect("qualified sources should parse");
+
+        validate_source_configs(&manifest, &configs).expect("backtest configs should validate");
+        validate_source_configs_for_run(&manifest, &configs).expect("live configs should validate");
+        assert_eq!(source_exchange_label(&configs), "binancef,okx");
+        assert_eq!(
+            first_source_config(&configs, &ScriptSource::Candles)
+                .unwrap()
+                .selector,
+            "candles@binancef"
+        );
+    }
+
+    #[test]
+    fn unqualified_source_requires_a_global_exchange() {
+        let error = parse_source_configs(&["candles:timeframe=60".to_string()], None)
+            .expect_err("unqualified source must fail without --exchange");
+        assert!(error.to_string().contains("requires --exchange"));
     }
 
     #[test]
@@ -429,17 +635,20 @@ mod tests {
             lookback: None,
             params: BTreeMap::new(),
         };
-        let mut configs = parse_source_configs(&[
-            "candles:timeframe=60".to_string(),
-            "orderbook:depth=50".to_string(),
-        ])
+        let mut configs = parse_source_configs(
+            &[
+                "candles:timeframe=60".to_string(),
+                "orderbook:depth=50".to_string(),
+            ],
+            Some("bulk"),
+        )
         .unwrap();
-        populate_source_defaults(&manifest, &mut configs);
+        populate_source_defaults(&manifest, &mut configs, "bulk");
 
         validate_bulk_source_configs(&manifest, &configs, false)
             .expect("BULK live configs should validate");
-        assert!(configs.contains_key(&ScriptSource::Vd));
-        assert!(configs.contains_key(&ScriptSource::Oi));
+        assert!(configs.contains_key("vd"));
+        assert!(configs.contains_key("oi"));
     }
 
     #[test]
@@ -455,7 +664,7 @@ mod tests {
             params: BTreeMap::new(),
         };
         let mut configs = SourceConfigs::new();
-        populate_source_defaults(&manifest, &mut configs);
+        populate_source_defaults(&manifest, &mut configs, "bulk");
 
         let error = validate_bulk_source_configs(&manifest, &configs, true)
             .expect_err("historical BULK orderbook should fail");
