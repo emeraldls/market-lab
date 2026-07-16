@@ -12,6 +12,7 @@ use bulk::market_data::BulkProvider;
 use marketlab_cloud::MarketLabProvider;
 use mmt::MmtProvider;
 
+#[allow(async_fn_in_trait)]
 pub trait MarketDataProvider {
     async fn inspect(&self, req: &InspectRequest) -> Result<OrderBookSnapshot>;
     async fn replay(&self, req: &ReplayRequest) -> Result<Vec<TopOfBook>>;

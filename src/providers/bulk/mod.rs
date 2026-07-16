@@ -7,6 +7,7 @@ use serde_json::Value;
 
 pub mod catalog;
 pub mod client;
+pub mod execution;
 pub mod market_data;
 pub mod ws;
 

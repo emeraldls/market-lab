@@ -56,6 +56,22 @@ impl BulkClient {
         self.get(path, &[] as &[(&str, &str)]).await
     }
 
+    pub async fn post<T, B>(&self, path: &str, body: &B) -> Result<T>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        let url = self.url(path);
+        let response = self
+            .http
+            .request(Method::POST, &url)
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("failed to call BULK {path}"))?;
+        decode_response(response, path).await
+    }
+
     pub fn url(&self, path: &str) -> String {
         format!("{}/{}", self.base_url, path.trim_start_matches('/'))
     }

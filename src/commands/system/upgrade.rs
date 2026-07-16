@@ -16,6 +16,7 @@ use crate::domain::types::UpgradeStatus;
 
 const REPO: &str = "emeraldls/market-lab";
 const APP_NAME: &str = "mlab";
+const DAEMON_NAME: &str = "mlabd";
 
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
@@ -157,10 +158,19 @@ async fn self_update(url: &str) -> Result<()> {
     let parent = current_exe
         .parent()
         .ok_or_else(|| anyhow::anyhow!("current executable has no parent directory"))?;
-    let temp_path = temp_binary_path(parent);
+    let daemon_exe = parent.join(DAEMON_NAME);
+    let cli_temp_path = temp_binary_path(parent, APP_NAME);
+    let daemon_temp_path = temp_binary_path(parent, DAEMON_NAME);
 
-    extract_binary(&bytes, &temp_path)?;
-    fs::rename(&temp_path, &current_exe).with_context(|| {
+    extract_binary(&bytes, APP_NAME, &cli_temp_path)?;
+    extract_binary(&bytes, DAEMON_NAME, &daemon_temp_path)?;
+    fs::rename(&daemon_temp_path, &daemon_exe).with_context(|| {
+        format!(
+            "failed to replace runtime executable {}",
+            daemon_exe.display()
+        )
+    })?;
+    fs::rename(&cli_temp_path, &current_exe).with_context(|| {
         format!(
             "failed to replace current executable {}",
             current_exe.display()
@@ -170,7 +180,7 @@ async fn self_update(url: &str) -> Result<()> {
     Ok(())
 }
 
-fn extract_binary(archive_bytes: &[u8], destination: &Path) -> Result<()> {
+fn extract_binary(archive_bytes: &[u8], binary_name: &str, destination: &Path) -> Result<()> {
     let cursor = Cursor::new(archive_bytes);
     let gz = GzDecoder::new(cursor);
     let mut archive = Archive::new(gz);
@@ -178,7 +188,7 @@ fn extract_binary(archive_bytes: &[u8], destination: &Path) -> Result<()> {
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?;
-        if path.file_name() == Some(OsStr::new(APP_NAME)) {
+        if path.file_name() == Some(OsStr::new(binary_name)) {
             let mut out = fs::File::create(destination)?;
             std::io::copy(&mut entry, &mut out)?;
             #[cfg(unix)]
@@ -190,15 +200,15 @@ fn extract_binary(archive_bytes: &[u8], destination: &Path) -> Result<()> {
         }
     }
 
-    bail!("downloaded archive did not contain {}", APP_NAME)
+    bail!("downloaded archive did not contain {binary_name}")
 }
 
-fn temp_binary_path(parent: &Path) -> PathBuf {
+fn temp_binary_path(parent: &Path, binary_name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    parent.join(format!(".{APP_NAME}.upgrade.{nanos}"))
+    parent.join(format!(".{binary_name}.upgrade.{nanos}"))
 }
 
 fn render(status: &UpgradeStatus, output: OutputFormat) -> Result<()> {
@@ -252,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn extracts_binary_from_tarball() {
+    fn extracts_cli_and_daemon_from_tarball() {
         use flate2::Compression;
         use flate2::write::GzEncoder;
         use std::io::Read;
@@ -262,30 +272,43 @@ mod tests {
         {
             let gz = GzEncoder::new(&mut tar_buf, Compression::default());
             let mut builder = Builder::new(gz);
-            let contents = b"test-binary";
-            let mut header = tar::Header::new_gnu();
-            header.set_size(contents.len() as u64);
-            header.set_mode(0o755);
-            header.set_cksum();
-            builder
-                .append_data(
-                    &mut header,
-                    "mlab-0.0.1-aarch64-apple-darwin/mlab",
-                    &contents[..],
-                )
-                .unwrap();
+            for (name, contents) in [
+                ("mlab", b"test-cli".as_slice()),
+                ("mlabd", b"test-daemon".as_slice()),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(contents.len() as u64);
+                header.set_mode(0o755);
+                header.set_cksum();
+                builder
+                    .append_data(
+                        &mut header,
+                        format!("mlab-0.0.1-aarch64-apple-darwin/{name}"),
+                        contents,
+                    )
+                    .unwrap();
+            }
             builder.finish().unwrap();
         }
 
-        let dest = env::temp_dir().join(format!("mlab-test-{}", std::process::id()));
-        extract_binary(&tar_buf, &dest).unwrap();
+        let cli_dest = env::temp_dir().join(format!("mlab-test-{}", std::process::id()));
+        let daemon_dest = env::temp_dir().join(format!("mlabd-test-{}", std::process::id()));
+        extract_binary(&tar_buf, APP_NAME, &cli_dest).unwrap();
+        extract_binary(&tar_buf, DAEMON_NAME, &daemon_dest).unwrap();
 
-        let mut out = String::new();
-        fs::File::open(&dest)
+        let mut cli = String::new();
+        fs::File::open(&cli_dest)
             .unwrap()
-            .read_to_string(&mut out)
+            .read_to_string(&mut cli)
             .unwrap();
-        assert_eq!(out, "test-binary");
-        let _ = fs::remove_file(dest);
+        let mut daemon = String::new();
+        fs::File::open(&daemon_dest)
+            .unwrap()
+            .read_to_string(&mut daemon)
+            .unwrap();
+        assert_eq!(cli, "test-cli");
+        assert_eq!(daemon, "test-daemon");
+        let _ = fs::remove_file(cli_dest);
+        let _ = fs::remove_file(daemon_dest);
     }
 }

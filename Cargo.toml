@@ -2,10 +2,15 @@
 name = "market-lab"
 version = "0.0.4"
 edition = "2024"
+default-run = "mlab"
 
 [[bin]]
 name = "mlab"
 path = "src/main.rs"
+
+[[bin]]
+name = "mlabd"
+path = "src/bin/mlabd.rs"
 
 [dependencies]
 anyhow = "1.0.102"
@@ -27,3 +32,4 @@ keyring = { version = "3.6.3", features = ["apple-native", "sync-secret-service"
 rpassword = "7.4.0"
 toml = "1.1.2"
 zeroize = "1.8.2"
+libc = "0.2"

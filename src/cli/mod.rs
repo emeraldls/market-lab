@@ -3,6 +3,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 use crate::domain::enums::{BookMode, ProviderKind, Side};
+use crate::domain::execution::{ExecutionVenue, OrderKind, TimeInForce};
 use crate::domain::requests::{
     DepthRequest, ImbalanceRequest, InspectRequest, ReplayRequest, SlippageRequest, SpreadRequest,
     VampRequest,
@@ -20,6 +21,19 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     Markets(MarketsArgs),
+    Trade {
+        #[command(subcommand)]
+        command: TradeCommands,
+    },
+    Positions(AccountQueryArgs),
+    Orders(AccountQueryArgs),
+    Fills(AccountQueryArgs),
+    Cancel(CancelOrderArgs),
+    Close(ClosePositionArgs),
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
+    },
     Inspect(InspectArgs),
     Replay(ReplayArgs),
     Source {
@@ -45,6 +59,250 @@ pub enum Commands {
         #[command(subcommand)]
         command: AuthCommands,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TradeCommands {
+    #[command(alias = "buy")]
+    Long(TradeArgs),
+    #[command(alias = "sell")]
+    Short(TradeArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DaemonCommands {
+    Start(DaemonOutputArgs),
+    Status(DaemonOutputArgs),
+    Stop(DaemonOutputArgs),
+    Events(DaemonEventsArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct DaemonOutputArgs {
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct DaemonEventsArgs {
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct TradeArgs {
+    pub symbol: String,
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    pub venue: ExecutionVenueArg,
+    #[arg(
+        long,
+        conflicts_with = "notional",
+        required_unless_present = "notional"
+    )]
+    pub size: Option<f64>,
+    #[arg(long, conflicts_with = "size", required_unless_present = "size")]
+    pub notional: Option<f64>,
+    #[arg(long = "type", value_enum, default_value_t = TradeOrderKind::Market)]
+    pub order_kind: TradeOrderKind,
+    #[arg(long)]
+    pub price: Option<f64>,
+    #[arg(long, value_enum, default_value_t = TradeTimeInForce::Gtc)]
+    pub tif: TradeTimeInForce,
+    #[arg(long, default_value_t = 1.0)]
+    pub leverage: f64,
+    #[arg(long, default_value_t = false)]
+    pub reduce_only: bool,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl TradeArgs {
+    pub fn validate_shape(&self) -> Result<()> {
+        if !is_valid_symbol(&self.symbol) {
+            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        if let Some(size) = self.size
+            && (!size.is_finite() || size <= 0.0)
+        {
+            bail!("--size must be > 0");
+        }
+        if let Some(notional) = self.notional
+            && (!notional.is_finite() || notional <= 0.0)
+        {
+            bail!("--notional must be > 0");
+        }
+        match (self.size, self.notional) {
+            (Some(_), Some(_)) => bail!("set only one of --size or --notional"),
+            (None, None) => bail!("one of --size or --notional is required"),
+            _ => {}
+        }
+        if !self.leverage.is_finite() || self.leverage < 1.0 {
+            bail!("--leverage must be at least 1");
+        }
+        match self.order_kind {
+            TradeOrderKind::Market if self.price.is_some() => {
+                bail!("--price is only valid with --type limit")
+            }
+            TradeOrderKind::Market if self.tif != TradeTimeInForce::Gtc => {
+                bail!("--tif is only valid with --type limit")
+            }
+            TradeOrderKind::Limit => {
+                let price = self
+                    .price
+                    .context("--price is required with --type limit")?;
+                if !price.is_finite() || price <= 0.0 {
+                    bail!("--price must be > 0");
+                }
+            }
+            TradeOrderKind::Market => {}
+        }
+        if self.dry_run && self.yes {
+            bail!("--yes is not used with --dry-run");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("trade supports only --output terminal|json|jsonl");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct AccountQueryArgs {
+    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    pub venue: ExecutionVenueArg,
+    #[arg(long)]
+    pub symbol: Option<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct CancelOrderArgs {
+    pub symbol: String,
+    pub order_id: String,
+    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    pub venue: ExecutionVenueArg,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl CancelOrderArgs {
+    pub fn validate(&self) -> Result<()> {
+        if !is_valid_symbol(&self.symbol) {
+            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        if self.order_id.trim().is_empty() {
+            bail!("order id cannot be empty");
+        }
+        if self.dry_run && self.yes {
+            bail!("--yes is not used with --dry-run");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("cancel supports only --output terminal|json|jsonl");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ClosePositionArgs {
+    pub symbol: Option<String>,
+    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    pub venue: ExecutionVenueArg,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl ClosePositionArgs {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(symbol) = &self.symbol
+            && !is_valid_symbol(symbol)
+        {
+            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        if self.dry_run && self.yes {
+            bail!("--yes is not used with --dry-run");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("close supports only --output terminal|json|jsonl");
+        }
+        Ok(())
+    }
+}
+
+impl AccountQueryArgs {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(symbol) = &self.symbol
+            && !is_valid_symbol(symbol)
+        {
+            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("account queries support only --output terminal|json|jsonl");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum ExecutionVenueArg {
+    Bulk,
+}
+
+impl From<ExecutionVenueArg> for ExecutionVenue {
+    fn from(value: ExecutionVenueArg) -> Self {
+        match value {
+            ExecutionVenueArg::Bulk => ExecutionVenue::Bulk,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum TradeOrderKind {
+    Market,
+    Limit,
+}
+
+impl From<TradeOrderKind> for OrderKind {
+    fn from(value: TradeOrderKind) -> Self {
+        match value {
+            TradeOrderKind::Market => OrderKind::Market,
+            TradeOrderKind::Limit => OrderKind::Limit,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum TradeTimeInForce {
+    Gtc,
+    Ioc,
+    Alo,
+}
+
+impl From<TradeTimeInForce> for TimeInForce {
+    fn from(value: TradeTimeInForce) -> Self {
+        match value {
+            TradeTimeInForce::Gtc => TimeInForce::Gtc,
+            TradeTimeInForce::Ioc => TimeInForce::Ioc,
+            TradeTimeInForce::Alo => TimeInForce::Alo,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Args)]
@@ -1418,6 +1676,106 @@ mod tests {
             }
             _ => panic!("expected markets command"),
         }
+    }
+
+    #[test]
+    fn parse_trade_long_dry_run() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "long",
+            "BTC/USDT",
+            "--venue",
+            "bulk",
+            "--size",
+            "0.001",
+            "--type",
+            "limit",
+            "--price",
+            "65000.001",
+            "--tif",
+            "alo",
+            "--leverage",
+            "5",
+            "--dry-run",
+        ])
+        .expect("trade command should parse");
+
+        match cli.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => {
+                args.validate_shape().expect("trade shape is valid");
+                assert_eq!(args.symbol, "BTC/USDT");
+                assert_eq!(args.size, Some(0.001));
+                assert!(matches!(args.order_kind, TradeOrderKind::Limit));
+                assert!(matches!(args.tif, TradeTimeInForce::Alo));
+                assert!(args.dry_run);
+            }
+            _ => panic!("expected trade long command"),
+        }
+    }
+
+    #[test]
+    fn trade_buy_and_sell_aliases_map_to_position_directions() {
+        let buy = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "buy",
+            "BTC/USDT",
+            "--notional",
+            "100",
+            "--dry-run",
+        ])
+        .expect("buy alias should parse");
+        let sell = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "sell",
+            "BTC/USDT",
+            "--size",
+            "0.001",
+            "--dry-run",
+        ])
+        .expect("sell alias should parse");
+        assert!(matches!(
+            buy.command,
+            Commands::Trade {
+                command: TradeCommands::Long(_)
+            }
+        ));
+        assert!(matches!(
+            sell.command,
+            Commands::Trade {
+                command: TradeCommands::Short(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_execution_management_commands() {
+        let cancel = Cli::try_parse_from([
+            "mlab",
+            "cancel",
+            "BTC/USDT",
+            "Fpa3oVuL3UzjNANAMZZdmrn6D1Zhk83GmBuJpuAWG51F",
+            "--dry-run",
+        ])
+        .expect("cancel should parse");
+        assert!(matches!(cancel.command, Commands::Cancel(_)));
+
+        let close = Cli::try_parse_from(["mlab", "close", "BTC/USDT", "--dry-run"])
+            .expect("close should parse");
+        assert!(matches!(close.command, Commands::Close(_)));
+
+        let daemon = Cli::try_parse_from(["mlab", "daemon", "events", "--limit", "10"])
+            .expect("daemon events should parse");
+        assert!(matches!(
+            daemon.command,
+            Commands::Daemon {
+                command: DaemonCommands::Events(DaemonEventsArgs { limit: 10, .. })
+            }
+        ));
     }
 
     #[test]

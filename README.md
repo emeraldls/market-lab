@@ -18,13 +18,19 @@ Bulk public market data is standalone: it does not require an MMT key, a Bulk
 key, or `mlab auth set bulk`. The production HTTP and WebSocket endpoints are
 compiled into the adapter and are not configured through environment variables.
 
-To connect future Bulk execution, Market Lab generates an agent wallet locally
+For Bulk execution, Market Lab generates an agent wallet locally
 and uses the main wallet private key once to authorize it. The main wallet key
 is never stored; only the generated agent credential is saved in the OS
 keychain.
 
 ```bash
 mlab auth set bulk
+```
+
+Build both the CLI and its lightweight execution runtime:
+
+```bash
+cargo build --bins
 ```
 
 BULK market rules are snapshotted in
@@ -37,6 +43,56 @@ internal symbol (`BTC/USDT`) so provider boundaries do not reconstruct mappings.
 ```bash
 mlab markets --provider bulk
 mlab markets --provider bulk --symbol BTC/USDT
+```
+
+Execution is expressed as `long`/`short` (with `buy`/`sell` aliases). Every
+request is checked against the embedded market catalog before signing. A dry
+run prints the complete normalized trade plan and never starts the runtime or
+submits a signed transaction.
+
+```bash
+mlab trade long BTC/USDT --notional 100 --leverage 5 --dry-run
+mlab trade short BTC/USDT --size 0.001 --type limit \
+  --price 65000 --tif alo --dry-run
+
+mlab positions --venue bulk
+mlab orders --venue bulk
+mlab fills --venue bulk
+mlab close BTC/USDT --dry-run
+mlab cancel BTC/USDT <ORDER_ID> --dry-run
+```
+
+Live place/cancel requests are confirmed in the terminal unless `--yes` is
+passed. They are then sent over local IPC to `mlabd`, which owns signing and
+nonce sequencing for every terminal or future scripted caller. The runtime is
+started automatically for live execution, stays alive while idle, and stores
+bounded active state plus append-only events under `~/.market-lab/execution`.
+
+```bash
+mlab daemon start
+mlab daemon status
+mlab daemon events --limit 20
+mlab daemon stop
+```
+
+Trade commands also support TOML with CLI values taking precedence:
+
+```toml
+version = 1
+
+[market]
+symbol = "BTC/USDT"
+
+[execution]
+venue = "bulk"
+notional = 100
+order_type = "market"
+leverage = 5
+dry_run = true
+```
+
+```bash
+mlab trade long --config marketlab.toml
 ```
 
 Example:

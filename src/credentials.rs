@@ -16,6 +16,11 @@ const BULK_CREDENTIAL_VERSION: u8 = 1;
 
 static MMT_API_KEY: OnceLock<String> = OnceLock::new();
 
+pub struct ActiveBulkCredential {
+    pub account: Pubkey,
+    pub agent: Keypair,
+}
+
 pub fn mmt_api_key() -> Result<String> {
     if let Some(key) = MMT_API_KEY.get() {
         return Ok(key.clone());
@@ -94,6 +99,27 @@ impl Drop for BulkCredential {
     fn drop(&mut self) {
         self.agent_private_key.zeroize();
     }
+}
+
+pub fn active_bulk_credential() -> Result<ActiveBulkCredential> {
+    let credential = load_bulk_credential()?
+        .context("BULK credentials are not configured; run `mlab auth set bulk`")?;
+    if credential.status != BulkCredentialStatus::Active {
+        bail!("BULK agent registration is pending; run `mlab auth set bulk` to finish it");
+    }
+    let account = credential
+        .account
+        .as_deref()
+        .context("stored BULK credential is missing its account public key")?;
+    Ok(ActiveBulkCredential {
+        account: Pubkey::from_base58(account)
+            .context("stored BULK account public key is invalid")?,
+        agent: credential.agent_keypair()?,
+    })
+}
+
+pub fn bulk_account() -> Result<String> {
+    Ok(active_bulk_credential()?.account.to_base58())
 }
 
 pub async fn handle_set(args: AuthProviderArgs) -> Result<()> {

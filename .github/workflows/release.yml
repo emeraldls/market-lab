@@ -45,9 +45,9 @@ jobs:
       - name: Build binary
         run: |
           if [ "${{ matrix.use-cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
+            cross build --release --bins --target ${{ matrix.target }}
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --release --bins --target ${{ matrix.target }}
           fi
 
       - name: Package artifact

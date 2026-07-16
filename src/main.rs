@@ -2,20 +2,15 @@ use anyhow::Result;
 use clap::Parser;
 use mimalloc::MiMalloc;
 
-mod cli;
-mod commands;
-mod config;
-mod core;
-mod credentials;
-mod domain;
-mod functions;
-mod providers;
-mod scripting;
-
-use cli::{
-    AuthCommands, Cli, Commands, ScriptCommands, ScriptRunHistoryCommands, SourceCommands,
-    StrategyBacktestCommands, StrategyCommands, StrategyRunCommands, StudyCommands,
+use market_lab::cli::{
+    AuthCommands, Cli, Commands, DaemonCommands, ScriptCommands, ScriptRunHistoryCommands,
+    SourceCommands, StrategyBacktestCommands, StrategyCommands, StrategyRunCommands, StudyCommands,
+    TradeCommands,
 };
+use market_lab::commands;
+use market_lab::config;
+use market_lab::credentials;
+use market_lab::domain::execution::PositionDirection;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -27,6 +22,25 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Markets(args) => commands::markets::handle(args)?,
+        Commands::Trade { command } => match command {
+            TradeCommands::Long(args) => {
+                commands::execution::handle_trade(args, PositionDirection::Long).await?
+            }
+            TradeCommands::Short(args) => {
+                commands::execution::handle_trade(args, PositionDirection::Short).await?
+            }
+        },
+        Commands::Positions(args) => commands::execution::handle_positions(args).await?,
+        Commands::Orders(args) => commands::execution::handle_orders(args).await?,
+        Commands::Fills(args) => commands::execution::handle_fills(args).await?,
+        Commands::Cancel(args) => commands::execution::handle_cancel(args).await?,
+        Commands::Close(args) => commands::execution::handle_close(args).await?,
+        Commands::Daemon { command } => match command {
+            DaemonCommands::Start(args) => commands::runtime::handle_start(args).await?,
+            DaemonCommands::Status(args) => commands::runtime::handle_status(args).await?,
+            DaemonCommands::Stop(args) => commands::runtime::handle_stop(args).await?,
+            DaemonCommands::Events(args) => commands::runtime::handle_events(args)?,
+        },
         Commands::Inspect(args) => commands::market::inspect::handle(args).await?,
         Commands::Replay(args) => commands::market::replay::handle(args).await?,
         Commands::Source { command: source } => match source {

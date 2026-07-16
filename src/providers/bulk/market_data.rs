@@ -32,6 +32,14 @@ impl BulkProvider {
                 "app_boundary": "milliseconds",
                 "provider_conversion": "adapter-only"
             },
+            "execution": {
+                "venue": "bulk",
+                "orders": ["market", "limit"],
+                "time_in_force": ["GTC", "IOC", "ALO"],
+                "reduce_only": true,
+                "agent_signing": true,
+                "runtime": "mlabd"
+            },
             "historical": {
                 "candles": true,
                 "volume_bars": true,

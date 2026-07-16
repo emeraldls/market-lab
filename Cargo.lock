@@ -1304,6 +1304,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "keyring",
+ "libc",
  "mimalloc",
  "reqwest",
  "rpassword",

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
@@ -7,7 +7,14 @@ use serde::{Deserialize, Serialize};
 const CATALOG_SCHEMA_VERSION: u8 = 2;
 const CATALOG_JSON: &str = include_str!("markets.json");
 
-static CATALOG: OnceLock<BulkMarketCatalog> = OnceLock::new();
+static CATALOG: OnceLock<BulkMarketIndex> = OnceLock::new();
+
+#[derive(Debug)]
+struct BulkMarketIndex {
+    catalog: BulkMarketCatalog,
+    by_internal_symbol: HashMap<String, usize>,
+    by_venue_symbol: HashMap<String, usize>,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,15 +45,6 @@ pub struct BulkMarket {
 }
 
 impl BulkMarketCatalog {
-    pub fn find(&self, symbol: &str) -> Result<Option<&BulkMarket>> {
-        let (base, quote) = symbol_parts(symbol)?;
-        let venue_candidate = format!("{base}-{quote}");
-        let internal_candidate = format!("{base}/{quote}");
-        Ok(self.markets.iter().find(|market| {
-            market.symbol == venue_candidate || market.internal_symbol == internal_candidate
-        }))
-    }
-
     fn validate(&self) -> Result<()> {
         if self.schema_version != CATALOG_SCHEMA_VERSION {
             bail!(
@@ -134,14 +132,19 @@ impl BulkMarket {
 }
 
 pub fn market_catalog() -> Result<&'static BulkMarketCatalog> {
-    if let Some(catalog) = CATALOG.get() {
-        return Ok(catalog);
+    Ok(&market_index()?.catalog)
+}
+
+fn market_index() -> Result<&'static BulkMarketIndex> {
+    if let Some(index) = CATALOG.get() {
+        return Ok(index);
     }
 
     let catalog: BulkMarketCatalog =
         serde_json::from_str(CATALOG_JSON).context("embedded BULK market catalog is malformed")?;
     catalog.validate()?;
-    let _ = CATALOG.set(catalog);
+    let index = BulkMarketIndex::new(catalog);
+    let _ = CATALOG.set(index);
 
     CATALOG
         .get()
@@ -149,9 +152,10 @@ pub fn market_catalog() -> Result<&'static BulkMarketCatalog> {
 }
 
 pub fn market(symbol: &str) -> Result<&'static BulkMarket> {
-    let catalog = market_catalog()?;
-    catalog.find(symbol)?.with_context(|| {
-        let supported = catalog
+    let index = market_index()?;
+    index.find(symbol)?.with_context(|| {
+        let supported = index
+            .catalog
             .markets
             .iter()
             .map(|market| market.symbol.as_str())
@@ -159,6 +163,35 @@ pub fn market(symbol: &str) -> Result<&'static BulkMarket> {
             .join(", ");
         format!("BULK does not support `{symbol}` in the local catalog; supported: {supported}")
     })
+}
+
+impl BulkMarketIndex {
+    fn new(catalog: BulkMarketCatalog) -> Self {
+        let mut by_internal_symbol = HashMap::with_capacity(catalog.markets.len());
+        let mut by_venue_symbol = HashMap::with_capacity(catalog.markets.len());
+        for (index, market) in catalog.markets.iter().enumerate() {
+            by_internal_symbol.insert(market.internal_symbol.clone(), index);
+            by_venue_symbol.insert(market.symbol.clone(), index);
+        }
+        Self {
+            catalog,
+            by_internal_symbol,
+            by_venue_symbol,
+        }
+    }
+
+    fn find(&self, symbol: &str) -> Result<Option<&BulkMarket>> {
+        let (base, quote) = symbol_parts(symbol)?;
+        let venue_quote = if quote == "USDT" { "USD" } else { &quote };
+        let internal_quote = if quote == "USD" { "USDT" } else { &quote };
+        let venue_symbol = format!("{base}-{venue_quote}");
+        let internal_symbol = format!("{base}/{internal_quote}");
+        let market_index = self
+            .by_internal_symbol
+            .get(&internal_symbol)
+            .or_else(|| self.by_venue_symbol.get(&venue_symbol));
+        Ok(market_index.map(|index| &self.catalog.markets[*index]))
+    }
 }
 
 fn venue_symbol(symbol: &str) -> Result<String> {
