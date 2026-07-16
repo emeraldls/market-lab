@@ -95,6 +95,33 @@ dry_run = true
 mlab trade long --config marketlab.toml
 ```
 
+Scripts can consume BULK directly without `--exchange` or MMT authentication.
+Live scripts support candles, order books, open-interest snapshots, total-volume
+bars, and trade-derived volume delta. Historical BULK script backtests support
+candles and total-volume bars; unsupported historical sources fail before any
+provider request.
+
+```bash
+mlab script run examples/candle-summary.js \
+  --provider bulk --symbol BTC/USDT \
+  --source candles:timeframe=60
+
+mlab script run examples/all-sources-live.js \
+  --provider bulk --symbol BTC/USDT \
+  --source candles:timeframe=60 \
+  --source orderbook:depth=50
+
+mlab script backtest examples/sma-cross.js \
+  --provider bulk --symbol BTC/USDT \
+  --from 1784052554000 --to 1784056154000 \
+  --source candles:timeframe=60
+```
+
+Script source records use milliseconds in `t`. Candle records always contain
+`o`, `h`, `l`, `c`, `volume`, and `trades`. MMT additionally supplies its
+directional `vb`, `vs`, `tb`, and `ts` fields; BULK leaves those fields absent
+instead of fabricating directional volume.
+
 Example:
 
 ```bash

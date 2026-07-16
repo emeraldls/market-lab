@@ -11,17 +11,28 @@ use crate::commands::script::{
     write_running_report_best_effort,
 };
 use crate::commands::source::common::render_terminal;
+use crate::commands::study::common::provider_name;
 use crate::core::orderbook::OrderBookState;
 use crate::domain::enums::ProviderKind;
-use crate::domain::types::{OhlcvtCandle, OiCandle, OrderBookSnapshot, VdCandle, VolumeProfile};
+use crate::domain::types::{
+    OhlcvtCandle, OiCandle, OpenInterestSnapshot, OrderBookSnapshot, VdCandle, VolumeDeltaTick,
+    VolumeProfile,
+};
+use crate::providers::bulk::catalog;
+use crate::providers::bulk::ws::{
+    BulkCandleStream, BulkOrderBookStream, BulkTickerStream, BulkTradesStream,
+};
 use crate::providers::mmt::utils::{normalize_symbol_for_mmt, normalize_to_ms, parse_levels};
 use crate::providers::mmt::ws_client::MmtWsClient;
 use crate::scripting::engine::Script;
 use crate::scripting::inputs::{
-    SourceConfigs, parse_param_values, parse_source_configs, resolve_params,
-    validate_source_configs_for_run,
+    SourceConfigs, parse_param_values, parse_source_configs, populate_source_defaults,
+    resolve_params, validate_bulk_source_configs, validate_source_configs_for_run,
 };
 use crate::scripting::manifest::ScriptSource;
+use crate::scripting::market_data::{
+    ScriptCandle, ScriptOpenInterest, ScriptVolume, ScriptVolumeDelta,
+};
 
 #[derive(Debug, Clone, Serialize)]
 struct ScriptRunResult<I>
@@ -68,20 +79,26 @@ struct ScriptRunOutput {
 
 #[derive(Debug, Clone, Default)]
 struct LiveState {
-    candles: Option<OhlcvtCandle>,
+    candles: Option<ScriptCandle>,
     orderbook: Option<OrderBookSnapshot>,
-    vd: Option<VdCandle>,
-    oi: Option<OiCandle>,
-    volumes: Option<VolumeProfile>,
+    vd: Option<ScriptVolumeDelta>,
+    oi: Option<ScriptOpenInterest>,
+    volumes: Option<ScriptVolume>,
 }
 
 #[derive(Debug, Clone)]
 enum LiveUpdate {
-    Candles(OhlcvtCandle),
+    Candles(ScriptCandle),
     Orderbook(OrderBookSnapshot),
-    Vd(VdCandle),
-    Oi(OiCandle),
-    Volumes(VolumeProfile),
+    Vd(ScriptVolumeDelta),
+    Oi(ScriptOpenInterest),
+    Volumes(ScriptVolume),
+}
+
+struct ScriptRunMarket {
+    provider: ProviderKind,
+    exchange: String,
+    symbol: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -96,19 +113,21 @@ struct ScriptRunSummary {
 
 pub async fn handle(args: ScriptRunArgs) -> Result<()> {
     args.validate()?;
-    if !matches!(args.provider.into(), ProviderKind::Mmt) {
-        bail!("scripts currently support only --provider mmt");
+    if matches!(args.provider.into(), ProviderKind::MarketLab) {
+        bail!("script run supports --provider mmt|bulk");
     }
     if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
         bail!("scripts currently support only --output terminal|json|jsonl");
     }
 
     let script = Script::load(&args.script)?;
+    let provider = provider_name(args.provider.into()).to_string();
+    let exchange = args.exchange_name()?.to_string();
     let mut report = report_builder(
         "script.run",
         &script,
-        Some("mmt".to_string()),
-        args.exchange.clone(),
+        Some(provider),
+        Some(exchange),
         args.symbol.clone(),
     );
     let result = run(args, script, &mut report).await;
@@ -131,21 +150,38 @@ async fn run(
             "--from/--to are not allowed with script run; use script backtest for historical data"
         );
     }
-    let exchange = require_non_empty(args.exchange.as_deref(), "--exchange")?.to_string();
-    let symbol = require_symbol(args.symbol.as_deref())?.to_string();
+    let provider: ProviderKind = args.provider.into();
+    let exchange = args.exchange_name()?.to_string();
+    let symbol = require_symbol(args.symbol.as_deref())?;
+    let symbol = match provider {
+        ProviderKind::Bulk => catalog::market(symbol)?.internal_symbol.clone(),
+        ProviderKind::Mmt => symbol.to_string(),
+        ProviderKind::MarketLab => unreachable!(),
+    };
 
-    let source_configs = parse_source_configs(&args.source)?;
-    validate_source_configs_for_run(&script.manifest, &source_configs)?;
+    let mut source_configs = parse_source_configs(&args.source)?;
+    match provider {
+        ProviderKind::Mmt => validate_source_configs_for_run(&script.manifest, &source_configs)?,
+        ProviderKind::Bulk => {
+            populate_source_defaults(&script.manifest, &mut source_configs);
+            validate_bulk_source_configs(&script.manifest, &source_configs, false)?;
+        }
+        ProviderKind::MarketLab => unreachable!(),
+    }
     let raw_params = parse_param_values(&args.param)?;
     let resolved_params = resolve_params(&script.manifest, &raw_params)?;
 
+    let market = ScriptRunMarket {
+        provider,
+        exchange,
+        symbol,
+    };
     stream_sources(
         args,
         script,
         source_configs,
         resolved_params,
-        exchange,
-        symbol,
+        market,
         report,
     )
     .await
@@ -156,15 +192,20 @@ async fn stream_sources(
     script: Script,
     source_configs: SourceConfigs,
     resolved_params: Value,
-    exchange: String,
-    symbol: String,
+    market: ScriptRunMarket,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
 ) -> Result<()> {
     report.set_phase("connecting_streams");
     write_running_report_best_effort(report);
 
-    let ws = MmtWsClient::shared().await?;
-    subscribe_sources(&ws, &script, &source_configs, &exchange, &symbol).await?;
+    let mut streams = ScriptLiveStreams::connect(
+        market.provider,
+        &script,
+        &source_configs,
+        &market.exchange,
+        &market.symbol,
+    )
+    .await?;
 
     let session = script.start_session(&resolved_params)?;
     let cancel_handle = session.cancel_handle();
@@ -177,7 +218,6 @@ async fn stream_sources(
     let mut hooks = 0_u64;
     let mut summary = ScriptRunSummary::default();
     let mut live_state = LiveState::default();
-    let mut orderbook_state = orderbook_state(&source_configs);
 
     report.set_phase("streaming_sources");
     write_running_report_best_effort(report);
@@ -190,7 +230,7 @@ async fn stream_sources(
         }
 
         let update = tokio::select! {
-            update = next_live_update(&ws, &source_configs, &mut orderbook_state) => {
+            update = streams.next_update() => {
                 let Some(update) = update? else { continue; };
                 update
             }
@@ -204,7 +244,14 @@ async fn stream_sources(
         let source = update.source();
         let ts_ms = update.ts_ms();
         live_state.apply(update);
-        let payload = live_stream_payload(source, &live_state, &source_configs)?;
+        let payload = live_stream_payload(
+            source,
+            &live_state,
+            &source_configs,
+            provider_name(market.provider),
+            &market.exchange,
+            &market.symbol,
+        )?;
         let execution = match session.run_stream(payload) {
             Ok(execution) => execution,
             Err(err) => {
@@ -226,9 +273,9 @@ async fn stream_sources(
         let result = ScriptRunResult {
             r#type: "script.run.result",
             version: "1",
-            provider: "mmt",
-            exchange: exchange.clone(),
-            symbol: symbol.clone(),
+            provider: provider_name(market.provider),
+            exchange: market.exchange.clone(),
+            symbol: market.symbol.clone(),
             ts_ms,
             stream: true,
             script: ScriptDescriptor {
@@ -255,7 +302,195 @@ async fn stream_sources(
     }
 }
 
-async fn subscribe_sources(
+enum ScriptLiveStreams {
+    Mmt {
+        ws: MmtWsClient,
+        source_configs: SourceConfigs,
+        orderbook_state: Option<OrderBookState>,
+    },
+    Bulk(Box<BulkScriptStreams>),
+}
+
+impl ScriptLiveStreams {
+    async fn connect(
+        provider: ProviderKind,
+        script: &Script,
+        source_configs: &SourceConfigs,
+        exchange: &str,
+        symbol: &str,
+    ) -> Result<Self> {
+        match provider {
+            ProviderKind::Mmt => {
+                let ws = MmtWsClient::shared().await?;
+                subscribe_mmt_sources(&ws, script, source_configs, exchange, symbol).await?;
+                Ok(Self::Mmt {
+                    ws,
+                    source_configs: source_configs.clone(),
+                    orderbook_state: orderbook_state(source_configs),
+                })
+            }
+            ProviderKind::Bulk => Ok(Self::Bulk(Box::new(
+                BulkScriptStreams::connect(script, source_configs, symbol).await?,
+            ))),
+            ProviderKind::MarketLab => bail!("script run supports --provider mmt|bulk"),
+        }
+    }
+
+    async fn next_update(&mut self) -> Result<Option<LiveUpdate>> {
+        match self {
+            Self::Mmt {
+                ws,
+                source_configs,
+                orderbook_state,
+            } => next_mmt_update(ws, source_configs, orderbook_state).await,
+            Self::Bulk(streams) => streams.next_update().await.map(Some),
+        }
+    }
+}
+
+struct BulkScriptStreams {
+    candles: Option<BulkCandleStream>,
+    orderbook: Option<BulkOrderBookStream>,
+    vd: Option<BulkTradesStream>,
+    oi: Option<BulkTickerStream>,
+    volumes: Option<BulkCandleStream>,
+    cumulative_delta: f64,
+}
+
+impl BulkScriptStreams {
+    async fn connect(
+        script: &Script,
+        source_configs: &SourceConfigs,
+        symbol: &str,
+    ) -> Result<Self> {
+        let candles = if script.manifest.sources.contains(&ScriptSource::Candles) {
+            let seconds = source_configs
+                .get(&ScriptSource::Candles)
+                .context("missing source config for candles")?
+                .require_timeframe(&ScriptSource::Candles)?;
+            let interval = crate::providers::bulk::market_data::timeframe_from_seconds(seconds)?;
+            Some(BulkCandleStream::connect(symbol, interval).await?)
+        } else {
+            None
+        };
+        let orderbook = if script.manifest.sources.contains(&ScriptSource::Orderbook) {
+            let depth = source_configs
+                .get(&ScriptSource::Orderbook)
+                .context("missing source config for orderbook")?
+                .depth_or_default();
+            let state_cap = (depth as usize).saturating_mul(10).clamp(100, 10_000);
+            Some(BulkOrderBookStream::connect(symbol, depth, state_cap).await?)
+        } else {
+            None
+        };
+        let vd = if script.manifest.sources.contains(&ScriptSource::Vd) {
+            Some(BulkTradesStream::connect(symbol).await?)
+        } else {
+            None
+        };
+        let oi = if script.manifest.sources.contains(&ScriptSource::Oi) {
+            Some(BulkTickerStream::connect(symbol).await?)
+        } else {
+            None
+        };
+        let volumes = if script.manifest.sources.contains(&ScriptSource::Volumes) {
+            let seconds = source_configs
+                .get(&ScriptSource::Volumes)
+                .context("missing source config for volumes")?
+                .require_timeframe(&ScriptSource::Volumes)?;
+            let interval = crate::providers::bulk::market_data::timeframe_from_seconds(seconds)?;
+            Some(BulkCandleStream::connect(symbol, interval).await?)
+        } else {
+            None
+        };
+        Ok(Self {
+            candles,
+            orderbook,
+            vd,
+            oi,
+            volumes,
+            cumulative_delta: 0.0,
+        })
+    }
+
+    async fn next_update(&mut self) -> Result<LiveUpdate> {
+        loop {
+            let has_candles = self.candles.is_some();
+            let has_orderbook = self.orderbook.is_some();
+            let has_vd = self.vd.is_some();
+            let has_oi = self.oi.is_some();
+            let has_volumes = self.volumes.is_some();
+            let candles = &mut self.candles;
+            let orderbook = &mut self.orderbook;
+            let vd = &mut self.vd;
+            let oi = &mut self.oi;
+            let volumes = &mut self.volumes;
+
+            tokio::select! {
+                candle = async { candles.as_mut().expect("guarded candle stream").next_candle().await }, if has_candles => {
+                    return Ok(LiveUpdate::Candles(ScriptCandle::from_bulk(candle?)));
+                }
+                snapshot = async { orderbook.as_mut().expect("guarded orderbook stream").next_snapshot().await }, if has_orderbook => {
+                    return Ok(LiveUpdate::Orderbook(snapshot?));
+                }
+                trades = async { vd.as_mut().expect("guarded trades stream").next_trades().await }, if has_vd => {
+                    let trades = trades?;
+                    if let Some(update) = bulk_vd_update(&trades, &mut self.cumulative_delta) {
+                        return Ok(LiveUpdate::Vd(update));
+                    }
+                }
+                ticker = async { oi.as_mut().expect("guarded ticker stream").next_ticker().await }, if has_oi => {
+                    let ticker = ticker?;
+                    return Ok(LiveUpdate::Oi(ScriptOpenInterest::from_bulk(OpenInterestSnapshot {
+                        exchange: ticker.exchange,
+                        symbol: ticker.symbol,
+                        timestamp_ms: ticker.timestamp_ms,
+                        open_interest: ticker.open_interest,
+                        mark_price: ticker.mark_price,
+                        notional: ticker.open_interest * ticker.mark_price,
+                    })));
+                }
+                candle = async { volumes.as_mut().expect("guarded volume stream").next_candle().await }, if has_volumes => {
+                    return Ok(LiveUpdate::Volumes(ScriptVolume::from_bulk_candle(candle?)));
+                }
+                else => bail!("BULK script has no live source streams"),
+            }
+        }
+    }
+}
+
+fn bulk_vd_update(
+    trades: &[crate::domain::types::TradeTick],
+    cumulative_delta: &mut f64,
+) -> Option<ScriptVolumeDelta> {
+    if trades.is_empty() {
+        return None;
+    }
+    let delta = trades
+        .iter()
+        .map(|trade| {
+            if trade.taker_buy {
+                trade.size
+            } else {
+                -trade.size
+            }
+        })
+        .sum::<f64>();
+    *cumulative_delta += delta;
+    Some(ScriptVolumeDelta::from_bulk(VolumeDeltaTick {
+        exchange: "bulk".to_string(),
+        symbol: trades[0].symbol.clone(),
+        timestamp_ms: trades
+            .iter()
+            .map(|trade| trade.timestamp_ms)
+            .max()
+            .unwrap_or_default(),
+        delta,
+        cumulative_delta: *cumulative_delta,
+    }))
+}
+
+async fn subscribe_mmt_sources(
     ws: &MmtWsClient,
     script: &Script,
     source_configs: &SourceConfigs,
@@ -357,7 +592,7 @@ fn orderbook_state(source_configs: &SourceConfigs) -> Option<OrderBookState> {
     })
 }
 
-async fn next_live_update(
+async fn next_mmt_update(
     ws: &MmtWsClient,
     source_configs: &SourceConfigs,
     orderbook_state: &mut Option<OrderBookState>,
@@ -380,25 +615,25 @@ async fn next_live_update(
             let payload = value.get("data").context("candles payload missing data")?;
             let candle: OhlcvtCandle =
                 serde_json::from_value(payload.clone()).context("invalid candles candle shape")?;
-            Ok(Some(LiveUpdate::Candles(candle)))
+            Ok(Some(LiveUpdate::Candles(ScriptCandle::from_mmt(candle))))
         }
         Some("vd") => {
             let payload = value.get("data").context("vd payload missing data")?;
             let candle: VdCandle =
                 serde_json::from_value(payload.clone()).context("invalid vd candle shape")?;
-            Ok(Some(LiveUpdate::Vd(candle)))
+            Ok(Some(LiveUpdate::Vd(ScriptVolumeDelta::from_mmt(candle))))
         }
         Some("oi") => {
             let payload = value.get("data").context("oi payload missing data")?;
             let candle: OiCandle =
                 serde_json::from_value(payload.clone()).context("invalid oi candle shape")?;
-            Ok(Some(LiveUpdate::Oi(candle)))
+            Ok(Some(LiveUpdate::Oi(ScriptOpenInterest::from_mmt(candle))))
         }
         Some("volumes") => {
             let payload = value.get("data").context("volumes payload missing data")?;
             let profile: VolumeProfile =
                 serde_json::from_value(payload.clone()).context("invalid volumes profile shape")?;
-            Ok(Some(LiveUpdate::Volumes(profile)))
+            Ok(Some(LiveUpdate::Volumes(ScriptVolume::from_mmt(profile))))
         }
         Some("depth") => {
             let Some(state) = orderbook_state.as_mut() else {
@@ -465,11 +700,11 @@ impl LiveUpdate {
 
     fn ts_ms(&self) -> u64 {
         match self {
-            LiveUpdate::Candles(candle) => candle.t * 1000,
+            LiveUpdate::Candles(candle) => candle.t,
             LiveUpdate::Orderbook(snapshot) => snapshot.timestamp_ms,
-            LiveUpdate::Vd(candle) => candle.t * 1000,
-            LiveUpdate::Oi(candle) => candle.t * 1000,
-            LiveUpdate::Volumes(profile) => profile.t * 1000,
+            LiveUpdate::Vd(candle) => candle.t,
+            LiveUpdate::Oi(candle) => candle.t,
+            LiveUpdate::Volumes(profile) => profile.t,
         }
     }
 }
@@ -544,6 +779,9 @@ fn live_stream_payload(
     source: ScriptSource,
     state: &LiveState,
     source_configs: &SourceConfigs,
+    provider: &str,
+    exchange: &str,
+    symbol: &str,
 ) -> Result<Value> {
     let mut payload = serde_json::Map::new();
     payload.insert("mode".to_string(), Value::String("stream".to_string()));
@@ -551,6 +789,9 @@ fn live_stream_payload(
         "source".to_string(),
         Value::String(source.as_str().to_string()),
     );
+    payload.insert("provider".to_string(), Value::String(provider.to_string()));
+    payload.insert("exchange".to_string(), Value::String(exchange.to_string()));
+    payload.insert("symbol".to_string(), Value::String(symbol.to_string()));
 
     if let Some(candle) = &state.candles {
         payload.insert(
@@ -576,8 +817,9 @@ fn live_stream_payload(
             "vd".to_string(),
             json!({
                 "candle": candle,
-                "bucket": config.require_bucket(&ScriptSource::Vd)?,
-                "timeframe_sec": config.require_timeframe(&ScriptSource::Vd)?,
+                "record": candle,
+                "bucket": config.bucket,
+                "timeframe_sec": config.timeframe,
             }),
         );
     }
@@ -589,7 +831,8 @@ fn live_stream_payload(
             "oi".to_string(),
             json!({
                 "candle": candle,
-                "timeframe_sec": config.require_timeframe(&ScriptSource::Oi)?,
+                "record": candle,
+                "timeframe_sec": config.timeframe,
             }),
         );
     }
@@ -601,6 +844,7 @@ fn live_stream_payload(
             "volumes".to_string(),
             json!({
                 "profile": profile,
+                "record": profile,
                 "timeframe_sec": config.require_timeframe(&ScriptSource::Volumes)?,
             }),
         );

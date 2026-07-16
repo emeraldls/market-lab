@@ -12,15 +12,19 @@ use crate::commands::script::{
 };
 use crate::commands::study::common::{is_empty_object, provider_name};
 use crate::domain::enums::ProviderKind;
-use crate::domain::types::{OhlcvtCandle, OiCandle, OrderBookSnapshot, VdCandle, VolumeProfile};
+use crate::domain::types::OrderBookSnapshot;
+use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::mmt::MmtProvider;
 use crate::scripting::engine::Script;
 use crate::scripting::inputs::{
-    SourceConfigs, parse_param_values, parse_source_configs, resolve_params,
-    validate_source_configs,
+    SourceConfigs, parse_param_values, parse_source_configs, populate_source_defaults,
+    resolve_params, validate_bulk_source_configs, validate_source_configs,
 };
 use crate::scripting::limits::SCRIPT_DEFAULT_LOOKBACK_CANDLES;
 use crate::scripting::manifest::ScriptSource;
+use crate::scripting::market_data::{
+    ScriptCandle, ScriptOpenInterest, ScriptVolume, ScriptVolumeDelta,
+};
 use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone, Serialize)]
@@ -190,17 +194,17 @@ struct ScriptBacktestLatestOutput {
 
 #[derive(Default)]
 struct BacktestData {
-    candles: Option<Vec<OhlcvtCandle>>,
+    candles: Option<Vec<ScriptCandle>>,
     orderbooks: Option<Vec<OrderBookSnapshot>>,
-    vd: Option<Vec<VdCandle>>,
-    oi: Option<Vec<OiCandle>>,
-    volumes: Option<Vec<VolumeProfile>>,
+    vd: Option<Vec<ScriptVolumeDelta>>,
+    oi: Option<Vec<ScriptOpenInterest>>,
+    volumes: Option<Vec<ScriptVolume>>,
 }
 
 pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
     args.validate()?;
-    if !matches!(args.provider.into(), ProviderKind::Mmt) {
-        bail!("scripts currently support only --provider mmt");
+    if matches!(args.provider.into(), ProviderKind::MarketLab) {
+        bail!("script backtest supports --provider mmt|bulk");
     }
     if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
         bail!("script backtest currently supports only --output terminal|json|jsonl");
@@ -211,10 +215,10 @@ pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
         "script.backtest",
         &script,
         Some(provider_name(args.provider.into()).to_string()),
-        Some(args.exchange.clone()),
+        Some(args.exchange_name()?.to_string()),
         Some(args.symbol.clone()),
     );
-    let source_configs = match parse_source_configs(&args.source) {
+    let mut source_configs = match parse_source_configs(&args.source) {
         Ok(configs) => configs,
         Err(err) => {
             let runtime_report = report.finish_error(&err);
@@ -222,7 +226,15 @@ pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
             return Err(err);
         }
     };
-    if let Err(err) = validate_source_configs(&script.manifest, &source_configs) {
+    let source_validation = match args.provider.into() {
+        ProviderKind::Mmt => validate_source_configs(&script.manifest, &source_configs),
+        ProviderKind::Bulk => {
+            populate_source_defaults(&script.manifest, &mut source_configs);
+            validate_bulk_source_configs(&script.manifest, &source_configs, true)
+        }
+        ProviderKind::MarketLab => unreachable!(),
+    };
+    if let Err(err) = source_validation {
         let runtime_report = report.finish_error(&err);
         write_report_best_effort(&runtime_report);
         return Err(err);
@@ -311,6 +323,9 @@ async fn backtest_window(
             script: &script,
             data: &data,
             source_configs: &source_configs,
+            provider: provider_name(args.provider.into()),
+            exchange: args.exchange_name()?,
+            symbol: &args.symbol,
             clock: &clock,
             clock_idx: idx,
             cutoff_ms: cutoff,
@@ -407,7 +422,7 @@ async fn backtest_window(
         r#type: "script.backtest.result",
         version: "1",
         provider: provider_name(args.provider.into()),
-        exchange: args.exchange.clone(),
+        exchange: args.exchange_name()?.to_string(),
         symbol: args.symbol.clone(),
         ts_ms: mark_ts_ms,
         script: ScriptDescriptor {
@@ -453,8 +468,22 @@ async fn fetch_sources(
     source_configs: &SourceConfigs,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
 ) -> Result<BacktestData> {
+    match args.provider.into() {
+        ProviderKind::Mmt => fetch_mmt_sources(args, script, source_configs, report).await,
+        ProviderKind::Bulk => fetch_bulk_sources(args, script, source_configs, report).await,
+        ProviderKind::MarketLab => bail!("script backtest supports --provider mmt|bulk"),
+    }
+}
+
+async fn fetch_mmt_sources(
+    args: &ScriptBacktestArgs,
+    script: &Script,
+    source_configs: &SourceConfigs,
+    report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
+) -> Result<BacktestData> {
     let mut data = BacktestData::default();
     let mut cancel = Box::pin(tokio::signal::ctrl_c());
+    let exchange = args.exchange_name()?;
 
     for source in &script.manifest.sources {
         let config = source_configs
@@ -469,10 +498,9 @@ async fn fetch_sources(
                 write_running_report_best_effort(report);
                 eprintln!(
                     "fetching candles exchange={} symbol={} tf={} from={} to={}",
-                    args.exchange, args.symbol, timeframe, args.from, args.to
+                    exchange, args.symbol, timeframe, args.from, args.to
                 );
-                let future =
-                    MmtProvider::candles(&args.exchange, &args.symbol, tf, args.from, args.to);
+                let future = MmtProvider::candles(exchange, &args.symbol, tf, args.from, args.to);
                 let series = tokio::select! {
                     result = future => result?,
                     _ = &mut cancel => {
@@ -491,7 +519,13 @@ async fn fetch_sources(
                     series.data.len() as u64,
                 );
                 write_running_report_best_effort(report);
-                data.candles = Some(series.data);
+                data.candles = Some(
+                    series
+                        .data
+                        .into_iter()
+                        .map(ScriptCandle::from_mmt)
+                        .collect(),
+                );
             }
             ScriptSource::Orderbook => {
                 let timeframe = config.require_timeframe(source)?;
@@ -502,10 +536,10 @@ async fn fetch_sources(
                 write_running_report_best_effort(report);
                 eprintln!(
                     "fetching orderbooks exchange={} symbol={} tf={} from={} to={} depth={}",
-                    args.exchange, args.symbol, timeframe, args.from, args.to, depth
+                    exchange, args.symbol, timeframe, args.from, args.to, depth
                 );
                 let future = MmtProvider::historical_orderbooks(
-                    &args.exchange,
+                    exchange,
                     &args.symbol,
                     tf,
                     args.from,
@@ -541,10 +575,10 @@ async fn fetch_sources(
                 write_running_report_best_effort(report);
                 eprintln!(
                     "fetching vd exchange={} symbol={} tf={} from={} to={} bucket={}",
-                    args.exchange, args.symbol, timeframe, args.from, args.to, bucket
+                    exchange, args.symbol, timeframe, args.from, args.to, bucket
                 );
                 let future =
-                    MmtProvider::vd(&args.exchange, &args.symbol, tf, args.from, args.to, bucket);
+                    MmtProvider::vd(exchange, &args.symbol, tf, args.from, args.to, bucket);
                 let series = tokio::select! {
                     result = future => result?,
                     _ = &mut cancel => {
@@ -563,7 +597,13 @@ async fn fetch_sources(
                     series.data.len() as u64,
                 );
                 write_running_report_best_effort(report);
-                data.vd = Some(series.data);
+                data.vd = Some(
+                    series
+                        .data
+                        .into_iter()
+                        .map(ScriptVolumeDelta::from_mmt)
+                        .collect(),
+                );
             }
             ScriptSource::Oi => {
                 let timeframe = config.require_timeframe(source)?;
@@ -573,9 +613,9 @@ async fn fetch_sources(
                 write_running_report_best_effort(report);
                 eprintln!(
                     "fetching oi exchange={} symbol={} tf={} from={} to={}",
-                    args.exchange, args.symbol, timeframe, args.from, args.to
+                    exchange, args.symbol, timeframe, args.from, args.to
                 );
-                let future = MmtProvider::oi(&args.exchange, &args.symbol, tf, args.from, args.to);
+                let future = MmtProvider::oi(exchange, &args.symbol, tf, args.from, args.to);
                 let series = tokio::select! {
                     result = future => result?,
                     _ = &mut cancel => {
@@ -594,7 +634,13 @@ async fn fetch_sources(
                     series.data.len() as u64,
                 );
                 write_running_report_best_effort(report);
-                data.oi = Some(series.data);
+                data.oi = Some(
+                    series
+                        .data
+                        .into_iter()
+                        .map(ScriptOpenInterest::from_mmt)
+                        .collect(),
+                );
             }
             ScriptSource::Volumes => {
                 let timeframe = config.require_timeframe(source)?;
@@ -604,10 +650,9 @@ async fn fetch_sources(
                 write_running_report_best_effort(report);
                 eprintln!(
                     "fetching volumes exchange={} symbol={} tf={} from={} to={}",
-                    args.exchange, args.symbol, timeframe, args.from, args.to
+                    exchange, args.symbol, timeframe, args.from, args.to
                 );
-                let future =
-                    MmtProvider::volumes(&args.exchange, &args.symbol, tf, args.from, args.to);
+                let future = MmtProvider::volumes(exchange, &args.symbol, tf, args.from, args.to);
                 let series = tokio::select! {
                     result = future => result?,
                     _ = &mut cancel => {
@@ -626,9 +671,97 @@ async fn fetch_sources(
                     series.data.len() as u64,
                 );
                 write_running_report_best_effort(report);
-                data.volumes = Some(series.data);
+                data.volumes = Some(
+                    series
+                        .data
+                        .into_iter()
+                        .map(ScriptVolume::from_mmt)
+                        .collect(),
+                );
             }
         }
+    }
+
+    Ok(data)
+}
+
+async fn fetch_bulk_sources(
+    args: &ScriptBacktestArgs,
+    script: &Script,
+    source_configs: &SourceConfigs,
+    report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
+) -> Result<BacktestData> {
+    let mut data = BacktestData::default();
+    let mut cancel = Box::pin(tokio::signal::ctrl_c());
+
+    for source in &script.manifest.sources {
+        let config = source_configs
+            .get(source)
+            .ok_or_else(|| anyhow::anyhow!("missing source config for {}", source.as_str()))?;
+        let timeframe = config.require_timeframe(source)?;
+        let interval = crate::providers::bulk::market_data::timeframe_from_seconds(timeframe)?;
+        let phase = match source {
+            ScriptSource::Candles => "fetching_candles",
+            ScriptSource::Volumes => "fetching_volumes",
+            ScriptSource::Orderbook | ScriptSource::Vd | ScriptSource::Oi => {
+                bail!(
+                    "BULK does not provide historical {} for script backtests",
+                    source.as_str()
+                );
+            }
+        };
+        report.set_phase(phase);
+        write_running_report_best_effort(report);
+        let started = Instant::now();
+        eprintln!(
+            "fetching BULK {} symbol={} tf={} from={} to={}",
+            source.as_str(),
+            args.symbol,
+            timeframe,
+            args.from,
+            args.to
+        );
+        let future = BulkProvider::candles(&args.symbol, interval, args.from, args.to);
+        let series = tokio::select! {
+            result = future => result?,
+            _ = &mut cancel => {
+                report.set_phase("cancelled");
+                return Err(ScriptCancelled.into());
+            }
+        };
+        let points = series.data.len();
+        match source {
+            ScriptSource::Candles => {
+                data.candles = Some(
+                    series
+                        .data
+                        .into_iter()
+                        .map(ScriptCandle::from_bulk)
+                        .collect(),
+                );
+            }
+            ScriptSource::Volumes => {
+                data.volumes = Some(
+                    series
+                        .data
+                        .into_iter()
+                        .map(ScriptVolume::from_bulk_candle)
+                        .collect(),
+                );
+            }
+            ScriptSource::Orderbook | ScriptSource::Vd | ScriptSource::Oi => unreachable!(),
+        }
+        eprintln!(
+            "fetched {points} BULK {} records in {}ms",
+            source.as_str(),
+            started.elapsed().as_millis()
+        );
+        report.set_progress(
+            format!("{}_fetched", source.as_str()),
+            points as u64,
+            points as u64,
+        );
+        write_running_report_best_effort(report);
     }
 
     Ok(data)
@@ -638,6 +771,9 @@ struct WindowPayloadContext<'a> {
     script: &'a Script,
     data: &'a BacktestData,
     source_configs: &'a SourceConfigs,
+    provider: &'a str,
+    exchange: &'a str,
+    symbol: &'a str,
     clock: &'a ScriptSource,
     clock_idx: usize,
     cutoff_ms: u64,
@@ -649,6 +785,15 @@ struct WindowPayloadContext<'a> {
 fn build_window_payload(ctx: WindowPayloadContext<'_>) -> Result<Value> {
     let mut root = Map::new();
     root.insert("mode".to_string(), Value::String("window".to_string()));
+    root.insert(
+        "provider".to_string(),
+        Value::String(ctx.provider.to_string()),
+    );
+    root.insert(
+        "exchange".to_string(),
+        Value::String(ctx.exchange.to_string()),
+    );
+    root.insert("symbol".to_string(), Value::String(ctx.symbol.to_string()));
 
     for source in &ctx.script.manifest.sources {
         match source {
@@ -698,7 +843,8 @@ fn build_window_payload(ctx: WindowPayloadContext<'_>) -> Result<Value> {
                 root.insert(
                     "vd".to_string(),
                     json!({
-                        "candles": slice,
+                        "candles": slice.clone(),
+                        "records": slice,
                         "bucket": config.require_bucket(source)?,
                         "timeframe_sec": config.require_timeframe(source)?,
                     }),
@@ -720,7 +866,8 @@ fn build_window_payload(ctx: WindowPayloadContext<'_>) -> Result<Value> {
                 root.insert(
                     "oi".to_string(),
                     json!({
-                        "candles": slice,
+                        "candles": slice.clone(),
+                        "records": slice,
                         "timeframe_sec": config.require_timeframe(source)?,
                     }),
                 );
@@ -745,7 +892,8 @@ fn build_window_payload(ctx: WindowPayloadContext<'_>) -> Result<Value> {
                 root.insert(
                     "volumes".to_string(),
                     json!({
-                        "profiles": slice,
+                        "profiles": slice.clone(),
+                        "records": slice,
                         "timeframe_sec": config.require_timeframe(source)?,
                     }),
                 );
@@ -828,58 +976,31 @@ fn clock_price(clock: &ScriptSource, data: &BacktestData, idx: usize) -> Result<
                 .as_ref()
                 .context("orderbook data not loaded")?[idx],
         ),
-        ScriptSource::Vd => Ok(data.vd.as_ref().context("vd data not loaded")?[idx].c),
+        ScriptSource::Vd => {
+            let record = &data.vd.as_ref().context("vd data not loaded")?[idx];
+            Ok(record.c.unwrap_or(record.value))
+        }
         ScriptSource::Oi => Ok(data.oi.as_ref().context("oi data not loaded")?[idx].c),
-        ScriptSource::Volumes => {
-            volume_profile_price(&data.volumes.as_ref().context("volumes data not loaded")?[idx])
-        }
+        ScriptSource::Volumes => data.volumes.as_ref().context("volumes data not loaded")?[idx]
+            .reference_price()
+            .context("volume record has no reference price"),
     }
 }
 
-fn candle_ts_ms(candle: &OhlcvtCandle) -> u64 {
-    if candle.t < 10_000_000_000 {
-        candle.t * 1000
-    } else {
-        candle.t
-    }
+fn candle_ts_ms(candle: &ScriptCandle) -> u64 {
+    candle.t
 }
 
-fn vd_ts_ms(candle: &VdCandle) -> u64 {
-    if candle.t < 10_000_000_000 {
-        candle.t * 1000
-    } else {
-        candle.t
-    }
+fn vd_ts_ms(candle: &ScriptVolumeDelta) -> u64 {
+    candle.t
 }
 
-fn oi_ts_ms(candle: &OiCandle) -> u64 {
-    if candle.t < 10_000_000_000 {
-        candle.t * 1000
-    } else {
-        candle.t
-    }
+fn oi_ts_ms(candle: &ScriptOpenInterest) -> u64 {
+    candle.t
 }
 
-fn volume_ts_ms(profile: &VolumeProfile) -> u64 {
-    if profile.t < 10_000_000_000 {
-        profile.t * 1000
-    } else {
-        profile.t
-    }
-}
-
-fn volume_profile_price(profile: &VolumeProfile) -> Result<f64> {
-    let mut best_price = None;
-    let mut best_volume = f64::NEG_INFINITY;
-    for (idx, price) in profile.p.iter().enumerate() {
-        let total =
-            profile.b.get(idx).copied().unwrap_or(0.0) + profile.s.get(idx).copied().unwrap_or(0.0);
-        if total > best_volume {
-            best_volume = total;
-            best_price = Some(*price);
-        }
-    }
-    best_price.context("volume profile has no price levels")
+fn volume_ts_ms(profile: &ScriptVolume) -> u64 {
+    profile.t
 }
 
 fn book_mid(book: &OrderBookSnapshot) -> Result<f64> {

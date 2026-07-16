@@ -450,7 +450,7 @@ leverage = 2
                 command: ScriptCommands::Backtest(args),
             } => {
                 assert_eq!(args.symbol, "BTC/USDT");
-                assert_eq!(args.exchange, "bybitf");
+                assert_eq!(args.exchange.as_deref(), Some("bybitf"));
                 assert_eq!(args.leverage, 5.0);
                 assert_eq!(args.source, vec!["candles:timeframe=60"]);
                 assert_eq!(args.param, vec!["candles:fast=20"]);

@@ -49,8 +49,12 @@ export function onData(ctx, input) {
     depth: Math.trunc(ctx.params.orderbook.depth_levels)
   })
   const bodyBps = candle.o > 0 ? ((candle.c - candle.o) / candle.o) * 10000 : 0
-  const cvd = ctx.study.cvd(vd, { bucket: input.vd.bucket })
-  const vdDelta = cvd.delta
+  const isTradeDerivedVd = typeof vd.delta === "number"
+  const cvd = isTradeDerivedVd
+    ? null
+    : ctx.study.cvd(vd, { bucket: input.vd.bucket ?? 1 })
+  const vdDelta = isTradeDerivedVd ? vd.delta : cvd.delta
+  const latestCvd = isTradeDerivedVd ? vd.cumulative_delta : cvd.latest
 
   const bullish =
     bodyBps >= ctx.params.candles.min_body_bps &&
@@ -74,8 +78,8 @@ export function onData(ctx, input) {
       spread_bps: spread.spread_bps,
       imbalance: imbalance.imbalance,
       vd_delta: vdDelta,
-      latest_cvd: cvd.latest,
-      vd_trades: vd.n
+      latest_cvd: latestCvd,
+      vd_trades: vd.n ?? null
     },
     signal: {
       event: bullish ? "bullish_alignment" : bearish ? "bearish_alignment" : "no_alignment",

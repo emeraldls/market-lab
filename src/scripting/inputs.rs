@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use anyhow::{Result, bail};
 use serde_json::{Map, Value};
 
+use crate::providers::bulk::market_data::timeframe_from_seconds as bulk_timeframe_from_seconds;
+
 use super::manifest::{InputType, ScriptManifest, ScriptParamSchema, ScriptSource};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -76,6 +78,67 @@ pub fn parse_source_configs(values: &[String]) -> Result<SourceConfigs> {
 
 pub fn parse_param_values(values: &[String]) -> Result<RawScopedValues> {
     parse_scoped_values(values, "--param")
+}
+
+pub fn populate_source_defaults(manifest: &ScriptManifest, configs: &mut SourceConfigs) {
+    for source in &manifest.sources {
+        configs.entry(source.clone()).or_default();
+    }
+}
+
+pub fn validate_bulk_source_configs(
+    manifest: &ScriptManifest,
+    configs: &SourceConfigs,
+    historical: bool,
+) -> Result<()> {
+    for source in configs.keys() {
+        if !manifest.sources.contains(source) {
+            bail!(
+                "--source {} is not listed in script.sources",
+                source.as_str()
+            );
+        }
+    }
+
+    for source in &manifest.sources {
+        let config = configs
+            .get(source)
+            .ok_or_else(|| anyhow::anyhow!("missing source config for {}", source.as_str()))?;
+        match source {
+            ScriptSource::Candles | ScriptSource::Volumes => {
+                let timeframe = config.require_timeframe(source)?;
+                bulk_timeframe_from_seconds(timeframe)?;
+            }
+            ScriptSource::Orderbook if historical => {
+                bail!("BULK does not provide historical orderbooks for script backtests");
+            }
+            ScriptSource::Vd if historical => {
+                bail!("BULK does not provide historical volume delta for script backtests");
+            }
+            ScriptSource::Oi if historical => {
+                bail!("BULK does not provide historical open interest for script backtests");
+            }
+            ScriptSource::Orderbook => {
+                if config.timeframe.is_some() {
+                    bail!("BULK live orderbook does not use a timeframe");
+                }
+                if config.depth_or_default() == 0 {
+                    bail!("--source orderbook:depth must be >= 1");
+                }
+            }
+            ScriptSource::Vd => {
+                if config.timeframe.is_some() || config.bucket.is_some() {
+                    bail!("BULK live volume delta is trade-derived; omit timeframe and bucket");
+                }
+            }
+            ScriptSource::Oi => {
+                if config.timeframe.is_some() {
+                    bail!("BULK live open interest is snapshot-based; omit timeframe");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_source_configs(manifest: &ScriptManifest, configs: &SourceConfigs) -> Result<()> {
@@ -347,5 +410,55 @@ mod tests {
         assert_eq!(configs[&ScriptSource::Vd].bucket, Some(1));
         assert_eq!(configs[&ScriptSource::Oi].timeframe, Some(60));
         assert_eq!(configs[&ScriptSource::Volumes].timeframe, Some(60));
+    }
+
+    #[test]
+    fn validates_bulk_live_sources_without_mmt_only_options() {
+        let manifest = ScriptManifest {
+            name: "bulk-live".to_string(),
+            version: "1".to_string(),
+            sources: vec![
+                ScriptSource::Candles,
+                ScriptSource::Orderbook,
+                ScriptSource::Vd,
+                ScriptSource::Oi,
+            ],
+            modes: vec![],
+            clock: None,
+            description: None,
+            lookback: None,
+            params: BTreeMap::new(),
+        };
+        let mut configs = parse_source_configs(&[
+            "candles:timeframe=60".to_string(),
+            "orderbook:depth=50".to_string(),
+        ])
+        .unwrap();
+        populate_source_defaults(&manifest, &mut configs);
+
+        validate_bulk_source_configs(&manifest, &configs, false)
+            .expect("BULK live configs should validate");
+        assert!(configs.contains_key(&ScriptSource::Vd));
+        assert!(configs.contains_key(&ScriptSource::Oi));
+    }
+
+    #[test]
+    fn rejects_bulk_historical_sources_that_do_not_exist() {
+        let manifest = ScriptManifest {
+            name: "bulk-history".to_string(),
+            version: "1".to_string(),
+            sources: vec![ScriptSource::Orderbook],
+            modes: vec![],
+            clock: None,
+            description: None,
+            lookback: None,
+            params: BTreeMap::new(),
+        };
+        let mut configs = SourceConfigs::new();
+        populate_source_defaults(&manifest, &mut configs);
+
+        let error = validate_bulk_source_configs(&manifest, &configs, true)
+            .expect_err("historical BULK orderbook should fail");
+        assert!(error.to_string().contains("historical orderbooks"));
     }
 }

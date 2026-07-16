@@ -441,6 +441,10 @@ impl ScriptRunArgs {
         }
         Ok(())
     }
+
+    pub fn exchange_name(&self) -> Result<&str> {
+        source_exchange(self.provider, self.exchange.as_deref())
+    }
 }
 
 #[derive(Clone, Debug, Args)]
@@ -450,8 +454,8 @@ pub struct ScriptBacktestArgs {
     pub config: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
     pub provider: CliProviderKind,
-    #[arg(long)]
-    pub exchange: String,
+    #[arg(long, required_if_eq("provider", "mmt"))]
+    pub exchange: Option<String>,
     #[arg(long)]
     pub symbol: String,
     #[arg(long)]
@@ -475,9 +479,7 @@ impl ScriptBacktestArgs {
         if self.script.trim().is_empty() {
             bail!("script path is required");
         }
-        if self.exchange.trim().is_empty() {
-            bail!("--exchange cannot be empty");
-        }
+        source_exchange(self.provider, self.exchange.as_deref())?;
         if !is_valid_symbol(&self.symbol) {
             bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
@@ -490,6 +492,10 @@ impl ScriptBacktestArgs {
             bail!("--leverage must be > 0");
         }
         Ok(())
+    }
+
+    pub fn exchange_name(&self) -> Result<&str> {
+        source_exchange(self.provider, self.exchange.as_deref())
     }
 }
 
@@ -2504,6 +2510,57 @@ mod tests {
                 assert_eq!(args.param, vec!["candles:fast=20"]);
                 assert_eq!(args.leverage, 5.0);
                 args.validate().expect("validate should succeed");
+            }
+            _ => panic!("expected script backtest command"),
+        }
+    }
+
+    #[test]
+    fn bulk_scripts_do_not_require_exchange() {
+        let run = Cli::try_parse_from([
+            "mlab",
+            "script",
+            "run",
+            "./examples/candle-summary.js",
+            "--provider",
+            "bulk",
+            "--symbol",
+            "BTC/USDT",
+            "--source",
+            "candles:timeframe=60",
+        ])
+        .expect("BULK script run should parse without exchange");
+        match run.command {
+            Commands::Script {
+                command: ScriptCommands::Run(args),
+            } => assert_eq!(args.exchange_name().unwrap(), "bulk"),
+            _ => panic!("expected script run command"),
+        }
+
+        let backtest = Cli::try_parse_from([
+            "mlab",
+            "script",
+            "backtest",
+            "./examples/sma-cross.js",
+            "--provider",
+            "bulk",
+            "--symbol",
+            "BTC/USDT",
+            "--from",
+            "1704067200000",
+            "--to",
+            "1704067800000",
+            "--source",
+            "candles:timeframe=60",
+        ])
+        .expect("BULK script backtest should parse without exchange");
+        match backtest.command {
+            Commands::Script {
+                command: ScriptCommands::Backtest(args),
+            } => {
+                assert!(args.exchange.is_none());
+                assert_eq!(args.exchange_name().unwrap(), "bulk");
+                args.validate().expect("BULK backtest should validate");
             }
             _ => panic!("expected script backtest command"),
         }
