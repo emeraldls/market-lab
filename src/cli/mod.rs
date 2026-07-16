@@ -116,6 +116,12 @@ pub struct TradeArgs {
     pub leverage: f64,
     #[arg(long, default_value_t = false)]
     pub reduce_only: bool,
+    /// Native stop-loss trigger price attached after the entry first fills.
+    #[arg(long)]
+    pub sl: Option<f64>,
+    /// Native take-profit trigger price attached after the entry first fills.
+    #[arg(long)]
+    pub tp: Option<f64>,
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
     #[arg(long, default_value_t = false)]
@@ -146,6 +152,19 @@ impl TradeArgs {
         }
         if !self.leverage.is_finite() || self.leverage < 1.0 {
             bail!("--leverage must be at least 1");
+        }
+        for (flag, price) in [("--sl", self.sl), ("--tp", self.tp)] {
+            if price.is_some_and(|price| !price.is_finite() || price <= 0.0) {
+                bail!("{flag} must be > 0");
+            }
+        }
+        if self.sl.is_some() || self.tp.is_some() {
+            if self.reduce_only {
+                bail!("--sl/--tp cannot be attached to a reduce-only order");
+            }
+            if self.sl == self.tp {
+                bail!("--sl and --tp must use different prices");
+            }
         }
         match self.order_kind {
             TradeOrderKind::Market if self.price.is_some() => {
@@ -364,6 +383,11 @@ pub enum StudyCommands {
 pub enum ScriptCommands {
     Run(ScriptRunArgs),
     Backtest(ScriptBacktestArgs),
+    Jobs(ScriptJobsArgs),
+    Status(ScriptJobArgs),
+    Logs(ScriptLogsArgs),
+    Stop(ScriptJobArgs),
+    Restart(ScriptJobArgs),
     Runs {
         #[command(subcommand)]
         command: ScriptRunHistoryCommands,
@@ -409,6 +433,9 @@ pub struct ScriptRunArgs {
     pub exchange: Option<String>,
     #[arg(long)]
     pub symbol: Option<String>,
+    /// Arms live execution for ctx.trade/ctx.cancel while data may come from any provider.
+    #[arg(long, value_enum)]
+    pub venue: Option<ExecutionVenueArg>,
     #[arg(long)]
     pub from: Option<u64>,
     #[arg(long)]
@@ -421,6 +448,60 @@ pub struct ScriptRunArgs {
     pub output: OutputFormat,
     #[arg(long, default_value_t = false)]
     pub verbose: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ScriptJobsArgs {
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ScriptJobArgs {
+    pub job: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl ScriptJobArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.job.trim().is_empty() {
+            bail!("script job id is required");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("script job commands support only --output terminal|json|jsonl");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ScriptLogsArgs {
+    pub job: String,
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
+    #[arg(long, default_value_t = false)]
+    pub follow: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl ScriptLogsArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.job.trim().is_empty() {
+            bail!("script job id is required");
+        }
+        if self.limit == 0 {
+            bail!("--limit must be >= 1");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("script logs supports only --output terminal|json|jsonl");
+        }
+        if self.follow && matches!(self.output, OutputFormat::Json) {
+            bail!("--follow supports terminal or jsonl output");
+        }
+        Ok(())
+    }
 }
 
 impl ScriptRunArgs {
@@ -1703,6 +1784,10 @@ mod tests {
             "alo",
             "--leverage",
             "5",
+            "--sl",
+            "64000",
+            "--tp",
+            "67000",
             "--dry-run",
         ])
         .expect("trade command should parse");
@@ -1716,6 +1801,8 @@ mod tests {
                 assert_eq!(args.size, Some(0.001));
                 assert!(matches!(args.order_kind, TradeOrderKind::Limit));
                 assert!(matches!(args.tif, TradeTimeInForce::Alo));
+                assert_eq!(args.sl, Some(64_000.0));
+                assert_eq!(args.tp, Some(67_000.0));
                 assert!(args.dry_run);
             }
             _ => panic!("expected trade long command"),
@@ -2618,6 +2705,41 @@ mod tests {
                 args.validate().expect("validate should succeed");
             }
             _ => panic!("expected script runs show command"),
+        }
+    }
+
+    #[test]
+    fn parses_detached_script_execution_and_job_commands() {
+        let run = Cli::try_parse_from([
+            "mlab",
+            "script",
+            "run",
+            "strategy.js",
+            "--provider",
+            "bulk",
+            "--symbol",
+            "BTC/USDT",
+            "--venue",
+            "bulk",
+        ])
+        .expect("detached script execution should parse");
+        match run.command {
+            Commands::Script {
+                command: ScriptCommands::Run(args),
+            } => assert!(matches!(args.venue, Some(ExecutionVenueArg::Bulk))),
+            _ => panic!("expected script run command"),
+        }
+
+        let logs = Cli::try_parse_from(["mlab", "script", "logs", "job_123", "--follow"])
+            .expect("script logs should parse");
+        match logs.command {
+            Commands::Script {
+                command: ScriptCommands::Logs(args),
+            } => {
+                assert_eq!(args.job, "job_123");
+                assert!(args.follow);
+            }
+            _ => panic!("expected script logs command"),
         }
     }
 }

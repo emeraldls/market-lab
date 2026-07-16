@@ -173,6 +173,8 @@ pub async fn handle_close(args: ClosePositionArgs) -> Result<()> {
             tif: TradeTimeInForce::Gtc,
             leverage: position.leverage.max(1.0),
             reduce_only: true,
+            sl: None,
+            tp: None,
             dry_run: args.dry_run,
             yes: args.yes,
             output: args.output,
@@ -237,7 +239,10 @@ fn choose_position(
     Ok(positions[index - 1].clone())
 }
 
-async fn build_trade_plan(args: &TradeArgs, direction: PositionDirection) -> Result<TradePlan> {
+pub(crate) async fn build_trade_plan(
+    args: &TradeArgs,
+    direction: PositionDirection,
+) -> Result<TradePlan> {
     let market = catalog::market(&args.symbol)?;
     validate_market_rules(market, args)?;
     let account = match args.venue {
@@ -259,6 +264,7 @@ async fn build_trade_plan(args: &TradeArgs, direction: PositionDirection) -> Res
             market.symbol
         );
     }
+    validate_protection_prices(market, args, direction, reference_price)?;
 
     let size = if let Some(size) = args.size {
         if !is_step_aligned(size, market.lot_size) {
@@ -311,6 +317,8 @@ async fn build_trade_plan(args: &TradeArgs, direction: PositionDirection) -> Res
         estimated_notional,
         leverage: args.leverage,
         reduce_only: args.reduce_only,
+        stop_loss_price: args.sl,
+        take_profit_price: args.tp,
         rules: MarketRules {
             tick_size: market.tick_size,
             lot_size: market.lot_size,
@@ -318,6 +326,44 @@ async fn build_trade_plan(args: &TradeArgs, direction: PositionDirection) -> Res
             max_leverage: market.max_leverage,
         },
     })
+}
+
+fn validate_protection_prices(
+    market: &BulkMarket,
+    args: &TradeArgs,
+    direction: PositionDirection,
+    entry_price: f64,
+) -> Result<()> {
+    for (flag, price) in [("--sl", args.sl), ("--tp", args.tp)] {
+        if let Some(price) = price
+            && !is_step_aligned(price, market.tick_size)
+        {
+            bail!(
+                "{flag} {price} is not aligned to BULK tick size {} for {}",
+                market.tick_size,
+                market.internal_symbol
+            );
+        }
+    }
+    match direction {
+        PositionDirection::Long => {
+            if args.sl.is_some_and(|price| price >= entry_price) {
+                bail!("--sl must be below the long entry price {entry_price}");
+            }
+            if args.tp.is_some_and(|price| price <= entry_price) {
+                bail!("--tp must be above the long entry price {entry_price}");
+            }
+        }
+        PositionDirection::Short => {
+            if args.sl.is_some_and(|price| price <= entry_price) {
+                bail!("--sl must be above the short entry price {entry_price}");
+            }
+            if args.tp.is_some_and(|price| price >= entry_price) {
+                bail!("--tp must be below the short entry price {entry_price}");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_market_rules(market: &BulkMarket, args: &TradeArgs) -> Result<()> {
@@ -428,6 +474,12 @@ fn render_trade_plan(plan: &TradePlan, dry_run: bool, output: OutputFormat) -> R
             println!("  est. notional:     {:.8}", plan.estimated_notional);
             println!("  leverage:          {}x", plan.leverage);
             println!("  reduce only:       {}", plan.reduce_only);
+            if let Some(price) = plan.stop_loss_price {
+                println!("  stop loss:         {price} (native on-fill trigger)");
+            }
+            if let Some(price) = plan.take_profit_price {
+                println!("  take profit:       {price} (native on-fill trigger)");
+            }
             println!(
                 "  rules:              tick={} lot={} min={} max_leverage={}x",
                 plan.rules.tick_size,

@@ -8,6 +8,9 @@ use anyhow::{Context as AnyhowContext, Result};
 use rquickjs::{CatchResultExt, Context, Ctx, Function, Module, Object, Promise, Runtime, Value};
 use serde_json::Value as JsonValue;
 
+use super::execution::{
+    ScriptCommandBuffer, ScriptExecutionCommand, ScriptExecutionContext, attach_execution_helpers,
+};
 use super::limits::default_limits;
 use super::manifest::ScriptManifest;
 use super::output::ScriptOutput;
@@ -33,7 +36,19 @@ impl Script {
         })
     }
 
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
     pub fn start_session(&self, params: &JsonValue) -> Result<ScriptSession> {
+        self.start_session_with_execution(params, ScriptExecutionContext::disabled())
+    }
+
+    pub fn start_session_with_execution(
+        &self,
+        params: &JsonValue,
+        execution: ScriptExecutionContext,
+    ) -> Result<ScriptSession> {
         let limits = default_limits();
         let rt = Runtime::new().context("failed to create QuickJS runtime")?;
         rt.set_memory_limit(limits.heap_bytes);
@@ -52,6 +67,7 @@ impl Script {
                 .unwrap_or(true)
         })));
         let ctx = Context::full(&rt).context("failed to create QuickJS context")?;
+        let commands: ScriptCommandBuffer = Arc::new(Mutex::new(Vec::new()));
 
         ctx.with(|ctx| -> Result<()> {
             let module =
@@ -69,6 +85,9 @@ impl Script {
             let hook: Function = namespace
                 .get("onData")
                 .context("scripts require export `onData(ctx, input)`")?;
+            let execution_hook: Option<Function> = namespace
+                .get("onExecution")
+                .context("failed to inspect optional onExecution hook")?;
 
             let script_ctx = Object::new(ctx.clone()).context("failed to create script ctx")?;
             let params_val = json_to_js(ctx.clone(), params)?;
@@ -76,6 +95,7 @@ impl Script {
                 .set("params", params_val)
                 .context("failed to assign ctx.params")?;
             attach_study_helpers(ctx.clone(), &script_ctx)?;
+            attach_execution_helpers(ctx.clone(), &script_ctx, &execution, &commands)?;
 
             let globals = ctx.globals();
             globals
@@ -84,6 +104,11 @@ impl Script {
             globals
                 .set("__mlab_ctx", script_ctx)
                 .context("failed to store script ctx")?;
+            if let Some(execution_hook) = execution_hook {
+                globals
+                    .set("__mlab_onExecution", execution_hook)
+                    .context("failed to store onExecution hook")?;
+            }
             Ok(())
         })?;
 
@@ -92,6 +117,7 @@ impl Script {
             ctx,
             hook_started,
             cancelled,
+            commands,
         })
     }
 }
@@ -101,6 +127,7 @@ pub struct ScriptSession {
     rt: Runtime,
     hook_started: Arc<Mutex<Instant>>,
     cancelled: Arc<AtomicBool>,
+    commands: ScriptCommandBuffer,
 }
 
 impl ScriptSession {
@@ -142,7 +169,30 @@ impl ScriptSession {
         self.run_with_input(payload)
     }
 
+    pub fn run_execution_event(&self, event: JsonValue) -> Result<Option<ScriptExecution>> {
+        let has_hook = self.ctx.with(|ctx| -> Result<bool> {
+            Ok(!ctx
+                .globals()
+                .get::<_, Value>("__mlab_onExecution")?
+                .is_undefined())
+        })?;
+        if !has_hook {
+            return Ok(None);
+        }
+        self.run_hook("__mlab_onExecution", "onExecution", event)
+            .map(Some)
+    }
+
     fn run_with_input(&self, input_payload: JsonValue) -> Result<ScriptExecution> {
+        self.run_hook("__mlab_onData", "onData", input_payload)
+    }
+
+    fn run_hook(
+        &self,
+        global_name: &str,
+        display_name: &str,
+        input_payload: JsonValue,
+    ) -> Result<ScriptExecution> {
         let started = Instant::now();
         {
             let mut hook_started = self
@@ -152,11 +202,12 @@ impl ScriptSession {
             *hook_started = started;
         }
 
+        self.clear_commands()?;
         let output = self.ctx.with(|ctx| -> Result<ScriptOutput> {
             let globals = ctx.globals();
             let hook: Function = globals
-                .get("__mlab_onData")
-                .context("scripts require export `onData(ctx, input)`")?;
+                .get(global_name)
+                .with_context(|| format!("script has no `{display_name}` hook"))?;
             let script_ctx: Object = globals
                 .get("__mlab_ctx")
                 .context("failed to read script ctx")?;
@@ -164,25 +215,51 @@ impl ScriptSession {
             let result: Value = hook
                 .call((script_ctx, input_val))
                 .catch(&ctx)
-                .map_err(|err| anyhow::anyhow!("onData failed: {}", err))?;
-            let result_json = js_to_json(ctx.clone(), result)?;
+                .map_err(|err| anyhow::anyhow!("{display_name} failed: {}", err))?;
+            let result_json = js_to_json_or_null(ctx.clone(), result)?;
             ScriptOutput::from_json(result_json)
-        })?;
+        });
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                self.clear_commands()?;
+                return Err(error);
+            }
+        };
+        let commands = self.drain_commands()?;
 
         let memory_usage = self.rt.memory_usage();
         Ok(ScriptExecution {
             output,
+            commands,
             stats: ScriptHookStats {
                 duration_ms: started.elapsed().as_millis() as u64,
                 heap_used_bytes: u64::try_from(memory_usage.memory_used_size).ok(),
             },
         })
     }
+
+    fn clear_commands(&self) -> Result<()> {
+        self.commands
+            .lock()
+            .map_err(|_| anyhow::anyhow!("script execution queue lock poisoned"))?
+            .clear();
+        Ok(())
+    }
+
+    fn drain_commands(&self) -> Result<Vec<ScriptExecutionCommand>> {
+        let mut commands = self
+            .commands
+            .lock()
+            .map_err(|_| anyhow::anyhow!("script execution queue lock poisoned"))?;
+        Ok(std::mem::take(&mut *commands))
+    }
 }
 
 #[derive(Debug)]
 pub struct ScriptExecution {
     pub output: ScriptOutput,
+    pub commands: Vec<ScriptExecutionCommand>,
     pub stats: ScriptHookStats,
 }
 
@@ -238,6 +315,14 @@ fn js_to_json<'js>(ctx: rquickjs::Ctx<'js>, value: Value<'js>) -> Result<JsonVal
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .ok_or_else(|| anyhow::anyhow!("script return value is not JSON-serializable"))?;
     serde_json::from_str(&json.to_string()?).context("failed to decode JS JSON")
+}
+
+fn js_to_json_or_null<'js>(ctx: rquickjs::Ctx<'js>, value: Value<'js>) -> Result<JsonValue> {
+    if value.is_undefined() || value.is_null() {
+        Ok(JsonValue::Null)
+    } else {
+        js_to_json(ctx, value)
+    }
 }
 
 fn module_name(path: &Path) -> String {
@@ -925,6 +1010,77 @@ export const script = {
         let message = err.to_string();
 
         assert!(message.contains("onData(ctx, input)"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn queues_trade_and_cancel_without_requiring_script_returns() {
+        let path = write_temp_script(
+            r#"
+export const script = {
+  name: "execution-script",
+  version: "1",
+  sources: ["candles"],
+  modes: ["stream"],
+  params: {}
+};
+
+export function onData(ctx, input) {
+  ctx.trade({
+    key: "entry-1",
+    side: "long",
+    notional: 100,
+    leverage: 5,
+    order: { type: "limit", price: 64000, tif: "gtc" },
+    sl: 63000,
+    tp: 67000
+  });
+}
+
+export function onExecution(ctx, event) {
+  if (event.type === "order.accepted") {
+    ctx.cancel({ key: "cancel-entry-1", order: event.orderId });
+  }
+}
+"#,
+            "execution",
+        );
+
+        let script = Script::load(&path).expect("load script");
+        let session = script
+            .start_session_with_execution(
+                &json!({}),
+                crate::scripting::execution::ScriptExecutionContext {
+                    job_id: "job_test".to_string(),
+                    enabled: true,
+                },
+            )
+            .expect("start execution session");
+        let execution = session
+            .run_stream(json!({ "mode": "stream", "candles": { "candles": [] } }))
+            .expect("run onData");
+        assert!(execution.output.metrics.as_object().unwrap().is_empty());
+        assert_eq!(execution.commands.len(), 1);
+        let order_id = match &execution.commands[0] {
+            crate::scripting::execution::ScriptExecutionCommand::Trade { order, request } => {
+                assert_eq!(request.sl, Some(63_000.0));
+                assert_eq!(request.tp, Some(67_000.0));
+                order.id.clone()
+            }
+            _ => panic!("expected trade command"),
+        };
+
+        let execution = session
+            .run_execution_event(json!({
+                "type": "order.accepted",
+                "orderId": order_id
+            }))
+            .expect("run onExecution")
+            .expect("onExecution exists");
+        assert!(matches!(
+            execution.commands.as_slice(),
+            [crate::scripting::execution::ScriptExecutionCommand::Cancel { .. }]
+        ));
         let _ = fs::remove_file(path);
     }
 

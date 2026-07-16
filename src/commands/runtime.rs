@@ -73,16 +73,37 @@ fn render_status(status: &RuntimeStatus, output: OutputFormat) -> Result<()> {
                 return Ok(());
             }
             println!("mlabd: running");
+            println!("  runtime version:  {}", status.version);
             println!("  pid:              {}", status.pid.unwrap_or_default());
             println!(
                 "  started (ms):     {}",
                 format_optional_ts(status.started_at_ms)
             );
             println!(
-                "  last reconcile:   {}",
-                format_optional_ts(status.last_reconcile_ms)
+                "  account stream:   {}",
+                if status.account_stream_connected {
+                    "connected"
+                } else {
+                    "disconnected"
+                }
+            );
+            println!(
+                "  last account event: {}",
+                format_optional_ts(status.last_account_event_ms)
+            );
+            println!(
+                "  last gap recovery: {}",
+                format_optional_ts(status.last_recovery_ms)
             );
             println!("  tracked open orders: {}", status.tracked_orders.len());
+            println!(
+                "  active script jobs: {}",
+                status
+                    .script_jobs
+                    .iter()
+                    .filter(|job| job.status.is_active())
+                    .count()
+            );
             if let Some(error) = &status.last_error {
                 println!("  last error:       {error}");
             }

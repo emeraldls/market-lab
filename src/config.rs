@@ -61,6 +61,8 @@ struct ExecutionConfig {
     tif: Option<String>,
     leverage: Option<f64>,
     reduce_only: Option<bool>,
+    sl: Option<f64>,
+    tp: Option<f64>,
     dry_run: Option<bool>,
     yes: Option<bool>,
 }
@@ -189,6 +191,12 @@ fn append_script_config_flags(
         );
     }
 
+    if mode == "run"
+        && let Some(execution) = &config.execution
+    {
+        append_optional(args, "--venue", execution.venue.as_deref());
+    }
+
     if let Some(output) = &config.output {
         append_optional(args, "--output", output.format.as_deref());
         if output.verbose.unwrap_or(false) {
@@ -227,6 +235,8 @@ fn append_trade_config_flags(args: &mut Vec<OsString>, config: &MarketLabConfig)
             "--leverage",
             execution.leverage.map(|value| value.to_string()),
         );
+        append_optional_owned(args, "--sl", execution.sl.map(|value| value.to_string()));
+        append_optional_owned(args, "--tp", execution.tp.map(|value| value.to_string()));
         if execution.reduce_only.unwrap_or(false) {
             args.push("--reduce-only".into());
         }
@@ -295,6 +305,7 @@ fn has_script_positional(args: &[OsString], start: usize) -> bool {
         "--provider",
         "--exchange",
         "--symbol",
+        "--venue",
         "--from",
         "--to",
         "--source",
@@ -330,6 +341,8 @@ fn has_trade_positional(args: &[OsString], start: usize) -> bool {
         "--price",
         "--tif",
         "--leverage",
+        "--sl",
+        "--tp",
         "--output",
     ];
     let mut skip_value = false;
@@ -517,4 +530,5 @@ format = "json"
             _ => panic!("expected trade long"),
         }
     }
+
 }

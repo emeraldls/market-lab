@@ -253,6 +253,63 @@ pub struct BulkTradesStream {
     venue_symbol: String,
 }
 
+/// Dedicated account-event connection used by `mlabd`. It receives the complete
+/// account snapshot on subscription followed by order, position, fill, margin,
+/// liquidation, and ADL deltas. Reconnection is deliberately owned by the
+/// daemon supervisor rather than this low-level stream.
+pub struct BulkAccountStream {
+    client: BulkWsClient,
+    topic: String,
+}
+
+impl BulkAccountStream {
+    pub async fn connect(account: &str) -> Result<Self> {
+        if account.trim().is_empty() {
+            bail!("BULK account WebSocket requires an account public key");
+        }
+        let client = BulkWsClient::subscribe(serde_json::json!({
+            "type": "account",
+            "user": account,
+        }))
+        .await?;
+        Ok(Self {
+            client,
+            topic: format!("account.{account}"),
+        })
+    }
+
+    pub async fn next_event(&mut self) -> Result<Value> {
+        loop {
+            let message = self.client.next_json().await?;
+            if message.get("type").and_then(Value::as_str) == Some("subscriptionResponse") {
+                let subscribed =
+                    message
+                        .get("topics")
+                        .and_then(Value::as_array)
+                        .is_some_and(|topics| {
+                            topics
+                                .iter()
+                                .any(|topic| topic.as_str() == Some(self.topic.as_str()))
+                        });
+                if !subscribed {
+                    bail!("BULK account WebSocket did not subscribe to {}", self.topic);
+                }
+                continue;
+            }
+            if message.get("type").and_then(Value::as_str) != Some("account") {
+                continue;
+            }
+            if message.get("topic").and_then(Value::as_str) != Some(self.topic.as_str()) {
+                continue;
+            }
+            return message
+                .get("data")
+                .cloned()
+                .context("BULK account event omitted data");
+        }
+    }
+}
+
 impl BulkTradesStream {
     pub async fn connect(symbol: &str) -> Result<Self> {
         let market = catalog::market(symbol)?;

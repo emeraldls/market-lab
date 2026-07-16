@@ -4,8 +4,11 @@ use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::cli::{OutputFormat, ScriptRunArgs, mmt_timeframe_from_seconds};
+use crate::cli::{
+    CliProviderKind, ExecutionVenueArg, OutputFormat, ScriptRunArgs, mmt_timeframe_from_seconds,
+};
 use crate::commands::script::{
     ScriptDescriptor, ScriptInputs, report_builder, write_report_best_effort,
     write_running_report_best_effort,
@@ -25,10 +28,12 @@ use crate::providers::bulk::ws::{
 use crate::providers::mmt::utils::{normalize_symbol_for_mmt, normalize_to_ms, parse_levels};
 use crate::providers::mmt::ws_client::MmtWsClient;
 use crate::scripting::engine::Script;
+use crate::scripting::execution::{ScriptExecutionCommand, ScriptExecutionContext};
 use crate::scripting::inputs::{
     SourceConfigs, parse_param_values, parse_source_configs, populate_source_defaults,
     resolve_params, validate_bulk_source_configs, validate_source_configs_for_run,
 };
+use crate::scripting::jobs::ScriptJobSubmission;
 use crate::scripting::manifest::ScriptSource;
 use crate::scripting::market_data::{
     ScriptCandle, ScriptOpenInterest, ScriptVolume, ScriptVolumeDelta,
@@ -101,6 +106,11 @@ struct ScriptRunMarket {
     symbol: String,
 }
 
+struct ScriptWorkerState<'a> {
+    job_id: &'a str,
+    initial_event_cursor: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 struct ScriptRunSummary {
     updates: u64,
@@ -120,30 +130,127 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
         bail!("scripts currently support only --output terminal|json|jsonl");
     }
 
+    if args.from.is_some() || args.to.is_some() {
+        bail!(
+            "--from/--to are not allowed with script run; use script backtest for historical data"
+        );
+    }
     let script = Script::load(&args.script)?;
-    let provider = provider_name(args.provider.into()).to_string();
+    let provider: ProviderKind = args.provider.into();
     let exchange = args.exchange_name()?.to_string();
+    let symbol = require_symbol(args.symbol.as_deref())?;
+    let symbol = match provider {
+        ProviderKind::Bulk => catalog::market(symbol)?.internal_symbol.clone(),
+        ProviderKind::Mmt => symbol.to_string(),
+        ProviderKind::MarketLab => unreachable!(),
+    };
+    let mut source_configs = parse_source_configs(&args.source)?;
+    match provider {
+        ProviderKind::Mmt => validate_source_configs_for_run(&script.manifest, &source_configs)?,
+        ProviderKind::Bulk => {
+            populate_source_defaults(&script.manifest, &mut source_configs);
+            validate_bulk_source_configs(&script.manifest, &source_configs, false)?;
+        }
+        ProviderKind::MarketLab => unreachable!(),
+    };
+    let raw_params = parse_param_values(&args.param)?;
+    resolve_params(&script.manifest, &raw_params)?;
+
+    let submission = ScriptJobSubmission {
+        script_name: script.manifest.name.clone(),
+        original_path: script.path.display().to_string(),
+        source: script.source().to_string(),
+        provider,
+        exchange,
+        symbol,
+        sources: args.source,
+        params: args.param,
+        venue: args.venue.map(Into::into),
+        verbose: args.verbose,
+    };
+    let job = crate::runtime::submit_script_job(submission).await?;
+    match args.output {
+        OutputFormat::Terminal => {
+            println!("script deployed");
+            println!("  job:       {}", job.id);
+            println!("  status:    starting");
+            println!("  provider:  {}", provider_name(job.definition.provider));
+            println!("  symbol:    {}", job.definition.symbol);
+            println!(
+                "  venue:     {}",
+                job.definition.venue.map_or_else(
+                    || "disabled".to_string(),
+                    |venue| format!("{venue:?}").to_ascii_lowercase()
+                )
+            );
+            println!("  logs:      mlab script logs {} --follow", job.id);
+        }
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&job)?),
+        OutputFormat::Jsonl => println!("{}", serde_json::to_string(&job)?),
+        OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
+    }
+    Ok(())
+}
+
+pub async fn handle_worker(job_id: &str) -> Result<()> {
+    let job = crate::runtime::get_script_job_from_running_daemon(job_id).await?;
+    let script = Script::load(&job.definition.snapshot_path)?;
+    let provider = match job.definition.provider {
+        ProviderKind::Mmt => CliProviderKind::Mmt,
+        ProviderKind::Bulk => CliProviderKind::Bulk,
+        ProviderKind::MarketLab => bail!("script worker does not support marketlab provider"),
+    };
+    let venue = job.definition.venue.map(|venue| match venue {
+        crate::domain::execution::ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
+    });
+    let args = ScriptRunArgs {
+        script: job.definition.snapshot_path.display().to_string(),
+        config: None,
+        provider,
+        exchange: (job.definition.provider == ProviderKind::Mmt)
+            .then(|| job.definition.exchange.clone()),
+        symbol: Some(job.definition.symbol.clone()),
+        venue,
+        from: None,
+        to: None,
+        source: job.definition.sources.clone(),
+        param: job.definition.params.clone(),
+        output: OutputFormat::Jsonl,
+        verbose: job.definition.verbose,
+    };
     let mut report = report_builder(
-        "script.run",
+        "script.worker",
         &script,
-        Some(provider),
-        Some(exchange),
-        args.symbol.clone(),
+        Some(provider_name(job.definition.provider).to_string()),
+        Some(job.definition.exchange.clone()),
+        Some(job.definition.symbol.clone()),
     );
-    let result = run(args, script, &mut report).await;
+    let pid = std::process::id();
+    crate::runtime::script_worker_started(job_id, pid).await?;
+    let result = run(args, script, &mut report, job_id, job.worker_event_cursor).await;
+    let error = result
+        .as_ref()
+        .err()
+        .and_then(|error| (!error.is::<ScriptCancelled>()).then(|| format!("{error:#}")));
     let runtime_report = match &result {
         Ok(_) => report.finish_ok(),
-        Err(err) if err.is::<ScriptCancelled>() => report.finish_cancelled(),
-        Err(err) => report.finish_error(err),
+        Err(error) if error.is::<ScriptCancelled>() => report.finish_cancelled(),
+        Err(error) => report.finish_error(error),
     };
     write_report_best_effort(&runtime_report);
-    result
+    let _ = crate::runtime::script_worker_finished(job_id, pid, error).await;
+    match result {
+        Err(error) if error.is::<ScriptCancelled>() => Ok(()),
+        result => result,
+    }
 }
 
 async fn run(
     args: ScriptRunArgs,
     script: Script,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
+    job_id: &str,
+    initial_event_cursor: u64,
 ) -> Result<()> {
     if args.from.is_some() || args.to.is_some() {
         bail!(
@@ -183,6 +290,10 @@ async fn run(
         resolved_params,
         market,
         report,
+        ScriptWorkerState {
+            job_id,
+            initial_event_cursor,
+        },
     )
     .await
 }
@@ -194,7 +305,9 @@ async fn stream_sources(
     resolved_params: Value,
     market: ScriptRunMarket,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
+    worker: ScriptWorkerState<'_>,
 ) -> Result<()> {
+    let job_id = worker.job_id;
     report.set_phase("connecting_streams");
     write_running_report_best_effort(report);
 
@@ -207,7 +320,13 @@ async fn stream_sources(
     )
     .await?;
 
-    let session = script.start_session(&resolved_params)?;
+    let session = script.start_session_with_execution(
+        &resolved_params,
+        ScriptExecutionContext {
+            job_id: job_id.to_string(),
+            enabled: args.venue.is_some(),
+        },
+    )?;
     let cancel_handle = session.cancel_handle();
     let _cancel_task = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -218,6 +337,13 @@ async fn stream_sources(
     let mut hooks = 0_u64;
     let mut summary = ScriptRunSummary::default();
     let mut live_state = LiveState::default();
+    let mut event_cursor = worker.initial_event_cursor;
+    let mut execution_events = tokio::time::interval(std::time::Duration::from_millis(250));
+    execution_events.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(2));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to install script worker termination handler")?;
 
     report.set_phase("streaming_sources");
     write_running_report_best_effort(report);
@@ -238,6 +364,19 @@ async fn stream_sources(
                 report.set_phase("cancelled");
                 render_run_summary(&summary, args.output, args.verbose)?;
                 return Err(ScriptCancelled.into());
+            }
+            _ = terminate.recv() => {
+                report.set_phase("cancelled");
+                render_run_summary(&summary, args.output, args.verbose)?;
+                return Err(ScriptCancelled.into());
+            }
+            _ = heartbeat.tick() => {
+                crate::runtime::script_worker_heartbeat(job_id, std::process::id()).await?;
+                continue;
+            }
+            _ = execution_events.tick() => {
+                dispatch_execution_events(&session, job_id, &mut event_cursor).await?;
+                continue;
             }
         };
 
@@ -265,6 +404,7 @@ async fn stream_sources(
                 return Err(err);
             }
         };
+        dispatch_execution_commands(job_id, execution.commands).await?;
         hooks += 1;
         report.record_hook(&execution.stats);
         report.set_progress("streaming_sources", hooks, hooks);
@@ -298,8 +438,75 @@ async fn stream_sources(
             },
         };
         summary.record(&result);
+        crate::runtime::append_script_output(job_id, &result)?;
         render_stream_result(&result, args.output, args.verbose, &mut rendered)?;
     }
+}
+
+async fn dispatch_execution_commands(
+    job_id: &str,
+    commands: Vec<ScriptExecutionCommand>,
+) -> Result<()> {
+    for command in commands {
+        let result = match command {
+            ScriptExecutionCommand::Trade { order, request } => {
+                crate::runtime::submit_script_trade(job_id, order, request)
+                    .await
+                    .map(|_| ())
+            }
+            ScriptExecutionCommand::Cancel { request } => {
+                crate::runtime::submit_script_cancellation(job_id, request)
+                    .await
+                    .map(|_| ())
+            }
+        };
+        if let Err(error) = result {
+            crate::runtime::append_script_output(
+                job_id,
+                &serde_json::json!({
+                    "type": "script.execution.error",
+                    "version": "1",
+                    "ts_ms": now_ms(),
+                    "error": format!("{error:#}")
+                }),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+async fn dispatch_execution_events(
+    session: &crate::scripting::engine::ScriptSession,
+    job_id: &str,
+    cursor: &mut u64,
+) -> Result<()> {
+    let events = crate::runtime::script_execution_events(job_id, *cursor, 100).await?;
+    for event in events {
+        let seq = event.seq;
+        if let Some(execution) = session.run_execution_event(serde_json::to_value(&event)?)? {
+            dispatch_execution_commands(job_id, execution.commands).await?;
+            crate::runtime::append_script_output(
+                job_id,
+                &serde_json::json!({
+                    "type": "script.execution.result",
+                    "version": "1",
+                    "ts_ms": now_ms(),
+                    "event": event,
+                    "output": execution.output,
+                }),
+            )?;
+        }
+        crate::runtime::acknowledge_script_events(job_id, seq).await?;
+        *cursor = (*cursor).max(seq);
+    }
+    Ok(())
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 enum ScriptLiveStreams {

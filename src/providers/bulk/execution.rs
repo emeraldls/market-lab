@@ -3,7 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use bulk_keychain::{
-    Action, Cancel, Hash, Order, OrderItem, Pubkey, SignedTransaction, Signer, TimeInForce,
+    Action, Cancel, Hash, OnFill, Order, OrderItem, Pubkey, RangeOco, SignedTransaction, Signer,
+    Stop, TakeProfit, TimeInForce,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -38,6 +39,9 @@ impl BulkExecutionAdapter {
             reduce_only: true,
             deterministic_order_ids: true,
             delegated_agent_signing: true,
+            native_protective_triggers: true,
+            native_oco: true,
+            native_on_fill: true,
         }
     }
 
@@ -229,14 +233,51 @@ fn sign_trade_order(
     if plan.reduce_only {
         order = order.reduce_only();
     }
+    let mut orders = vec![OrderItem::Order(order)];
+    let mut protection = Vec::new();
+    match (plan.stop_loss_price, plan.take_profit_price) {
+        (Some(stop_loss), Some(take_profit)) => {
+            protection.push(OrderItem::RangeOco(RangeOco {
+                symbol: plan.venue_symbol.clone(),
+                is_buy: plan.direction == PositionDirection::Long,
+                size: plan.size,
+                collar_min: stop_loss.min(take_profit),
+                collar_max: stop_loss.max(take_profit),
+                limit_min: f64::NAN,
+                limit_max: f64::NAN,
+                iso: false,
+            }));
+        }
+        (Some(stop_loss), None) => {
+            protection.push(OrderItem::Stop(Stop {
+                symbol: plan.venue_symbol.clone(),
+                is_buy: plan.direction == PositionDirection::Short,
+                size: plan.size,
+                trigger_price: stop_loss,
+                limit_price: f64::NAN,
+                iso: false,
+            }));
+        }
+        (None, Some(take_profit)) => {
+            protection.push(OrderItem::TakeProfit(TakeProfit {
+                symbol: plan.venue_symbol.clone(),
+                is_buy: plan.direction == PositionDirection::Long,
+                size: plan.size,
+                trigger_price: take_profit,
+                limit_price: f64::NAN,
+                iso: false,
+            }));
+        }
+        (None, None) => {}
+    }
+    if !protection.is_empty() {
+        orders.push(OrderItem::OnFill(OnFill {
+            p: 0,
+            actions: protection,
+        }));
+    }
     signer
-        .sign_action(
-            &Action::Order {
-                orders: vec![OrderItem::Order(order)],
-            },
-            nonce,
-            account,
-        )
+        .sign_action(&Action::Order { orders }, nonce, account)
         .context("failed to sign BULK order")
 }
 
@@ -278,6 +319,7 @@ fn validate_trade_plan(plan: &TradePlan) -> Result<()> {
             market.internal_symbol
         );
     }
+    validate_protection(plan, market.tick_size)?;
     match plan.order_kind {
         OrderKind::Market => {
             if !market.supports_order_type("MARKET") {
@@ -321,6 +363,54 @@ fn validate_trade_plan(plan: &TradePlan) -> Result<()> {
                 .any(|candidate| candidate.eq_ignore_ascii_case(tif))
             {
                 bail!("BULK market `{}` does not support TIF {tif}", market.symbol);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_protection(plan: &TradePlan, tick_size: f64) -> Result<()> {
+    if plan.reduce_only && (plan.stop_loss_price.is_some() || plan.take_profit_price.is_some()) {
+        bail!("protective SL/TP cannot be attached to a reduce-only order");
+    }
+    let entry_price = plan.price.unwrap_or(plan.reference_price);
+    for (name, price) in [
+        ("stop-loss", plan.stop_loss_price),
+        ("take-profit", plan.take_profit_price),
+    ] {
+        if let Some(price) = price
+            && (!price.is_finite() || price <= 0.0 || !is_step_aligned(price, tick_size))
+        {
+            bail!("trade plan {name} is not aligned to BULK tick size {tick_size}");
+        }
+    }
+    match plan.direction {
+        PositionDirection::Long => {
+            if plan
+                .stop_loss_price
+                .is_some_and(|price| price >= entry_price)
+            {
+                bail!("long stop-loss must be below the entry price {entry_price}");
+            }
+            if plan
+                .take_profit_price
+                .is_some_and(|price| price <= entry_price)
+            {
+                bail!("long take-profit must be above the entry price {entry_price}");
+            }
+        }
+        PositionDirection::Short => {
+            if plan
+                .stop_loss_price
+                .is_some_and(|price| price <= entry_price)
+            {
+                bail!("short stop-loss must be above the entry price {entry_price}");
+            }
+            if plan
+                .take_profit_price
+                .is_some_and(|price| price >= entry_price)
+            {
+                bail!("short take-profit must be below the entry price {entry_price}");
             }
         }
     }
@@ -902,6 +992,8 @@ mod tests {
             estimated_notional: 65.0,
             leverage: 5.0,
             reduce_only: false,
+            stop_loss_price: None,
+            take_profit_price: None,
             rules: crate::domain::execution::MarketRules {
                 tick_size: 0.001,
                 lot_size: 0.000001,
@@ -919,6 +1011,38 @@ mod tests {
         assert_eq!(
             signed.actions[0].pointer("/l/c").and_then(Value::as_str),
             Some("BTC-USD")
+        );
+
+        let protected_plan = TradePlan {
+            stop_loss_price: Some(64_000.0),
+            take_profit_price: Some(67_000.0),
+            ..plan
+        };
+        let protected = sign_trade_order(
+            &mut signer,
+            &account,
+            &protected_plan,
+            1_784_158_000_000_000_001,
+        )
+        .expect("agent signs native on-fill protection");
+        assert_eq!(protected.actions.len(), 2);
+        assert_eq!(
+            protected.actions[1]
+                .pointer("/of/p")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            protected.actions[1]
+                .pointer("/of/actions/0/rng/pmin")
+                .and_then(Value::as_f64),
+            Some(64_000.0)
+        );
+        assert_eq!(
+            protected.actions[1]
+                .pointer("/of/actions/0/rng/pmax")
+                .and_then(Value::as_f64),
+            Some(67_000.0)
         );
     }
 }

@@ -15,6 +15,9 @@ pub struct ScriptOutput {
 
 impl ScriptOutput {
     pub fn from_json(value: Value) -> Result<Self> {
+        if value.is_null() {
+            return Ok(Self::empty());
+        }
         let output: Self =
             serde_json::from_value(value).map_err(|err| anyhow::anyhow!(err.to_string()))?;
         if !output.metrics.is_object() {
@@ -35,6 +38,15 @@ impl ScriptOutput {
             intent: normalize_object(output.intent),
             meta: normalize_meta(output.meta),
         })
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            metrics: Value::Object(Default::default()),
+            signal: Value::Object(Default::default()),
+            intent: Value::Object(Default::default()),
+            meta: Value::Object(Default::default()),
+        }
     }
 }
 

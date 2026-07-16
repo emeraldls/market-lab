@@ -52,6 +52,9 @@ pub struct VenueCapabilities {
     pub reduce_only: bool,
     pub deterministic_order_ids: bool,
     pub delegated_agent_signing: bool,
+    pub native_protective_triggers: bool,
+    pub native_oco: bool,
+    pub native_on_fill: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -81,6 +84,10 @@ pub struct TradePlan {
     pub estimated_notional: f64,
     pub leverage: f64,
     pub reduce_only: bool,
+    #[serde(default)]
+    pub stop_loss_price: Option<f64>,
+    #[serde(default)]
+    pub take_profit_price: Option<f64>,
     pub rules: MarketRules,
 }
 

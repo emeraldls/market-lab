@@ -54,6 +54,8 @@ submits a signed transaction.
 mlab trade long BTC/USDT --notional 100 --leverage 5 --dry-run
 mlab trade short BTC/USDT --size 0.001 --type limit \
   --price 65000 --tif alo --dry-run
+mlab trade long BTC/USDT --notional 100 --leverage 5 \
+  --sl 63000 --tp 69000 --dry-run
 
 mlab positions --venue bulk
 mlab orders --venue bulk
@@ -64,9 +66,16 @@ mlab cancel BTC/USDT <ORDER_ID> --dry-run
 
 Live place/cancel requests are confirmed in the terminal unless `--yes` is
 passed. They are then sent over local IPC to `mlabd`, which owns signing and
-nonce sequencing for every terminal or future scripted caller. The runtime is
+nonce sequencing for every terminal and scripted caller. The runtime is
 started automatically for live execution, stays alive while idle, and stores
-bounded active state plus append-only events under `~/.market-lab/execution`.
+bounded control state plus append-only events under `~/.market-lab/execution`.
+
+`mlabd` maintains Bulk's account WebSocket for order, fill, position, margin,
+liquidation, and ADL lifecycle events. It does not poll REST on a timer. If the
+connection is lost, it reconnects and performs one REST order/fill recovery for
+the disconnected interval before continuing from WebSocket events. Bulk remains
+the source of truth for account state; Market Lab persists only job,
+idempotency, correlation, and event-delivery metadata.
 
 ```bash
 mlab daemon start
@@ -115,6 +124,90 @@ mlab script backtest examples/sma-cross.js \
   --provider bulk --symbol BTC/USDT \
   --from 1784052554000 --to 1784056154000 \
   --source candles:timeframe=60
+```
+
+### Detached script execution
+
+`script run` submits an immutable copy of the script to `mlabd`, starts a
+dedicated lightweight script worker, prints its job ID, and releases the
+terminal immediately. Market data and execution are independent: a script can
+use MMT data and Bulk execution, or Bulk for both. Omitting `--venue` leaves
+`ctx.trade` and `ctx.cancel` disabled, so an analysis-only script cannot trade
+accidentally.
+
+The script snapshot, provider, exchange, source settings, parameters, symbol,
+and venue are immutable deployment inputs. Running the same source with another
+exchange or another `--param` value creates another independent job; restarting
+a job uses its original snapshot and inputs.
+
+```bash
+# Analysis only; detached, but unable to execute.
+mlab script run examples/candle-summary.js \
+  --provider bulk --symbol BTC/USDT \
+  --source candles:timeframe=60
+
+# Explicitly arm Bulk execution. This example defaults to armed=false.
+mlab script run examples/bulk-limit-protected.js \
+  --provider bulk --symbol BTC/USDT \
+  --source candles:timeframe=60 \
+  --venue bulk \
+  --param candles.armed=true
+
+mlab script jobs
+mlab script status <JOB_ID>
+mlab script logs <JOB_ID> --follow
+mlab script stop <JOB_ID>
+mlab script restart <JOB_ID>
+```
+
+`ctx.trade(request)` validates the request synchronously and returns a stable
+Market Lab order reference immediately. The actual signing/submission is then
+serialized through `mlabd`. `key` is required and acts as the strategy's
+idempotency key: retrying the exact request returns the same order, while
+reusing the key with different parameters is rejected.
+
+```js
+const entry = ctx.trade({
+  key: "btc-entry-v1",
+  side: "long",             // long | short
+  notional: 100,             // exactly one of notional | size
+  leverage: 5,
+  order: {
+    type: "limit",           // market | limit
+    price: 65000,
+    tif: "gtc"               // gtc | ioc | alo
+  },
+  sl: 63000,
+  tp: 69000
+})
+
+// entry = { id: "ord_...", key: "btc-entry-v1" }
+ctx.cancel({
+  key: "cancel-btc-entry-v1",
+  order: entry.id             // the original trade key also works
+})
+```
+
+For an entry with `sl` and/or `tp`, Market Lab signs Bulk's native on-fill
+protection in the same transaction as the parent order. Supplying both creates
+Bulk's native OCO range; protection becomes active after the entry fills and
+one trigger cancels its sibling. Market Lab does not monitor prices locally to
+emulate protective orders.
+
+Scripts may optionally export `onExecution(ctx, event)`. Events include
+`order.pending`, `order.accepted`, `order.updated`, `order.fill`,
+`order.filled`, `order.cancelled`, `order.rejected`, position lifecycle events,
+and account margin updates. Order-related events include the stable `orderId`,
+the strategy `key`, and Bulk's `venueOrderId`. Delivery is journaled and
+acknowledged only after the hook succeeds, so an unacknowledged event is
+replayed after a worker restart.
+
+```js
+export function onExecution(ctx, event) {
+  if (event.type === "order.rejected") {
+    return { metrics: { rejected_order: event.orderId, details: event.data } }
+  }
+}
 ```
 
 Script source records use milliseconds in `t`. Candle records always contain

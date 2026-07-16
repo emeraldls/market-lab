@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -16,6 +17,10 @@ use crate::domain::types::OrderBookSnapshot;
 use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::mmt::MmtProvider;
 use crate::scripting::engine::Script;
+use crate::scripting::execution::{
+    ScriptCancelRequest, ScriptExecutionCommand, ScriptExecutionContext, ScriptOrderKind,
+    ScriptOrderRef, ScriptTradeRequest,
+};
 use crate::scripting::inputs::{
     SourceConfigs, parse_param_values, parse_source_configs, populate_source_defaults,
     resolve_params, validate_bulk_source_configs, validate_source_configs,
@@ -78,6 +83,8 @@ struct ScriptWindow {
 struct ScriptBacktestSummary {
     signals: usize,
     orders: usize,
+    pending_orders: usize,
+    cancelled_orders: usize,
     closed_trades: usize,
     open_positions: usize,
     wins: usize,
@@ -109,6 +116,8 @@ struct ScriptBacktestPerformance {
 struct ScriptBacktestTrade {
     id: String,
     position_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    order_id: Option<String>,
     side: TradeSide,
     entry: ScriptBacktestTradeLeg,
     exit: ScriptBacktestTradeLeg,
@@ -134,6 +143,8 @@ struct ScriptBacktestTradeLeg {
 #[derive(Debug, Clone, Serialize)]
 struct ScriptBacktestOpenPosition {
     id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    order_id: Option<String>,
     side: TradeSide,
     entry_ts_ms: u64,
     entry_price: f64,
@@ -143,6 +154,10 @@ struct ScriptBacktestOpenPosition {
     margin: f64,
     leverage: f64,
     qty: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_loss_price: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    take_profit_price: Option<f64>,
     unrealized_pnl: f64,
     bars_held: usize,
     reason: String,
@@ -158,13 +173,32 @@ enum TradeSide {
 #[derive(Debug, Clone)]
 struct OpenTrade {
     id: String,
+    order_id: Option<String>,
     side: TradeSide,
     entry_idx: usize,
     entry_ts_ms: u64,
     entry_price: f64,
     notional: f64,
     qty: f64,
+    leverage: f64,
+    stop_loss_price: Option<f64>,
+    take_profit_price: Option<f64>,
     reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimulatedOrderStatus {
+    Pending,
+    Filled,
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+struct SimulatedScriptOrder {
+    order: ScriptOrderRef,
+    request: ScriptTradeRequest,
+    submitted_idx: usize,
+    status: SimulatedOrderStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +209,19 @@ struct TradeEvent {
     reason: String,
     notional: Option<f64>,
     position_id: Option<String>,
+}
+
+struct TradeEntry {
+    side: TradeSide,
+    idx: usize,
+    ts_ms: u64,
+    price: f64,
+    reason: String,
+    notional: Option<f64>,
+    leverage: f64,
+    order_id: Option<String>,
+    stop_loss_price: Option<f64>,
+    take_profit_price: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -289,10 +336,17 @@ async fn backtest_window(
     let mut orders = 0_usize;
     let mut closed_trades = Vec::new();
     let mut open_trades = Vec::new();
+    let mut script_orders = HashMap::<String, SimulatedScriptOrder>::new();
     let mut next_position_id = 1_usize;
     let mut saw_strategy_like_output = false;
     let mut latest_output = None;
-    let session = script.start_session(&resolved_params)?;
+    let session = script.start_session_with_execution(
+        &resolved_params,
+        ScriptExecutionContext {
+            job_id: "backtest".to_string(),
+            enabled: true,
+        },
+    )?;
     let cancel_handle = session.cancel_handle();
     let _cancel_task = AbortOnDrop(tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -319,6 +373,15 @@ async fn backtest_window(
         }
 
         let cutoff = clock_ts_ms(&clock, &data, idx)?;
+        apply_protective_triggers(&clock, &data, idx, &mut open_trades, &mut closed_trades)?;
+        fill_pending_script_orders(
+            &clock,
+            &data,
+            idx,
+            &mut script_orders,
+            &mut open_trades,
+            &mut next_position_id,
+        )?;
         let payload = build_window_payload(WindowPayloadContext {
             script: &script,
             data: &data,
@@ -331,7 +394,6 @@ async fn backtest_window(
             cutoff_ms: cutoff,
             lookback,
             open_trades: &open_trades,
-            leverage: args.leverage,
         })?;
         let execution = match session.run_window(payload) {
             Ok(execution) => execution,
@@ -345,6 +407,7 @@ async fn backtest_window(
             }
         };
         report.record_hook(&execution.stats);
+        let commands = execution.commands;
         let output = execution.output;
 
         let has_signal = !is_empty_json_object(&output.signal);
@@ -375,9 +438,23 @@ async fn backtest_window(
             }
         }
 
+        let script_order_count = apply_script_execution_commands(
+            commands,
+            idx,
+            cutoff,
+            clock_price(&clock, &data, idx)?,
+            &mut script_orders,
+            &mut open_trades,
+            &mut next_position_id,
+        )?;
+        if script_order_count > 0 {
+            saw_strategy_like_output = true;
+            orders += script_order_count;
+        }
+
         let curr = clock_price(&clock, &data, idx)?;
         let next = clock_price(&clock, &data, idx + 1)?;
-        returns.push(position_return(&open_trades, curr, next, args.leverage));
+        returns.push(position_return(&open_trades, curr, next));
         latest_output = Some(ScriptBacktestLatestOutput {
             metrics: output.metrics,
             signal: output.signal,
@@ -397,7 +474,9 @@ async fn backtest_window(
     }
 
     if !saw_strategy_like_output {
-        bail!("script backtest requires strategy-like output: return `signal` or `intent`");
+        bail!(
+            "script backtest requires an execution action: call `ctx.trade()` or return `signal`/`intent`"
+        );
     }
 
     let timeframe_sec = source_configs
@@ -406,16 +485,17 @@ async fn backtest_window(
         .unwrap_or_default();
     let mark_ts_ms = clock_ts_ms(&clock, &data, clock_len - 1).unwrap_or(args.to);
     let mark_price = clock_price(&clock, &data, clock_len - 1).unwrap_or_default();
-    let open_positions = open_trades_to_positions(
-        &open_trades,
-        clock_len - 1,
-        mark_ts_ms,
-        mark_price,
-        args.leverage,
-    )
-    .into_iter()
-    .collect::<Vec<_>>();
-    let summary = backtest_summary(signals, orders, &closed_trades, &open_positions);
+    let open_positions =
+        open_trades_to_positions(&open_trades, clock_len - 1, mark_ts_ms, mark_price)
+            .into_iter()
+            .collect::<Vec<_>>();
+    let summary = backtest_summary(
+        signals,
+        orders,
+        &script_orders,
+        &closed_trades,
+        &open_positions,
+    );
     let performance =
         backtest_performance(&returns, &closed_trades, &open_positions, args.leverage);
     let result = ScriptBacktestResult {
@@ -779,7 +859,6 @@ struct WindowPayloadContext<'a> {
     cutoff_ms: u64,
     lookback: usize,
     open_trades: &'a [OpenTrade],
-    leverage: f64,
 }
 
 fn build_window_payload(ctx: WindowPayloadContext<'_>) -> Result<Value> {
@@ -902,13 +981,8 @@ fn build_window_payload(ctx: WindowPayloadContext<'_>) -> Result<Value> {
     }
 
     let mark_price = clock_price(ctx.clock, ctx.data, ctx.clock_idx)?;
-    let open_positions = open_trades_to_positions(
-        ctx.open_trades,
-        ctx.clock_idx,
-        ctx.cutoff_ms,
-        mark_price,
-        ctx.leverage,
-    );
+    let open_positions =
+        open_trades_to_positions(ctx.open_trades, ctx.clock_idx, ctx.cutoff_ms, mark_price);
     root.insert("positions".to_string(), json!({ "open": open_positions }));
 
     Ok(Value::Object(root))
@@ -1122,6 +1196,289 @@ fn position_id_from_output(intent: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn apply_script_execution_commands(
+    commands: Vec<ScriptExecutionCommand>,
+    idx: usize,
+    ts_ms: u64,
+    current_price: f64,
+    script_orders: &mut HashMap<String, SimulatedScriptOrder>,
+    open_trades: &mut Vec<OpenTrade>,
+    next_position_id: &mut usize,
+) -> Result<usize> {
+    let mut submitted = 0;
+    for command in commands {
+        match command {
+            ScriptExecutionCommand::Trade { order, request } => {
+                request.validate()?;
+                if request.reduce_only {
+                    bail!("ctx.trade reduceOnly is not yet supported by the backtest simulator");
+                }
+                if let Some(existing) = script_orders.get(&order.id) {
+                    if existing.request != request {
+                        bail!(
+                            "ctx.trade key `{}` was reused with different order parameters",
+                            request.key
+                        );
+                    }
+                    continue;
+                }
+                let reference_price = request.order.price.unwrap_or(current_price);
+                validate_script_protection(&request, reference_price)?;
+                let order_id = order.id.clone();
+                script_orders.insert(
+                    order_id.clone(),
+                    SimulatedScriptOrder {
+                        order,
+                        request: request.clone(),
+                        submitted_idx: idx,
+                        status: SimulatedOrderStatus::Pending,
+                    },
+                );
+                submitted += 1;
+                if request.order.kind == ScriptOrderKind::Market {
+                    fill_script_order(
+                        &order_id,
+                        idx,
+                        ts_ms,
+                        current_price,
+                        script_orders,
+                        open_trades,
+                        next_position_id,
+                    )?;
+                }
+            }
+            ScriptExecutionCommand::Cancel { request } => {
+                cancel_script_order(request, script_orders)?;
+            }
+        }
+    }
+    Ok(submitted)
+}
+
+fn cancel_script_order(
+    request: ScriptCancelRequest,
+    script_orders: &mut HashMap<String, SimulatedScriptOrder>,
+) -> Result<()> {
+    request.validate()?;
+    let Some(order_id) = script_orders
+        .values()
+        .find(|order| order.order.id == request.order || order.order.key == request.order)
+        .map(|order| order.order.id.clone())
+    else {
+        bail!(
+            "ctx.cancel could not find simulated order `{}`",
+            request.order
+        );
+    };
+    let order = script_orders
+        .get_mut(&order_id)
+        .context("simulated order disappeared during cancellation")?;
+    if order.status == SimulatedOrderStatus::Pending {
+        order.status = SimulatedOrderStatus::Cancelled;
+    }
+    Ok(())
+}
+
+fn fill_pending_script_orders(
+    clock: &ScriptSource,
+    data: &BacktestData,
+    idx: usize,
+    script_orders: &mut HashMap<String, SimulatedScriptOrder>,
+    open_trades: &mut Vec<OpenTrade>,
+    next_position_id: &mut usize,
+) -> Result<()> {
+    let ts_ms = clock_ts_ms(clock, data, idx)?;
+    let mut fillable = Vec::new();
+    for order in script_orders.values().filter(|order| {
+        order.status == SimulatedOrderStatus::Pending
+            && order.submitted_idx < idx
+            && order.request.order.kind == ScriptOrderKind::Limit
+    }) {
+        let price = order
+            .request
+            .order
+            .price
+            .context("simulated limit order omitted its price")?;
+        if limit_order_touched(clock, data, idx, &order.request, price)? {
+            fillable.push((order.order.id.clone(), price));
+        }
+    }
+    for (order_id, price) in fillable {
+        fill_script_order(
+            &order_id,
+            idx,
+            ts_ms,
+            price,
+            script_orders,
+            open_trades,
+            next_position_id,
+        )?;
+    }
+    Ok(())
+}
+
+fn limit_order_touched(
+    clock: &ScriptSource,
+    data: &BacktestData,
+    idx: usize,
+    request: &ScriptTradeRequest,
+    limit: f64,
+) -> Result<bool> {
+    use crate::domain::execution::PositionDirection;
+
+    if *clock == ScriptSource::Candles {
+        let candle = &data.candles.as_ref().context("candles data not loaded")?[idx];
+        return Ok(match request.side {
+            PositionDirection::Long => candle.l <= limit,
+            PositionDirection::Short => candle.h >= limit,
+        });
+    }
+    let price = clock_price(clock, data, idx)?;
+    Ok(match request.side {
+        PositionDirection::Long => price <= limit,
+        PositionDirection::Short => price >= limit,
+    })
+}
+
+fn fill_script_order(
+    order_id: &str,
+    idx: usize,
+    ts_ms: u64,
+    price: f64,
+    script_orders: &mut HashMap<String, SimulatedScriptOrder>,
+    open_trades: &mut Vec<OpenTrade>,
+    next_position_id: &mut usize,
+) -> Result<()> {
+    use crate::domain::execution::PositionDirection;
+
+    let order = script_orders
+        .get(order_id)
+        .cloned()
+        .with_context(|| format!("simulated order `{order_id}` was not found"))?;
+    if order.status != SimulatedOrderStatus::Pending {
+        return Ok(());
+    }
+    let side = match order.request.side {
+        PositionDirection::Long => TradeSide::Long,
+        PositionDirection::Short => TradeSide::Short,
+    };
+    let notional = order
+        .request
+        .notional
+        .or_else(|| order.request.size.map(|size| size * price));
+    open_trades.push(open_trade_from_entry(
+        next_position_id,
+        TradeEntry {
+            side,
+            idx,
+            ts_ms,
+            price,
+            reason: format!("ctx.trade {}", order.request.key),
+            notional,
+            leverage: order.request.leverage,
+            order_id: Some(order.order.id.clone()),
+            stop_loss_price: order.request.sl,
+            take_profit_price: order.request.tp,
+        },
+    ));
+    script_orders
+        .get_mut(order_id)
+        .context("simulated order disappeared after fill")?
+        .status = SimulatedOrderStatus::Filled;
+    Ok(())
+}
+
+fn validate_script_protection(request: &ScriptTradeRequest, entry_price: f64) -> Result<()> {
+    use crate::domain::execution::PositionDirection;
+
+    match request.side {
+        PositionDirection::Long => {
+            if request.sl.is_some_and(|price| price >= entry_price) {
+                bail!("long ctx.trade sl must be below the entry price");
+            }
+            if request.tp.is_some_and(|price| price <= entry_price) {
+                bail!("long ctx.trade tp must be above the entry price");
+            }
+        }
+        PositionDirection::Short => {
+            if request.sl.is_some_and(|price| price <= entry_price) {
+                bail!("short ctx.trade sl must be above the entry price");
+            }
+            if request.tp.is_some_and(|price| price >= entry_price) {
+                bail!("short ctx.trade tp must be below the entry price");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_protective_triggers(
+    clock: &ScriptSource,
+    data: &BacktestData,
+    idx: usize,
+    open_trades: &mut Vec<OpenTrade>,
+    closed_trades: &mut Vec<ScriptBacktestTrade>,
+) -> Result<()> {
+    let ts_ms = clock_ts_ms(clock, data, idx)?;
+    let mut open_index = 0;
+    while open_index < open_trades.len() {
+        let trigger = protective_trigger(clock, data, idx, &open_trades[open_index])?;
+        let Some((price, reason)) = trigger else {
+            open_index += 1;
+            continue;
+        };
+        let open = open_trades.remove(open_index);
+        close_open_trade(
+            open,
+            closed_trades,
+            &TradeEvent {
+                idx,
+                ts_ms,
+                price,
+                reason,
+                notional: None,
+                position_id: None,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn protective_trigger(
+    clock: &ScriptSource,
+    data: &BacktestData,
+    idx: usize,
+    open: &OpenTrade,
+) -> Result<Option<(f64, String)>> {
+    if idx <= open.entry_idx {
+        return Ok(None);
+    }
+    let (low, high) = if *clock == ScriptSource::Candles {
+        let candle = &data.candles.as_ref().context("candles data not loaded")?[idx];
+        (candle.l, candle.h)
+    } else {
+        let price = clock_price(clock, data, idx)?;
+        (price, price)
+    };
+
+    // With OHLC data the intra-bar path is unknown. If both sides are touched,
+    // choose the stop first so the simulation does not assume the favorable path.
+    let stop_hit = match (open.side, open.stop_loss_price) {
+        (TradeSide::Long, Some(stop)) if low <= stop => Some(stop),
+        (TradeSide::Short, Some(stop)) if high >= stop => Some(stop),
+        _ => None,
+    };
+    if let Some(price) = stop_hit {
+        return Ok(Some((price, "ctx.trade stop loss".to_string())));
+    }
+    let take_profit_hit = match (open.side, open.take_profit_price) {
+        (TradeSide::Long, Some(target)) if high >= target => Some(target),
+        (TradeSide::Short, Some(target)) if low <= target => Some(target),
+        _ => None,
+    };
+    Ok(take_profit_hit.map(|price| (price, "ctx.trade take profit".to_string())))
+}
+
 fn apply_trade_action(
     action: TradeAction,
     open_trades: &mut Vec<OpenTrade>,
@@ -1134,23 +1491,35 @@ fn apply_trade_action(
         TradeAction::OpenLong => {
             open_trades.push(open_trade_from_entry(
                 next_position_id,
-                TradeSide::Long,
-                event.idx,
-                event.ts_ms,
-                event.price,
-                event.reason,
-                event.notional,
+                TradeEntry {
+                    side: TradeSide::Long,
+                    idx: event.idx,
+                    ts_ms: event.ts_ms,
+                    price: event.price,
+                    reason: event.reason,
+                    notional: event.notional,
+                    leverage,
+                    order_id: None,
+                    stop_loss_price: None,
+                    take_profit_price: None,
+                },
             ));
         }
         TradeAction::OpenShort => {
             open_trades.push(open_trade_from_entry(
                 next_position_id,
-                TradeSide::Short,
-                event.idx,
-                event.ts_ms,
-                event.price,
-                event.reason,
-                event.notional,
+                TradeEntry {
+                    side: TradeSide::Short,
+                    idx: event.idx,
+                    ts_ms: event.ts_ms,
+                    price: event.price,
+                    reason: event.reason,
+                    notional: event.notional,
+                    leverage,
+                    order_id: None,
+                    stop_loss_price: None,
+                    take_profit_price: None,
+                },
             ));
         }
         TradeAction::Close => {
@@ -1167,32 +1536,28 @@ fn apply_trade_action(
     Ok(())
 }
 
-fn open_trade_from_entry(
-    next_position_id: &mut usize,
-    side: TradeSide,
-    idx: usize,
-    ts_ms: u64,
-    price: f64,
-    reason: String,
-    notional: Option<f64>,
-) -> OpenTrade {
+fn open_trade_from_entry(next_position_id: &mut usize, entry: TradeEntry) -> OpenTrade {
     let id = format_position_id(*next_position_id);
     *next_position_id += 1;
-    let notional = notional.unwrap_or(1_000.0);
-    let qty = if price.abs() > f64::EPSILON {
-        notional / price
+    let notional = entry.notional.unwrap_or(1_000.0);
+    let qty = if entry.price.abs() > f64::EPSILON {
+        notional / entry.price
     } else {
         0.0
     };
     OpenTrade {
         id,
-        side,
-        entry_idx: idx,
-        entry_ts_ms: ts_ms,
-        entry_price: price,
+        order_id: entry.order_id,
+        side: entry.side,
+        entry_idx: entry.idx,
+        entry_ts_ms: entry.ts_ms,
+        entry_price: entry.price,
         notional,
         qty,
-        reason,
+        leverage: entry.leverage,
+        stop_loss_price: entry.stop_loss_price,
+        take_profit_price: entry.take_profit_price,
+        reason: entry.reason,
     }
 }
 
@@ -1201,13 +1566,13 @@ fn close_position_by_id(
     closed_trades: &mut Vec<ScriptBacktestTrade>,
     position_id: &str,
     event: &TradeEvent,
-    leverage: f64,
+    _leverage: f64,
 ) -> Result<()> {
     let Some(index) = open_trades.iter().position(|trade| trade.id == position_id) else {
         bail!("cannot close unknown position_id `{position_id}`");
     };
     let open = open_trades.remove(index);
-    close_open_trade(open, closed_trades, event, leverage);
+    close_open_trade(open, closed_trades, event);
     Ok(())
 }
 
@@ -1215,11 +1580,11 @@ fn close_all_positions(
     open_trades: &mut Vec<OpenTrade>,
     closed_trades: &mut Vec<ScriptBacktestTrade>,
     event: &TradeEvent,
-    leverage: f64,
+    _leverage: f64,
 ) {
     let trades = std::mem::take(open_trades);
     for open in trades {
-        close_open_trade(open, closed_trades, event, leverage);
+        close_open_trade(open, closed_trades, event);
     }
 }
 
@@ -1227,13 +1592,12 @@ fn close_open_trade(
     open: OpenTrade,
     closed_trades: &mut Vec<ScriptBacktestTrade>,
     event: &TradeEvent,
-    leverage: f64,
 ) {
     let gross_pnl = trade_pnl(open.side, open.entry_price, event.price, open.qty);
     let fees = 0.0;
     let slippage = 0.0;
     let net_pnl = gross_pnl - fees - slippage;
-    let margin = margin_for_notional(open.notional, leverage);
+    let margin = margin_for_notional(open.notional, open.leverage);
     let net_return = if margin.abs() > f64::EPSILON {
         net_pnl / margin
     } else {
@@ -1243,6 +1607,7 @@ fn close_open_trade(
     closed_trades.push(ScriptBacktestTrade {
         id: format_trade_id(closed_trades.len() + 1),
         position_id: open.id,
+        order_id: open.order_id,
         side: open.side,
         entry: ScriptBacktestTradeLeg {
             ts_ms: open.entry_ts_ms,
@@ -1256,7 +1621,7 @@ fn close_open_trade(
         },
         notional: open.notional,
         margin,
-        leverage,
+        leverage: open.leverage,
         qty: open.qty,
         gross_pnl,
         fees,
@@ -1274,7 +1639,7 @@ fn trade_pnl(side: TradeSide, entry_price: f64, exit_price: f64, qty: f64) -> f6
     }
 }
 
-fn position_return(open_trades: &[OpenTrade], curr: f64, next: f64, leverage: f64) -> f64 {
+fn position_return(open_trades: &[OpenTrade], curr: f64, next: f64) -> f64 {
     if open_trades.is_empty() {
         return 0.0;
     }
@@ -1284,7 +1649,7 @@ fn position_return(open_trades: &[OpenTrade], curr: f64, next: f64, leverage: f6
         .sum::<f64>();
     let margin = open_trades
         .iter()
-        .map(|open| margin_for_notional(open.notional, leverage))
+        .map(|open| margin_for_notional(open.notional, open.leverage))
         .sum::<f64>();
     if margin.abs() > f64::EPSILON {
         pnl / margin
@@ -1298,21 +1663,23 @@ fn open_trades_to_positions(
     mark_idx: usize,
     mark_ts_ms: u64,
     mark_price: f64,
-    leverage: f64,
 ) -> Vec<ScriptBacktestOpenPosition> {
     open_trades
         .iter()
         .map(|open| ScriptBacktestOpenPosition {
             id: open.id.clone(),
+            order_id: open.order_id.clone(),
             side: open.side,
             entry_ts_ms: open.entry_ts_ms,
             entry_price: open.entry_price,
             mark_ts_ms,
             mark_price,
             notional: open.notional,
-            margin: margin_for_notional(open.notional, leverage),
-            leverage,
+            margin: margin_for_notional(open.notional, open.leverage),
+            leverage: open.leverage,
             qty: open.qty,
+            stop_loss_price: open.stop_loss_price,
+            take_profit_price: open.take_profit_price,
             unrealized_pnl: trade_pnl(open.side, open.entry_price, mark_price, open.qty),
             bars_held: mark_idx.saturating_sub(open.entry_idx),
             reason: "backtest ended before exit signal".to_string(),
@@ -1335,6 +1702,7 @@ fn format_trade_id(id: usize) -> String {
 fn backtest_summary(
     signals: usize,
     orders: usize,
+    script_orders: &HashMap<String, SimulatedScriptOrder>,
     trades: &[ScriptBacktestTrade],
     open_positions: &[ScriptBacktestOpenPosition],
 ) -> ScriptBacktestSummary {
@@ -1348,6 +1716,14 @@ fn backtest_summary(
     ScriptBacktestSummary {
         signals,
         orders,
+        pending_orders: script_orders
+            .values()
+            .filter(|order| order.status == SimulatedOrderStatus::Pending)
+            .count(),
+        cancelled_orders: script_orders
+            .values()
+            .filter(|order| order.status == SimulatedOrderStatus::Cancelled)
+            .count(),
         closed_trades: trades.len(),
         open_positions: open_positions.len(),
         wins,
@@ -1445,9 +1821,11 @@ fn render_backtest(
             println!();
             println!("summary");
             println!(
-                "  signals: {}\n  orders: {}\n  closed trades: {}\n  open positions: {}\n  wins/losses: {}/{}\n  win rate: {}",
+                "  signals: {}\n  orders: {}\n  pending/cancelled orders: {}/{}\n  closed trades: {}\n  open positions: {}\n  wins/losses: {}/{}\n  win rate: {}",
                 result.summary.signals,
                 result.summary.orders,
+                result.summary.pending_orders,
+                result.summary.cancelled_orders,
                 result.summary.closed_trades,
                 result.summary.open_positions,
                 result.summary.wins,
@@ -1657,6 +2035,33 @@ fn max_drawdown(returns: &[f64]) -> Option<f64> {
 mod tests {
     use super::*;
 
+    fn candle(idx: usize, open: f64, high: f64, low: f64, close: f64) -> ScriptCandle {
+        ScriptCandle {
+            t: 1_780_000_000_000 + idx as u64 * 60_000,
+            o: open,
+            h: high,
+            l: low,
+            c: close,
+            volume: 1.0,
+            trades: 1,
+            close_time: None,
+            vb: None,
+            vs: None,
+            tb: None,
+            ts: None,
+        }
+    }
+
+    fn script_trade(value: Value) -> ScriptExecutionCommand {
+        let request: ScriptTradeRequest =
+            serde_json::from_value(value).expect("valid script trade request");
+        let order = ScriptOrderRef {
+            id: crate::scripting::execution::local_order_id("backtest", &request.key),
+            key: request.key.clone(),
+        };
+        ScriptExecutionCommand::Trade { order, request }
+    }
+
     fn event(idx: usize, price: f64, position_id: Option<&str>) -> TradeEvent {
         TradeEvent {
             idx,
@@ -1739,5 +2144,100 @@ mod tests {
         assert!(err.to_string().contains("position_id"));
         assert_eq!(open_trades.len(), 1);
         assert!(closed_trades.is_empty());
+    }
+
+    #[test]
+    fn script_limit_order_cannot_fill_on_its_submission_bar() {
+        let data = BacktestData {
+            candles: Some(vec![
+                candle(0, 100.0, 105.0, 85.0, 100.0),
+                candle(1, 100.0, 101.0, 89.0, 95.0),
+            ]),
+            ..BacktestData::default()
+        };
+        let mut orders = HashMap::new();
+        let mut open = Vec::new();
+        let mut next_position_id = 1;
+        let submitted = apply_script_execution_commands(
+            vec![script_trade(json!({
+                "key": "limit-1",
+                "side": "long",
+                "notional": 100,
+                "leverage": 2,
+                "order": { "type": "limit", "price": 90, "tif": "gtc" }
+            }))],
+            0,
+            data.candles.as_ref().unwrap()[0].t,
+            100.0,
+            &mut orders,
+            &mut open,
+            &mut next_position_id,
+        )
+        .expect("queue limit order");
+        assert_eq!(submitted, 1);
+
+        fill_pending_script_orders(
+            &ScriptSource::Candles,
+            &data,
+            0,
+            &mut orders,
+            &mut open,
+            &mut next_position_id,
+        )
+        .expect("same-bar check");
+        assert!(open.is_empty());
+
+        fill_pending_script_orders(
+            &ScriptSource::Candles,
+            &data,
+            1,
+            &mut orders,
+            &mut open,
+            &mut next_position_id,
+        )
+        .expect("next-bar fill");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].entry_price, 90.0);
+        assert_eq!(open[0].leverage, 2.0);
+    }
+
+    #[test]
+    fn simulated_oco_uses_stop_when_both_triggers_touch_same_candle() {
+        let data = BacktestData {
+            candles: Some(vec![
+                candle(0, 100.0, 105.0, 95.0, 100.0),
+                candle(1, 100.0, 125.0, 85.0, 105.0),
+            ]),
+            ..BacktestData::default()
+        };
+        let mut orders = HashMap::new();
+        let mut open = Vec::new();
+        let mut closed = Vec::new();
+        let mut next_position_id = 1;
+        apply_script_execution_commands(
+            vec![script_trade(json!({
+                "key": "protected-1",
+                "side": "long",
+                "notional": 100,
+                "leverage": 2,
+                "order": { "type": "market" },
+                "sl": 90,
+                "tp": 120
+            }))],
+            0,
+            data.candles.as_ref().unwrap()[0].t,
+            100.0,
+            &mut orders,
+            &mut open,
+            &mut next_position_id,
+        )
+        .expect("fill market order");
+
+        apply_protective_triggers(&ScriptSource::Candles, &data, 1, &mut open, &mut closed)
+            .expect("apply protection");
+        assert!(open.is_empty());
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].exit.price, 90.0);
+        assert_eq!(closed[0].exit.reason, "ctx.trade stop loss");
     }
 }

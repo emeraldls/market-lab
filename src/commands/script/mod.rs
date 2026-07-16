@@ -7,6 +7,7 @@ use crate::scripting::telemetry::{
 };
 
 pub mod backtest;
+pub mod jobs;
 pub mod run;
 pub mod runs;
 
