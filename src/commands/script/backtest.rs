@@ -200,6 +200,24 @@ struct SimulatedScriptOrder {
     status: SimulatedOrderStatus,
 }
 
+struct ScriptSimulationState {
+    orders: HashMap<String, SimulatedScriptOrder>,
+    open_trades: Vec<OpenTrade>,
+    closed_trades: Vec<ScriptBacktestTrade>,
+    next_position_id: usize,
+}
+
+impl Default for ScriptSimulationState {
+    fn default() -> Self {
+        Self {
+            orders: HashMap::new(),
+            open_trades: Vec::new(),
+            closed_trades: Vec::new(),
+            next_position_id: 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TradeEvent {
     idx: usize,
@@ -324,11 +342,8 @@ async fn backtest_events(
 
     let mut returns = Vec::new();
     let mut orders = 0_usize;
-    let mut closed_trades = Vec::new();
-    let mut open_trades = Vec::new();
+    let mut simulation = ScriptSimulationState::default();
     let mut peak_margin = 0.0_f64;
-    let mut script_orders = HashMap::<String, SimulatedScriptOrder>::new();
-    let mut next_position_id = 1_usize;
     let mut latest_output = None;
     let session = script.start_session_with_execution(
         &resolved_params,
@@ -377,7 +392,11 @@ async fn backtest_events(
             && let Some(price) = backtest_series_reference_price(series, event.record_idx)?
         {
             if let Some(previous_price) = latest_reference_price {
-                returns.push(position_return(&open_trades, previous_price, price));
+                returns.push(position_return(
+                    &simulation.open_trades,
+                    previous_price,
+                    price,
+                ));
             }
             latest_reference_price = Some(price);
             latest_reference_ts = event.ts_ms;
@@ -386,20 +405,11 @@ async fn backtest_events(
                 &data,
                 event.record_idx,
                 idx,
-                &mut open_trades,
-                &mut closed_trades,
+                &mut simulation.open_trades,
+                &mut simulation.closed_trades,
             )?;
-            fill_pending_script_orders(
-                config,
-                &data,
-                event.record_idx,
-                idx,
-                &mut script_orders,
-                &mut open_trades,
-                &mut closed_trades,
-                &mut next_position_id,
-            )?;
-            peak_margin = peak_margin.max(open_position_margin(&open_trades));
+            fill_pending_script_orders(config, &data, event.record_idx, idx, &mut simulation)?;
+            peak_margin = peak_margin.max(open_position_margin(&simulation.open_trades));
         }
         let payload = build_event_payload(EventPayloadContext {
             source_configs: &source_configs,
@@ -410,7 +420,7 @@ async fn backtest_events(
             event_idx: idx,
             mark_ts_ms: latest_reference_ts,
             mark_price: latest_reference_price.unwrap_or_default(),
-            open_trades: &open_trades,
+            open_trades: &simulation.open_trades,
         })?;
         let execution = match session.run_event(payload) {
             Ok(execution) => execution,
@@ -432,12 +442,9 @@ async fn backtest_events(
             idx,
             event.ts_ms,
             latest_reference_price,
-            &mut script_orders,
-            &mut open_trades,
-            &mut closed_trades,
-            &mut next_position_id,
+            &mut simulation,
         )?;
-        peak_margin = peak_margin.max(open_position_margin(&open_trades));
+        peak_margin = peak_margin.max(open_position_margin(&simulation.open_trades));
         if script_order_count > 0 {
             orders += script_order_count;
         }
@@ -458,13 +465,23 @@ async fn backtest_events(
 
     let mark_price = latest_reference_price.context("backtest produced no reference price")?;
     let open_positions = open_trades_to_positions(
-        &open_trades,
+        &simulation.open_trades,
         events.len().saturating_sub(1),
         latest_reference_ts,
         mark_price,
     );
-    let summary = backtest_summary(orders, &script_orders, &closed_trades, &open_positions);
-    let performance = backtest_performance(&returns, &closed_trades, &open_positions, peak_margin);
+    let summary = backtest_summary(
+        orders,
+        &simulation.orders,
+        &simulation.closed_trades,
+        &open_positions,
+    );
+    let performance = backtest_performance(
+        &returns,
+        &simulation.closed_trades,
+        &open_positions,
+        peak_margin,
+    );
     let result = ScriptBacktestResult {
         r#type: "script.backtest.result",
         version: "1",
@@ -490,7 +507,7 @@ async fn backtest_events(
         },
         summary,
         performance,
-        closed_trades,
+        closed_trades: simulation.closed_trades,
         open_positions,
         latest_output,
         meta: json!({
@@ -1110,17 +1127,14 @@ fn apply_script_execution_commands(
     idx: usize,
     ts_ms: u64,
     current_price: Option<f64>,
-    script_orders: &mut HashMap<String, SimulatedScriptOrder>,
-    open_trades: &mut Vec<OpenTrade>,
-    closed_trades: &mut Vec<ScriptBacktestTrade>,
-    next_position_id: &mut usize,
+    simulation: &mut ScriptSimulationState,
 ) -> Result<usize> {
     let mut submitted = 0;
     for command in commands {
         match command {
             ScriptExecutionCommand::Trade { order, request } => {
                 request.validate()?;
-                if let Some(existing) = script_orders.get(&order.id) {
+                if let Some(existing) = simulation.orders.get(&order.id) {
                     if existing.request != request {
                         bail!(
                             "ctx.trade key `{}` was reused with different order parameters",
@@ -1129,13 +1143,13 @@ fn apply_script_execution_commands(
                     }
                     continue;
                 }
-                validate_position_transition(&request, open_trades)?;
+                validate_position_transition(&request, &simulation.open_trades)?;
                 let reference_price = request.order.price.or(current_price).context(
                     "ctx.trade requires a price-bearing source before submitting this order",
                 )?;
                 validate_script_protection(&request, reference_price)?;
                 let order_id = order.id.clone();
-                script_orders.insert(
+                simulation.orders.insert(
                     order_id.clone(),
                     SimulatedScriptOrder {
                         order,
@@ -1149,20 +1163,11 @@ fn apply_script_execution_commands(
                     let fill_price = current_price.context(
                         "ctx.trade market order requires a price-bearing source event first",
                     )?;
-                    fill_script_order(
-                        &order_id,
-                        idx,
-                        ts_ms,
-                        fill_price,
-                        script_orders,
-                        open_trades,
-                        closed_trades,
-                        next_position_id,
-                    )?;
+                    fill_script_order(&order_id, idx, ts_ms, fill_price, simulation)?;
                 }
             }
             ScriptExecutionCommand::Cancel { request } => {
-                cancel_script_order(request, script_orders)?;
+                cancel_script_order(request, &mut simulation.orders)?;
             }
         }
     }
@@ -1198,10 +1203,7 @@ fn fill_pending_script_orders(
     data: &BacktestData,
     record_idx: usize,
     event_idx: usize,
-    script_orders: &mut HashMap<String, SimulatedScriptOrder>,
-    open_trades: &mut Vec<OpenTrade>,
-    closed_trades: &mut Vec<ScriptBacktestTrade>,
-    next_position_id: &mut usize,
+    simulation: &mut ScriptSimulationState,
 ) -> Result<()> {
     let series = data
         .series
@@ -1209,7 +1211,7 @@ fn fill_pending_script_orders(
         .with_context(|| format!("{} data not loaded", config.selector))?;
     let ts_ms = backtest_series_event_ts_ms(series, record_idx, config)?;
     let mut fillable = Vec::new();
-    for order in script_orders.values().filter(|order| {
+    for order in simulation.orders.values().filter(|order| {
         order.status == SimulatedOrderStatus::Pending
             && order.submitted_idx < event_idx
             && order.request.order.kind == ScriptOrderKind::Limit
@@ -1224,16 +1226,7 @@ fn fill_pending_script_orders(
         }
     }
     for (order_id, price) in fillable {
-        fill_script_order(
-            &order_id,
-            event_idx,
-            ts_ms,
-            price,
-            script_orders,
-            open_trades,
-            closed_trades,
-            next_position_id,
-        )?;
+        fill_script_order(&order_id, event_idx, ts_ms, price, simulation)?;
     }
     Ok(())
 }
@@ -1269,19 +1262,17 @@ fn fill_script_order(
     idx: usize,
     ts_ms: u64,
     price: f64,
-    script_orders: &mut HashMap<String, SimulatedScriptOrder>,
-    open_trades: &mut Vec<OpenTrade>,
-    closed_trades: &mut Vec<ScriptBacktestTrade>,
-    next_position_id: &mut usize,
+    simulation: &mut ScriptSimulationState,
 ) -> Result<()> {
-    let order = script_orders
+    let order = simulation
+        .orders
         .get(order_id)
         .cloned()
         .with_context(|| format!("simulated order `{order_id}` was not found"))?;
     if order.status != SimulatedOrderStatus::Pending {
         return Ok(());
     }
-    validate_position_transition(&order.request, open_trades)?;
+    validate_position_transition(&order.request, &simulation.open_trades)?;
     if order.request.position.is_open() {
         let side = trade_side(order.request.position.position_direction());
         let leverage = order.request.leverage_or_default();
@@ -1295,7 +1286,7 @@ fn fill_script_order(
             .margin
             .or_else(|| notional.map(|notional| margin_for_notional(notional, leverage)));
         let opened = open_trade_from_entry(
-            next_position_id,
+            &mut simulation.next_position_id,
             TradeEntry {
                 side,
                 idx,
@@ -1310,23 +1301,27 @@ fn fill_script_order(
                 take_profit_price: order.request.tp,
             },
         );
-        if let Some(existing) = open_trades.first_mut() {
+        if let Some(existing) = simulation.open_trades.first_mut() {
             add_to_open_position(existing, opened);
         } else {
-            open_trades.push(opened);
+            simulation.open_trades.push(opened);
         }
     } else {
         let side = trade_side(order.request.position.position_direction());
-        let open_index = open_trades
+        let open_index = simulation
+            .open_trades
             .iter()
             .position(|open| open.side == side)
             .context("matching simulated position disappeared before the close filled")?;
-        let close_qty = order.request.size.unwrap_or(open_trades[open_index].qty);
+        let close_qty = order
+            .request
+            .size
+            .unwrap_or(simulation.open_trades[open_index].qty);
         close_position_quantity(
             open_index,
             close_qty,
-            open_trades,
-            closed_trades,
+            &mut simulation.open_trades,
+            &mut simulation.closed_trades,
             &TradeEvent {
                 idx,
                 ts_ms,
@@ -1335,7 +1330,8 @@ fn fill_script_order(
             },
         )?;
     }
-    script_orders
+    simulation
+        .orders
         .get_mut(order_id)
         .context("simulated order disappeared after fill")?
         .status = SimulatedOrderStatus::Filled;
@@ -2278,10 +2274,7 @@ export function onData(ctx, input, history) {
             candle(1, 100.0, 101.0, 89.0, 95.0),
         ]);
         let source = candle_source();
-        let mut orders = HashMap::new();
-        let mut open = Vec::new();
-        let mut closed = Vec::new();
-        let mut next_position_id = 1;
+        let mut simulation = ScriptSimulationState::default();
         let submitted = apply_script_execution_commands(
             vec![script_trade(json!({
                 "key": "limit-1",
@@ -2293,42 +2286,21 @@ export function onData(ctx, input, history) {
             0,
             candle_ts_ms(&candle(0, 100.0, 105.0, 85.0, 100.0)),
             Some(100.0),
-            &mut orders,
-            &mut open,
-            &mut closed,
-            &mut next_position_id,
+            &mut simulation,
         )
         .expect("queue limit order");
         assert_eq!(submitted, 1);
 
-        fill_pending_script_orders(
-            &source,
-            &data,
-            0,
-            0,
-            &mut orders,
-            &mut open,
-            &mut closed,
-            &mut next_position_id,
-        )
-        .expect("same-event check");
-        assert!(open.is_empty());
+        fill_pending_script_orders(&source, &data, 0, 0, &mut simulation)
+            .expect("same-event check");
+        assert!(simulation.open_trades.is_empty());
 
-        fill_pending_script_orders(
-            &source,
-            &data,
-            1,
-            1,
-            &mut orders,
-            &mut open,
-            &mut closed,
-            &mut next_position_id,
-        )
-        .expect("later-event fill");
-        assert_eq!(open.len(), 1);
-        assert_eq!(open[0].entry_price, 90.0);
-        assert_eq!(open[0].leverage, 2.0);
-        assert_eq!(open[0].notional, 200.0);
+        fill_pending_script_orders(&source, &data, 1, 1, &mut simulation)
+            .expect("later-event fill");
+        assert_eq!(simulation.open_trades.len(), 1);
+        assert_eq!(simulation.open_trades[0].entry_price, 90.0);
+        assert_eq!(simulation.open_trades[0].leverage, 2.0);
+        assert_eq!(simulation.open_trades[0].notional, 200.0);
     }
 
     #[test]
@@ -2338,10 +2310,7 @@ export function onData(ctx, input, history) {
             candle(1, 100.0, 125.0, 85.0, 105.0),
         ]);
         let source = candle_source();
-        let mut orders = HashMap::new();
-        let mut open = Vec::new();
-        let mut closed = Vec::new();
-        let mut next_position_id = 1;
+        let mut simulation = ScriptSimulationState::default();
         apply_script_execution_commands(
             vec![script_trade(json!({
                 "key": "protected-1",
@@ -2355,27 +2324,31 @@ export function onData(ctx, input, history) {
             0,
             candle_ts_ms(&candle(0, 100.0, 105.0, 95.0, 100.0)),
             Some(100.0),
-            &mut orders,
-            &mut open,
-            &mut closed,
-            &mut next_position_id,
+            &mut simulation,
         )
         .expect("fill market order");
 
-        apply_protective_triggers(&source, &data, 1, 1, &mut open, &mut closed)
-            .expect("apply protection");
-        assert!(open.is_empty());
-        assert_eq!(closed.len(), 1);
-        assert_eq!(closed[0].exit.price, 90.0);
-        assert_eq!(closed[0].exit.reason, "ctx.trade stop loss");
+        apply_protective_triggers(
+            &source,
+            &data,
+            1,
+            1,
+            &mut simulation.open_trades,
+            &mut simulation.closed_trades,
+        )
+        .expect("apply protection");
+        assert!(simulation.open_trades.is_empty());
+        assert_eq!(simulation.closed_trades.len(), 1);
+        assert_eq!(simulation.closed_trades[0].exit.price, 90.0);
+        assert_eq!(
+            simulation.closed_trades[0].exit.reason,
+            "ctx.trade stop loss"
+        );
     }
 
     #[test]
     fn close_long_is_reduce_only_and_defaults_to_the_full_position() {
-        let mut orders = HashMap::new();
-        let mut open = Vec::new();
-        let mut closed = Vec::new();
-        let mut next_position_id = 1;
+        let mut simulation = ScriptSimulationState::default();
 
         apply_script_execution_commands(
             vec![script_trade(json!({
@@ -2387,13 +2360,10 @@ export function onData(ctx, input, history) {
             0,
             1_000,
             Some(100.0),
-            &mut orders,
-            &mut open,
-            &mut closed,
-            &mut next_position_id,
+            &mut simulation,
         )
         .expect("open long");
-        assert_eq!(open.len(), 1);
+        assert_eq!(simulation.open_trades.len(), 1);
 
         apply_script_execution_commands(
             vec![script_trade(json!({
@@ -2403,25 +2373,19 @@ export function onData(ctx, input, history) {
             1,
             2_000,
             Some(110.0),
-            &mut orders,
-            &mut open,
-            &mut closed,
-            &mut next_position_id,
+            &mut simulation,
         )
         .expect("close long");
 
-        assert!(open.is_empty());
-        assert_eq!(closed.len(), 1);
-        assert_eq!(closed[0].qty, 2.0);
-        assert_eq!(closed[0].net_pnl, 20.0);
+        assert!(simulation.open_trades.is_empty());
+        assert_eq!(simulation.closed_trades.len(), 1);
+        assert_eq!(simulation.closed_trades[0].qty, 2.0);
+        assert_eq!(simulation.closed_trades[0].net_pnl, 20.0);
     }
 
     #[test]
     fn opposite_open_requires_an_explicit_close_first() {
-        let mut orders = HashMap::new();
-        let mut open = Vec::new();
-        let mut closed = Vec::new();
-        let mut next_position_id = 1;
+        let mut simulation = ScriptSimulationState::default();
 
         apply_script_execution_commands(
             vec![script_trade(json!({
@@ -2432,10 +2396,7 @@ export function onData(ctx, input, history) {
             0,
             1_000,
             Some(100.0),
-            &mut orders,
-            &mut open,
-            &mut closed,
-            &mut next_position_id,
+            &mut simulation,
         )
         .expect("open long");
 
@@ -2448,10 +2409,7 @@ export function onData(ctx, input, history) {
             1,
             2_000,
             Some(99.0),
-            &mut orders,
-            &mut open,
-            &mut closed,
-            &mut next_position_id,
+            &mut simulation,
         )
         .expect_err("opposite open must fail");
 

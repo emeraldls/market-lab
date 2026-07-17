@@ -18,6 +18,7 @@ pub struct TwapJobDefinition {
     pub side: StrategySide,
     pub total_size: f64,
     pub requested_margin: Option<f64>,
+    #[serde(default)]
     pub target_margin: f64,
     pub target_exposure: f64,
     pub duration_seconds: u64,
@@ -132,4 +133,30 @@ pub struct StrategyJob {
     pub stopped_at_ms: Option<u64>,
     pub last_heartbeat_ms: Option<u64>,
     pub last_error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::TwapJobDefinition;
+
+    #[test]
+    fn twap_job_without_target_margin_can_be_read_from_a_running_daemon() {
+        let definition: TwapJobDefinition = serde_json::from_value(json!({
+            "exchange": "bulk",
+            "symbol": "BTC/USDT",
+            "side": "buy",
+            "totalSize": 0.01,
+            "requestedMargin": 100.0,
+            "targetExposure": 1_000.0,
+            "durationSeconds": 300,
+            "intervalSeconds": 60,
+            "leverage": 10.0,
+            "reduceOnly": false
+        }))
+        .expect("deserialize a TWAP job created before targetMargin was persisted");
+
+        assert_eq!(definition.target_margin, 0.0);
+    }
 }
