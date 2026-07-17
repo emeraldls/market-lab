@@ -160,17 +160,6 @@ pub fn source_config<'a>(
     Ok(config)
 }
 
-pub fn first_source_config<'a>(
-    configs: &'a SourceConfigs,
-    source: &ScriptSource,
-) -> Result<&'a SourceConfig> {
-    configs
-        .values()
-        .filter(|config| &config.source == source)
-        .min_by_key(|config| config.position)
-        .ok_or_else(|| anyhow::anyhow!("missing source config for {}", source.as_str()))
-}
-
 pub fn source_exchange_label(configs: &SourceConfigs) -> String {
     let mut exchanges = configs
         .values()
@@ -503,8 +492,6 @@ mod tests {
             name: "test-script".to_string(),
             version: "1".to_string(),
             sources,
-            modes: vec![],
-            clock: None,
             description: None,
             lookback: None,
             params: BTreeMap::new(),
@@ -517,8 +504,6 @@ mod tests {
             name: "buy-pressure".to_string(),
             version: "1".to_string(),
             sources: vec![ScriptSource::Candles],
-            modes: vec![],
-            clock: None,
             description: None,
             lookback: None,
             params: BTreeMap::from([
@@ -588,12 +573,6 @@ mod tests {
         validate_source_configs(&manifest, &configs).expect("backtest configs should validate");
         validate_source_configs_for_run(&manifest, &configs).expect("live configs should validate");
         assert_eq!(source_exchange_label(&configs), "binancef,okx");
-        assert_eq!(
-            first_source_config(&configs, &ScriptSource::Candles)
-                .unwrap()
-                .selector,
-            "candles@binancef@mmt"
-        );
         assert_eq!(configs["candles@okx@mmt"].timeframe, Some(300));
     }
 

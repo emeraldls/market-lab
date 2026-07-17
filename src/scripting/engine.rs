@@ -221,7 +221,7 @@ impl ScriptSession {
     }
 
     #[cfg(test)]
-    pub fn run_candles_window(&self, candles: &JsonValue) -> Result<ScriptExecution> {
+    pub fn run_candles(&self, candles: &JsonValue) -> Result<ScriptExecution> {
         let candles = candles
             .as_array()
             .context("test candle window must be an array")?;
@@ -232,26 +232,22 @@ impl ScriptSession {
                 candle.get("t").and_then(JsonValue::as_u64),
             )?;
         }
-        self.run_on_data(serde_json::json!({ "mode": "window" }))
+        self.run_on_data(serde_json::json!({}))
     }
 
     #[cfg(test)]
-    pub fn run_orderbook_window(&self, books: &JsonValue) -> Result<ScriptExecution> {
+    pub fn run_orderbooks(&self, books: &JsonValue) -> Result<ScriptExecution> {
         let books = books
             .as_array()
             .context("test orderbook window must be an array")?;
         for book in books {
             self.record_source("orderbook@binancef@mmt", book.clone(), None)?;
         }
-        self.run_on_data(serde_json::json!({ "mode": "window" }))
+        self.run_on_data(serde_json::json!({}))
     }
 
-    pub fn run_window(&self, payload: JsonValue) -> Result<ScriptExecution> {
-        self.run_on_data(payload)
-    }
-
-    pub fn run_stream(&self, mut payload: JsonValue) -> Result<ScriptExecution> {
-        let (source, record, identity) = stream_history_entry(&payload)?;
+    pub fn run_event(&self, mut payload: JsonValue) -> Result<ScriptExecution> {
+        let (source, record, identity) = event_history_entry(&payload)?;
         self.record_source(&source, record, identity)?;
         strip_source_data(&mut payload);
         self.run_on_data(payload)
@@ -467,11 +463,11 @@ fn native_history_source(history: &Arc<Mutex<SourceHistory>>, source: &str, offs
     serde_json::to_string(&response).expect("history response must serialize")
 }
 
-fn stream_history_entry(input: &JsonValue) -> Result<(String, JsonValue, Option<u64>)> {
+fn event_history_entry(input: &JsonValue) -> Result<(String, JsonValue, Option<u64>)> {
     let selector = input
         .get("source")
         .and_then(JsonValue::as_str)
-        .context("stream input.source is required for source history")?;
+        .context("input.source is required for source history")?;
     let source = input
         .get("source_type")
         .and_then(JsonValue::as_str)
@@ -487,9 +483,9 @@ fn stream_history_entry(input: &JsonValue) -> Result<(String, JsonValue, Option<
         "vd" => current.and_then(|value| value.get("record").or_else(|| value.get("candle"))),
         "oi" => current.and_then(|value| value.get("record").or_else(|| value.get("candle"))),
         "volumes" => current.and_then(|value| value.get("record").or_else(|| value.get("profile"))),
-        _ => anyhow::bail!("unknown stream input.source `{selector}`"),
+        _ => anyhow::bail!("unknown input.source `{selector}`"),
     }
-    .with_context(|| format!("stream input has no current {source} record"))?;
+    .with_context(|| format!("input has no current {source} record"))?;
 
     let replaces_same_timestamp = match source {
         "candles" | "volumes" => true,
@@ -602,7 +598,6 @@ export const script = {
   name: "buy-pressure-filter",
   version: "1",
   sources: ["candles"],
-  modes: ["window"],
   params: {
     min_vbuy: { type: "number", required: true }
   }
@@ -628,7 +623,6 @@ export const study = {
   name: "legacy-study",
   version: "1",
   sources: ["candles"],
-  modes: ["window"],
   params: {}
 };
 
@@ -651,14 +645,13 @@ export function onData(ctx, input, history) {
     }
 
     #[test]
-    fn runs_candles_window_hook() {
+    fn runs_candles_hook() {
         let path = write_temp_script(
             r#"
 export const script = {
   name: "buy-pressure-filter",
   version: "1",
   sources: ["candles"],
-  modes: ["window"],
   params: {
     min_vbuy: { type: "number", required: true }
   }
@@ -685,7 +678,7 @@ export function onData(ctx, input, history) {
             { "t": 2, "o": 1.5, "h": 2.2, "l": 1.0, "c": 2.0, "vb": 200.0, "vs": 90.0, "tb": 12, "ts": 10 }
         ]);
         let session = script.start_session(&inputs).expect("start session");
-        let execution = session.run_candles_window(&candles).expect("run script");
+        let execution = session.run_candles(&candles).expect("run script");
 
         assert_eq!(execution.output.metrics["qualifying_candles"], 1);
         assert_eq!(execution.output.metrics["latest_close"], 2.0);
@@ -701,7 +694,6 @@ export const script = {
   name: "helper-script",
   version: "1",
   sources: ["candles"],
-  modes: ["window"],
   params: {}
 };
 
@@ -729,7 +721,7 @@ export function onData(ctx, input, history) {
             { "t": 3, "o": 1.0, "h": 1.0, "l": 1.0, "c": 30.0, "vb": 130.0, "vs": 100.0, "tb": 1, "ts": 1 },
             { "t": 4, "o": 1.0, "h": 1.0, "l": 1.0, "c": 40.0, "vb": 140.0, "vs": 100.0, "tb": 1, "ts": 1 }
         ]);
-        let execution = session.run_candles_window(&candles).expect("run script");
+        let execution = session.run_candles(&candles).expect("run script");
 
         assert_eq!(execution.output.metrics["sma_latest"], 30.0);
         assert_eq!(execution.output.metrics["sma_previous"], 20.0);
@@ -785,8 +777,7 @@ export function onData(ctx, input, history) {
                 .expect("record vd history");
         }
         let execution = session
-            .run_window(json!({
-                "mode": "window",
+            .run_on_data(json!({
                 "source_configs": {
                     "vd@hyperliquid@mmt": {
                         "type": "vd",
@@ -830,7 +821,7 @@ export function onData(ctx, input, history) {
         let script = Script::load(&path).expect("load script");
         let session = script.start_session(&json!({})).expect("start session");
         let err = session
-            .run_candles_window(&json!([
+            .run_candles(&json!([
                 { "t": 1, "o": 1.0, "h": 1.0, "l": 1.0, "c": 10.0, "vb": 100.0, "vs": 80.0, "tb": 1, "ts": 1 }
             ]))
             .expect_err("cvd must reject non-vd candles");
@@ -847,7 +838,6 @@ export const script = {
   name: "bad-helper-script",
   version: "1",
   sources: ["candles"],
-  modes: ["window"],
   params: {}
 };
 
@@ -861,7 +851,7 @@ export function onData(ctx, input, history) {
         let script = Script::load(&path).expect("load script");
         let session = script.start_session(&json!({})).expect("start session");
         let err = session
-            .run_candles_window(&json!([{ "c": 1.0 }]))
+            .run_candles(&json!([{ "c": 1.0 }]))
             .expect_err("helper should reject missing field");
         let message = err.to_string();
 
@@ -878,7 +868,6 @@ export const script = {
   name: "orderbook-helper-script",
   version: "1",
   sources: ["orderbook"],
-  modes: ["window"],
   params: {}
 };
 
@@ -891,7 +880,6 @@ export function onData(ctx, input, history) {
   const vamp = ctx.study.vamp(book, { dollar_depth: 150 });
   return {
     metrics: {
-      mode: input.mode,
       spread_bps: spread.spread_bps,
       bid_quote: depth.bid_quote,
       ask_quote: depth.ask_quote,
@@ -922,11 +910,8 @@ export function onData(ctx, input, history) {
         });
         let script = Script::load(&path).expect("load script");
         let session = script.start_session(&json!({})).expect("start session");
-        let execution = session
-            .run_orderbook_window(&json!([book]))
-            .expect("run script");
+        let execution = session.run_orderbooks(&json!([book])).expect("run script");
 
-        assert_eq!(execution.output.metrics["mode"], "window");
         assert_eq!(execution.output.metrics["bid_quote"], 295.0);
         assert_eq!(execution.output.metrics["ask_quote"], 305.0);
         assert_eq!(execution.output.metrics["slippage_levels"], 2);
@@ -945,14 +930,13 @@ export function onData(ctx, input, history) {
     }
 
     #[test]
-    fn runs_orderbook_window_hook() {
+    fn runs_orderbook_hook() {
         let path = write_temp_script(
             r#"
 export const script = {
   name: "orderbook-window-script",
   version: "1",
   sources: ["orderbook"],
-  modes: ["window"],
   params: {}
 };
 
@@ -962,7 +946,6 @@ export function onData(ctx, input, history) {
   const spread = ctx.study.spread(latest);
   return {
     metrics: {
-      mode: input.mode,
       books: books.length,
       latest_ts: latest.timestamp_ms,
       spread_bps: spread.spread_bps
@@ -991,9 +974,8 @@ export function onData(ctx, input, history) {
         ]);
         let script = Script::load(&path).expect("load script");
         let session = script.start_session(&json!({})).expect("start session");
-        let execution = session.run_orderbook_window(&books).expect("run script");
+        let execution = session.run_orderbooks(&books).expect("run script");
 
-        assert_eq!(execution.output.metrics["mode"], "window");
         assert_eq!(execution.output.metrics["books"], 2);
         assert_eq!(execution.output.metrics["latest_ts"], 2);
         assert!(
@@ -1005,7 +987,7 @@ export function onData(ctx, input, history) {
     }
 
     #[test]
-    fn runs_vd_window_hook() {
+    fn runs_vd_hook() {
         let path = write_temp_script(
             r#"
 export const script = {
@@ -1020,7 +1002,6 @@ export function onData(ctx, input, history) {
   const latest = history.source("vd@hyperliquid@mmt", 0);
   return {
     metrics: {
-      mode: input.mode,
       candles: candles.length,
       latest_close: latest.c,
       trades: candles.reduce((sum, candle) => sum + candle.n, 0)
@@ -1046,11 +1027,8 @@ export function onData(ctx, input, history) {
                 )
                 .expect("record vd history");
         }
-        let execution = session
-            .run_window(json!({ "mode": "window" }))
-            .expect("run script");
+        let execution = session.run_on_data(json!({})).expect("run script");
 
-        assert_eq!(execution.output.metrics["mode"], "window");
         assert_eq!(execution.output.metrics["candles"], 2);
         assert_eq!(execution.output.metrics["latest_close"], 2.0);
         assert_eq!(execution.output.metrics["trades"], 22);
@@ -1065,7 +1043,6 @@ export const script = {
   name: "stateful-script",
   version: "1",
   sources: ["candles"],
-  modes: ["window"],
   params: {}
 };
 
@@ -1087,10 +1064,10 @@ export function onData(ctx, input, history) {
         let script = Script::load(&path).expect("load script");
         let session = script.start_session(&json!({})).expect("start session");
         let first = session
-            .run_candles_window(&json!([{ "c": 1.0 }]))
+            .run_candles(&json!([{ "c": 1.0 }]))
             .expect("first run");
         let second = session
-            .run_candles_window(&json!([{ "c": 2.0 }]))
+            .run_candles(&json!([{ "c": 2.0 }]))
             .expect("second run");
 
         assert_eq!(first.output.metrics["calls"], 1);
@@ -1100,14 +1077,13 @@ export function onData(ctx, input, history) {
     }
 
     #[test]
-    fn runs_candle_stream_hook() {
+    fn runs_candle_event_hook() {
         let path = write_temp_script(
             r#"
 export const script = {
   name: "stream-script",
   version: "1",
   sources: ["candles"],
-  modes: ["stream"],
   params: {}
 };
 
@@ -1130,8 +1106,7 @@ export function onData(ctx, input, history) {
         let script = Script::load(&path).expect("load script");
         let session = script.start_session(&json!({})).expect("start session");
         let first = session
-            .run_stream(json!({
-                "mode": "stream",
+            .run_event(json!({
                 "source": "candles@binancef@mmt",
                 "source_type": "candles",
                 "data": {
@@ -1140,8 +1115,7 @@ export function onData(ctx, input, history) {
             }))
             .expect("first stream run");
         let second = session
-            .run_stream(json!({
-                "mode": "stream",
+            .run_event(json!({
                 "source": "candles@binancef@mmt",
                 "source_type": "candles",
                 "data": {
@@ -1166,7 +1140,6 @@ export const script = {
   name: "stream-history",
   version: "1",
   sources: ["candles"],
-  modes: ["stream"],
   lookback: 2,
   params: {}
 };
@@ -1195,24 +1168,21 @@ export function onData(ctx, input, history) {
         let script = Script::load(&path).expect("load script");
         let session = script.start_session(&json!({})).expect("start session");
         let first = session
-            .run_stream(json!({
-                "mode": "stream",
+            .run_event(json!({
                 "source": "candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 1, "c": 10.0 } }
             }))
             .expect("first stream run");
         let second = session
-            .run_stream(json!({
-                "mode": "stream",
+            .run_event(json!({
                 "source": "candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 2, "c": 11.0 } }
             }))
             .expect("second stream run");
         let third = session
-            .run_stream(json!({
-                "mode": "stream",
+            .run_event(json!({
                 "source": "candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 3, "c": 12.0 } }
@@ -1242,7 +1212,6 @@ export const script = {
   name: "stream-history-bar-replacement",
   version: "1",
   sources: ["candles"],
-  modes: ["stream"],
   params: {}
 };
 
@@ -1261,24 +1230,21 @@ export function onData(ctx, input, history) {
         let script = Script::load(&path).expect("load script");
         let session = script.start_session(&json!({})).expect("start session");
         session
-            .run_stream(json!({
-                "mode": "stream",
+            .run_event(json!({
                 "source": "candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 1, "c": 10.0 } }
             }))
             .expect("first stream run");
         let replacement = session
-            .run_stream(json!({
-                "mode": "stream",
+            .run_event(json!({
                 "source": "candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 1, "c": 10.5 } }
             }))
             .expect("replacement stream run");
         let next = session
-            .run_stream(json!({
-                "mode": "stream",
+            .run_event(json!({
                 "source": "candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 2, "c": 11.0 } }
@@ -1300,7 +1266,6 @@ export const script = {
   name: "stream-history-sources",
   version: "1",
   sources: ["candles", "orderbook"],
-  modes: ["stream"],
   params: {}
 };
 
@@ -1320,16 +1285,14 @@ export function onData(ctx, input, history) {
         let script = Script::load(&path).expect("load script");
         let session = script.start_session(&json!({})).expect("start session");
         session
-            .run_stream(json!({
-                "mode": "stream",
+            .run_event(json!({
                 "source": "candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 1, "c": 10.0 } }
             }))
             .expect("candle stream run");
         let book = session
-            .run_stream(json!({
-                "mode": "stream",
+            .run_event(json!({
                 "source": "orderbook@bulk",
                 "source_type": "orderbook",
                 "data": {
@@ -1338,8 +1301,7 @@ export function onData(ctx, input, history) {
             }))
             .expect("orderbook stream run");
         let candle = session
-            .run_stream(json!({
-                "mode": "stream",
+            .run_event(json!({
                 "source": "candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 3, "c": 11.0 } }
@@ -1362,7 +1324,6 @@ export const script = {
   name: "stream-history-exchanges",
   version: "1",
   sources: ["candles"],
-  modes: ["stream"],
   params: {}
 };
 
@@ -1382,24 +1343,21 @@ export function onData(ctx, input, history) {
         let script = Script::load(&path).expect("load script");
         let session = script.start_session(&json!({})).expect("start session");
         session
-            .run_stream(json!({
-                "mode": "stream",
+            .run_event(json!({
                 "source": "candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 1, "c": 10.0 } }
             }))
             .expect("first binance stream run");
         let okx = session
-            .run_stream(json!({
-                "mode": "stream",
+            .run_event(json!({
                 "source": "candles@okx@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 1, "c": 20.0 } }
             }))
             .expect("okx stream run");
         let binance = session
-            .run_stream(json!({
-                "mode": "stream",
+            .run_event(json!({
                 "source": "candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 2, "c": 11.0 } }
@@ -1422,7 +1380,6 @@ export const script = {
   name: "bad-script",
   version: "1",
   sources: ["candles"],
-  modes: ["window"],
   params: {}
 };
 
@@ -1436,7 +1393,7 @@ export function onData(ctx, input, history) {
         let script = Script::load(&path).expect("load script");
         let session = script.start_session(&json!({})).expect("start session");
         let err = session
-            .run_candles_window(&json!([{ "c": 1.0 }]))
+            .run_candles(&json!([{ "c": 1.0 }]))
             .expect_err("script should fail");
         let message = err.to_string();
 
@@ -1453,7 +1410,6 @@ export const script = {
   name: "cancel-script",
   version: "1",
   sources: ["candles"],
-  modes: ["window"],
   params: {}
 };
 
@@ -1482,7 +1438,6 @@ export const script = {
   name: "missing-hook",
   version: "1",
   sources: ["candles"],
-  modes: ["window"],
   params: {}
 };
 "#,
@@ -1508,15 +1463,14 @@ export const script = {
   name: "execution-script",
   version: "1",
   sources: ["candles"],
-  modes: ["stream"],
   params: {}
 };
 
 export function onData(ctx, input, history) {
   ctx.trade({
     key: "entry-1",
-    side: "long",
-    notional: 100,
+    position: "open-long",
+    margin: 100,
     leverage: 5,
     order: { type: "limit", price: 64000, tif: "gtc" },
     sl: 63000,
@@ -1544,8 +1498,7 @@ export function onExecution(ctx, event) {
             )
             .expect("start execution session");
         let execution = session
-            .run_stream(json!({
-                "mode": "stream",
+            .run_event(json!({
                 "source": "candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 1, "c": 1.0 } }
@@ -1577,15 +1530,14 @@ export function onExecution(ctx, event) {
     }
 
     #[test]
-    #[ignore = "local benchmark; run with `cargo test bench_candle_window_payload_sizes -- --ignored --nocapture`"]
-    fn bench_candle_window_payload_sizes() {
+    #[ignore = "local benchmark; run with `cargo test bench_candle_history_sizes -- --ignored --nocapture`"]
+    fn bench_candle_history_sizes() {
         let path = write_temp_script(
             r#"
 export const script = {
   name: "payload-bench",
   version: "1",
   sources: ["candles"],
-  modes: ["window"],
   params: {}
 };
 
@@ -1612,7 +1564,7 @@ export function onData(ctx, input, history) {
         for size in [1_000_usize, 5_000] {
             let candles = synthetic_candles(size);
             let started = Instant::now();
-            let execution = session.run_candles_window(&candles).expect("run hook");
+            let execution = session.run_candles(&candles).expect("run hook");
             let elapsed = started.elapsed();
 
             println!(

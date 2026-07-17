@@ -4,8 +4,7 @@ use mimalloc::MiMalloc;
 
 use market_lab::cli::{
     AuthCommands, Cli, Commands, DaemonCommands, ScriptCommands, ScriptRunHistoryCommands,
-    SourceCommands, StrategyBacktestCommands, StrategyCommands, StrategyRunCommands, StudyCommands,
-    TradeCommands,
+    SourceCommands, StrategyCommands, StrategyRunCommands, StudyCommands, TradeCommands,
 };
 use market_lab::commands;
 use market_lab::config;
@@ -75,15 +74,12 @@ async fn main() -> Result<()> {
         },
         Commands::Strategy { command: strategy } => match strategy {
             StrategyCommands::Run { command } => match command {
-                StrategyRunCommands::SmaCrossover(args) => {
-                    commands::strategy::sma_crossover::handle_run(args).await?
-                }
+                StrategyRunCommands::Twap(args) => commands::strategy::twap::handle(args).await?,
             },
-            StrategyCommands::Backtest { command } => match command {
-                StrategyBacktestCommands::SmaCrossover(args) => {
-                    commands::strategy::sma_crossover::handle_backtest(args).await?
-                }
-            },
+            StrategyCommands::Jobs(args) => commands::strategy::jobs::handle_list(args).await?,
+            StrategyCommands::Status(args) => commands::strategy::jobs::handle_status(args).await?,
+            StrategyCommands::Logs(args) => commands::strategy::jobs::handle_logs(args).await?,
+            StrategyCommands::Stop(args) => commands::strategy::jobs::handle_stop(args).await?,
         },
         Commands::Health(args) => commands::system::health::handle(args).await?,
         Commands::Status(args) => commands::system::status::handle(args).await?,

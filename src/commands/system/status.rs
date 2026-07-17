@@ -54,10 +54,7 @@ fn build_status(provider_health: ProviderHealth) -> SystemStatus {
             "vamp".to_string(),
             "cvd".to_string(),
         ],
-        strategies: vec![
-            "run sma-crossover".to_string(),
-            "backtest sma-crossover".to_string(),
-        ],
+        strategies: vec!["run twap".to_string()],
         provider_health,
     }
 }

@@ -16,14 +16,14 @@ use crate::domain::enums::ProviderKind;
 use crate::domain::types::OrderBookSnapshot;
 use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::mmt::MmtProvider;
-use crate::scripting::engine::{Script, ScriptSession};
+use crate::scripting::engine::Script;
 use crate::scripting::execution::{
     ScriptCancelRequest, ScriptExecutionCommand, ScriptExecutionContext, ScriptOrderKind,
     ScriptOrderRef, ScriptTradeRequest,
 };
 use crate::scripting::inputs::{
-    SourceConfig, SourceConfigs, first_source_config, parse_param_values, parse_source_configs,
-    resolve_params, source_configs_payload, source_exchange_label, source_provider_label,
+    SourceConfig, SourceConfigs, parse_param_values, parse_source_configs, resolve_params,
+    source_configs_payload, source_exchange_label, source_provider_label, source_provider_name,
     validate_source_configs,
 };
 use crate::scripting::manifest::ScriptSource;
@@ -77,7 +77,6 @@ where
 struct ScriptWindow {
     from: u64,
     to: u64,
-    timeframe_sec: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -94,8 +93,7 @@ struct ScriptBacktestSummary {
 
 #[derive(Debug, Clone, Default, Serialize)]
 struct ScriptBacktestPerformance {
-    leverage: f64,
-    capital: f64,
+    capital_required: f64,
     gross_pnl: f64,
     realized_pnl: f64,
     unrealized_pnl: f64,
@@ -130,7 +128,7 @@ struct ScriptBacktestTrade {
     slippage: f64,
     net_pnl: f64,
     net_return: f64,
-    bars_held: usize,
+    events_held: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,7 +157,7 @@ struct ScriptBacktestOpenPosition {
     #[serde(skip_serializing_if = "Option::is_none")]
     take_profit_price: Option<f64>,
     unrealized_pnl: f64,
-    bars_held: usize,
+    events_held: usize,
     reason: String,
 }
 
@@ -179,6 +177,7 @@ struct OpenTrade {
     entry_ts_ms: u64,
     entry_price: f64,
     notional: f64,
+    margin: f64,
     qty: f64,
     leverage: f64,
     stop_loss_price: Option<f64>,
@@ -216,6 +215,7 @@ struct TradeEntry {
     price: f64,
     reason: String,
     notional: Option<f64>,
+    margin: Option<f64>,
     leverage: f64,
     order_id: Option<String>,
     stop_loss_price: Option<f64>,
@@ -241,48 +241,12 @@ enum BacktestSeries {
     Volumes(Vec<ScriptVolume>),
 }
 
-#[derive(Default)]
-struct BacktestHistoryCursors {
-    next: BTreeMap<String, usize>,
-}
-
-impl BacktestHistoryCursors {
-    fn sync(
-        &mut self,
-        session: &ScriptSession,
-        data: &BacktestData,
-        source_configs: &SourceConfigs,
-        clock: &SourceConfig,
-        clock_idx: usize,
-        cutoff_ms: u64,
-    ) -> Result<()> {
-        let mut configs = source_configs.values().collect::<Vec<_>>();
-        configs.sort_by_key(|config| config.position);
-        for config in configs {
-            let series = data
-                .series
-                .get(&config.selector)
-                .with_context(|| format!("{} data not loaded", config.selector))?;
-            let next = self.next.entry(config.selector.clone()).or_default();
-            let end = if config.selector == clock.selector {
-                clock_idx + 1
-            } else {
-                let mut end = *next;
-                while end < backtest_series_len(series)
-                    && backtest_series_ts_ms(series, end)? <= cutoff_ms
-                {
-                    end += 1;
-                }
-                end
-            };
-            while *next < end {
-                let (record, identity) = backtest_history_record(series, *next)?;
-                session.record_source(&config.selector, record, identity)?;
-                *next += 1;
-            }
-        }
-        Ok(())
-    }
+#[derive(Debug, Clone)]
+struct BacktestEvent {
+    selector: String,
+    record_idx: usize,
+    ts_ms: u64,
+    source_position: usize,
 }
 
 pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
@@ -333,7 +297,7 @@ pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
         }
     };
 
-    let result = backtest_window(args, script, source_configs, resolved_params, &mut report).await;
+    let result = backtest_events(args, script, source_configs, resolved_params, &mut report).await;
     let runtime_report = match &result {
         Ok(_) => report.finish_ok(),
         Err(err) if err.is::<ScriptCancelled>() => report.finish_cancelled(),
@@ -343,7 +307,7 @@ pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
     result
 }
 
-async fn backtest_window(
+async fn backtest_events(
     args: ScriptBacktestArgs,
     script: Script,
     source_configs: SourceConfigs,
@@ -351,22 +315,20 @@ async fn backtest_window(
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
 ) -> Result<()> {
     let data = fetch_sources(&args, &script, &source_configs, report).await?;
-    let clock = first_source_config(&source_configs, script.manifest.clock_source())?.clone();
-    let clock_len = clock_len(&clock, &data)?;
-    if clock_len < 2 {
-        bail!(
-            "script backtest requires at least 2 {} records",
-            clock.selector
-        );
+    let events = build_event_timeline(&data, &source_configs)?;
+    if events.is_empty() {
+        bail!("script backtest received no source events in the requested range");
     }
+    let reference_source = resolve_reference_source(&data, &source_configs)?;
+    let reference_selector = reference_source.selector.clone();
 
     let mut returns = Vec::new();
     let mut orders = 0_usize;
     let mut closed_trades = Vec::new();
     let mut open_trades = Vec::new();
+    let mut peak_margin = 0.0_f64;
     let mut script_orders = HashMap::<String, SimulatedScriptOrder>::new();
     let mut next_position_id = 1_usize;
-    let mut saw_execution_action = false;
     let mut latest_output = None;
     let session = script.start_session_with_execution(
         &resolved_params,
@@ -384,51 +346,78 @@ async fn backtest_window(
 
     let lookback = script.history_capacity(&resolved_params);
     let provider_label = source_provider_label(&source_configs);
-    let mut history_cursors = BacktestHistoryCursors::default();
+    let exchange_label = source_exchange_label(&source_configs);
+    let mut latest_reference_price = None;
+    let mut latest_reference_ts = args.from;
     eprintln!(
-        "running script={} sources={} clock={} records={} lookback={}",
+        "running script={} sources={} events={} reference={} lookback={}",
         script.manifest.name,
         script.manifest.source_names(),
-        clock.selector,
-        clock_len,
+        events.len(),
+        reference_selector,
         lookback
     );
-    report.set_progress("executing_hooks", 0, (clock_len - 1) as u64);
+    report.set_progress("executing_hooks", 0, events.len() as u64);
     write_running_report_best_effort(report);
 
-    for idx in 0..(clock_len - 1) {
+    for (idx, event) in events.iter().enumerate() {
         if session.is_cancelled() {
-            report.set_progress("cancelled", idx as u64, (clock_len - 1) as u64);
+            report.set_progress("cancelled", idx as u64, events.len() as u64);
             return Err(ScriptCancelled.into());
         }
 
-        let cutoff = clock_ts_ms(&clock, &data, idx)?;
-        history_cursors.sync(&session, &data, &source_configs, &clock, idx, cutoff)?;
-        apply_protective_triggers(&clock, &data, idx, &mut open_trades, &mut closed_trades)?;
-        fill_pending_script_orders(
-            &clock,
-            &data,
-            idx,
-            &mut script_orders,
-            &mut open_trades,
-            &mut next_position_id,
-        )?;
-        let payload = build_window_payload(WindowPayloadContext {
+        let config = source_configs
+            .get(&event.selector)
+            .with_context(|| format!("missing source config for {}", event.selector))?;
+        let series = data
+            .series
+            .get(&event.selector)
+            .with_context(|| format!("{} data not loaded", event.selector))?;
+        if event.selector == reference_selector
+            && let Some(price) = backtest_series_reference_price(series, event.record_idx)?
+        {
+            if let Some(previous_price) = latest_reference_price {
+                returns.push(position_return(&open_trades, previous_price, price));
+            }
+            latest_reference_price = Some(price);
+            latest_reference_ts = event.ts_ms;
+            apply_protective_triggers(
+                config,
+                &data,
+                event.record_idx,
+                idx,
+                &mut open_trades,
+                &mut closed_trades,
+            )?;
+            fill_pending_script_orders(
+                config,
+                &data,
+                event.record_idx,
+                idx,
+                &mut script_orders,
+                &mut open_trades,
+                &mut closed_trades,
+                &mut next_position_id,
+            )?;
+            peak_margin = peak_margin.max(open_position_margin(&open_trades));
+        }
+        let payload = build_event_payload(EventPayloadContext {
             source_configs: &source_configs,
-            provider: &provider_label,
             symbol: &args.symbol,
-            clock: &clock,
-            clock_idx: idx,
-            cutoff_ms: cutoff,
-            mark_price: clock_price(&clock, &data, idx)?,
+            config,
+            series,
+            record_idx: event.record_idx,
+            event_idx: idx,
+            mark_ts_ms: latest_reference_ts,
+            mark_price: latest_reference_price.unwrap_or_default(),
             open_trades: &open_trades,
         })?;
-        let execution = match session.run_window(payload) {
+        let execution = match session.run_event(payload) {
             Ok(execution) => execution,
             Err(err) => {
                 report.record_hook_failure();
                 if session.is_cancelled() {
-                    report.set_progress("cancelled", idx as u64, (clock_len - 1) as u64);
+                    report.set_progress("cancelled", idx as u64, events.len() as u64);
                     return Err(ScriptCancelled.into());
                 }
                 return Err(err);
@@ -441,20 +430,18 @@ async fn backtest_window(
         let script_order_count = apply_script_execution_commands(
             commands,
             idx,
-            cutoff,
-            clock_price(&clock, &data, idx)?,
+            event.ts_ms,
+            latest_reference_price,
             &mut script_orders,
             &mut open_trades,
+            &mut closed_trades,
             &mut next_position_id,
         )?;
+        peak_margin = peak_margin.max(open_position_margin(&open_trades));
         if script_order_count > 0 {
-            saw_execution_action = true;
             orders += script_order_count;
         }
 
-        let curr = clock_price(&clock, &data, idx)?;
-        let next = clock_price(&clock, &data, idx + 1)?;
-        returns.push(position_return(&open_trades, curr, next));
         if !output.is_empty() {
             latest_output = Some(ScriptBacktestLatestOutput {
                 metrics: output.metrics,
@@ -462,42 +449,29 @@ async fn backtest_window(
             });
         }
 
-        if (idx + 1) % 500 == 0 || idx + 2 == clock_len {
-            eprintln!(
-                "processed {}/{} {} records",
-                idx + 1,
-                clock_len - 1,
-                clock.selector
-            );
-            report.set_progress("executing_hooks", (idx + 1) as u64, (clock_len - 1) as u64);
+        if (idx + 1) % 500 == 0 || idx + 1 == events.len() {
+            eprintln!("processed {}/{} source events", idx + 1, events.len());
+            report.set_progress("executing_hooks", (idx + 1) as u64, events.len() as u64);
             write_running_report_best_effort(report);
         }
     }
 
-    if !saw_execution_action {
-        bail!("script backtest requires an execution action: call `ctx.trade()`");
-    }
-
-    let timeframe_sec = source_configs
-        .get(&clock.selector)
-        .and_then(|config| config.timeframe)
-        .unwrap_or_default();
-    let mark_ts_ms = clock_ts_ms(&clock, &data, clock_len - 1).unwrap_or(args.to);
-    let mark_price = clock_price(&clock, &data, clock_len - 1).unwrap_or_default();
-    let open_positions =
-        open_trades_to_positions(&open_trades, clock_len - 1, mark_ts_ms, mark_price)
-            .into_iter()
-            .collect::<Vec<_>>();
+    let mark_price = latest_reference_price.context("backtest produced no reference price")?;
+    let open_positions = open_trades_to_positions(
+        &open_trades,
+        events.len().saturating_sub(1),
+        latest_reference_ts,
+        mark_price,
+    );
     let summary = backtest_summary(orders, &script_orders, &closed_trades, &open_positions);
-    let performance =
-        backtest_performance(&returns, &closed_trades, &open_positions, args.leverage);
+    let performance = backtest_performance(&returns, &closed_trades, &open_positions, peak_margin);
     let result = ScriptBacktestResult {
         r#type: "script.backtest.result",
         version: "1",
         provider: provider_label,
-        exchange: clock.exchange.clone(),
+        exchange: exchange_label,
         symbol: args.symbol.clone(),
-        ts_ms: mark_ts_ms,
+        ts_ms: latest_reference_ts,
         script: ScriptDescriptor {
             name: script.manifest.name.clone(),
             sources: script
@@ -510,7 +484,6 @@ async fn backtest_window(
         window: ScriptWindow {
             from: args.from,
             to: args.to,
-            timeframe_sec,
         },
         params: ScriptInputs {
             values: resolved_params,
@@ -521,7 +494,8 @@ async fn backtest_window(
         open_positions,
         latest_output,
         meta: json!({
-            "clock": clock.selector,
+            "events": events.len(),
+            "reference_source": reference_selector,
             "source_data": {
                 "orderbook": "flat_heatmap_hd"
             }
@@ -872,32 +846,40 @@ async fn fetch_bulk_sources(
     Ok(data)
 }
 
-struct WindowPayloadContext<'a> {
+struct EventPayloadContext<'a> {
     source_configs: &'a SourceConfigs,
-    provider: &'a str,
     symbol: &'a str,
-    clock: &'a SourceConfig,
-    clock_idx: usize,
-    cutoff_ms: u64,
+    config: &'a SourceConfig,
+    series: &'a BacktestSeries,
+    record_idx: usize,
+    event_idx: usize,
+    mark_ts_ms: u64,
     mark_price: f64,
     open_trades: &'a [OpenTrade],
 }
 
-fn build_window_payload(ctx: WindowPayloadContext<'_>) -> Result<Value> {
+fn build_event_payload(ctx: EventPayloadContext<'_>) -> Result<Value> {
     let mut root = Map::new();
-    root.insert("mode".to_string(), Value::String("window".to_string()));
     root.insert(
         "provider".to_string(),
-        Value::String(ctx.provider.to_string()),
+        Value::String(source_provider_name(ctx.config.provider).to_string()),
     );
     root.insert(
         "exchange".to_string(),
-        Value::String(ctx.clock.exchange.clone()),
+        Value::String(ctx.config.exchange.clone()),
     );
     root.insert("symbol".to_string(), Value::String(ctx.symbol.to_string()));
     root.insert(
-        "clock".to_string(),
-        Value::String(ctx.clock.selector.clone()),
+        "source".to_string(),
+        Value::String(ctx.config.selector.clone()),
+    );
+    root.insert(
+        "source_type".to_string(),
+        Value::String(ctx.config.source.as_str().to_string()),
+    );
+    root.insert(
+        "data".to_string(),
+        backtest_record_payload(ctx.series, ctx.record_idx, ctx.config)?,
     );
     root.insert(
         "source_configs".to_string(),
@@ -905,13 +887,56 @@ fn build_window_payload(ctx: WindowPayloadContext<'_>) -> Result<Value> {
     );
     let open_positions = open_trades_to_positions(
         ctx.open_trades,
-        ctx.clock_idx,
-        ctx.cutoff_ms,
+        ctx.event_idx,
+        ctx.mark_ts_ms,
         ctx.mark_price,
     );
     root.insert("positions".to_string(), json!({ "open": open_positions }));
 
     Ok(Value::Object(root))
+}
+
+fn build_event_timeline(
+    data: &BacktestData,
+    source_configs: &SourceConfigs,
+) -> Result<Vec<BacktestEvent>> {
+    let mut events = Vec::new();
+    for config in source_configs.values() {
+        let series = data
+            .series
+            .get(&config.selector)
+            .with_context(|| format!("{} data not loaded", config.selector))?;
+        for record_idx in 0..backtest_series_len(series) {
+            events.push(BacktestEvent {
+                selector: config.selector.clone(),
+                record_idx,
+                ts_ms: backtest_series_event_ts_ms(series, record_idx, config)?,
+                source_position: config.position,
+            });
+        }
+    }
+    events.sort_by_key(|event| (event.ts_ms, event.source_position, event.record_idx));
+    Ok(events)
+}
+
+fn resolve_reference_source<'a>(
+    data: &BacktestData,
+    source_configs: &'a SourceConfigs,
+) -> Result<&'a SourceConfig> {
+    let mut configs = source_configs.values().collect::<Vec<_>>();
+    configs.sort_by_key(|config| config.position);
+    for config in configs {
+        let series = data
+            .series
+            .get(&config.selector)
+            .with_context(|| format!("{} data not loaded", config.selector))?;
+        for idx in 0..backtest_series_len(series) {
+            if backtest_series_reference_price(series, idx)?.is_some() {
+                return Ok(config);
+            }
+        }
+    }
+    bail!("script backtest requires a price-bearing source such as candles, orderbook, or volumes")
 }
 
 fn backtest_series_len(series: &BacktestSeries) -> usize {
@@ -949,8 +974,33 @@ fn backtest_series_ts_ms(series: &BacktestSeries, idx: usize) -> Result<u64> {
     }
 }
 
-fn backtest_history_record(series: &BacktestSeries, idx: usize) -> Result<(Value, Option<u64>)> {
-    let ts_ms = backtest_series_ts_ms(series, idx)?;
+fn backtest_series_event_ts_ms(
+    series: &BacktestSeries,
+    idx: usize,
+    config: &SourceConfig,
+) -> Result<u64> {
+    if let BacktestSeries::Orderbooks(_) = series {
+        return backtest_series_ts_ms(series, idx);
+    }
+    if let BacktestSeries::Candles(items) = series
+        && let Some(close_time) = items.get(idx).and_then(|item| item.close_time)
+    {
+        return Ok(close_time);
+    }
+    if let BacktestSeries::Volumes(items) = series
+        && let Some(close_time) = items.get(idx).and_then(|item| item.close_time)
+    {
+        return Ok(close_time);
+    }
+    let timeframe_ms = u64::from(config.require_timeframe(&config.source)?) * 1_000;
+    Ok(backtest_series_ts_ms(series, idx)?.saturating_add(timeframe_ms))
+}
+
+fn backtest_record_payload(
+    series: &BacktestSeries,
+    idx: usize,
+    config: &SourceConfig,
+) -> Result<Value> {
     let record = match series {
         BacktestSeries::Candles(items) => serde_json::to_value(&items[idx]),
         BacktestSeries::Orderbooks(items) => serde_json::to_value(&items[idx]),
@@ -958,60 +1008,51 @@ fn backtest_history_record(series: &BacktestSeries, idx: usize) -> Result<(Value
         BacktestSeries::Oi(items) => serde_json::to_value(&items[idx]),
         BacktestSeries::Volumes(items) => serde_json::to_value(&items[idx]),
     }
-    .context("failed to serialize backtest history record")?;
-    let identity = (!matches!(series, BacktestSeries::Orderbooks(_))).then_some(ts_ms);
-    Ok((record, identity))
+    .context("failed to serialize backtest source event")?;
+    Ok(match &config.source {
+        ScriptSource::Candles => json!({ "candle": record }),
+        ScriptSource::Orderbook => json!({ "snapshot": record }),
+        ScriptSource::Vd => json!({
+            "candle": record,
+            "record": record,
+            "bucket": config.bucket,
+            "timeframe_sec": config.timeframe,
+        }),
+        ScriptSource::Oi => json!({
+            "candle": record,
+            "record": record,
+            "timeframe_sec": config.timeframe,
+        }),
+        ScriptSource::Volumes => json!({
+            "profile": record,
+            "record": record,
+            "timeframe_sec": config.timeframe,
+        }),
+    })
 }
 
-fn clock_len(clock: &SourceConfig, data: &BacktestData) -> Result<usize> {
-    match data.series.get(&clock.selector) {
-        Some(BacktestSeries::Candles(items)) => Ok(items.len()),
-        Some(BacktestSeries::Orderbooks(items)) => Ok(items.len()),
-        Some(BacktestSeries::Vd(items)) => Ok(items.len()),
-        Some(BacktestSeries::Oi(items)) => Ok(items.len()),
-        Some(BacktestSeries::Volumes(items)) => Ok(items.len()),
-        None => bail!("{} data not loaded", clock.selector),
-    }
+fn backtest_series_reference_price(series: &BacktestSeries, idx: usize) -> Result<Option<f64>> {
+    let price = match series {
+        BacktestSeries::Candles(items) => items.get(idx).map(|item| item.c),
+        BacktestSeries::Orderbooks(items) => items.get(idx).map(book_mid).transpose()?,
+        BacktestSeries::Vd(_) => None,
+        BacktestSeries::Oi(items) => items.get(idx).and_then(|item| item.mark_price),
+        BacktestSeries::Volumes(items) => items.get(idx).and_then(ScriptVolume::reference_price),
+    };
+    Ok(price.filter(|price| price.is_finite() && *price > 0.0))
 }
 
-fn clock_ts_ms(clock: &SourceConfig, data: &BacktestData, idx: usize) -> Result<u64> {
-    match data.series.get(&clock.selector) {
-        Some(BacktestSeries::Candles(items)) => Ok(candle_ts_ms(&items[idx])),
-        Some(BacktestSeries::Orderbooks(items)) => Ok(items[idx].timestamp_ms),
-        Some(BacktestSeries::Vd(items)) => Ok(vd_ts_ms(&items[idx])),
-        Some(BacktestSeries::Oi(items)) => Ok(oi_ts_ms(&items[idx])),
-        Some(BacktestSeries::Volumes(items)) => Ok(volume_ts_ms(&items[idx])),
-        None => bail!("{} data not loaded", clock.selector),
-    }
-}
-
-fn clock_price(clock: &SourceConfig, data: &BacktestData, idx: usize) -> Result<f64> {
-    match data.series.get(&clock.selector) {
-        Some(BacktestSeries::Candles(items)) => Ok(items[idx].c),
-        Some(BacktestSeries::Orderbooks(items)) => book_mid(&items[idx]),
-        Some(BacktestSeries::Vd(items)) => {
-            let record = &items[idx];
-            Ok(record.c.unwrap_or(record.value))
-        }
-        Some(BacktestSeries::Oi(items)) => Ok(items[idx].c),
-        Some(BacktestSeries::Volumes(items)) => items[idx]
-            .reference_price()
-            .context("volume record has no reference price"),
-        None => bail!("{} data not loaded", clock.selector),
-    }
-}
-
-fn clock_candle<'a>(
-    clock: &SourceConfig,
+fn backtest_candle<'a>(
+    config: &SourceConfig,
     data: &'a BacktestData,
     idx: usize,
 ) -> Result<&'a ScriptCandle> {
-    match data.series.get(&clock.selector) {
+    match data.series.get(&config.selector) {
         Some(BacktestSeries::Candles(items)) => items
             .get(idx)
-            .with_context(|| format!("{} record {idx} is out of range", clock.selector)),
-        Some(_) => bail!("{} is not candle data", clock.selector),
-        None => bail!("{} data not loaded", clock.selector),
+            .with_context(|| format!("{} record {idx} is out of range", config.selector)),
+        Some(_) => bail!("{} is not candle data", config.selector),
+        None => bail!("{} data not loaded", config.selector),
     }
 }
 
@@ -1068,9 +1109,10 @@ fn apply_script_execution_commands(
     commands: Vec<ScriptExecutionCommand>,
     idx: usize,
     ts_ms: u64,
-    current_price: f64,
+    current_price: Option<f64>,
     script_orders: &mut HashMap<String, SimulatedScriptOrder>,
     open_trades: &mut Vec<OpenTrade>,
+    closed_trades: &mut Vec<ScriptBacktestTrade>,
     next_position_id: &mut usize,
 ) -> Result<usize> {
     let mut submitted = 0;
@@ -1078,9 +1120,6 @@ fn apply_script_execution_commands(
         match command {
             ScriptExecutionCommand::Trade { order, request } => {
                 request.validate()?;
-                if request.reduce_only {
-                    bail!("ctx.trade reduceOnly is not yet supported by the backtest simulator");
-                }
                 if let Some(existing) = script_orders.get(&order.id) {
                     if existing.request != request {
                         bail!(
@@ -1090,7 +1129,10 @@ fn apply_script_execution_commands(
                     }
                     continue;
                 }
-                let reference_price = request.order.price.unwrap_or(current_price);
+                validate_position_transition(&request, open_trades)?;
+                let reference_price = request.order.price.or(current_price).context(
+                    "ctx.trade requires a price-bearing source before submitting this order",
+                )?;
                 validate_script_protection(&request, reference_price)?;
                 let order_id = order.id.clone();
                 script_orders.insert(
@@ -1104,13 +1146,17 @@ fn apply_script_execution_commands(
                 );
                 submitted += 1;
                 if request.order.kind == ScriptOrderKind::Market {
+                    let fill_price = current_price.context(
+                        "ctx.trade market order requires a price-bearing source event first",
+                    )?;
                     fill_script_order(
                         &order_id,
                         idx,
                         ts_ms,
-                        current_price,
+                        fill_price,
                         script_orders,
                         open_trades,
+                        closed_trades,
                         next_position_id,
                     )?;
                 }
@@ -1148,18 +1194,24 @@ fn cancel_script_order(
 }
 
 fn fill_pending_script_orders(
-    clock: &SourceConfig,
+    config: &SourceConfig,
     data: &BacktestData,
-    idx: usize,
+    record_idx: usize,
+    event_idx: usize,
     script_orders: &mut HashMap<String, SimulatedScriptOrder>,
     open_trades: &mut Vec<OpenTrade>,
+    closed_trades: &mut Vec<ScriptBacktestTrade>,
     next_position_id: &mut usize,
 ) -> Result<()> {
-    let ts_ms = clock_ts_ms(clock, data, idx)?;
+    let series = data
+        .series
+        .get(&config.selector)
+        .with_context(|| format!("{} data not loaded", config.selector))?;
+    let ts_ms = backtest_series_event_ts_ms(series, record_idx, config)?;
     let mut fillable = Vec::new();
     for order in script_orders.values().filter(|order| {
         order.status == SimulatedOrderStatus::Pending
-            && order.submitted_idx < idx
+            && order.submitted_idx < event_idx
             && order.request.order.kind == ScriptOrderKind::Limit
     }) {
         let price = order
@@ -1167,18 +1219,19 @@ fn fill_pending_script_orders(
             .order
             .price
             .context("simulated limit order omitted its price")?;
-        if limit_order_touched(clock, data, idx, &order.request, price)? {
+        if limit_order_touched(config, data, record_idx, &order.request, price)? {
             fillable.push((order.order.id.clone(), price));
         }
     }
     for (order_id, price) in fillable {
         fill_script_order(
             &order_id,
-            idx,
+            event_idx,
             ts_ms,
             price,
             script_orders,
             open_trades,
+            closed_trades,
             next_position_id,
         )?;
     }
@@ -1186,25 +1239,28 @@ fn fill_pending_script_orders(
 }
 
 fn limit_order_touched(
-    clock: &SourceConfig,
+    config: &SourceConfig,
     data: &BacktestData,
-    idx: usize,
+    record_idx: usize,
     request: &ScriptTradeRequest,
     limit: f64,
 ) -> Result<bool> {
-    use crate::domain::execution::PositionDirection;
-
-    if clock.source == ScriptSource::Candles {
-        let candle = clock_candle(clock, data, idx)?;
-        return Ok(match request.side {
-            PositionDirection::Long => candle.l <= limit,
-            PositionDirection::Short => candle.h >= limit,
+    if config.source == ScriptSource::Candles {
+        let candle = backtest_candle(config, data, record_idx)?;
+        return Ok(match request.position.order_direction() {
+            crate::domain::execution::PositionDirection::Long => candle.l <= limit,
+            crate::domain::execution::PositionDirection::Short => candle.h >= limit,
         });
     }
-    let price = clock_price(clock, data, idx)?;
-    Ok(match request.side {
-        PositionDirection::Long => price <= limit,
-        PositionDirection::Short => price >= limit,
+    let series = data
+        .series
+        .get(&config.selector)
+        .with_context(|| format!("{} data not loaded", config.selector))?;
+    let price = backtest_series_reference_price(series, record_idx)?
+        .context("limit order evaluation requires a price-bearing source event")?;
+    Ok(match request.position.order_direction() {
+        crate::domain::execution::PositionDirection::Long => price <= limit,
+        crate::domain::execution::PositionDirection::Short => price >= limit,
     })
 }
 
@@ -1215,10 +1271,9 @@ fn fill_script_order(
     price: f64,
     script_orders: &mut HashMap<String, SimulatedScriptOrder>,
     open_trades: &mut Vec<OpenTrade>,
+    closed_trades: &mut Vec<ScriptBacktestTrade>,
     next_position_id: &mut usize,
 ) -> Result<()> {
-    use crate::domain::execution::PositionDirection;
-
     let order = script_orders
         .get(order_id)
         .cloned()
@@ -1226,29 +1281,60 @@ fn fill_script_order(
     if order.status != SimulatedOrderStatus::Pending {
         return Ok(());
     }
-    let side = match order.request.side {
-        PositionDirection::Long => TradeSide::Long,
-        PositionDirection::Short => TradeSide::Short,
-    };
-    let notional = order
-        .request
-        .notional
-        .or_else(|| order.request.size.map(|size| size * price));
-    open_trades.push(open_trade_from_entry(
-        next_position_id,
-        TradeEntry {
-            side,
-            idx,
-            ts_ms,
-            price,
-            reason: format!("ctx.trade {}", order.request.key),
-            notional,
-            leverage: order.request.leverage,
-            order_id: Some(order.order.id.clone()),
-            stop_loss_price: order.request.sl,
-            take_profit_price: order.request.tp,
-        },
-    ));
+    validate_position_transition(&order.request, open_trades)?;
+    if order.request.position.is_open() {
+        let side = trade_side(order.request.position.position_direction());
+        let leverage = order.request.leverage_or_default();
+        let notional = order
+            .request
+            .margin
+            .map(|margin| margin * leverage)
+            .or_else(|| order.request.size.map(|size| size * price));
+        let margin = order
+            .request
+            .margin
+            .or_else(|| notional.map(|notional| margin_for_notional(notional, leverage)));
+        let opened = open_trade_from_entry(
+            next_position_id,
+            TradeEntry {
+                side,
+                idx,
+                ts_ms,
+                price,
+                reason: format!("ctx.trade {}", order.request.key),
+                notional,
+                margin,
+                leverage,
+                order_id: Some(order.order.id.clone()),
+                stop_loss_price: order.request.sl,
+                take_profit_price: order.request.tp,
+            },
+        );
+        if let Some(existing) = open_trades.first_mut() {
+            add_to_open_position(existing, opened);
+        } else {
+            open_trades.push(opened);
+        }
+    } else {
+        let side = trade_side(order.request.position.position_direction());
+        let open_index = open_trades
+            .iter()
+            .position(|open| open.side == side)
+            .context("matching simulated position disappeared before the close filled")?;
+        let close_qty = order.request.size.unwrap_or(open_trades[open_index].qty);
+        close_position_quantity(
+            open_index,
+            close_qty,
+            open_trades,
+            closed_trades,
+            &TradeEvent {
+                idx,
+                ts_ms,
+                price,
+                reason: format!("ctx.trade {}", order.request.key),
+            },
+        )?;
+    }
     script_orders
         .get_mut(order_id)
         .context("simulated order disappeared after fill")?
@@ -1256,11 +1342,107 @@ fn fill_script_order(
     Ok(())
 }
 
-fn validate_script_protection(request: &ScriptTradeRequest, entry_price: f64) -> Result<()> {
-    use crate::domain::execution::PositionDirection;
+fn validate_position_transition(
+    request: &ScriptTradeRequest,
+    open_trades: &[OpenTrade],
+) -> Result<()> {
+    let target = trade_side(request.position.position_direction());
+    let Some(open) = open_trades.first() else {
+        if request.position.is_close() {
+            bail!(
+                "ctx.trade {} requires an open {} position",
+                request.position.as_str(),
+                format_side(target)
+            );
+        }
+        return Ok(());
+    };
 
-    match request.side {
-        PositionDirection::Long => {
+    if request.position.is_open() && open.side != target {
+        let required_close = match open.side {
+            TradeSide::Long => "close-long",
+            TradeSide::Short => "close-short",
+        };
+        bail!(
+            "ctx.trade {} cannot reverse an open {} position; submit {required_close} first",
+            request.position.as_str(),
+            format_side(open.side)
+        );
+    }
+    if request.position.is_close() && open.side != target {
+        bail!(
+            "ctx.trade {} requires an open {} position",
+            request.position.as_str(),
+            format_side(target)
+        );
+    }
+    Ok(())
+}
+
+fn trade_side(direction: crate::domain::execution::PositionDirection) -> TradeSide {
+    match direction {
+        crate::domain::execution::PositionDirection::Long => TradeSide::Long,
+        crate::domain::execution::PositionDirection::Short => TradeSide::Short,
+    }
+}
+
+fn add_to_open_position(existing: &mut OpenTrade, added: OpenTrade) {
+    debug_assert_eq!(existing.side, added.side);
+    let qty = existing.qty + added.qty;
+    if qty > f64::EPSILON {
+        existing.entry_price =
+            ((existing.entry_price * existing.qty) + (added.entry_price * added.qty)) / qty;
+    }
+    existing.qty = qty;
+    existing.notional += added.notional;
+    existing.leverage = added.leverage;
+    existing.margin = margin_for_notional(existing.notional, existing.leverage);
+    if added.stop_loss_price.is_some() {
+        existing.stop_loss_price = added.stop_loss_price;
+    }
+    if added.take_profit_price.is_some() {
+        existing.take_profit_price = added.take_profit_price;
+    }
+}
+
+fn close_position_quantity(
+    open_index: usize,
+    close_qty: f64,
+    open_trades: &mut Vec<OpenTrade>,
+    closed_trades: &mut Vec<ScriptBacktestTrade>,
+    event: &TradeEvent,
+) -> Result<()> {
+    let open_qty = open_trades[open_index].qty;
+    let tolerance = (open_qty.abs() * 1e-9).max(f64::EPSILON);
+    if close_qty > open_qty + tolerance {
+        bail!("ctx.trade close size {close_qty} exceeds the open position size {open_qty}");
+    }
+
+    let closed = if close_qty >= open_qty - tolerance {
+        open_trades.remove(open_index)
+    } else {
+        let fraction = close_qty / open_qty;
+        let mut closed = open_trades[open_index].clone();
+        closed.qty = close_qty;
+        closed.notional *= fraction;
+        closed.margin *= fraction;
+
+        let open = &mut open_trades[open_index];
+        open.qty -= close_qty;
+        open.notional -= closed.notional;
+        open.margin -= closed.margin;
+        closed
+    };
+    close_open_trade(closed, closed_trades, event);
+    Ok(())
+}
+
+fn validate_script_protection(request: &ScriptTradeRequest, entry_price: f64) -> Result<()> {
+    if request.position.is_close() {
+        return Ok(());
+    }
+    match request.position.position_direction() {
+        crate::domain::execution::PositionDirection::Long => {
             if request.sl.is_some_and(|price| price >= entry_price) {
                 bail!("long ctx.trade sl must be below the entry price");
             }
@@ -1268,7 +1450,7 @@ fn validate_script_protection(request: &ScriptTradeRequest, entry_price: f64) ->
                 bail!("long ctx.trade tp must be above the entry price");
             }
         }
-        PositionDirection::Short => {
+        crate::domain::execution::PositionDirection::Short => {
             if request.sl.is_some_and(|price| price <= entry_price) {
                 bail!("short ctx.trade sl must be above the entry price");
             }
@@ -1281,16 +1463,27 @@ fn validate_script_protection(request: &ScriptTradeRequest, entry_price: f64) ->
 }
 
 fn apply_protective_triggers(
-    clock: &SourceConfig,
+    config: &SourceConfig,
     data: &BacktestData,
-    idx: usize,
+    record_idx: usize,
+    event_idx: usize,
     open_trades: &mut Vec<OpenTrade>,
     closed_trades: &mut Vec<ScriptBacktestTrade>,
 ) -> Result<()> {
-    let ts_ms = clock_ts_ms(clock, data, idx)?;
+    let series = data
+        .series
+        .get(&config.selector)
+        .with_context(|| format!("{} data not loaded", config.selector))?;
+    let ts_ms = backtest_series_event_ts_ms(series, record_idx, config)?;
     let mut open_index = 0;
     while open_index < open_trades.len() {
-        let trigger = protective_trigger(clock, data, idx, &open_trades[open_index])?;
+        let trigger = protective_trigger(
+            config,
+            data,
+            record_idx,
+            event_idx,
+            &open_trades[open_index],
+        )?;
         let Some((price, reason)) = trigger else {
             open_index += 1;
             continue;
@@ -1300,7 +1493,7 @@ fn apply_protective_triggers(
             open,
             closed_trades,
             &TradeEvent {
-                idx,
+                idx: event_idx,
                 ts_ms,
                 price,
                 reason,
@@ -1311,19 +1504,25 @@ fn apply_protective_triggers(
 }
 
 fn protective_trigger(
-    clock: &SourceConfig,
+    config: &SourceConfig,
     data: &BacktestData,
-    idx: usize,
+    record_idx: usize,
+    event_idx: usize,
     open: &OpenTrade,
 ) -> Result<Option<(f64, String)>> {
-    if idx <= open.entry_idx {
+    if event_idx <= open.entry_idx {
         return Ok(None);
     }
-    let (low, high) = if clock.source == ScriptSource::Candles {
-        let candle = clock_candle(clock, data, idx)?;
+    let (low, high) = if config.source == ScriptSource::Candles {
+        let candle = backtest_candle(config, data, record_idx)?;
         (candle.l, candle.h)
     } else {
-        let price = clock_price(clock, data, idx)?;
+        let series = data
+            .series
+            .get(&config.selector)
+            .with_context(|| format!("{} data not loaded", config.selector))?;
+        let price = backtest_series_reference_price(series, record_idx)?
+            .context("protective order evaluation requires a price-bearing source event")?;
         (price, price)
     };
 
@@ -1349,6 +1548,9 @@ fn open_trade_from_entry(next_position_id: &mut usize, entry: TradeEntry) -> Ope
     let id = format_position_id(*next_position_id);
     *next_position_id += 1;
     let notional = entry.notional.unwrap_or(1_000.0);
+    let margin = entry
+        .margin
+        .unwrap_or_else(|| margin_for_notional(notional, entry.leverage));
     let qty = if entry.price.abs() > f64::EPSILON {
         notional / entry.price
     } else {
@@ -1362,6 +1564,7 @@ fn open_trade_from_entry(next_position_id: &mut usize, entry: TradeEntry) -> Ope
         entry_ts_ms: entry.ts_ms,
         entry_price: entry.price,
         notional,
+        margin,
         qty,
         leverage: entry.leverage,
         stop_loss_price: entry.stop_loss_price,
@@ -1379,7 +1582,7 @@ fn close_open_trade(
     let fees = 0.0;
     let slippage = 0.0;
     let net_pnl = gross_pnl - fees - slippage;
-    let margin = margin_for_notional(open.notional, open.leverage);
+    let margin = open.margin;
     let net_return = if margin.abs() > f64::EPSILON {
         net_pnl / margin
     } else {
@@ -1410,7 +1613,7 @@ fn close_open_trade(
         slippage,
         net_pnl,
         net_return,
-        bars_held: event.idx.saturating_sub(open.entry_idx),
+        events_held: event.idx.saturating_sub(open.entry_idx),
     });
 }
 
@@ -1429,10 +1632,7 @@ fn position_return(open_trades: &[OpenTrade], curr: f64, next: f64) -> f64 {
         .iter()
         .map(|open| trade_pnl(open.side, curr, next, open.qty))
         .sum::<f64>();
-    let margin = open_trades
-        .iter()
-        .map(|open| margin_for_notional(open.notional, open.leverage))
-        .sum::<f64>();
+    let margin = open_trades.iter().map(|open| open.margin).sum::<f64>();
     if margin.abs() > f64::EPSILON {
         pnl / margin
     } else {
@@ -1457,13 +1657,13 @@ fn open_trades_to_positions(
             mark_ts_ms,
             mark_price,
             notional: open.notional,
-            margin: margin_for_notional(open.notional, open.leverage),
+            margin: open.margin,
             leverage: open.leverage,
             qty: open.qty,
             stop_loss_price: open.stop_loss_price,
             take_profit_price: open.take_profit_price,
             unrealized_pnl: trade_pnl(open.side, open.entry_price, mark_price, open.qty),
-            bars_held: mark_idx.saturating_sub(open.entry_idx),
+            events_held: mark_idx.saturating_sub(open.entry_idx),
             reason: "backtest ended before exit signal".to_string(),
         })
         .collect()
@@ -1471,6 +1671,10 @@ fn open_trades_to_positions(
 
 fn margin_for_notional(notional: f64, leverage: f64) -> f64 {
     notional / leverage.max(f64::EPSILON)
+}
+
+fn open_position_margin(open_trades: &[OpenTrade]) -> f64 {
+    open_trades.iter().map(|open| open.margin).sum()
 }
 
 fn format_position_id(id: usize) -> String {
@@ -1516,7 +1720,7 @@ fn backtest_performance(
     returns: &[f64],
     trades: &[ScriptBacktestTrade],
     open_positions: &[ScriptBacktestOpenPosition],
-    leverage: f64,
+    peak_margin: f64,
 ) -> ScriptBacktestPerformance {
     let gross_pnl = trades.iter().map(|trade| trade.gross_pnl).sum::<f64>();
     let realized_pnl = trades.iter().map(|trade| trade.net_pnl).sum::<f64>();
@@ -1525,12 +1729,16 @@ fn backtest_performance(
         .map(|position| position.unrealized_pnl)
         .sum::<f64>();
     let total_pnl = realized_pnl + unrealized_pnl;
-    let capital = trades
-        .first()
-        .map(|trade| trade.margin)
-        .or_else(|| open_positions.first().map(|position| position.margin))
-        .unwrap_or_else(|| margin_for_notional(1_000.0, leverage))
-        .max(1.0);
+    let capital_required = peak_margin
+        .max(
+            trades
+                .iter()
+                .map(|trade| trade.margin)
+                .chain(open_positions.iter().map(|position| position.margin))
+                .fold(0.0_f64, f64::max),
+        )
+        .max(0.0);
+    let return_basis = capital_required.max(1.0);
     let gross_profit = trades
         .iter()
         .filter(|trade| trade.net_pnl > 0.0)
@@ -1557,16 +1765,15 @@ fn backtest_performance(
     };
 
     ScriptBacktestPerformance {
-        leverage,
-        capital,
+        capital_required,
         gross_pnl,
         realized_pnl,
         unrealized_pnl,
         total_pnl,
         net_pnl: total_pnl,
-        realized_return: realized_pnl / capital,
-        total_return: total_pnl / capital,
-        net_return: total_pnl / capital,
+        realized_return: realized_pnl / return_basis,
+        total_return: total_pnl / return_basis,
+        net_return: total_pnl / return_basis,
         profit_factor,
         best_trade_pnl,
         worst_trade_pnl,
@@ -1586,12 +1793,8 @@ fn render_backtest(
             println!("script backtest");
             println!("---------------");
             println!(
-                "market: {}:{} tf={} [{}-{}]",
-                result.exchange,
-                result.symbol,
-                result.window.timeframe_sec,
-                result.window.from,
-                result.window.to
+                "market: {}:{} [{}-{}]",
+                result.exchange, result.symbol, result.window.from, result.window.to
             );
             println!("script: {}", result.script.name);
             println!();
@@ -1610,9 +1813,8 @@ fn render_backtest(
             println!();
             println!("performance");
             println!(
-                "  leverage: {:.2}x\n  capital: {}\n  realized pnl: {}\n  unrealized pnl: {}\n  total pnl: {}\n  total return: {}\n  gross pnl: {}\n  profit factor: {}\n  avg trade: {}\n  best trade: {}\n  worst trade: {}\n  sharpe: {}\n  max drawdown: {}",
-                result.performance.leverage,
-                format_money(result.performance.capital),
+                "  capital required: {}\n  realized pnl: {}\n  unrealized pnl: {}\n  total pnl: {}\n  total return: {}\n  gross pnl: {}\n  profit factor: {}\n  avg trade: {}\n  best trade: {}\n  worst trade: {}\n  sharpe: {}\n  max drawdown: {}",
+                format_money(result.performance.capital_required),
                 format_money(result.performance.realized_pnl),
                 format_money(result.performance.unrealized_pnl),
                 format_money(result.performance.total_pnl),
@@ -1635,7 +1837,7 @@ fn render_backtest(
                 };
                 for trade in result.closed_trades.iter().take(shown) {
                     println!(
-                        "  {} pos={} {} entry={} exit={} notional={} margin={} pnl={} bars={} reason={}",
+                        "  {} pos={} {} entry={} exit={} notional={} margin={} pnl={} events={} reason={}",
                         trade.id,
                         trade.position_id,
                         format_side(trade.side),
@@ -1644,7 +1846,7 @@ fn render_backtest(
                         format_money(trade.notional),
                         format_money(trade.margin),
                         format_money(trade.net_pnl),
-                        trade.bars_held,
+                        trade.events_held,
                         trade.exit.reason
                     );
                 }
@@ -1660,7 +1862,7 @@ fn render_backtest(
                 println!("open positions");
                 for open in &result.open_positions {
                     println!(
-                        "  {} {} entry={} mark={} notional={} margin={} unrealized={} bars={}",
+                        "  {} {} entry={} mark={} notional={} margin={} unrealized={} events={}",
                         open.id,
                         format_side(open.side),
                         format_price(open.entry_price),
@@ -1668,7 +1870,7 @@ fn render_backtest(
                         format_money(open.notional),
                         format_money(open.margin),
                         format_money(open.unrealized_pnl),
-                        open.bars_held
+                        open.events_held
                     );
                 }
             }
@@ -1810,7 +2012,7 @@ fn max_drawdown(returns: &[f64]) -> Option<f64> {
 mod tests {
     use super::*;
 
-    fn candle_clock() -> SourceConfig {
+    fn candle_source() -> SourceConfig {
         SourceConfig {
             selector: "candles@binancef@mmt".to_string(),
             source: ScriptSource::Candles,
@@ -1860,13 +2062,13 @@ mod tests {
     }
 
     #[test]
-    fn window_payload_exposes_source_metadata_without_source_records() {
+    fn event_payload_matches_live_source_metadata() {
         let configs = parse_source_configs(&[
             "candles@binancef@mmt:timeframe=60".to_string(),
             "candles@okx@mmt:timeframe=60".to_string(),
         ])
         .expect("parse source configs");
-        let clock = &configs["candles@binancef@mmt"];
+        let config = &configs["candles@binancef@mmt"];
         let data = BacktestData {
             series: BTreeMap::from([
                 (
@@ -1880,20 +2082,25 @@ mod tests {
             ]),
         };
 
-        let payload = build_window_payload(WindowPayloadContext {
+        let series = &data.series["candles@binancef@mmt"];
+        let payload = build_event_payload(EventPayloadContext {
             source_configs: &configs,
-            provider: "mmt",
             symbol: "BTC/USDT",
-            clock,
-            clock_idx: 0,
-            cutoff_ms: clock_ts_ms(clock, &data, 0).unwrap(),
-            mark_price: clock_price(clock, &data, 0).unwrap(),
+            config,
+            series,
+            record_idx: 0,
+            event_idx: 0,
+            mark_ts_ms: backtest_series_event_ts_ms(series, 0, config).unwrap(),
+            mark_price: backtest_series_reference_price(series, 0).unwrap().unwrap(),
             open_trades: &[],
         })
-        .expect("build window payload");
+        .expect("build event payload");
 
-        assert_eq!(payload["clock"], "candles@binancef@mmt");
+        assert_eq!(payload["source"], "candles@binancef@mmt");
+        assert_eq!(payload["source_type"], "candles");
         assert_eq!(payload["exchange"], "binancef");
+        assert_eq!(payload["provider"], "mmt");
+        assert_eq!(payload["data"]["candle"]["c"], 10.0);
         assert_eq!(
             payload["source_configs"]["candles@binancef@mmt"]["exchange"],
             "binancef"
@@ -1907,6 +2114,44 @@ mod tests {
     }
 
     #[test]
+    fn reference_source_skips_non_price_series() {
+        let configs = parse_source_configs(&[
+            "oi@binancef@mmt:timeframe=60".to_string(),
+            "candles@binancef@mmt:timeframe=60".to_string(),
+        ])
+        .expect("parse source configs");
+        let data = BacktestData {
+            series: BTreeMap::from([
+                (
+                    "oi@binancef@mmt".to_string(),
+                    BacktestSeries::Oi(vec![ScriptOpenInterest {
+                        t: candle(0, 0.0, 0.0, 0.0, 0.0).t,
+                        value: 1_000.0,
+                        o: 1_000.0,
+                        h: 1_000.0,
+                        l: 1_000.0,
+                        c: 1_000.0,
+                        n: 1,
+                        mark_price: None,
+                        notional: None,
+                    }]),
+                ),
+                (
+                    "candles@binancef@mmt".to_string(),
+                    BacktestSeries::Candles(vec![candle(0, 10.0, 10.0, 10.0, 10.0)]),
+                ),
+            ]),
+        };
+
+        assert_eq!(
+            resolve_reference_source(&data, &configs)
+                .expect("resolve reference source")
+                .selector,
+            "candles@binancef@mmt"
+        );
+    }
+
+    #[test]
     fn backtest_history_is_incremental_and_exchange_qualified() {
         let path =
             std::env::temp_dir().join(format!("mlab-backtest-history-{}.js", std::process::id()));
@@ -1917,7 +2162,6 @@ export const script = {
   name: "backtest-history",
   version: "1",
   sources: ["candles"],
-  clock: "candles",
   lookback: 3,
   params: {}
 };
@@ -1931,6 +2175,7 @@ export function onData(ctx, input, history) {
       okx: okx.map((candle) => candle.c),
       current: history.source("candles@binancef@mmt", 0)?.c ?? null,
       previous: history.source("candles@binancef@mmt", 1)?.c ?? null,
+      trigger: input.source,
       has_legacy_input: input.candles !== undefined || input.sources !== undefined
     }
   };
@@ -1945,7 +2190,6 @@ export function onData(ctx, input, history) {
             "candles@okx@mmt:timeframe=60".to_string(),
         ])
         .expect("parse source configs");
-        let clock = &configs["candles@binancef@mmt"];
         let data = BacktestData {
             series: BTreeMap::from([
                 (
@@ -1965,98 +2209,126 @@ export function onData(ctx, input, history) {
             ]),
         };
         let session = script.start_session(&json!({})).expect("start session");
-        let mut cursors = BacktestHistoryCursors::default();
+        let events = build_event_timeline(&data, &configs).expect("build event timeline");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.selector.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "candles@binancef@mmt",
+                "candles@okx@mmt",
+                "candles@binancef@mmt",
+                "candles@okx@mmt",
+            ]
+        );
+        assert_eq!(events[0].ts_ms, candle(0, 0.0, 0.0, 0.0, 0.0).t + 60_000);
+        let mut outputs = Vec::new();
+        for (event_idx, event) in events.iter().enumerate() {
+            let config = &configs[&event.selector];
+            let series = &data.series[&event.selector];
+            let payload = build_event_payload(EventPayloadContext {
+                source_configs: &configs,
+                symbol: "BTC/USDT",
+                config,
+                series,
+                record_idx: event.record_idx,
+                event_idx,
+                mark_ts_ms: event.ts_ms,
+                mark_price: backtest_series_reference_price(series, event.record_idx)
+                    .unwrap()
+                    .unwrap(),
+                open_trades: &[],
+            })
+            .expect("build event payload");
+            outputs.push(
+                session
+                    .run_event(payload)
+                    .expect("run source event")
+                    .output
+                    .metrics,
+            );
+        }
 
-        cursors
-            .sync(
-                &session,
-                &data,
-                &configs,
-                clock,
-                0,
-                clock_ts_ms(clock, &data, 0).unwrap(),
-            )
-            .expect("sync first bar");
-        let first = session
-            .run_window(json!({ "mode": "window" }))
-            .expect("run first hook");
-        assert_eq!(first.output.metrics["binance"], json!([10]));
-        assert_eq!(first.output.metrics["okx"], json!([20]));
-        assert!(first.output.metrics["previous"].is_null());
+        let first = &outputs[0];
+        assert_eq!(first["binance"], json!([10]));
+        assert_eq!(first["okx"], json!([]));
+        assert!(first["previous"].is_null());
+        assert_eq!(first["trigger"], "candles@binancef@mmt");
 
-        cursors
-            .sync(
-                &session,
-                &data,
-                &configs,
-                clock,
-                1,
-                clock_ts_ms(clock, &data, 1).unwrap(),
-            )
-            .expect("sync second bar");
-        let second = session
-            .run_window(json!({ "mode": "window" }))
-            .expect("run second hook");
-        assert_eq!(second.output.metrics["binance"], json!([10, 11]));
-        assert_eq!(second.output.metrics["okx"], json!([20, 21]));
-        assert_eq!(second.output.metrics["current"], 11.0);
-        assert_eq!(second.output.metrics["previous"], 10.0);
-        assert_eq!(second.output.metrics["has_legacy_input"], false);
+        let second = &outputs[1];
+        assert_eq!(second["binance"], json!([10]));
+        assert_eq!(second["okx"], json!([20]));
+        assert_eq!(second["trigger"], "candles@okx@mmt");
+
+        let last = outputs.last().unwrap();
+        assert_eq!(last["binance"], json!([10, 11]));
+        assert_eq!(last["okx"], json!([20, 21]));
+        assert_eq!(last["current"], 11.0);
+        assert_eq!(last["previous"], 10.0);
+        assert_eq!(last["has_legacy_input"], false);
 
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn script_limit_order_cannot_fill_on_its_submission_bar() {
+    fn script_limit_order_cannot_fill_on_its_submission_event() {
         let data = candle_data(vec![
             candle(0, 100.0, 105.0, 85.0, 100.0),
             candle(1, 100.0, 101.0, 89.0, 95.0),
         ]);
-        let clock = candle_clock();
+        let source = candle_source();
         let mut orders = HashMap::new();
         let mut open = Vec::new();
+        let mut closed = Vec::new();
         let mut next_position_id = 1;
         let submitted = apply_script_execution_commands(
             vec![script_trade(json!({
                 "key": "limit-1",
-                "side": "long",
-                "notional": 100,
+                "position": "open-long",
+                "margin": 100,
                 "leverage": 2,
                 "order": { "type": "limit", "price": 90, "tif": "gtc" }
             }))],
             0,
-            clock_ts_ms(&clock, &data, 0).unwrap(),
-            100.0,
+            candle_ts_ms(&candle(0, 100.0, 105.0, 85.0, 100.0)),
+            Some(100.0),
             &mut orders,
             &mut open,
+            &mut closed,
             &mut next_position_id,
         )
         .expect("queue limit order");
         assert_eq!(submitted, 1);
 
         fill_pending_script_orders(
-            &clock,
+            &source,
             &data,
+            0,
             0,
             &mut orders,
             &mut open,
+            &mut closed,
             &mut next_position_id,
         )
-        .expect("same-bar check");
+        .expect("same-event check");
         assert!(open.is_empty());
 
         fill_pending_script_orders(
-            &clock,
+            &source,
             &data,
+            1,
             1,
             &mut orders,
             &mut open,
+            &mut closed,
             &mut next_position_id,
         )
-        .expect("next-bar fill");
+        .expect("later-event fill");
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].entry_price, 90.0);
         assert_eq!(open[0].leverage, 2.0);
+        assert_eq!(open[0].notional, 200.0);
     }
 
     #[test]
@@ -2065,7 +2337,7 @@ export function onData(ctx, input, history) {
             candle(0, 100.0, 105.0, 95.0, 100.0),
             candle(1, 100.0, 125.0, 85.0, 105.0),
         ]);
-        let clock = candle_clock();
+        let source = candle_source();
         let mut orders = HashMap::new();
         let mut open = Vec::new();
         let mut closed = Vec::new();
@@ -2073,27 +2345,116 @@ export function onData(ctx, input, history) {
         apply_script_execution_commands(
             vec![script_trade(json!({
                 "key": "protected-1",
-                "side": "long",
-                "notional": 100,
+                "position": "open-long",
+                "margin": 100,
                 "leverage": 2,
                 "order": { "type": "market" },
                 "sl": 90,
                 "tp": 120
             }))],
             0,
-            clock_ts_ms(&clock, &data, 0).unwrap(),
-            100.0,
+            candle_ts_ms(&candle(0, 100.0, 105.0, 95.0, 100.0)),
+            Some(100.0),
             &mut orders,
             &mut open,
+            &mut closed,
             &mut next_position_id,
         )
         .expect("fill market order");
 
-        apply_protective_triggers(&clock, &data, 1, &mut open, &mut closed)
+        apply_protective_triggers(&source, &data, 1, 1, &mut open, &mut closed)
             .expect("apply protection");
         assert!(open.is_empty());
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].exit.price, 90.0);
         assert_eq!(closed[0].exit.reason, "ctx.trade stop loss");
+    }
+
+    #[test]
+    fn close_long_is_reduce_only_and_defaults_to_the_full_position() {
+        let mut orders = HashMap::new();
+        let mut open = Vec::new();
+        let mut closed = Vec::new();
+        let mut next_position_id = 1;
+
+        apply_script_execution_commands(
+            vec![script_trade(json!({
+                "key": "open-1",
+                "position": "open-long",
+                "margin": 100,
+                "leverage": 2
+            }))],
+            0,
+            1_000,
+            Some(100.0),
+            &mut orders,
+            &mut open,
+            &mut closed,
+            &mut next_position_id,
+        )
+        .expect("open long");
+        assert_eq!(open.len(), 1);
+
+        apply_script_execution_commands(
+            vec![script_trade(json!({
+                "key": "close-1",
+                "position": "close-long"
+            }))],
+            1,
+            2_000,
+            Some(110.0),
+            &mut orders,
+            &mut open,
+            &mut closed,
+            &mut next_position_id,
+        )
+        .expect("close long");
+
+        assert!(open.is_empty());
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].qty, 2.0);
+        assert_eq!(closed[0].net_pnl, 20.0);
+    }
+
+    #[test]
+    fn opposite_open_requires_an_explicit_close_first() {
+        let mut orders = HashMap::new();
+        let mut open = Vec::new();
+        let mut closed = Vec::new();
+        let mut next_position_id = 1;
+
+        apply_script_execution_commands(
+            vec![script_trade(json!({
+                "key": "open-long-1",
+                "position": "open-long",
+                "size": 1
+            }))],
+            0,
+            1_000,
+            Some(100.0),
+            &mut orders,
+            &mut open,
+            &mut closed,
+            &mut next_position_id,
+        )
+        .expect("open long");
+
+        let error = apply_script_execution_commands(
+            vec![script_trade(json!({
+                "key": "open-short-1",
+                "position": "open-short",
+                "size": 1
+            }))],
+            1,
+            2_000,
+            Some(99.0),
+            &mut orders,
+            &mut open,
+            &mut closed,
+            &mut next_position_id,
+        )
+        .expect_err("opposite open must fail");
+
+        assert!(error.to_string().contains("submit close-long first"));
     }
 }

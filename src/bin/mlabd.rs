@@ -14,8 +14,19 @@ async fn main() -> Result<()> {
             }
             market_lab::commands::script::run::handle_worker(&job_id).await
         }
+        Some("strategy-worker") => {
+            let job_id = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("strategy-worker requires a job id"))?;
+            if args.next().is_some() {
+                anyhow::bail!("strategy-worker accepts exactly one job id");
+            }
+            market_lab::commands::strategy::twap::handle_worker(&job_id).await
+        }
         Some(command) => {
-            anyhow::bail!("unknown mlabd command `{command}` (expected `serve|script-worker`)")
+            anyhow::bail!(
+                "unknown mlabd command `{command}` (expected `serve|script-worker|strategy-worker`)"
+            )
         }
     }
 }

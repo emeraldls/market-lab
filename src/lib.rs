@@ -8,3 +8,4 @@ pub mod functions;
 pub mod providers;
 pub mod runtime;
 pub mod scripting;
+pub mod strategies;

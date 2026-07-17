@@ -50,7 +50,6 @@ struct ScriptConfig {
 struct BacktestConfig {
     from: Option<u64>,
     to: Option<u64>,
-    leverage: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,7 +57,7 @@ struct BacktestConfig {
 struct ExecutionConfig {
     venue: Option<String>,
     size: Option<f64>,
-    notional: Option<f64>,
+    margin: Option<f64>,
     order_type: Option<String>,
     price: Option<f64>,
     tif: Option<String>,
@@ -195,11 +194,6 @@ fn append_script_config_flags(
     {
         append_optional_owned(args, "--from", backtest.from.map(|value| value.to_string()));
         append_optional_owned(args, "--to", backtest.to.map(|value| value.to_string()));
-        append_optional_owned(
-            args,
-            "--leverage",
-            backtest.leverage.map(|value| value.to_string()),
-        );
     }
 
     if mode == "run"
@@ -220,8 +214,8 @@ fn append_script_config_flags(
 
 fn append_trade_config_flags(args: &mut Vec<OsString>, config: &MarketLabConfig) -> Result<()> {
     if let Some(execution) = &config.execution {
-        if execution.size.is_some() && execution.notional.is_some() {
-            bail!("[execution] cannot set both size and notional");
+        if execution.size.is_some() && execution.margin.is_some() {
+            bail!("[execution] cannot set both size and margin");
         }
         append_optional(args, "--venue", execution.venue.as_deref());
         append_optional_owned(
@@ -231,8 +225,8 @@ fn append_trade_config_flags(args: &mut Vec<OsString>, config: &MarketLabConfig)
         );
         append_optional_owned(
             args,
-            "--notional",
-            execution.notional.map(|value| value.to_string()),
+            "--margin",
+            execution.margin.map(|value| value.to_string()),
         );
         append_optional(args, "--type", execution.order_type.as_deref());
         append_optional_owned(
@@ -312,15 +306,7 @@ fn config_command(args: &[OsString]) -> Option<ConfigCommand<'_>> {
 
 fn has_script_positional(args: &[OsString], start: usize) -> bool {
     let value_flags = [
-        "--config",
-        "--symbol",
-        "--venue",
-        "--from",
-        "--to",
-        "--source",
-        "--param",
-        "--leverage",
-        "--output",
+        "--config", "--symbol", "--venue", "--from", "--to", "--source", "--param", "--output",
     ];
     let mut skip_value = false;
     for arg in &args[start..] {
@@ -345,7 +331,7 @@ fn has_trade_positional(args: &[OsString], start: usize) -> bool {
         "--config",
         "--venue",
         "--size",
-        "--notional",
+        "--margin",
         "--type",
         "--price",
         "--tif",
@@ -448,7 +434,6 @@ fast = 20
 [backtest]
 from = 1000
 to = 2000
-leverage = 2
 "#,
         )
         .expect("write config");
@@ -462,8 +447,6 @@ leverage = 2
                 path.to_str().expect("utf8 path"),
                 "--symbol",
                 "BTC/USDT",
-                "--leverage",
-                "5",
             ]
             .into_iter()
             .map(OsString::from),
@@ -476,7 +459,6 @@ leverage = 2
                 command: ScriptCommands::Backtest(args),
             } => {
                 assert_eq!(args.symbol, "BTC/USDT");
-                assert_eq!(args.leverage, 5.0);
                 assert_eq!(args.source, vec!["candles@bybitf@mmt:timeframe=60"]);
                 assert_eq!(args.param, vec!["fast=20"]);
                 assert!(args.script.ends_with("strategy.js"));
@@ -545,8 +527,6 @@ max_spread = 1
                     name: "toml-multi-exchange".to_string(),
                     version: "1".to_string(),
                     sources: vec![ScriptSource::Candles, ScriptSource::Orderbook],
-                    modes: vec![],
-                    clock: None,
                     description: None,
                     lookback: None,
                     params: BTreeMap::from([(
@@ -587,7 +567,7 @@ symbol = "BTC/USDT"
 
 [execution]
 venue = "bulk"
-notional = 100
+margin = 100
 order_type = "market"
 leverage = 3
 dry_run = true
@@ -605,7 +585,7 @@ format = "json"
                 "long",
                 "--config",
                 path.to_str().expect("utf8 path"),
-                "--notional",
+                "--margin",
                 "250",
                 "--leverage",
                 "5",
@@ -621,7 +601,7 @@ format = "json"
                 command: crate::cli::TradeCommands::Long(args),
             } => {
                 assert_eq!(args.symbol, "BTC/USDT");
-                assert_eq!(args.notional, Some(250.0));
+                assert_eq!(args.margin, Some(250.0));
                 assert_eq!(args.leverage, 5.0);
                 assert!(args.dry_run);
                 assert!(matches!(args.output, crate::cli::OutputFormat::Json));

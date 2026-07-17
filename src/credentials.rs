@@ -5,7 +5,7 @@ use bulk_keychain::{Keypair, Pubkey};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::cli::{AuthProvider, AuthProviderArgs};
+use crate::cli::{AuthProvider, AuthProviderArgs, AuthSetArgs};
 use crate::providers::bulk;
 
 const MMT_API_KEY_ENV: &str = "MMT_API_KEY";
@@ -122,9 +122,12 @@ pub fn bulk_account() -> Result<String> {
     Ok(active_bulk_credential()?.account.to_base58())
 }
 
-pub async fn handle_set(args: AuthProviderArgs) -> Result<()> {
+pub async fn handle_set(args: AuthSetArgs) -> Result<()> {
     match args.provider {
         AuthProvider::Mmt => {
+            if args.reauthorize {
+                bail!("`--reauthorize` is only supported for BULK");
+            }
             let key = rpassword::prompt_password("MMT API key: ")?;
             let key = validate_key(key, "MMT API key")?;
             mmt_entry()?
@@ -132,7 +135,7 @@ pub async fn handle_set(args: AuthProviderArgs) -> Result<()> {
                 .context("failed to store MMT API key in the OS keychain")?;
             println!("mmt: configured");
         }
-        AuthProvider::Bulk => handle_set_bulk().await?,
+        AuthProvider::Bulk => handle_set_bulk(args.reauthorize).await?,
     }
     Ok(())
 }
@@ -186,16 +189,23 @@ pub async fn handle_remove(args: AuthProviderArgs) -> Result<()> {
     Ok(())
 }
 
-async fn handle_set_bulk() -> Result<()> {
+async fn handle_set_bulk(reauthorize: bool) -> Result<()> {
     let mut credential = match load_bulk_credential()? {
-        Some(credential) if credential.status == BulkCredentialStatus::Active => {
+        Some(credential) if credential.status == BulkCredentialStatus::Active && !reauthorize => {
             println!("bulk: already configured");
             println!(
                 "  account: {}",
                 credential.account.as_deref().unwrap_or("unknown")
             );
             println!("  agent: {}", credential.agent_public_key);
+            println!(
+                "  use `mlab auth set bulk --reauthorize` if BULK rejects this agent as unauthorized"
+            );
             return Ok(());
+        }
+        Some(credential) if credential.status == BulkCredentialStatus::Active => {
+            println!("bulk: reauthorizing the existing agent");
+            credential
         }
         Some(credential) => {
             println!("bulk: retrying registration for the pending agent");
@@ -227,18 +237,23 @@ async fn handle_set_bulk() -> Result<()> {
         && expected_account != &account
     {
         bail!(
-            "this pending agent belongs to BULK account {expected_account}, but the supplied key belongs to {account}"
+            "this BULK agent belongs to account {expected_account}, but the supplied key belongs to {account}"
         );
     }
 
-    credential.account = Some(account.clone());
-    save_bulk_credential(&credential)?;
+    if credential.account.is_none() {
+        credential.account = Some(account.clone());
+        save_bulk_credential(&credential)?;
+    }
     println!("bulk: authorizing the agent for account {account}");
 
     let registration = bulk::register_agent(master, agent).await.map_err(|error| {
-        error.context(
-            "BULK agent registration was not confirmed; the pending agent remains in the OS keychain and `mlab auth set bulk` can safely retry it",
-        )
+        let recovery = if reauthorize {
+            "BULK agent reauthorization was not confirmed; the existing local agent was preserved and `mlab auth set bulk --reauthorize` can safely retry it"
+        } else {
+            "BULK agent registration was not confirmed; the pending agent remains in the OS keychain and `mlab auth set bulk` can safely retry it"
+        };
+        error.context(recovery)
     })?;
 
     if registration.account != account
@@ -248,11 +263,22 @@ async fn handle_set_bulk() -> Result<()> {
     }
 
     credential.status = BulkCredentialStatus::Active;
-    save_bulk_credential(&credential).context(
-        "BULK registered the agent, but Market Lab could not mark it active in the OS keychain; the pending credential was preserved",
-    )?;
+    save_bulk_credential(&credential).with_context(|| {
+        if reauthorize {
+            "BULK reauthorized the agent, but Market Lab could not refresh it in the OS keychain; the existing credential was preserved"
+        } else {
+            "BULK registered the agent, but Market Lab could not mark it active in the OS keychain; the pending credential was preserved"
+        }
+    })?;
 
-    println!("bulk: configured");
+    println!(
+        "bulk: {}",
+        if reauthorize {
+            "reauthorized"
+        } else {
+            "configured"
+        }
+    );
     println!("  account: {account}");
     println!("  agent: {}", credential.agent_public_key);
     Ok(())

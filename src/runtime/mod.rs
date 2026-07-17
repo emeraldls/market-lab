@@ -15,7 +15,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 use crate::credentials;
-use crate::domain::execution::{CancelPlan, ExecutionReceipt, ExecutionVenue, TradePlan};
+use crate::domain::execution::{CancelPlan, ExecutionReceipt, ExecutionVenue, Position, TradePlan};
 use crate::providers::bulk::execution::BulkExecutionAdapter;
 use crate::providers::bulk::ws::BulkAccountStream;
 use crate::scripting::execution::{
@@ -25,8 +25,11 @@ use crate::scripting::jobs::{
     ScriptExecutionEvent, ScriptJob, ScriptJobDefinition, ScriptJobStatus, ScriptJobSubmission,
     ScriptManagedOrder,
 };
+use crate::strategies::jobs::{
+    StrategyJob, StrategyJobDefinition, StrategyJobStatus, StrategyJobSubmission, StrategySide,
+};
 
-const RUNTIME_VERSION: u8 = 7;
+const RUNTIME_VERSION: u8 = 10;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -61,6 +64,8 @@ pub struct RuntimeStatus {
     pub tracked_orders: Vec<TrackedOrder>,
     #[serde(default)]
     pub script_jobs: Vec<ScriptJob>,
+    #[serde(default)]
+    pub strategy_jobs: Vec<StrategyJob>,
 }
 
 impl RuntimeStatus {
@@ -76,6 +81,7 @@ impl RuntimeStatus {
             last_error: None,
             tracked_orders: Vec::new(),
             script_jobs: Vec::new(),
+            strategy_jobs: Vec::new(),
         }
     }
 }
@@ -139,6 +145,37 @@ enum RuntimeRequest {
         job_id: String,
         through_seq: u64,
     },
+    ScriptPositions {
+        job_id: String,
+    },
+    SubmitStrategyJob {
+        submission: StrategyJobSubmission,
+    },
+    ListStrategyJobs,
+    GetStrategyJob {
+        job_id: String,
+    },
+    StopStrategyJob {
+        job_id: String,
+    },
+    StrategyWorkerStarted {
+        job_id: String,
+        pid: u32,
+    },
+    StrategyWorkerHeartbeat {
+        job_id: String,
+        pid: u32,
+    },
+    StrategyWorkerFinished {
+        job_id: String,
+        pid: u32,
+        error: Option<String>,
+    },
+    StrategyExecuteTrade {
+        job_id: String,
+        sequence: u64,
+        plan: TradePlan,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -156,6 +193,12 @@ struct RuntimeResponse {
     script_order: Option<ScriptManagedOrder>,
     #[serde(default)]
     script_events: Option<Vec<ScriptExecutionEvent>>,
+    #[serde(default)]
+    script_positions: Option<Vec<Position>>,
+    #[serde(default)]
+    strategy_job: Option<StrategyJob>,
+    #[serde(default)]
+    strategy_jobs: Option<Vec<StrategyJob>>,
 }
 
 impl RuntimeResponse {
@@ -169,6 +212,9 @@ impl RuntimeResponse {
             jobs: None,
             script_order: None,
             script_events: None,
+            script_positions: None,
+            strategy_job: None,
+            strategy_jobs: None,
         }
     }
 
@@ -201,9 +247,17 @@ struct RuntimeState {
     #[serde(default)]
     script_jobs: BTreeMap<String, ScriptJob>,
     #[serde(default)]
+    strategy_jobs: BTreeMap<String, StrategyJob>,
+    #[serde(default)]
+    strategy_executions: BTreeMap<String, ExecutionReceipt>,
+    #[serde(default)]
     script_orders: BTreeMap<String, ScriptManagedOrder>,
     #[serde(default)]
     script_cancel_keys: BTreeMap<String, String>,
+    #[serde(default)]
+    account_positions: BTreeMap<String, Vec<Position>>,
+    #[serde(default)]
+    account_positions_refreshed_at_ms: BTreeMap<String, u64>,
 }
 
 #[derive(Serialize)]
@@ -303,8 +357,12 @@ pub async fn serve() -> Result<()> {
         last_error: None,
         tracked_orders: BTreeMap::new(),
         script_jobs: BTreeMap::new(),
+        strategy_jobs: BTreeMap::new(),
+        strategy_executions: BTreeMap::new(),
         script_orders: BTreeMap::new(),
         script_cancel_keys: BTreeMap::new(),
+        account_positions: BTreeMap::new(),
+        account_positions_refreshed_at_ms: BTreeMap::new(),
     });
     state.version = RUNTIME_VERSION;
     state.pid = std::process::id();
@@ -364,6 +422,15 @@ pub async fn serve() -> Result<()> {
         .collect::<Vec<_>>();
     for job_id in active_jobs {
         let _ = stop_script_job_in_daemon(&paths, &mut state, &job_id);
+    }
+    let active_strategy_jobs = state
+        .strategy_jobs
+        .values()
+        .filter(|job| job.status.is_active())
+        .map(|job| job.id.clone())
+        .collect::<Vec<_>>();
+    for job_id in active_strategy_jobs {
+        let _ = stop_strategy_job_in_daemon(&paths, &mut state, &job_id);
     }
     drop(listener);
     let _ = fs::remove_file(&paths.socket);
@@ -513,6 +580,122 @@ pub async fn submit_script_job(submission: ScriptJobSubmission) -> Result<Script
     response
         .job
         .context("mlabd omitted the submitted script job")
+}
+
+pub async fn submit_strategy_job(submission: StrategyJobSubmission) -> Result<StrategyJob> {
+    ensure_running().await?;
+    let response = request(RuntimeRequest::SubmitStrategyJob { submission }).await?;
+    if !response.ok {
+        bail!("mlabd rejected strategy job: {}", response.message);
+    }
+    response
+        .strategy_job
+        .context("mlabd omitted the submitted strategy job")
+}
+
+pub async fn list_strategy_jobs() -> Result<Vec<StrategyJob>> {
+    ensure_running().await?;
+    let response = request(RuntimeRequest::ListStrategyJobs).await?;
+    if !response.ok {
+        bail!("mlabd could not list strategy jobs: {}", response.message);
+    }
+    response
+        .strategy_jobs
+        .context("mlabd omitted strategy jobs")
+}
+
+pub async fn get_strategy_job(job_id: &str) -> Result<StrategyJob> {
+    ensure_running().await?;
+    get_strategy_job_from_running_daemon(job_id).await
+}
+
+pub(crate) async fn get_strategy_job_from_running_daemon(job_id: &str) -> Result<StrategyJob> {
+    let response = request(RuntimeRequest::GetStrategyJob {
+        job_id: job_id.to_string(),
+    })
+    .await?;
+    if !response.ok {
+        bail!("mlabd could not get strategy job: {}", response.message);
+    }
+    response.strategy_job.context("mlabd omitted strategy job")
+}
+
+pub async fn stop_strategy_job(job_id: &str) -> Result<StrategyJob> {
+    ensure_running().await?;
+    let response = request(RuntimeRequest::StopStrategyJob {
+        job_id: job_id.to_string(),
+    })
+    .await?;
+    if !response.ok {
+        bail!("mlabd could not stop strategy job: {}", response.message);
+    }
+    response.strategy_job.context("mlabd omitted strategy job")
+}
+
+pub async fn strategy_worker_started(job_id: &str, pid: u32) -> Result<StrategyJob> {
+    let response = request(RuntimeRequest::StrategyWorkerStarted {
+        job_id: job_id.to_string(),
+        pid,
+    })
+    .await?;
+    if !response.ok {
+        bail!("mlabd rejected strategy worker: {}", response.message);
+    }
+    response.strategy_job.context("mlabd omitted strategy job")
+}
+
+pub async fn strategy_worker_heartbeat(job_id: &str, pid: u32) -> Result<StrategyJob> {
+    let response = request(RuntimeRequest::StrategyWorkerHeartbeat {
+        job_id: job_id.to_string(),
+        pid,
+    })
+    .await?;
+    if !response.ok {
+        bail!(
+            "mlabd rejected strategy worker heartbeat: {}",
+            response.message
+        );
+    }
+    response.strategy_job.context("mlabd omitted strategy job")
+}
+
+pub async fn strategy_worker_finished(
+    job_id: &str,
+    pid: u32,
+    error: Option<String>,
+) -> Result<StrategyJob> {
+    let response = request(RuntimeRequest::StrategyWorkerFinished {
+        job_id: job_id.to_string(),
+        pid,
+        error,
+    })
+    .await?;
+    if !response.ok {
+        bail!(
+            "mlabd rejected strategy worker finish: {}",
+            response.message
+        );
+    }
+    response.strategy_job.context("mlabd omitted strategy job")
+}
+
+pub async fn submit_strategy_trade(
+    job_id: &str,
+    sequence: u64,
+    plan: &TradePlan,
+) -> Result<ExecutionReceipt> {
+    let response = request(RuntimeRequest::StrategyExecuteTrade {
+        job_id: job_id.to_string(),
+        sequence,
+        plan: plan.clone(),
+    })
+    .await?;
+    if !response.ok {
+        bail!("strategy trade failed: {}", response.message);
+    }
+    response
+        .receipt
+        .context("mlabd omitted the strategy execution receipt")
 }
 
 pub async fn list_script_jobs() -> Result<Vec<ScriptJob>> {
@@ -680,10 +863,57 @@ pub async fn acknowledge_script_events(job_id: &str, through_seq: u64) -> Result
     Ok(())
 }
 
+pub async fn script_positions(job_id: &str) -> Result<Vec<Position>> {
+    let response = request(RuntimeRequest::ScriptPositions {
+        job_id: job_id.to_string(),
+    })
+    .await?;
+    if !response.ok {
+        bail!(
+            "mlabd could not read script positions: {}",
+            response.message
+        );
+    }
+    response
+        .script_positions
+        .context("mlabd omitted script positions")
+}
+
 pub fn append_script_output(job_id: &str, value: &impl Serialize) -> Result<()> {
     let paths = RuntimePaths::load()?;
     let path = script_job_directory(&paths, job_id)?.join("output.jsonl");
     append_json_line(&path, value)
+}
+
+pub fn append_strategy_output(job_id: &str, value: &impl Serialize) -> Result<()> {
+    let paths = RuntimePaths::load()?;
+    let path = strategy_job_directory(&paths, job_id)?.join("output.jsonl");
+    append_json_line(&path, value)
+}
+
+pub fn strategy_output_after(
+    job_id: &str,
+    after_line: usize,
+) -> Result<(usize, Vec<serde_json::Value>)> {
+    let paths = RuntimePaths::load()?;
+    let path = strategy_job_directory(&paths, job_id)?.join("output.jsonl");
+    let source = match fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((0, Vec::new()));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let lines = source.lines().collect::<Vec<_>>();
+    let total = lines.len();
+    let values = lines
+        .into_iter()
+        .skip(after_line.min(total))
+        .map(|line| serde_json::from_str(line).context("strategy output journal is malformed"))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((total, values))
 }
 
 pub fn recent_script_output(job_id: &str, limit: usize) -> Result<Vec<serde_json::Value>> {
@@ -996,6 +1226,216 @@ fn mark_script_worker_finished(
     Ok(job)
 }
 
+fn create_strategy_job(
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
+    submission: StrategyJobSubmission,
+) -> Result<StrategyJob> {
+    submission.validate()?;
+    credentials::bulk_account().context("BULK authentication is required for strategy jobs")?;
+
+    fs::create_dir_all(&paths.jobs)
+        .with_context(|| format!("failed to create {}", paths.jobs.display()))?;
+    fs::set_permissions(&paths.jobs, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to secure {}", paths.jobs.display()))?;
+    let job_id = new_strategy_job_id(state)?;
+    let job_directory = paths.jobs.join(&job_id);
+    fs::create_dir(&job_directory)
+        .with_context(|| format!("failed to create {}", job_directory.display()))?;
+    fs::set_permissions(&job_directory, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to secure {}", job_directory.display()))?;
+
+    let created_at_ms = now_ms()?;
+    let job = StrategyJob {
+        id: job_id.clone(),
+        definition: submission.definition,
+        status: StrategyJobStatus::Starting,
+        pid: None,
+        created_at_ms,
+        started_at_ms: None,
+        stopped_at_ms: None,
+        last_heartbeat_ms: None,
+        last_error: None,
+    };
+    state.strategy_jobs.insert(job_id.clone(), job);
+    persist_state(paths, state)?;
+    if let Err(error) = spawn_strategy_worker(paths, state, &job_id) {
+        if let Some(job) = state.strategy_jobs.get_mut(&job_id) {
+            job.status = StrategyJobStatus::Failed;
+            job.stopped_at_ms = Some(now_ms().unwrap_or(created_at_ms));
+            job.last_error = Some(format!("{error:#}"));
+        }
+        persist_state(paths, state)?;
+        return Err(error);
+    }
+    persist_state(paths, state)?;
+    state
+        .strategy_jobs
+        .get(&job_id)
+        .cloned()
+        .context("strategy job disappeared after creation")
+}
+
+fn new_strategy_job_id(state: &RuntimeState) -> Result<String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?;
+    let base = format!(
+        "strategy_{:013x}_{:05x}",
+        now.as_millis(),
+        now.subsec_nanos()
+    );
+    if !state.strategy_jobs.contains_key(&base) && !state.script_jobs.contains_key(&base) {
+        return Ok(base);
+    }
+    for suffix in 1..=9999_u16 {
+        let candidate = format!("{base}_{suffix}");
+        if !state.strategy_jobs.contains_key(&candidate)
+            && !state.script_jobs.contains_key(&candidate)
+        {
+            return Ok(candidate);
+        }
+    }
+    bail!("could not allocate a unique strategy job id")
+}
+
+fn spawn_strategy_worker(
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
+    job_id: &str,
+) -> Result<()> {
+    if !state.strategy_jobs.contains_key(job_id) {
+        bail!("strategy job was not found");
+    }
+    let worker_log = paths.jobs.join(job_id).join("worker.log");
+    let stdout = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&worker_log)
+        .with_context(|| format!("failed to open {}", worker_log.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .context("failed to clone strategy worker log handle")?;
+    let executable = std::env::current_exe().context("failed to locate mlabd")?;
+    let child = Command::new(executable)
+        .arg("strategy-worker")
+        .arg(job_id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .with_context(|| format!("failed to start strategy worker for {job_id}"))?;
+    let job = state
+        .strategy_jobs
+        .get_mut(job_id)
+        .context("strategy job disappeared while starting")?;
+    job.status = StrategyJobStatus::Starting;
+    job.pid = Some(child.id());
+    job.stopped_at_ms = None;
+    job.last_error = None;
+    Ok(())
+}
+
+fn stop_strategy_job_in_daemon(
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
+    job_id: &str,
+) -> Result<StrategyJob> {
+    let job = state
+        .strategy_jobs
+        .get_mut(job_id)
+        .with_context(|| format!("strategy job `{job_id}` was not found"))?;
+    if job.status.is_active()
+        && let Some(pid) = job.pid
+    {
+        let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        if result == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error).context("failed to stop strategy worker");
+            }
+        }
+    }
+    job.status = StrategyJobStatus::Stopped;
+    job.pid = None;
+    job.stopped_at_ms = Some(now_ms()?);
+    let job = job.clone();
+    persist_state(paths, state)?;
+    Ok(job)
+}
+
+fn mark_strategy_worker_started(
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
+    job_id: &str,
+    pid: u32,
+) -> Result<StrategyJob> {
+    let now = now_ms()?;
+    let job = state
+        .strategy_jobs
+        .get_mut(job_id)
+        .with_context(|| format!("strategy job `{job_id}` was not found"))?;
+    if job.status == StrategyJobStatus::Stopped {
+        bail!("strategy job `{job_id}` was stopped before its worker became ready");
+    }
+    job.status = StrategyJobStatus::Running;
+    job.pid = Some(pid);
+    job.started_at_ms = Some(now);
+    job.last_heartbeat_ms = Some(now);
+    job.last_error = None;
+    let job = job.clone();
+    persist_state(paths, state)?;
+    Ok(job)
+}
+
+fn mark_strategy_worker_heartbeat(
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
+    job_id: &str,
+    pid: u32,
+) -> Result<StrategyJob> {
+    let job = state
+        .strategy_jobs
+        .get_mut(job_id)
+        .with_context(|| format!("strategy job `{job_id}` was not found"))?;
+    if job.pid != Some(pid) || !job.status.is_active() {
+        bail!("strategy worker is no longer active for job `{job_id}`");
+    }
+    job.last_heartbeat_ms = Some(now_ms()?);
+    let job = job.clone();
+    persist_state(paths, state)?;
+    Ok(job)
+}
+
+fn mark_strategy_worker_finished(
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
+    job_id: &str,
+    pid: u32,
+    error: Option<String>,
+) -> Result<StrategyJob> {
+    let job = state
+        .strategy_jobs
+        .get_mut(job_id)
+        .with_context(|| format!("strategy job `{job_id}` was not found"))?;
+    if job.pid.is_some() && job.pid != Some(pid) {
+        bail!("stale strategy worker attempted to finish job `{job_id}`");
+    }
+    if job.status != StrategyJobStatus::Stopped {
+        job.status = if error.is_some() {
+            StrategyJobStatus::Failed
+        } else {
+            StrategyJobStatus::Completed
+        };
+    }
+    job.pid = None;
+    job.stopped_at_ms = Some(now_ms()?);
+    job.last_error = error;
+    let job = job.clone();
+    persist_state(paths, state)?;
+    Ok(job)
+}
+
 fn script_job_directory(paths: &RuntimePaths, job_id: &str) -> Result<PathBuf> {
     if job_id.is_empty()
         || !job_id
@@ -1003,6 +1443,17 @@ fn script_job_directory(paths: &RuntimePaths, job_id: &str) -> Result<PathBuf> {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     {
         bail!("invalid script job id");
+    }
+    Ok(paths.jobs.join(job_id))
+}
+
+fn strategy_job_directory(paths: &RuntimePaths, job_id: &str) -> Result<PathBuf> {
+    if job_id.is_empty()
+        || !job_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        bail!("invalid strategy job id");
     }
     Ok(paths.jobs.join(job_id))
 }
@@ -1176,24 +1627,93 @@ async fn execute_script_trade(
         crate::scripting::execution::ScriptTimeInForce::Ioc => crate::cli::TradeTimeInForce::Ioc,
         crate::scripting::execution::ScriptTimeInForce::Alo => crate::cli::TradeTimeInForce::Alo,
     };
+    let account = match credentials::bulk_account() {
+        Ok(account) => account,
+        Err(error) => {
+            fail_script_order(paths, state, job_id, &order.id, &error)?;
+            return Err(error);
+        }
+    };
+    let snapshot = match adapter.account_snapshot(&account).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            fail_script_order(paths, state, job_id, &order.id, &error)?;
+            return Err(error);
+        }
+    };
+    let symbol_position = snapshot.positions.iter().find(|position| {
+        position
+            .internal_symbol
+            .eq_ignore_ascii_case(&job.definition.symbol)
+            && position.size > f64::EPSILON
+    });
+    let target_direction = request.position.position_direction();
+    let (size, margin, leverage) = if request.position.is_open() {
+        if let Some(position) = symbol_position
+            && position.direction != target_direction
+        {
+            let required_close = match position.direction {
+                crate::domain::execution::PositionDirection::Long => "close-long",
+                crate::domain::execution::PositionDirection::Short => "close-short",
+            };
+            let error = anyhow::anyhow!(
+                "ctx.trade {} cannot reverse an open {:?} position; submit {required_close} first",
+                request.position.as_str(),
+                position.direction
+            );
+            fail_script_order(paths, state, job_id, &order.id, &error)?;
+            return Err(error);
+        }
+        (request.size, request.margin, request.leverage_or_default())
+    } else {
+        let Some(position) =
+            symbol_position.filter(|position| position.direction == target_direction)
+        else {
+            let error = anyhow::anyhow!(
+                "ctx.trade {} requires an open {:?} position for {}",
+                request.position.as_str(),
+                target_direction,
+                job.definition.symbol
+            );
+            fail_script_order(paths, state, job_id, &order.id, &error)?;
+            return Err(error);
+        };
+        let close_size = request.size.unwrap_or(position.size);
+        if close_size > position.size + f64::EPSILON {
+            let error = anyhow::anyhow!(
+                "ctx.trade {} size {} exceeds the open position size {}",
+                request.position.as_str(),
+                close_size,
+                position.size
+            );
+            fail_script_order(paths, state, job_id, &order.id, &error)?;
+            return Err(error);
+        }
+        (Some(close_size), None, position.leverage.max(1.0))
+    };
     let args = crate::cli::TradeArgs {
         symbol: job.definition.symbol.clone(),
         config: None,
         venue: crate::cli::ExecutionVenueArg::Bulk,
-        size: request.size,
-        notional: request.notional,
+        size,
+        margin,
         order_kind,
         price: request.order.price,
         tif,
-        leverage: request.leverage,
-        reduce_only: request.reduce_only,
+        leverage,
+        reduce_only: request.position.reduce_only(),
         sl: request.sl,
         tp: request.tp,
         dry_run: false,
         yes: true,
         output: crate::cli::OutputFormat::Json,
     };
-    let plan = match crate::commands::execution::build_trade_plan(&args, request.side).await {
+    let plan = match crate::commands::execution::build_trade_plan(
+        &args,
+        request.position.order_direction(),
+    )
+    .await
+    {
         Ok(plan) => plan,
         Err(error) => {
             fail_script_order(paths, state, job_id, &order.id, &error)?;
@@ -1390,6 +1910,76 @@ async fn execute_script_cancel(
     )?;
     persist_state(paths, state)?;
     Ok(managed)
+}
+
+async fn execute_strategy_trade(
+    paths: &RuntimePaths,
+    adapter: &BulkExecutionAdapter,
+    state: &mut RuntimeState,
+    job_id: &str,
+    sequence: u64,
+    plan: &TradePlan,
+) -> Result<ExecutionReceipt> {
+    if sequence == 0 {
+        bail!("strategy child sequence must start at 1");
+    }
+    let job = state
+        .strategy_jobs
+        .get(job_id)
+        .cloned()
+        .with_context(|| format!("strategy job `{job_id}` was not found"))?;
+    if !job.status.is_active() {
+        bail!("strategy job `{job_id}` is not running");
+    }
+    let StrategyJobDefinition::Twap(definition) = &job.definition;
+    let expected_direction = match definition.side {
+        StrategySide::Buy => crate::domain::execution::PositionDirection::Long,
+        StrategySide::Sell => crate::domain::execution::PositionDirection::Short,
+    };
+    let child_orders = definition
+        .duration_seconds
+        .div_ceil(definition.interval_seconds);
+    if sequence > child_orders {
+        bail!("TWAP child sequence {sequence} exceeds schedule length {child_orders}");
+    }
+    let market = crate::providers::bulk::catalog::market(&definition.symbol)?;
+    let schedule = crate::strategies::twap::TwapSchedule::build(
+        definition.total_size,
+        market.lot_size,
+        plan.reference_price,
+        market.min_notional,
+        definition.duration_seconds,
+        definition.interval_seconds,
+    )?;
+    let expected_size = schedule.children[(sequence - 1) as usize].size;
+    if plan.venue != definition.exchange
+        || plan.internal_symbol != definition.symbol
+        || plan.direction != expected_direction
+        || plan.order_kind != crate::domain::execution::OrderKind::Market
+        || plan.reduce_only != definition.reduce_only
+        || (plan.leverage - definition.leverage).abs() > f64::EPSILON
+        || (plan.size - expected_size).abs() > 1e-12_f64.max(expected_size.abs() * 1e-12)
+    {
+        bail!("strategy child order does not match its persisted TWAP definition");
+    }
+
+    let execution_key = format!("{job_id}:{sequence}");
+    if let Some(receipt) = state.strategy_executions.get(&execution_key) {
+        return Ok(receipt.clone());
+    }
+    if sequence > 1 {
+        let previous_key = format!("{job_id}:{}", sequence - 1);
+        if !state.strategy_executions.contains_key(&previous_key) {
+            bail!("TWAP child order {sequence} was submitted out of sequence");
+        }
+    }
+
+    let receipt = execute_trade(paths, adapter, state, plan, None).await?;
+    state
+        .strategy_executions
+        .insert(execution_key, receipt.clone());
+    persist_state(paths, state)?;
+    Ok(receipt)
 }
 
 async fn handle_connection(
@@ -1643,6 +2233,119 @@ async fn handle_connection(
             },
             Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
         },
+        RuntimeRequest::ScriptPositions { job_id } => {
+            match script_positions_in_daemon(paths, adapter, state, &job_id).await {
+                Ok(positions) => RuntimeResponse {
+                    ok: true,
+                    message: "script positions".to_string(),
+                    status: Some(runtime_status(state)),
+                    script_positions: Some(positions),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
+        RuntimeRequest::SubmitStrategyJob { submission } => {
+            if let Ok(account) = credentials::bulk_account() {
+                ensure_account_supervisor(&account, account_tx, account_supervisors);
+            }
+            match create_strategy_job(paths, state, submission) {
+                Ok(job) => RuntimeResponse {
+                    ok: true,
+                    message: "strategy job submitted".to_string(),
+                    status: Some(runtime_status(state)),
+                    strategy_job: Some(job),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
+        RuntimeRequest::ListStrategyJobs => RuntimeResponse {
+            ok: true,
+            message: "strategy jobs".to_string(),
+            status: Some(runtime_status(state)),
+            strategy_jobs: Some(state.strategy_jobs.values().cloned().collect()),
+            ..RuntimeResponse::empty()
+        },
+        RuntimeRequest::GetStrategyJob { job_id } => {
+            match state.strategy_jobs.get(&job_id).cloned() {
+                Some(job) => RuntimeResponse {
+                    ok: true,
+                    message: "strategy job".to_string(),
+                    status: Some(runtime_status(state)),
+                    strategy_job: Some(job),
+                    ..RuntimeResponse::empty()
+                },
+                None => {
+                    RuntimeResponse::error(format!("strategy job `{job_id}` was not found"), state)
+                }
+            }
+        }
+        RuntimeRequest::StopStrategyJob { job_id } => {
+            match stop_strategy_job_in_daemon(paths, state, &job_id) {
+                Ok(job) => RuntimeResponse {
+                    ok: true,
+                    message: "strategy job stopped".to_string(),
+                    status: Some(runtime_status(state)),
+                    strategy_job: Some(job),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
+        RuntimeRequest::StrategyWorkerStarted { job_id, pid } => {
+            match mark_strategy_worker_started(paths, state, &job_id, pid) {
+                Ok(job) => RuntimeResponse {
+                    ok: true,
+                    message: "strategy worker running".to_string(),
+                    status: Some(runtime_status(state)),
+                    strategy_job: Some(job),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
+        RuntimeRequest::StrategyWorkerHeartbeat { job_id, pid } => {
+            match mark_strategy_worker_heartbeat(paths, state, &job_id, pid) {
+                Ok(job) => RuntimeResponse {
+                    ok: true,
+                    message: "strategy worker heartbeat".to_string(),
+                    status: Some(runtime_status(state)),
+                    strategy_job: Some(job),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
+        RuntimeRequest::StrategyWorkerFinished { job_id, pid, error } => {
+            match mark_strategy_worker_finished(paths, state, &job_id, pid, error) {
+                Ok(job) => RuntimeResponse {
+                    ok: true,
+                    message: "strategy worker finished".to_string(),
+                    status: Some(runtime_status(state)),
+                    strategy_job: Some(job),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
+        RuntimeRequest::StrategyExecuteTrade {
+            job_id,
+            sequence,
+            plan,
+        } => {
+            ensure_account_supervisor(&plan.account, account_tx, account_supervisors);
+            match execute_strategy_trade(paths, adapter, state, &job_id, sequence, &plan).await {
+                Ok(receipt) => RuntimeResponse {
+                    ok: true,
+                    message: "strategy child order processed".to_string(),
+                    status: Some(runtime_status(state)),
+                    receipt: Some(receipt),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
     };
     let mut encoded = serde_json::to_vec(&response).context("failed to encode mlabd response")?;
     encoded.push(b'\n');
@@ -1831,6 +2534,7 @@ async fn handle_account_connection_event(
         } => {
             state.account_stream_connected = true;
             state.last_error = None;
+            refresh_account_positions(adapter, state, &account, true).await?;
             persist_state(paths, state)?;
             if reconnected {
                 recover_account_gap(paths, adapter, state, &account).await?;
@@ -1859,10 +2563,69 @@ async fn handle_account_connection_event(
                 },
             )?;
             apply_account_event(paths, state, &account, &data, received_at_ms)?;
+            refresh_account_positions(adapter, state, &account, false).await?;
             persist_state(paths, state)?;
         }
     }
     Ok(())
+}
+
+async fn refresh_account_positions(
+    adapter: &BulkExecutionAdapter,
+    state: &mut RuntimeState,
+    account: &str,
+    force: bool,
+) -> Result<()> {
+    let now = now_ms()?;
+    if !force
+        && state
+            .account_positions_refreshed_at_ms
+            .get(account)
+            .is_some_and(|last| now.saturating_sub(*last) < 250)
+    {
+        return Ok(());
+    }
+    let snapshot = adapter.account_snapshot(account).await?;
+    state
+        .account_positions
+        .insert(account.to_string(), snapshot.positions);
+    state
+        .account_positions_refreshed_at_ms
+        .insert(account.to_string(), snapshot.fetched_at_ms);
+    Ok(())
+}
+
+async fn script_positions_in_daemon(
+    paths: &RuntimePaths,
+    adapter: &BulkExecutionAdapter,
+    state: &mut RuntimeState,
+    job_id: &str,
+) -> Result<Vec<Position>> {
+    let job = state
+        .script_jobs
+        .get(job_id)
+        .cloned()
+        .with_context(|| format!("script job `{job_id}` was not found"))?;
+    if job.definition.venue.is_none() {
+        return Ok(Vec::new());
+    }
+    let account = credentials::bulk_account()?;
+    if !state.account_positions.contains_key(&account) {
+        refresh_account_positions(adapter, state, &account, true).await?;
+        persist_state(paths, state)?;
+    }
+    Ok(state
+        .account_positions
+        .get(&account)
+        .into_iter()
+        .flatten()
+        .filter(|position| {
+            position
+                .internal_symbol
+                .eq_ignore_ascii_case(&job.definition.symbol)
+        })
+        .cloned()
+        .collect())
 }
 
 fn apply_account_event(
@@ -2236,6 +2999,7 @@ fn runtime_status(state: &RuntimeState) -> RuntimeStatus {
         last_error: state.last_error.clone(),
         tracked_orders: state.tracked_orders.values().cloned().collect(),
         script_jobs: state.script_jobs.values().cloned().collect(),
+        strategy_jobs: state.strategy_jobs.values().cloned().collect(),
     }
 }
 
@@ -2247,11 +3011,17 @@ fn load_state(paths: &RuntimePaths) -> Result<Option<RuntimeState>> {
             return Err(error).with_context(|| format!("failed to read {}", paths.state.display()));
         }
     };
-    let state: RuntimeState = serde_json::from_str(&source)
+    let encoded: serde_json::Value = serde_json::from_str(&source)
         .with_context(|| format!("failed to parse {}", paths.state.display()))?;
-    if !(1..=RUNTIME_VERSION).contains(&state.version) {
-        bail!("unsupported mlabd state version {}", state.version);
+    let version = encoded
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .context("mlabd state is missing its schema version")?;
+    if version != u64::from(RUNTIME_VERSION) {
+        return Ok(None);
     }
+    let state: RuntimeState = serde_json::from_value(encoded)
+        .with_context(|| format!("failed to parse {}", paths.state.display()))?;
     Ok(Some(state))
 }
 
@@ -2329,6 +3099,7 @@ mod tests {
         assert!(status.pid.is_none());
         assert!(status.tracked_orders.is_empty());
         assert!(status.script_jobs.is_empty());
+        assert!(status.strategy_jobs.is_empty());
     }
 
     #[test]
@@ -2347,5 +3118,6 @@ mod tests {
         assert!(status.last_account_event_ms.is_none());
         assert!(status.last_recovery_ms.is_none());
         assert!(status.script_jobs.is_empty());
+        assert!(status.strategy_jobs.is_empty());
     }
 }

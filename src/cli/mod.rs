@@ -98,20 +98,19 @@ pub struct TradeArgs {
     pub config: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
-    #[arg(
-        long,
-        conflicts_with = "notional",
-        required_unless_present = "notional"
-    )]
+    /// Exact base-asset exposure; leverage does not multiply an explicit size.
+    #[arg(long, conflicts_with = "margin", required_unless_present = "margin")]
     pub size: Option<f64>,
+    /// Quote collateral to commit; exchange exposure is margin multiplied by leverage.
     #[arg(long, conflicts_with = "size", required_unless_present = "size")]
-    pub notional: Option<f64>,
+    pub margin: Option<f64>,
     #[arg(long = "type", value_enum, default_value_t = TradeOrderKind::Market)]
     pub order_kind: TradeOrderKind,
     #[arg(long)]
     pub price: Option<f64>,
     #[arg(long, value_enum, default_value_t = TradeTimeInForce::Gtc)]
     pub tif: TradeTimeInForce,
+    /// Exposure multiplier for margin sizing and the leverage setting sent to BULK.
     #[arg(long, default_value_t = 1.0)]
     pub leverage: f64,
     #[arg(long, default_value_t = false)]
@@ -140,18 +139,24 @@ impl TradeArgs {
         {
             bail!("--size must be > 0");
         }
-        if let Some(notional) = self.notional
-            && (!notional.is_finite() || notional <= 0.0)
+        if let Some(margin) = self.margin
+            && (!margin.is_finite() || margin <= 0.0)
         {
-            bail!("--notional must be > 0");
+            bail!("--margin must be > 0");
         }
-        match (self.size, self.notional) {
-            (Some(_), Some(_)) => bail!("set only one of --size or --notional"),
-            (None, None) => bail!("one of --size or --notional is required"),
+        match (self.size, self.margin) {
+            (Some(_), Some(_)) => bail!("set only one of --size or --margin"),
+            (None, None) => bail!("one of --size or --margin is required"),
             _ => {}
         }
         if !self.leverage.is_finite() || self.leverage < 1.0 {
             bail!("--leverage must be at least 1");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| !(margin * self.leverage).is_finite())
+        {
+            bail!("--margin multiplied by --leverage is too large");
         }
         for (flag, price) in [("--sl", self.sl), ("--tp", self.tp)] {
             if price.is_some_and(|price| !price.is_finite() || price <= 0.0) {
@@ -342,9 +347,18 @@ impl MarketsArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum AuthCommands {
-    Set(AuthProviderArgs),
+    Set(AuthSetArgs),
     Status,
     Remove(AuthProviderArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct AuthSetArgs {
+    #[arg(value_enum)]
+    pub provider: AuthProvider,
+    /// Reauthorize the existing remote credential without replacing it locally first.
+    #[arg(long, default_value_t = false)]
+    pub reauthorize: bool,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -407,20 +421,15 @@ pub enum StrategyCommands {
         #[command(subcommand)]
         command: StrategyRunCommands,
     },
-    Backtest {
-        #[command(subcommand)]
-        command: StrategyBacktestCommands,
-    },
+    Jobs(StrategyJobsArgs),
+    Status(StrategyJobArgs),
+    Logs(StrategyLogsArgs),
+    Stop(StrategyJobArgs),
 }
 
 #[derive(Subcommand, Debug)]
 pub enum StrategyRunCommands {
-    SmaCrossover(RunSmaCrossoverArgs),
-}
-
-#[derive(Subcommand, Debug)]
-pub enum StrategyBacktestCommands {
-    SmaCrossover(BacktestSmaCrossoverArgs),
+    Twap(RunTwapArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -542,8 +551,6 @@ pub struct ScriptBacktestArgs {
     pub source: Vec<String>,
     #[arg(long = "param")]
     pub param: Vec<String>,
-    #[arg(long, default_value_t = 1.0)]
-    pub leverage: f64,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
     #[arg(long, default_value_t = false)]
@@ -562,9 +569,6 @@ impl ScriptBacktestArgs {
         validate_millisecond_timestamp(self.to, "--to")?;
         if self.from >= self.to {
             bail!("--from must be less than --to");
-        }
-        if !self.leverage.is_finite() || self.leverage <= 0.0 {
-            bail!("--leverage must be > 0");
         }
         Ok(())
     }
@@ -1466,107 +1470,133 @@ pub struct DepthArgs {
 }
 
 #[derive(Clone, Debug, Args)]
-pub struct RunSmaCrossoverArgs {
-    #[arg(long, value_enum, default_value_t = CliDataProvider::Mmt)]
-    pub provider: CliDataProvider,
-    #[arg(long)]
-    pub exchange: String,
-    #[arg(long)]
+pub struct RunTwapArgs {
     pub symbol: String,
+    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    pub exchange: ExecutionVenueArg,
+    #[arg(long, value_enum)]
+    pub side: CliSide,
+    /// Exact total base-asset exposure; leverage does not multiply an explicit size.
+    #[arg(long, conflicts_with = "margin", required_unless_present = "margin")]
+    pub size: Option<f64>,
+    /// Total quote collateral for the TWAP; exposure is margin multiplied by leverage.
+    #[arg(long, conflicts_with = "size", required_unless_present = "size")]
+    pub margin: Option<f64>,
+    /// Total execution window in seconds.
     #[arg(long)]
-    pub timeframe: u32,
-    #[arg(long)]
-    pub from: Option<u64>,
-    #[arg(long, default_value_t = 20)]
-    pub fast: usize,
-    #[arg(long, default_value_t = 50)]
-    pub slow: usize,
-    #[arg(long, default_value_t = 1)]
-    pub confirm_bars: usize,
-    #[arg(long, default_value_t = 50)]
-    pub buffer_size: u16,
+    pub duration: u64,
+    /// Seconds between child orders.
+    #[arg(long, default_value_t = 60)]
+    pub interval: u64,
+    /// Exposure multiplier for margin sizing and the leverage setting sent to BULK.
+    #[arg(long, default_value_t = 1.0)]
+    pub leverage: f64,
+    #[arg(long, default_value_t = false)]
+    pub reduce_only: bool,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
-    #[arg(long, default_value_t = false)]
-    pub verbose: bool,
 }
 
-impl RunSmaCrossoverArgs {
+#[derive(Clone, Debug, Args)]
+pub struct StrategyJobsArgs {
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct StrategyJobArgs {
+    pub job: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl StrategyJobArgs {
     pub fn validate(&self) -> Result<()> {
-        if self.exchange.trim().is_empty() {
-            bail!("--exchange cannot be empty");
+        if self.job.trim().is_empty() {
+            bail!("strategy job id is required");
         }
-        if !is_valid_symbol(&self.symbol) {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
-        mmt_timeframe_from_seconds(self.timeframe)?;
-        if self.fast < 2 {
-            bail!("--fast must be >= 2");
-        }
-        if self.slow <= self.fast {
-            bail!("--slow must be greater than --fast");
-        }
-        if self.confirm_bars < 1 {
-            bail!("--confirm-bars must be >= 1");
-        }
-        if self.buffer_size == 0 {
-            bail!("--buffer-size must be >= 1");
-        }
-        if let Some(from) = self.from {
-            validate_millisecond_timestamp(from, "--from")?;
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("strategy job commands support only --output terminal|json|jsonl");
         }
         Ok(())
     }
 }
 
 #[derive(Clone, Debug, Args)]
-pub struct BacktestSmaCrossoverArgs {
-    #[arg(long, value_enum, default_value_t = CliDataProvider::Mmt)]
-    pub provider: CliDataProvider,
-    #[arg(long)]
-    pub exchange: String,
-    #[arg(long)]
-    pub symbol: String,
-    #[arg(long)]
-    pub timeframe: u32,
-    #[arg(long)]
-    pub from: u64,
-    #[arg(long)]
-    pub to: u64,
-    #[arg(long, default_value_t = 20)]
-    pub fast: usize,
+pub struct StrategyLogsArgs {
+    pub job: String,
     #[arg(long, default_value_t = 50)]
-    pub slow: usize,
-    #[arg(long, default_value_t = 1)]
-    pub confirm_bars: usize,
+    pub limit: usize,
+    #[arg(long, default_value_t = false)]
+    pub follow: bool,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
-    #[arg(long, default_value_t = false)]
-    pub verbose: bool,
 }
 
-impl BacktestSmaCrossoverArgs {
+impl StrategyLogsArgs {
     pub fn validate(&self) -> Result<()> {
-        if self.exchange.trim().is_empty() {
-            bail!("--exchange cannot be empty");
+        if self.job.trim().is_empty() {
+            bail!("strategy job id is required");
         }
+        if self.limit == 0 {
+            bail!("--limit must be >= 1");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("strategy logs supports only --output terminal|json|jsonl");
+        }
+        if self.follow && matches!(self.output, OutputFormat::Json) {
+            bail!("--follow supports terminal or jsonl output");
+        }
+        Ok(())
+    }
+}
+
+impl RunTwapArgs {
+    pub fn validate(&self) -> Result<()> {
         if !is_valid_symbol(&self.symbol) {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
-        mmt_timeframe_from_seconds(self.timeframe)?;
-        if self.fast < 2 {
-            bail!("--fast must be >= 2");
+        if self
+            .size
+            .is_some_and(|size| !size.is_finite() || size <= 0.0)
+        {
+            bail!("--size must be > 0");
         }
-        if self.slow <= self.fast {
-            bail!("--slow must be greater than --fast");
+        if self
+            .margin
+            .is_some_and(|margin| !margin.is_finite() || margin <= 0.0)
+        {
+            bail!("--margin must be > 0");
         }
-        if self.confirm_bars < 1 {
-            bail!("--confirm-bars must be >= 1");
+        match (self.size, self.margin) {
+            (Some(_), Some(_)) => bail!("set only one of --size or --margin"),
+            (None, None) => bail!("one of --size or --margin is required"),
+            _ => {}
         }
-        validate_millisecond_timestamp(self.from, "--from")?;
-        validate_millisecond_timestamp(self.to, "--to")?;
-        if self.from >= self.to {
-            bail!("--from must be less than --to");
+        if self.duration == 0 {
+            bail!("--duration must be >= 1 second");
+        }
+        if self.interval == 0 {
+            bail!("--interval must be >= 1 second");
+        }
+        if !self.leverage.is_finite() || self.leverage < 1.0 {
+            bail!("--leverage must be at least 1");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| !(margin * self.leverage).is_finite())
+        {
+            bail!("--margin multiplied by --leverage is too large");
+        }
+        if self.dry_run && self.yes {
+            bail!("--yes is not used with --dry-run");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("strategy run supports only --output terminal|json|jsonl");
         }
         Ok(())
     }
@@ -1889,6 +1919,7 @@ mod tests {
                 assert_eq!(args.size, Some(0.001));
                 assert!(matches!(args.order_kind, TradeOrderKind::Limit));
                 assert!(matches!(args.tif, TradeTimeInForce::Alo));
+                assert_eq!(args.leverage, 5.0);
                 assert_eq!(args.sl, Some(64_000.0));
                 assert_eq!(args.tp, Some(67_000.0));
                 assert!(args.dry_run);
@@ -1904,7 +1935,7 @@ mod tests {
             "trade",
             "buy",
             "BTC/USDT",
-            "--notional",
+            "--margin",
             "100",
             "--dry-run",
         ])
@@ -1931,6 +1962,14 @@ mod tests {
                 command: TradeCommands::Short(_)
             }
         ));
+    }
+
+    #[test]
+    fn live_trade_rejects_legacy_notional_sizing() {
+        let error = Cli::try_parse_from(["mlab", "trade", "long", "BTC/USDT", "--notional", "100"])
+            .expect_err("live trade sizing must use margin or size");
+
+        assert!(error.to_string().contains("--notional"));
     }
 
     #[test]
@@ -1966,8 +2005,9 @@ mod tests {
         assert!(matches!(
             set.command,
             Commands::Auth {
-                command: AuthCommands::Set(AuthProviderArgs {
-                    provider: AuthProvider::Mmt
+                command: AuthCommands::Set(AuthSetArgs {
+                    provider: AuthProvider::Mmt,
+                    reauthorize: false
                 })
             }
         ));
@@ -1986,8 +2026,22 @@ mod tests {
         assert!(matches!(
             bulk.command,
             Commands::Auth {
-                command: AuthCommands::Set(AuthProviderArgs {
-                    provider: AuthProvider::Bulk
+                command: AuthCommands::Set(AuthSetArgs {
+                    provider: AuthProvider::Bulk,
+                    reauthorize: false
+                })
+            }
+        ));
+
+        let bulk_reauthorize =
+            Cli::try_parse_from(["mlab", "auth", "set", "bulk", "--reauthorize"])
+                .expect("bulk reauthorization should parse");
+        assert!(matches!(
+            bulk_reauthorize.command,
+            Commands::Auth {
+                command: AuthCommands::Set(AuthSetArgs {
+                    provider: AuthProvider::Bulk,
+                    reauthorize: true
                 })
             }
         ));
@@ -2598,99 +2652,125 @@ mod tests {
     }
 
     #[test]
-    fn parse_strategy_sma_crossover_window_command() {
+    fn parse_strategy_twap_command() {
         let cli = Cli::try_parse_from([
-            "market-lab",
+            "mlab",
             "strategy",
-            "backtest",
-            "sma-crossover",
-            "--provider",
-            "mmt",
-            "--exchange",
-            "bybitf",
-            "--symbol",
+            "run",
+            "twap",
             "BTC/USDT",
-            "--timeframe",
-            "60",
-            "--from",
-            "1704067200000",
-            "--to",
-            "1704067800000",
-            "--fast",
-            "20",
-            "--slow",
-            "50",
+            "--exchange",
+            "bulk",
+            "--side",
+            "buy",
+            "--margin",
+            "1000",
+            "--duration",
+            "300",
+            "--interval",
+            "30",
+            "--dry-run",
         ])
         .expect("strategy parse should succeed");
 
         match cli.command {
             Commands::Strategy {
                 command:
-                    StrategyCommands::Backtest {
-                        command: StrategyBacktestCommands::SmaCrossover(args),
+                    StrategyCommands::Run {
+                        command: StrategyRunCommands::Twap(args),
                     },
             } => {
-                assert_eq!(args.from, 1704067200000);
-                assert_eq!(args.to, 1704067800000);
+                args.validate().expect("TWAP arguments should validate");
+                assert_eq!(args.margin, Some(1000.0));
+                assert_eq!(args.duration, 300);
+                assert_eq!(args.interval, 30);
+                assert!(args.dry_run);
             }
-            _ => panic!("expected strategy backtest sma-crossover command"),
+            _ => panic!("expected strategy run twap command"),
         }
     }
 
     #[test]
-    fn parse_strategy_run_with_from_command() {
-        let cli = Cli::try_parse_from([
-            "market-lab",
+    fn strategy_twap_requires_side() {
+        let error = Cli::try_parse_from([
+            "mlab",
             "strategy",
             "run",
-            "sma-crossover",
-            "--provider",
-            "mmt",
-            "--exchange",
-            "bybitf",
-            "--symbol",
+            "twap",
             "BTC/USDT",
-            "--timeframe",
-            "60",
-            "--from",
-            "1704067200000",
+            "--margin",
+            "1000",
+            "--duration",
+            "300",
         ])
-        .expect("strategy run parse should succeed");
+        .expect_err("TWAP must require a side");
+
+        assert!(error.to_string().contains("--side"));
+    }
+
+    #[test]
+    fn strategy_twap_rejects_zero_duration() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "strategy",
+            "run",
+            "twap",
+            "BTC/USDT",
+            "--side",
+            "sell",
+            "--size",
+            "1",
+            "--duration",
+            "0",
+        ])
+        .expect("syntax should parse before semantic validation");
 
         match cli.command {
             Commands::Strategy {
                 command:
                     StrategyCommands::Run {
-                        command: StrategyRunCommands::SmaCrossover(args),
+                        command: StrategyRunCommands::Twap(args),
                     },
             } => {
-                args.validate().expect("validate should succeed");
-                assert_eq!(args.from, Some(1704067200000));
+                let error = args.validate().expect_err("zero duration must fail");
+                assert!(error.to_string().contains("--duration"));
             }
-            _ => panic!("expected strategy run sma-crossover command"),
+            _ => panic!("expected strategy run twap command"),
         }
     }
 
     #[test]
-    fn reject_strategy_run_with_to() {
-        let err = Cli::try_parse_from([
-            "market-lab",
+    fn parse_strategy_job_management_commands() {
+        let status = Cli::try_parse_from([
+            "mlab",
             "strategy",
-            "run",
-            "sma-crossover",
-            "--provider",
-            "mmt",
-            "--exchange",
-            "bybitf",
-            "--symbol",
-            "BTC/USDT",
-            "--timeframe",
-            "60",
-            "--to",
-            "1704067800",
+            "status",
+            "strategy_123",
+            "--output",
+            "json",
         ])
-        .expect_err("strategy run parse should fail");
-        assert!(err.to_string().contains("--to"));
+        .expect("strategy status should parse");
+        match status.command {
+            Commands::Strategy {
+                command: StrategyCommands::Status(args),
+            } => {
+                args.validate().expect("strategy status should validate");
+                assert_eq!(args.job, "strategy_123");
+            }
+            _ => panic!("expected strategy status command"),
+        }
+
+        let logs = Cli::try_parse_from(["mlab", "strategy", "logs", "strategy_123", "--follow"])
+            .expect("strategy logs should parse");
+        match logs.command {
+            Commands::Strategy {
+                command: StrategyCommands::Logs(args),
+            } => {
+                args.validate().expect("strategy logs should validate");
+                assert!(args.follow);
+            }
+            _ => panic!("expected strategy logs command"),
+        }
     }
 
     #[test]
@@ -2788,8 +2868,6 @@ mod tests {
             "candles@bybitf@mmt:timeframe=60",
             "--param",
             "fast=20",
-            "--leverage",
-            "5",
             "--output",
             "json",
         ])
@@ -2802,7 +2880,6 @@ mod tests {
                 assert_eq!(args.script, "./scripts/sma-cross.js");
                 assert_eq!(args.source, vec!["candles@bybitf@mmt:timeframe=60"]);
                 assert_eq!(args.param, vec!["fast=20"]);
-                assert_eq!(args.leverage, 5.0);
                 args.validate().expect("validate should succeed");
             }
             _ => panic!("expected script backtest command"),
@@ -2894,15 +2971,8 @@ mod tests {
 
     #[test]
     fn reject_script_run_with_leverage() {
-        let err = Cli::try_parse_from([
-            "mlab",
-            "script",
-            "run",
-            "./scripts/sma-cross.js",
-            "--leverage",
-            "5",
-        ])
-        .expect_err("script run should not accept backtest leverage");
+        let err = Cli::try_parse_from(["mlab", "script", "run", "./scripts/sma-cross.js"])
+            .expect_err("script run should not accept backtest leverage");
         assert!(err.to_string().contains("--leverage"));
     }
 

@@ -1,0 +1,135 @@
+use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
+
+use crate::domain::execution::ExecutionVenue;
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategySide {
+    Buy,
+    Sell,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TwapJobDefinition {
+    pub exchange: ExecutionVenue,
+    pub symbol: String,
+    pub side: StrategySide,
+    pub total_size: f64,
+    pub requested_margin: Option<f64>,
+    pub target_margin: f64,
+    pub target_exposure: f64,
+    pub duration_seconds: u64,
+    pub interval_seconds: u64,
+    pub leverage: f64,
+    pub reduce_only: bool,
+}
+
+impl TwapJobDefinition {
+    pub fn validate(&self) -> Result<()> {
+        if self.symbol.trim().is_empty() {
+            bail!("TWAP job symbol is required");
+        }
+        if !self.total_size.is_finite() || self.total_size <= 0.0 {
+            bail!("TWAP job total size must be greater than zero");
+        }
+        if self
+            .requested_margin
+            .is_some_and(|margin| !margin.is_finite() || margin <= 0.0)
+        {
+            bail!("TWAP job requested margin must be greater than zero");
+        }
+        if !self.target_margin.is_finite() || self.target_margin <= 0.0 {
+            bail!("TWAP job target margin must be greater than zero");
+        }
+        if !self.target_exposure.is_finite() || self.target_exposure <= 0.0 {
+            bail!("TWAP job target exposure must be greater than zero");
+        }
+        if self.duration_seconds == 0 {
+            bail!("TWAP job duration must be at least one second");
+        }
+        if self.interval_seconds == 0 {
+            bail!("TWAP job interval must be at least one second");
+        }
+        if !self.leverage.is_finite() || self.leverage < 1.0 {
+            bail!("TWAP job leverage must be at least 1");
+        }
+        let expected_margin = self.target_exposure / self.leverage;
+        if (self.target_margin - expected_margin).abs()
+            > 1e-8_f64.max(expected_margin.abs() * 1e-10)
+        {
+            bail!("TWAP job margin, exposure, and leverage do not agree");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "name", content = "config", rename_all = "snake_case")]
+pub enum StrategyJobDefinition {
+    Twap(TwapJobDefinition),
+}
+
+impl StrategyJobDefinition {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Twap(_) => "twap",
+        }
+    }
+
+    pub fn symbol(&self) -> &str {
+        match self {
+            Self::Twap(definition) => &definition.symbol,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Twap(definition) => definition.validate(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StrategyJobSubmission {
+    pub definition: StrategyJobDefinition,
+}
+
+impl StrategyJobSubmission {
+    pub fn validate(&self) -> Result<()> {
+        self.definition.validate()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyJobStatus {
+    Starting,
+    Running,
+    Stopping,
+    Stopped,
+    Completed,
+    Failed,
+}
+
+impl StrategyJobStatus {
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Starting | Self::Running | Self::Stopping)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StrategyJob {
+    pub id: String,
+    pub definition: StrategyJobDefinition,
+    pub status: StrategyJobStatus,
+    pub pid: Option<u32>,
+    pub created_at_ms: u64,
+    pub started_at_ms: Option<u64>,
+    pub stopped_at_ms: Option<u64>,
+    pub last_heartbeat_ms: Option<u64>,
+    pub last_error: Option<String>,
+}

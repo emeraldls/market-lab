@@ -432,16 +432,31 @@ fn bulk_tif(tif: crate::domain::execution::TimeInForce) -> TimeInForce {
 
 fn validate_transaction_response(response: &Value, operation: &str) -> Result<()> {
     if response.get("status").and_then(Value::as_str) != Some("ok") {
-        bail!("BULK rejected {operation}: {}", response_message(response));
+        let error = response
+            .pointer("/response/data/statuses")
+            .and_then(Value::as_array)
+            .and_then(|statuses| statuses.iter().find_map(status_error))
+            .unwrap_or_else(|| response_message(response));
+        return Err(transaction_rejection(operation, error));
     }
     let statuses = response
         .pointer("/response/data/statuses")
         .and_then(Value::as_array)
         .with_context(|| format!("BULK {operation} response omitted statuses"))?;
     if let Some(error) = statuses.iter().find_map(status_error) {
-        bail!("BULK rejected {operation}: {error}");
+        return Err(transaction_rejection(operation, error));
     }
     Ok(())
+}
+
+fn transaction_rejection(operation: &str, error: String) -> anyhow::Error {
+    if error.to_ascii_lowercase().contains("unauthorized signer") {
+        anyhow::anyhow!(
+            "BULK rejected {operation}: {error}; reauthorize the configured BULK agent with `mlab auth set bulk --reauthorize`"
+        )
+    } else {
+        anyhow::anyhow!("BULK rejected {operation}: {error}")
+    }
 }
 
 fn receipt_from_response(
@@ -985,21 +1000,17 @@ mod tests {
             order_kind: OrderKind::Limit,
             time_in_force: Some(crate::domain::execution::TimeInForce::Gtc),
             requested_size: Some(0.001),
-            requested_notional: None,
             size: 0.001,
             price: Some(65_000.0),
             reference_price: 65_000.0,
-            estimated_notional: 65.0,
+            requested_margin: None,
+            estimated_margin: 13.0,
+            estimated_exposure: 65.0,
+            projected_liquidation_price: None,
             leverage: 5.0,
             reduce_only: false,
             stop_loss_price: None,
             take_profit_price: None,
-            rules: crate::domain::execution::MarketRules {
-                tick_size: 0.001,
-                lot_size: 0.000001,
-                min_notional: 1.0,
-                max_leverage: 40,
-            },
         };
 
         let signed = sign_trade_order(&mut signer, &account, &plan, 1_784_158_000_000_000_000)
@@ -1043,6 +1054,28 @@ mod tests {
                 .pointer("/of/actions/0/rng/pmax")
                 .and_then(Value::as_f64),
             Some(67_000.0)
+        );
+    }
+
+    #[test]
+    fn unauthorized_signer_rejection_includes_reauthorization_command() {
+        let response = serde_json::json!({
+            "status": "error",
+            "response": {
+                "data": {
+                    "statuses": [{
+                        "error": { "message": "unauthorized signer" }
+                    }]
+                }
+            }
+        });
+
+        let error = validate_transaction_response(&response, "leverage update")
+            .expect_err("unauthorized signer must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("mlab auth set bulk --reauthorize")
         );
     }
 }

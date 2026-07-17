@@ -17,13 +17,6 @@ pub enum ScriptSource {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum ScriptMode {
-    Window,
-    Stream,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
 pub enum InputType {
     String,
     Number,
@@ -43,14 +36,11 @@ pub struct ScriptParamSchema {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScriptManifest {
     pub name: String,
     pub version: String,
     pub sources: Vec<ScriptSource>,
-    #[serde(default)]
-    pub modes: Vec<ScriptMode>,
-    #[serde(default)]
-    pub clock: Option<ScriptSource>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -69,11 +59,6 @@ impl ScriptManifest {
         }
         if self.sources.is_empty() {
             bail!("script.sources must not be empty");
-        }
-        if let Some(clock) = &self.clock
-            && !self.sources.contains(clock)
-        {
-            bail!("script.clock must be one of script.sources");
         }
         if matches!(self.lookback, Some(0)) {
             bail!("script.lookback must be >= 1");
@@ -98,10 +83,6 @@ impl ScriptManifest {
             }
         }
         Ok(())
-    }
-
-    pub fn clock_source(&self) -> &ScriptSource {
-        self.clock.as_ref().unwrap_or(&self.sources[0])
     }
 
     pub fn source_names(&self) -> String {
@@ -184,8 +165,6 @@ mod tests {
             name: String::new(),
             version: "1".to_string(),
             sources: candle_sources(),
-            modes: vec![ScriptMode::Window],
-            clock: None,
             description: None,
             lookback: None,
             params: BTreeMap::new(),
@@ -208,8 +187,6 @@ mod tests {
             name: "x".to_string(),
             version: "1".to_string(),
             sources: candle_sources(),
-            modes: vec![ScriptMode::Window],
-            clock: None,
             description: None,
             lookback: None,
             params,
@@ -232,8 +209,6 @@ mod tests {
             name: "x".to_string(),
             version: "1".to_string(),
             sources: candle_sources(),
-            modes: vec![ScriptMode::Window],
-            clock: None,
             description: None,
             lookback: None,
             params,
@@ -247,8 +222,7 @@ mod tests {
         let err = serde_json::from_value::<ScriptManifest>(serde_json::json!({
             "name": "x",
             "version": "1",
-            "sources": ["xyz"],
-            "modes": ["window"]
+            "sources": ["xyz"]
         }))
         .expect_err("unknown source should fail");
 
@@ -256,31 +230,16 @@ mod tests {
     }
 
     #[test]
-    fn manifest_allows_missing_modes() {
-        let manifest = serde_json::from_value::<ScriptManifest>(serde_json::json!({
+    fn manifest_rejects_unknown_fields() {
+        let err = serde_json::from_value::<ScriptManifest>(serde_json::json!({
             "name": "x",
             "version": "1",
-            "sources": ["candles"]
+            "sources": ["candles"],
+            "anything": true
         }))
-        .expect("modes should be optional");
+        .expect_err("unknown field should fail");
 
-        assert!(manifest.modes.is_empty());
-        manifest.validate().expect("manifest should validate");
-    }
-
-    #[test]
-    fn manifest_rejects_clock_outside_sources() {
-        let manifest = ScriptManifest {
-            name: "x".to_string(),
-            version: "1".to_string(),
-            sources: candle_sources(),
-            modes: vec![ScriptMode::Window],
-            clock: Some(ScriptSource::Orderbook),
-            description: None,
-            lookback: None,
-            params: BTreeMap::new(),
-        };
-        assert!(manifest.validate().is_err());
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]
@@ -289,8 +248,6 @@ mod tests {
             name: "x".to_string(),
             version: "1".to_string(),
             sources: candle_sources(),
-            modes: vec![ScriptMode::Window],
-            clock: None,
             description: None,
             lookback: Some(0),
             params: BTreeMap::new(),
@@ -306,8 +263,6 @@ mod tests {
             name: "x".to_string(),
             version: "1".to_string(),
             sources: candle_sources(),
-            modes: vec![ScriptMode::Window],
-            clock: None,
             description: None,
             lookback: Some(SCRIPT_MAX_LOOKBACK_CANDLES + 1),
             params: BTreeMap::new(),

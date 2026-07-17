@@ -10,8 +10,9 @@ verbose = false
 [sources."candles@binancef@mmt"]
 timeframe = 60
 
-[sources."orderbook@bulk"]
+[sources."orderbook@lighterf@mmt"]
 depth = 20
+timeframe = 60
 
 [script]
 path = "./examples/sma-crossover.js"
@@ -21,8 +22,12 @@ path = "./examples/sma-crossover.js"
 [script.params]
 max_spread = 1
 max_slippage = 0.1
-entry_amount_dollar = 150
+margin = 150
 leverage = 5
 
 [execution]
 venue = "bulk"
+
+[backtest]
+from = 1784206676777
+to = 1784326676777

@@ -14,6 +14,7 @@ use crate::commands::script::{
 use crate::commands::source::common::render_terminal;
 use crate::core::orderbook::OrderBookState;
 use crate::domain::enums::ProviderKind;
+use crate::domain::execution::Position;
 use crate::domain::types::{
     OiCandle, OpenInterestSnapshot, OrderBookSnapshot, TradeTick, VdCandle, VolumeDeltaTick,
     VolumeProfile,
@@ -311,6 +312,7 @@ async fn stream_sources(
     let mut hooks = 0_u64;
     let mut summary = ScriptRunSummary::default();
     let mut event_cursor = worker.initial_event_cursor;
+    let mut positions = crate::runtime::script_positions(job_id).await?;
     let mut execution_events = tokio::time::interval(std::time::Duration::from_millis(250));
     execution_events.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -349,13 +351,14 @@ async fn stream_sources(
             }
             _ = execution_events.tick() => {
                 dispatch_execution_events(&session, job_id, &mut event_cursor).await?;
+                positions = crate::runtime::script_positions(job_id).await?;
                 continue;
             }
         };
 
         let ts_ms = update.ts_ms();
-        let payload = live_stream_payload(&update, &source_configs, &market.symbol)?;
-        let execution = match session.run_stream(payload) {
+        let payload = live_stream_payload(&update, &source_configs, &market.symbol, &positions)?;
+        let execution = match session.run_event(payload) {
             Ok(execution) => execution,
             Err(err) => {
                 report.record_hook_failure();
@@ -1093,9 +1096,9 @@ fn live_stream_payload(
     update: &LiveUpdate,
     source_configs: &SourceConfigs,
     symbol: &str,
+    positions: &[Position],
 ) -> Result<Value> {
     let mut payload = serde_json::Map::new();
-    payload.insert("mode".to_string(), Value::String("stream".to_string()));
     payload.insert("source".to_string(), Value::String(update.selector.clone()));
     payload.insert(
         "source_type".to_string(),
@@ -1122,8 +1125,33 @@ fn live_stream_payload(
         "source_configs".to_string(),
         source_configs_payload(source_configs),
     );
+    payload.insert(
+        "positions".to_string(),
+        json!({
+            "open": positions.iter().map(live_position_payload).collect::<Vec<_>>()
+        }),
+    );
 
     Ok(Value::Object(payload))
+}
+
+fn live_position_payload(position: &Position) -> Value {
+    let margin = position.notional / position.leverage.max(f64::EPSILON);
+    json!({
+        "id": format!("{}:{:?}", position.venue_symbol, position.direction).to_lowercase(),
+        "side": position.direction,
+        "entry_price": position.entry_price,
+        "mark_price": position.mark_price,
+        "notional": position.notional,
+        "margin": margin,
+        "leverage": position.leverage,
+        "qty": position.size,
+        "realized_pnl": position.realized_pnl,
+        "unrealized_pnl": position.unrealized_pnl,
+        "liquidation_price": position.liquidation_price,
+        "fees": position.fees,
+        "funding": position.funding,
+    })
 }
 
 fn live_record_payload(record: &LiveRecord, config: &SourceConfig) -> Value {
@@ -1309,7 +1337,8 @@ mod tests {
             LiveRecord::Candles(candle(20.0)),
         );
 
-        let payload = live_stream_payload(&okx, &configs, "BTC/USDT").expect("build live payload");
+        let payload =
+            live_stream_payload(&okx, &configs, "BTC/USDT", &[]).expect("build live payload");
 
         assert_eq!(payload["source"], "candles@okx@mmt");
         assert_eq!(payload["source_type"], "candles");

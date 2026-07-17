@@ -58,14 +58,6 @@ pub struct VenueCapabilities {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct MarketRules {
-    pub tick_size: f64,
-    pub lot_size: f64,
-    pub min_notional: f64,
-    pub max_leverage: u16,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TradePlan {
     pub created_at_ms: u64,
     pub venue: ExecutionVenue,
@@ -77,18 +69,20 @@ pub struct TradePlan {
     pub order_kind: OrderKind,
     pub time_in_force: Option<TimeInForce>,
     pub requested_size: Option<f64>,
-    pub requested_notional: Option<f64>,
     pub size: f64,
     pub price: Option<f64>,
     pub reference_price: f64,
-    pub estimated_notional: f64,
+    pub requested_margin: Option<f64>,
+    pub estimated_margin: f64,
+    pub estimated_exposure: f64,
+    /// BULK does not expose a pre-trade portfolio-liquidation simulation.
+    pub projected_liquidation_price: Option<f64>,
     pub leverage: f64,
     pub reduce_only: bool,
     #[serde(default)]
     pub stop_loss_price: Option<f64>,
     #[serde(default)]
     pub take_profit_price: Option<f64>,
-    pub rules: MarketRules,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -72,25 +72,65 @@ impl Default for ScriptOrderRequest {
     }
 }
 
-fn default_leverage() -> f64 {
-    1.0
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScriptPositionOperation {
+    OpenLong,
+    OpenShort,
+    CloseLong,
+    CloseShort,
+}
+
+impl ScriptPositionOperation {
+    pub fn position_direction(self) -> PositionDirection {
+        match self {
+            Self::OpenLong | Self::CloseLong => PositionDirection::Long,
+            Self::OpenShort | Self::CloseShort => PositionDirection::Short,
+        }
+    }
+
+    pub fn order_direction(self) -> PositionDirection {
+        match self {
+            Self::OpenLong | Self::CloseShort => PositionDirection::Long,
+            Self::OpenShort | Self::CloseLong => PositionDirection::Short,
+        }
+    }
+
+    pub fn is_open(self) -> bool {
+        matches!(self, Self::OpenLong | Self::OpenShort)
+    }
+
+    pub fn is_close(self) -> bool {
+        !self.is_open()
+    }
+
+    pub fn reduce_only(self) -> bool {
+        self.is_close()
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenLong => "open-long",
+            Self::OpenShort => "open-short",
+            Self::CloseLong => "close-long",
+            Self::CloseShort => "close-short",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ScriptTradeRequest {
     pub key: String,
-    pub side: PositionDirection,
+    pub position: ScriptPositionOperation,
     #[serde(default)]
     pub size: Option<f64>,
     #[serde(default)]
-    pub notional: Option<f64>,
-    #[serde(default = "default_leverage")]
-    pub leverage: f64,
+    pub margin: Option<f64>,
+    #[serde(default)]
+    pub leverage: Option<f64>,
     #[serde(default)]
     pub order: ScriptOrderRequest,
-    #[serde(default)]
-    pub reduce_only: bool,
     #[serde(default, alias = "stopLoss", alias = "stop_loss")]
     pub sl: Option<f64>,
     #[serde(default, alias = "takeProfit", alias = "take_profit")]
@@ -98,25 +138,49 @@ pub struct ScriptTradeRequest {
 }
 
 impl ScriptTradeRequest {
+    pub fn leverage_or_default(&self) -> f64 {
+        self.leverage.unwrap_or(1.0)
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_key(&self.key)?;
-        match (self.size, self.notional) {
-            (Some(_), Some(_)) => bail!("ctx.trade requires only one of size or notional"),
-            (None, None) => bail!("ctx.trade requires one of size or notional"),
-            _ => {}
+        if self.position.is_open() {
+            match (self.size, self.margin) {
+                (Some(_), Some(_)) => bail!("ctx.trade requires only one of size or margin"),
+                (None, None) => bail!("ctx.trade opening operations require size or margin"),
+                _ => {}
+            }
+        } else {
+            if self.margin.is_some() {
+                bail!("ctx.trade closing operations accept size, not margin");
+            }
+            if self.leverage.is_some() {
+                bail!("ctx.trade leverage is only valid for opening operations");
+            }
+            if self.sl.is_some() || self.tp.is_some() {
+                bail!("ctx.trade sl/tp are only valid for opening operations");
+            }
         }
         if let Some(size) = self.size
             && (!size.is_finite() || size <= 0.0)
         {
             bail!("ctx.trade size must be > 0");
         }
-        if let Some(notional) = self.notional
-            && (!notional.is_finite() || notional <= 0.0)
+        if let Some(margin) = self.margin
+            && (!margin.is_finite() || margin <= 0.0)
         {
-            bail!("ctx.trade notional must be > 0");
+            bail!("ctx.trade margin must be > 0");
         }
-        if !self.leverage.is_finite() || self.leverage < 1.0 {
-            bail!("ctx.trade leverage must be at least 1");
+        if let Some(leverage) = self.leverage {
+            if !leverage.is_finite() || leverage < 1.0 {
+                bail!("ctx.trade leverage must be at least 1");
+            }
+            if self
+                .margin
+                .is_some_and(|margin| !(margin * leverage).is_finite())
+            {
+                bail!("ctx.trade margin multiplied by leverage is too large");
+            }
         }
         match self.order.kind {
             ScriptOrderKind::Market if self.order.price.is_some() => {
@@ -140,13 +204,8 @@ impl ScriptTradeRequest {
         if let Some(price) = self.tp {
             validate_price("ctx.trade tp", price)?;
         }
-        if self.sl.is_some() || self.tp.is_some() {
-            if self.reduce_only {
-                bail!("ctx.trade sl/tp cannot be attached to a reduce-only order");
-            }
-            if self.sl == self.tp {
-                bail!("ctx.trade sl and tp must use different prices");
-            }
+        if (self.sl.is_some() || self.tp.is_some()) && self.sl == self.tp {
+            bail!("ctx.trade sl and tp must use different prices");
         }
         Ok(())
     }
@@ -343,8 +402,8 @@ mod tests {
     fn validates_limit_trade_with_protection() {
         let request: ScriptTradeRequest = serde_json::from_value(json!({
             "key": "entry-1",
-            "side": "long",
-            "notional": 100,
+            "position": "open-long",
+            "margin": 100,
             "leverage": 5,
             "order": { "type": "limit", "price": 64000, "tif": "gtc" },
             "sl": 63000,
@@ -353,6 +412,44 @@ mod tests {
         .expect("decode request");
         request.validate().expect("valid request");
         assert_eq!(request.order.kind, ScriptOrderKind::Limit);
+    }
+
+    #[test]
+    fn rejects_legacy_notional_trade_sizing() {
+        let error = serde_json::from_value::<ScriptTradeRequest>(json!({
+            "key": "entry-1",
+            "position": "open-long",
+            "notional": 100,
+            "leverage": 5
+        }))
+        .expect_err("ctx.trade sizing must use margin or size");
+
+        assert!(error.to_string().contains("notional"));
+    }
+
+    #[test]
+    fn validates_full_position_close_without_sizing() {
+        let request: ScriptTradeRequest = serde_json::from_value(json!({
+            "key": "exit-1",
+            "position": "close-long"
+        }))
+        .expect("decode close request");
+
+        request.validate().expect("valid close request");
+        assert!(request.position.reduce_only());
+        assert_eq!(request.position.order_direction(), PositionDirection::Short);
+    }
+
+    #[test]
+    fn rejects_margin_on_position_close() {
+        let request: ScriptTradeRequest = serde_json::from_value(json!({
+            "key": "exit-1",
+            "position": "close-short",
+            "margin": 100
+        }))
+        .expect("decode close request");
+
+        assert!(request.validate().is_err());
     }
 
     #[test]

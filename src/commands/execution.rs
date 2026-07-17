@@ -10,8 +10,8 @@ use crate::cli::{
 };
 use crate::credentials;
 use crate::domain::execution::{
-    CancelPlan, ExecutionReceipt, ExecutionVenue, MarketRules, OpenOrder, Position,
-    PositionDirection, TimeInForce, TradePlan,
+    CancelPlan, ExecutionReceipt, ExecutionVenue, OpenOrder, Position, PositionDirection,
+    TimeInForce, TradePlan,
 };
 use crate::providers::bulk::catalog::{self, BulkMarket};
 use crate::providers::bulk::execution::BulkExecutionAdapter;
@@ -47,7 +47,26 @@ pub async fn handle_trade(args: TradeArgs, direction: PositionDirection) -> Resu
     }
 
     let receipt = crate::runtime::submit_trade(&plan).await?;
-    render_trade_result(&plan, &receipt, args.output)
+    let post_trade_position = if matches!(receipt.status.as_str(), "filled" | "partiallyFilled") {
+        match BulkExecutionAdapter::new() {
+            Ok(adapter) => {
+                adapter
+                    .account_snapshot(&plan.account)
+                    .await
+                    .ok()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .positions
+                            .into_iter()
+                            .find(|position| position.internal_symbol == plan.internal_symbol)
+                    })
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    render_trade_result(&plan, &receipt, post_trade_position.as_ref(), args.output)
 }
 
 pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
@@ -167,7 +186,7 @@ pub async fn handle_close(args: ClosePositionArgs) -> Result<()> {
             config: None,
             venue: args.venue,
             size: Some(position.size),
-            notional: None,
+            margin: None,
             order_kind: TradeOrderKind::Market,
             price: None,
             tif: TradeTimeInForce::Gtc,
@@ -276,23 +295,24 @@ pub(crate) async fn build_trade_plan(
         }
         round_to_precision(size, market.size_precision)
     } else {
-        let raw_size = args
-            .notional
-            .context("one of --size or --notional is required")?
-            / reference_price;
+        let margin = args
+            .margin
+            .context("one of --size or --margin is required")?;
+        let raw_size = exposure_from_margin(margin, args.leverage)? / reference_price;
         floor_to_step(raw_size, market.lot_size, market.size_precision)
     };
     if size <= 0.0 {
         bail!(
-            "requested notional is too small for BULK lot size {} on {}",
+            "requested margin and leverage produce a size below BULK lot size {} on {}",
             market.lot_size,
             market.internal_symbol
         );
     }
-    let estimated_notional = size * reference_price;
-    if estimated_notional + f64::EPSILON < market.min_notional {
+    let estimated_exposure = size * reference_price;
+    let estimated_margin = estimated_exposure / args.leverage;
+    if estimated_exposure + f64::EPSILON < market.min_notional {
         bail!(
-            "estimated notional {estimated_notional:.8} is below BULK minimum {} for {}",
+            "estimated exposure {estimated_exposure:.8} is below BULK minimum notional {} for {}",
             market.min_notional,
             market.internal_symbol
         );
@@ -310,21 +330,17 @@ pub(crate) async fn build_trade_plan(
         time_in_force: matches!(args.order_kind, TradeOrderKind::Limit)
             .then(|| TimeInForce::from(args.tif)),
         requested_size: args.size,
-        requested_notional: args.notional,
         size,
         price: args.price,
         reference_price,
-        estimated_notional,
+        requested_margin: args.margin,
+        estimated_margin,
+        estimated_exposure,
+        projected_liquidation_price: None,
         leverage: args.leverage,
         reduce_only: args.reduce_only,
         stop_loss_price: args.sl,
         take_profit_price: args.tp,
-        rules: MarketRules {
-            tick_size: market.tick_size,
-            lot_size: market.lot_size,
-            min_notional: market.min_notional,
-            max_leverage: market.max_leverage,
-        },
     })
 }
 
@@ -429,6 +445,14 @@ fn is_step_aligned(value: f64, step: f64) -> bool {
     (units - units.round()).abs() <= 1e-8_f64.max(units.abs() * 1e-12)
 }
 
+fn exposure_from_margin(margin: f64, leverage: f64) -> Result<f64> {
+    let exposure = margin * leverage;
+    if !exposure.is_finite() {
+        bail!("--margin multiplied by --leverage is too large");
+    }
+    Ok(exposure)
+}
+
 fn floor_to_step(value: f64, step: f64, precision: u8) -> f64 {
     let units = (value / step + 1e-10).floor();
     round_to_precision(units * step, precision)
@@ -471,8 +495,13 @@ fn render_trade_plan(plan: &TradePlan, dry_run: bool, output: OutputFormat) -> R
                 println!("  limit price:       {price}");
             }
             println!("  reference price:   {}", plan.reference_price);
-            println!("  est. notional:     {:.8}", plan.estimated_notional);
+            if let Some(margin) = plan.requested_margin {
+                println!("  requested margin:  {margin:.8}");
+            }
+            println!("  est. margin:       {:.8}", plan.estimated_margin);
+            println!("  est. exposure:     {:.8}", plan.estimated_exposure);
             println!("  leverage:          {}x", plan.leverage);
+            println!("  liquidation price: determined by BULK after fill");
             println!("  reduce only:       {}", plan.reduce_only);
             if let Some(price) = plan.stop_loss_price {
                 println!("  stop loss:         {price} (native on-fill trigger)");
@@ -480,13 +509,6 @@ fn render_trade_plan(plan: &TradePlan, dry_run: bool, output: OutputFormat) -> R
             if let Some(price) = plan.take_profit_price {
                 println!("  take profit:       {price} (native on-fill trigger)");
             }
-            println!(
-                "  rules:              tick={} lot={} min={} max_leverage={}x",
-                plan.rules.tick_size,
-                plan.rules.lot_size,
-                plan.rules.min_notional,
-                plan.rules.max_leverage
-            );
         }
         OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
     }
@@ -541,6 +563,7 @@ fn confirm_live_action(output: OutputFormat, prompt: &str) -> Result<bool> {
 struct TradeExecutionOutput<'a> {
     plan: &'a TradePlan,
     receipt: &'a ExecutionReceipt,
+    post_trade_position: Option<&'a Position>,
 }
 
 #[derive(Serialize)]
@@ -552,13 +575,26 @@ struct CancelExecutionOutput<'a> {
 fn render_trade_result(
     plan: &TradePlan,
     receipt: &ExecutionReceipt,
+    post_trade_position: Option<&Position>,
     output: OutputFormat,
 ) -> Result<()> {
-    let result = TradeExecutionOutput { plan, receipt };
+    let result = TradeExecutionOutput {
+        plan,
+        receipt,
+        post_trade_position,
+    };
     match output {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
         OutputFormat::Jsonl => println!("{}", serde_json::to_string(&result)?),
-        OutputFormat::Terminal => render_terminal_receipt(receipt),
+        OutputFormat::Terminal => {
+            render_terminal_receipt(receipt);
+            if let Some(position) = post_trade_position {
+                println!("  position leverage: {}x", position.leverage);
+                println!("  liquidation price: {}", position.liquidation_price);
+            } else if matches!(receipt.status.as_str(), "filled" | "partiallyFilled") {
+                println!("  liquidation price: not yet available from BULK");
+            }
+        }
         OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
     }
     Ok(())
@@ -691,8 +727,16 @@ mod tests {
     }
 
     #[test]
-    fn floors_notional_size_to_lot_size() {
+    fn floors_exposure_size_to_lot_size() {
         assert_eq!(floor_to_step(0.0012349, 0.000001, 6), 0.001234);
+    }
+
+    #[test]
+    fn margin_is_multiplied_by_leverage_to_create_exposure() {
+        assert_eq!(
+            exposure_from_margin(100.0, 10.0).expect("valid exposure"),
+            1_000.0
+        );
     }
 
     #[test]
