@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,8 +30,9 @@ use crate::providers::mmt::ws_client::MmtWsClient;
 use crate::scripting::engine::Script;
 use crate::scripting::execution::{ScriptExecutionCommand, ScriptExecutionContext};
 use crate::scripting::inputs::{
-    SourceConfigs, parse_param_values, parse_source_configs, populate_source_defaults,
-    resolve_params, validate_bulk_source_configs, validate_source_configs_for_run,
+    SourceConfig, SourceConfigs, parse_param_values, parse_source_configs,
+    populate_source_defaults, resolve_params, source_config, source_exchange_label,
+    validate_bulk_source_configs, validate_source_configs_for_run,
 };
 use crate::scripting::jobs::ScriptJobSubmission;
 use crate::scripting::manifest::ScriptSource;
@@ -84,15 +85,11 @@ struct ScriptRunOutput {
 
 #[derive(Debug, Clone, Default)]
 struct LiveState {
-    candles: Option<ScriptCandle>,
-    orderbook: Option<OrderBookSnapshot>,
-    vd: Option<ScriptVolumeDelta>,
-    oi: Option<ScriptOpenInterest>,
-    volumes: Option<ScriptVolume>,
+    records: BTreeMap<String, LiveRecord>,
 }
 
 #[derive(Debug, Clone)]
-enum LiveUpdate {
+enum LiveRecord {
     Candles(ScriptCandle),
     Orderbook(OrderBookSnapshot),
     Vd(ScriptVolumeDelta),
@@ -100,15 +97,55 @@ enum LiveUpdate {
     Volumes(ScriptVolume),
 }
 
+#[derive(Debug, Clone)]
+struct LiveUpdate {
+    selector: String,
+    source: ScriptSource,
+    exchange: String,
+    record: LiveRecord,
+}
+
 struct ScriptRunMarket {
     provider: ProviderKind,
-    exchange: String,
     symbol: String,
 }
 
 struct ScriptWorkerState<'a> {
     job_id: &'a str,
     initial_event_cursor: u64,
+}
+
+pub(super) fn default_script_exchange(
+    provider: ProviderKind,
+    exchange: Option<&str>,
+) -> Result<Option<String>> {
+    match provider {
+        ProviderKind::Mmt => exchange
+            .map(|exchange| {
+                let exchange = exchange.trim().to_ascii_lowercase();
+                if exchange.is_empty() {
+                    bail!("--exchange cannot be empty");
+                }
+                Ok(exchange)
+            })
+            .transpose(),
+        ProviderKind::Bulk => {
+            if exchange.is_some_and(|exchange| !exchange.eq_ignore_ascii_case("bulk")) {
+                bail!("--exchange must be omitted or set to `bulk` with --provider bulk");
+            }
+            Ok(Some("bulk".to_string()))
+        }
+        ProviderKind::MarketLab => bail!("script run supports --provider mmt|bulk"),
+    }
+}
+
+fn uses_unqualified_source(sources: &[String]) -> bool {
+    sources.iter().any(|value| {
+        value
+            .split_once(':')
+            .map(|(selector, _)| !selector.contains('@'))
+            .unwrap_or(true)
+    })
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -137,24 +174,29 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
     }
     let script = Script::load(&args.script)?;
     let provider: ProviderKind = args.provider.into();
-    let exchange = args.exchange_name()?.to_string();
+    let default_exchange = default_script_exchange(provider, args.exchange.as_deref())?;
     let symbol = require_symbol(args.symbol.as_deref())?;
     let symbol = match provider {
         ProviderKind::Bulk => catalog::market(symbol)?.internal_symbol.clone(),
         ProviderKind::Mmt => symbol.to_string(),
         ProviderKind::MarketLab => unreachable!(),
     };
-    let mut source_configs = parse_source_configs(&args.source)?;
+    let mut source_configs = parse_source_configs(&args.source, default_exchange.as_deref())?;
     match provider {
         ProviderKind::Mmt => validate_source_configs_for_run(&script.manifest, &source_configs)?,
         ProviderKind::Bulk => {
-            populate_source_defaults(&script.manifest, &mut source_configs);
+            populate_source_defaults(&script.manifest, &mut source_configs, "bulk");
             validate_bulk_source_configs(&script.manifest, &source_configs, false)?;
         }
         ProviderKind::MarketLab => unreachable!(),
     };
     let raw_params = parse_param_values(&args.param)?;
     resolve_params(&script.manifest, &raw_params)?;
+    let exchange = if uses_unqualified_source(&args.source) {
+        default_exchange.context("unqualified script sources require --exchange")?
+    } else {
+        source_exchange_label(&source_configs)
+    };
 
     let submission = ScriptJobSubmission {
         script_name: script.manifest.name.clone(),
@@ -207,8 +249,9 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
         script: job.definition.snapshot_path.display().to_string(),
         config: None,
         provider,
-        exchange: (job.definition.provider == ProviderKind::Mmt)
-            .then(|| job.definition.exchange.clone()),
+        exchange: (job.definition.provider == ProviderKind::Mmt
+            && uses_unqualified_source(&job.definition.sources))
+        .then(|| job.definition.exchange.clone()),
         symbol: Some(job.definition.symbol.clone()),
         venue,
         from: None,
@@ -258,7 +301,7 @@ async fn run(
         );
     }
     let provider: ProviderKind = args.provider.into();
-    let exchange = args.exchange_name()?.to_string();
+    let default_exchange = default_script_exchange(provider, args.exchange.as_deref())?;
     let symbol = require_symbol(args.symbol.as_deref())?;
     let symbol = match provider {
         ProviderKind::Bulk => catalog::market(symbol)?.internal_symbol.clone(),
@@ -266,11 +309,11 @@ async fn run(
         ProviderKind::MarketLab => unreachable!(),
     };
 
-    let mut source_configs = parse_source_configs(&args.source)?;
+    let mut source_configs = parse_source_configs(&args.source, default_exchange.as_deref())?;
     match provider {
         ProviderKind::Mmt => validate_source_configs_for_run(&script.manifest, &source_configs)?,
         ProviderKind::Bulk => {
-            populate_source_defaults(&script.manifest, &mut source_configs);
+            populate_source_defaults(&script.manifest, &mut source_configs, "bulk");
             validate_bulk_source_configs(&script.manifest, &source_configs, false)?;
         }
         ProviderKind::MarketLab => unreachable!(),
@@ -278,11 +321,7 @@ async fn run(
     let raw_params = parse_param_values(&args.param)?;
     let resolved_params = resolve_params(&script.manifest, &raw_params)?;
 
-    let market = ScriptRunMarket {
-        provider,
-        exchange,
-        symbol,
-    };
+    let market = ScriptRunMarket { provider, symbol };
     stream_sources(
         args,
         script,
@@ -311,14 +350,8 @@ async fn stream_sources(
     report.set_phase("connecting_streams");
     write_running_report_best_effort(report);
 
-    let mut streams = ScriptLiveStreams::connect(
-        market.provider,
-        &script,
-        &source_configs,
-        &market.exchange,
-        &market.symbol,
-    )
-    .await?;
+    let mut streams =
+        ScriptLiveStreams::connect(market.provider, &source_configs, &market.symbol).await?;
 
     let session = script.start_session_with_execution(
         &resolved_params,
@@ -380,15 +413,13 @@ async fn stream_sources(
             }
         };
 
-        let source = update.source();
         let ts_ms = update.ts_ms();
-        live_state.apply(update);
+        live_state.apply(&update);
         let payload = live_stream_payload(
-            source,
             &live_state,
+            &update,
             &source_configs,
             provider_name(market.provider),
-            &market.exchange,
             &market.symbol,
         )?;
         let execution = match session.run_stream(payload) {
@@ -414,7 +445,7 @@ async fn stream_sources(
             r#type: "script.run.result",
             version: "1",
             provider: provider_name(market.provider),
-            exchange: market.exchange.clone(),
+            exchange: update.exchange.clone(),
             symbol: market.symbol.clone(),
             ts_ms,
             stream: true,
@@ -513,7 +544,7 @@ enum ScriptLiveStreams {
     Mmt {
         ws: MmtWsClient,
         source_configs: SourceConfigs,
-        orderbook_state: Option<OrderBookState>,
+        orderbook_states: BTreeMap<String, OrderBookState>,
     },
     Bulk(Box<BulkScriptStreams>),
 }
@@ -521,23 +552,21 @@ enum ScriptLiveStreams {
 impl ScriptLiveStreams {
     async fn connect(
         provider: ProviderKind,
-        script: &Script,
         source_configs: &SourceConfigs,
-        exchange: &str,
         symbol: &str,
     ) -> Result<Self> {
         match provider {
             ProviderKind::Mmt => {
                 let ws = MmtWsClient::shared().await?;
-                subscribe_mmt_sources(&ws, script, source_configs, exchange, symbol).await?;
+                subscribe_mmt_sources(&ws, source_configs, symbol).await?;
                 Ok(Self::Mmt {
                     ws,
                     source_configs: source_configs.clone(),
-                    orderbook_state: orderbook_state(source_configs),
+                    orderbook_states: orderbook_states(source_configs),
                 })
             }
             ProviderKind::Bulk => Ok(Self::Bulk(Box::new(
-                BulkScriptStreams::connect(script, source_configs, symbol).await?,
+                BulkScriptStreams::connect(source_configs, symbol).await?,
             ))),
             ProviderKind::MarketLab => bail!("script run supports --provider mmt|bulk"),
         }
@@ -548,14 +577,15 @@ impl ScriptLiveStreams {
             Self::Mmt {
                 ws,
                 source_configs,
-                orderbook_state,
-            } => next_mmt_update(ws, source_configs, orderbook_state).await,
+                orderbook_states,
+            } => next_mmt_update(ws, source_configs, orderbook_states).await,
             Self::Bulk(streams) => streams.next_update().await.map(Some),
         }
     }
 }
 
 struct BulkScriptStreams {
+    source_configs: SourceConfigs,
     candles: Option<BulkCandleStream>,
     orderbook: Option<BulkOrderBookStream>,
     vd: Option<BulkTradesStream>,
@@ -565,45 +595,49 @@ struct BulkScriptStreams {
 }
 
 impl BulkScriptStreams {
-    async fn connect(
-        script: &Script,
-        source_configs: &SourceConfigs,
-        symbol: &str,
-    ) -> Result<Self> {
-        let candles = if script.manifest.sources.contains(&ScriptSource::Candles) {
-            let seconds = source_configs
-                .get(&ScriptSource::Candles)
-                .context("missing source config for candles")?
+    async fn connect(source_configs: &SourceConfigs, symbol: &str) -> Result<Self> {
+        let candles = if source_configs
+            .values()
+            .any(|config| config.source == ScriptSource::Candles)
+        {
+            let seconds = source_config(source_configs, &ScriptSource::Candles)?
                 .require_timeframe(&ScriptSource::Candles)?;
             let interval = crate::providers::bulk::market_data::timeframe_from_seconds(seconds)?;
             Some(BulkCandleStream::connect(symbol, interval).await?)
         } else {
             None
         };
-        let orderbook = if script.manifest.sources.contains(&ScriptSource::Orderbook) {
-            let depth = source_configs
-                .get(&ScriptSource::Orderbook)
-                .context("missing source config for orderbook")?
-                .depth_or_default();
+        let orderbook = if source_configs
+            .values()
+            .any(|config| config.source == ScriptSource::Orderbook)
+        {
+            let depth = source_config(source_configs, &ScriptSource::Orderbook)?.depth_or_default();
             let state_cap = (depth as usize).saturating_mul(10).clamp(100, 10_000);
             Some(BulkOrderBookStream::connect(symbol, depth, state_cap).await?)
         } else {
             None
         };
-        let vd = if script.manifest.sources.contains(&ScriptSource::Vd) {
+        let vd = if source_configs
+            .values()
+            .any(|config| config.source == ScriptSource::Vd)
+        {
             Some(BulkTradesStream::connect(symbol).await?)
         } else {
             None
         };
-        let oi = if script.manifest.sources.contains(&ScriptSource::Oi) {
+        let oi = if source_configs
+            .values()
+            .any(|config| config.source == ScriptSource::Oi)
+        {
             Some(BulkTickerStream::connect(symbol).await?)
         } else {
             None
         };
-        let volumes = if script.manifest.sources.contains(&ScriptSource::Volumes) {
-            let seconds = source_configs
-                .get(&ScriptSource::Volumes)
-                .context("missing source config for volumes")?
+        let volumes = if source_configs
+            .values()
+            .any(|config| config.source == ScriptSource::Volumes)
+        {
+            let seconds = source_config(source_configs, &ScriptSource::Volumes)?
                 .require_timeframe(&ScriptSource::Volumes)?;
             let interval = crate::providers::bulk::market_data::timeframe_from_seconds(seconds)?;
             Some(BulkCandleStream::connect(symbol, interval).await?)
@@ -611,6 +645,7 @@ impl BulkScriptStreams {
             None
         };
         Ok(Self {
+            source_configs: source_configs.clone(),
             candles,
             orderbook,
             vd,
@@ -632,33 +667,48 @@ impl BulkScriptStreams {
             let vd = &mut self.vd;
             let oi = &mut self.oi;
             let volumes = &mut self.volumes;
+            let candles_config = source_config(&self.source_configs, &ScriptSource::Candles)
+                .ok()
+                .cloned();
+            let orderbook_config = source_config(&self.source_configs, &ScriptSource::Orderbook)
+                .ok()
+                .cloned();
+            let vd_config = source_config(&self.source_configs, &ScriptSource::Vd)
+                .ok()
+                .cloned();
+            let oi_config = source_config(&self.source_configs, &ScriptSource::Oi)
+                .ok()
+                .cloned();
+            let volumes_config = source_config(&self.source_configs, &ScriptSource::Volumes)
+                .ok()
+                .cloned();
 
             tokio::select! {
                 candle = async { candles.as_mut().expect("guarded candle stream").next_candle().await }, if has_candles => {
-                    return Ok(LiveUpdate::Candles(ScriptCandle::from_bulk(candle?)));
+                    return Ok(LiveUpdate::new(candles_config.as_ref().expect("configured candle source"), LiveRecord::Candles(ScriptCandle::from_bulk(candle?))));
                 }
                 snapshot = async { orderbook.as_mut().expect("guarded orderbook stream").next_snapshot().await }, if has_orderbook => {
-                    return Ok(LiveUpdate::Orderbook(snapshot?));
+                    return Ok(LiveUpdate::new(orderbook_config.as_ref().expect("configured orderbook source"), LiveRecord::Orderbook(snapshot?)));
                 }
                 trades = async { vd.as_mut().expect("guarded trades stream").next_trades().await }, if has_vd => {
                     let trades = trades?;
                     if let Some(update) = bulk_vd_update(&trades, &mut self.cumulative_delta) {
-                        return Ok(LiveUpdate::Vd(update));
+                        return Ok(LiveUpdate::new(vd_config.as_ref().expect("configured vd source"), LiveRecord::Vd(update)));
                     }
                 }
                 ticker = async { oi.as_mut().expect("guarded ticker stream").next_ticker().await }, if has_oi => {
                     let ticker = ticker?;
-                    return Ok(LiveUpdate::Oi(ScriptOpenInterest::from_bulk(OpenInterestSnapshot {
+                    return Ok(LiveUpdate::new(oi_config.as_ref().expect("configured oi source"), LiveRecord::Oi(ScriptOpenInterest::from_bulk(OpenInterestSnapshot {
                         exchange: ticker.exchange,
                         symbol: ticker.symbol,
                         timestamp_ms: ticker.timestamp_ms,
                         open_interest: ticker.open_interest,
                         mark_price: ticker.mark_price,
                         notional: ticker.open_interest * ticker.mark_price,
-                    })));
+                    }))));
                 }
                 candle = async { volumes.as_mut().expect("guarded volume stream").next_candle().await }, if has_volumes => {
-                    return Ok(LiveUpdate::Volumes(ScriptVolume::from_bulk_candle(candle?)));
+                    return Ok(LiveUpdate::new(volumes_config.as_ref().expect("configured volumes source"), LiveRecord::Volumes(ScriptVolume::from_bulk_candle(candle?))));
                 }
                 else => bail!("BULK script has no live source streams"),
             }
@@ -699,110 +749,108 @@ fn bulk_vd_update(
 
 async fn subscribe_mmt_sources(
     ws: &MmtWsClient,
-    script: &Script,
     source_configs: &SourceConfigs,
-    exchange: &str,
     symbol: &str,
 ) -> Result<()> {
-    let exchange = exchange.to_lowercase();
     let symbol = normalize_symbol_for_mmt(symbol)?;
-    for source in &script.manifest.sources {
-        match source {
+    let mut configs = source_configs.values().collect::<Vec<_>>();
+    configs.sort_by_key(|config| config.position);
+    for config in configs {
+        let exchange = config.exchange.as_str();
+        match &config.source {
             ScriptSource::Candles => {
-                let tf = source_configs
-                    .get(source)
-                    .context("missing source config for candles")?
-                    .require_timeframe(source)
+                let tf = config
+                    .require_timeframe(&config.source)
                     .and_then(mmt_timeframe_from_seconds)?;
                 ws.subscribe(json!({
                     "type": "subscribe",
                     "channel": "candles",
-                    "exchange": exchange.as_str(),
+                    "exchange": exchange,
                     "symbol": symbol.as_str(),
                     "tf": tf,
                 }))
                 .await
-                .context("failed to subscribe to candles channel")?;
+                .with_context(|| format!("failed to subscribe {}", config.selector))?;
             }
             ScriptSource::Orderbook => {
                 ws.subscribe(json!({
                     "type": "subscribe",
                     "channel": "depth",
-                    "exchange": exchange.as_str(),
+                    "exchange": exchange,
                     "symbol": symbol.as_str(),
                 }))
                 .await
-                .context("failed to subscribe to depth channel")?;
+                .with_context(|| format!("failed to subscribe {}", config.selector))?;
             }
             ScriptSource::Vd => {
-                let config = source_configs
-                    .get(source)
-                    .context("missing source config for vd")?;
                 let tf = config
-                    .require_timeframe(source)
+                    .require_timeframe(&config.source)
                     .and_then(mmt_timeframe_from_seconds)?;
-                let bucket = config.require_bucket(source)?;
+                let bucket = config.require_bucket(&config.source)?;
                 ws.subscribe(json!({
                     "type": "subscribe",
                     "channel": "vd",
-                    "exchange": exchange.as_str(),
+                    "exchange": exchange,
                     "symbol": symbol.as_str(),
                     "tf": tf,
                     "bucket": bucket,
                 }))
                 .await
-                .context("failed to subscribe to vd channel")?;
+                .with_context(|| format!("failed to subscribe {}", config.selector))?;
             }
             ScriptSource::Oi => {
-                let tf = source_configs
-                    .get(source)
-                    .context("missing source config for oi")?
-                    .require_timeframe(source)
+                let tf = config
+                    .require_timeframe(&config.source)
                     .and_then(mmt_timeframe_from_seconds)?;
                 ws.subscribe(json!({
                     "type": "subscribe",
                     "channel": "oi",
-                    "exchange": exchange.as_str(),
+                    "exchange": exchange,
                     "symbol": symbol.as_str(),
                     "tf": tf,
                 }))
                 .await
-                .context("failed to subscribe to oi channel")?;
+                .with_context(|| format!("failed to subscribe {}", config.selector))?;
             }
             ScriptSource::Volumes => {
-                let tf = source_configs
-                    .get(source)
-                    .context("missing source config for volumes")?
-                    .require_timeframe(source)
+                let tf = config
+                    .require_timeframe(&config.source)
                     .and_then(mmt_timeframe_from_seconds)?;
                 ws.subscribe(json!({
                     "type": "subscribe",
                     "channel": "volumes",
-                    "exchange": exchange.as_str(),
+                    "exchange": exchange,
                     "symbol": symbol.as_str(),
                     "tf": tf,
                 }))
                 .await
-                .context("failed to subscribe to volumes channel")?;
+                .with_context(|| format!("failed to subscribe {}", config.selector))?;
             }
         }
     }
     Ok(())
 }
 
-fn orderbook_state(source_configs: &SourceConfigs) -> Option<OrderBookState> {
-    source_configs.get(&ScriptSource::Orderbook).map(|config| {
-        let state_cap = (config.depth_or_default() as usize)
-            .saturating_mul(10)
-            .clamp(100, 10_000);
-        OrderBookState::with_max_levels_per_side(state_cap)
-    })
+fn orderbook_states(source_configs: &SourceConfigs) -> BTreeMap<String, OrderBookState> {
+    source_configs
+        .values()
+        .filter(|config| config.source == ScriptSource::Orderbook)
+        .map(|config| {
+            let state_cap = (config.depth_or_default() as usize)
+                .saturating_mul(10)
+                .clamp(100, 10_000);
+            (
+                config.selector.clone(),
+                OrderBookState::with_max_levels_per_side(state_cap),
+            )
+        })
+        .collect()
 }
 
 async fn next_mmt_update(
     ws: &MmtWsClient,
     source_configs: &SourceConfigs,
-    orderbook_state: &mut Option<OrderBookState>,
+    orderbook_states: &mut BTreeMap<String, OrderBookState>,
 ) -> Result<Option<LiveUpdate>> {
     let Some(value) = ws.next_json().await? else {
         bail!("websocket closed by server");
@@ -817,43 +865,92 @@ async fn next_mmt_update(
         return Ok(None);
     }
 
-    match value.get("channel").and_then(Value::as_str) {
-        Some("candles") => {
-            let payload = value.get("data").context("candles payload missing data")?;
-            let candle: OhlcvtCandle =
-                serde_json::from_value(payload.clone()).context("invalid candles candle shape")?;
-            Ok(Some(LiveUpdate::Candles(ScriptCandle::from_mmt(candle))))
-        }
-        Some("vd") => {
+    let source = match value.get("channel").and_then(Value::as_str) {
+        Some("candles") => ScriptSource::Candles,
+        Some("depth") => ScriptSource::Orderbook,
+        Some("vd") => ScriptSource::Vd,
+        Some("oi") => ScriptSource::Oi,
+        Some("volumes") => ScriptSource::Volumes,
+        _ => return Ok(None),
+    };
+    let config = mmt_update_config(&value, source_configs, &source)?;
+    let Some(config) = config else {
+        return Ok(None);
+    };
+
+    match source {
+        ScriptSource::Vd => {
             let payload = value.get("data").context("vd payload missing data")?;
             let candle: VdCandle =
                 serde_json::from_value(payload.clone()).context("invalid vd candle shape")?;
-            Ok(Some(LiveUpdate::Vd(ScriptVolumeDelta::from_mmt(candle))))
+            Ok(Some(LiveUpdate::new(
+                config,
+                LiveRecord::Vd(ScriptVolumeDelta::from_mmt(candle)),
+            )))
         }
-        Some("oi") => {
+        ScriptSource::Oi => {
             let payload = value.get("data").context("oi payload missing data")?;
             let candle: OiCandle =
                 serde_json::from_value(payload.clone()).context("invalid oi candle shape")?;
-            Ok(Some(LiveUpdate::Oi(ScriptOpenInterest::from_mmt(candle))))
+            Ok(Some(LiveUpdate::new(
+                config,
+                LiveRecord::Oi(ScriptOpenInterest::from_mmt(candle)),
+            )))
         }
-        Some("volumes") => {
+        ScriptSource::Volumes => {
             let payload = value.get("data").context("volumes payload missing data")?;
             let profile: VolumeProfile =
                 serde_json::from_value(payload.clone()).context("invalid volumes profile shape")?;
-            Ok(Some(LiveUpdate::Volumes(ScriptVolume::from_mmt(profile))))
+            Ok(Some(LiveUpdate::new(
+                config,
+                LiveRecord::Volumes(ScriptVolume::from_mmt(profile)),
+            )))
         }
-        Some("depth") => {
-            let Some(state) = orderbook_state.as_mut() else {
+        ScriptSource::Orderbook => {
+            let Some(state) = orderbook_states.get_mut(&config.selector) else {
                 return Ok(None);
             };
-            let depth = source_configs
-                .get(&ScriptSource::Orderbook)
-                .map(|config| config.depth_or_default())
-                .unwrap_or(100);
-            Ok(parse_depth_update(value, state, depth)?.map(LiveUpdate::Orderbook))
+            let depth = config.depth_or_default();
+            Ok(parse_depth_update(value, state, depth)?
+                .map(|snapshot| LiveUpdate::new(config, LiveRecord::Orderbook(snapshot))))
         }
-        _ => Ok(None),
+        ScriptSource::Candles => {
+            let payload = value.get("data").context("candles payload missing data")?;
+            let candle: OhlcvtCandle =
+                serde_json::from_value(payload.clone()).context("invalid candles candle shape")?;
+            Ok(Some(LiveUpdate::new(
+                config,
+                LiveRecord::Candles(ScriptCandle::from_mmt(candle)),
+            )))
+        }
     }
+}
+
+fn mmt_update_config<'a>(
+    value: &Value,
+    source_configs: &'a SourceConfigs,
+    source: &ScriptSource,
+) -> Result<Option<&'a SourceConfig>> {
+    let exchange = value
+        .get("exchange")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let mut matching = source_configs
+        .values()
+        .filter(|config| &config.source == source)
+        .filter(|config| {
+            exchange
+                .as_ref()
+                .is_none_or(|value| &config.exchange == value)
+        });
+    let config = matching.next();
+    if config.is_some() && matching.next().is_some() {
+        bail!(
+            "MMT {} update did not identify a unique exchange",
+            source.as_str()
+        );
+    }
+    Ok(config)
 }
 
 fn parse_depth_update(
@@ -895,36 +992,30 @@ fn parse_depth_update(
 }
 
 impl LiveUpdate {
-    fn source(&self) -> ScriptSource {
-        match self {
-            LiveUpdate::Candles(_) => ScriptSource::Candles,
-            LiveUpdate::Orderbook(_) => ScriptSource::Orderbook,
-            LiveUpdate::Vd(_) => ScriptSource::Vd,
-            LiveUpdate::Oi(_) => ScriptSource::Oi,
-            LiveUpdate::Volumes(_) => ScriptSource::Volumes,
+    fn new(config: &SourceConfig, record: LiveRecord) -> Self {
+        Self {
+            selector: config.selector.clone(),
+            source: config.source.clone(),
+            exchange: config.exchange.clone(),
+            record,
         }
     }
 
     fn ts_ms(&self) -> u64 {
-        match self {
-            LiveUpdate::Candles(candle) => candle.t,
-            LiveUpdate::Orderbook(snapshot) => snapshot.timestamp_ms,
-            LiveUpdate::Vd(candle) => candle.t,
-            LiveUpdate::Oi(candle) => candle.t,
-            LiveUpdate::Volumes(profile) => profile.t,
+        match &self.record {
+            LiveRecord::Candles(candle) => candle.t,
+            LiveRecord::Orderbook(snapshot) => snapshot.timestamp_ms,
+            LiveRecord::Vd(candle) => candle.t,
+            LiveRecord::Oi(candle) => candle.t,
+            LiveRecord::Volumes(profile) => profile.t,
         }
     }
 }
 
 impl LiveState {
-    fn apply(&mut self, update: LiveUpdate) {
-        match update {
-            LiveUpdate::Candles(candle) => self.candles = Some(candle),
-            LiveUpdate::Orderbook(snapshot) => self.orderbook = Some(snapshot),
-            LiveUpdate::Vd(candle) => self.vd = Some(candle),
-            LiveUpdate::Oi(candle) => self.oi = Some(candle),
-            LiveUpdate::Volumes(profile) => self.volumes = Some(profile),
-        }
+    fn apply(&mut self, update: &LiveUpdate) {
+        self.records
+            .insert(update.selector.clone(), update.record.clone());
     }
 }
 
@@ -983,81 +1074,75 @@ fn render_run_summary(
 }
 
 fn live_stream_payload(
-    source: ScriptSource,
     state: &LiveState,
+    update: &LiveUpdate,
     source_configs: &SourceConfigs,
     provider: &str,
-    exchange: &str,
     symbol: &str,
 ) -> Result<Value> {
     let mut payload = serde_json::Map::new();
     payload.insert("mode".to_string(), Value::String("stream".to_string()));
+    payload.insert("source".to_string(), Value::String(update.selector.clone()));
     payload.insert(
-        "source".to_string(),
-        Value::String(source.as_str().to_string()),
+        "source_type".to_string(),
+        Value::String(update.source.as_str().to_string()),
     );
     payload.insert("provider".to_string(), Value::String(provider.to_string()));
-    payload.insert("exchange".to_string(), Value::String(exchange.to_string()));
+    payload.insert(
+        "exchange".to_string(),
+        Value::String(update.exchange.clone()),
+    );
     payload.insert("symbol".to_string(), Value::String(symbol.to_string()));
 
-    if let Some(candle) = &state.candles {
-        payload.insert(
-            "candles".to_string(),
-            json!({
-                "candle": candle,
-            }),
-        );
-    }
-    if let Some(snapshot) = &state.orderbook {
-        payload.insert(
-            "orderbook".to_string(),
-            json!({
-                "snapshot": snapshot,
-            }),
-        );
-    }
-    if let Some(candle) = &state.vd {
+    let current_config = source_configs
+        .get(&update.selector)
+        .context("missing current source config")?;
+    payload.insert(
+        "data".to_string(),
+        live_record_payload(&update.record, current_config),
+    );
+
+    let mut sources = serde_json::Map::new();
+    for (selector, record) in &state.records {
         let config = source_configs
-            .get(&ScriptSource::Vd)
-            .context("missing source config for vd")?;
-        payload.insert(
-            "vd".to_string(),
-            json!({
-                "candle": candle,
-                "record": candle,
-                "bucket": config.bucket,
-                "timeframe_sec": config.timeframe,
-            }),
-        );
+            .get(selector)
+            .with_context(|| format!("missing source config for {selector}"))?;
+        let envelope = live_record_payload(record, config);
+        sources.insert(selector.clone(), envelope.clone());
+        let same_kind = source_configs
+            .values()
+            .filter(|candidate| candidate.source == config.source)
+            .count();
+        if same_kind == 1 {
+            payload.insert(config.source.as_str().to_string(), envelope);
+        }
     }
-    if let Some(candle) = &state.oi {
-        let config = source_configs
-            .get(&ScriptSource::Oi)
-            .context("missing source config for oi")?;
-        payload.insert(
-            "oi".to_string(),
-            json!({
-                "candle": candle,
-                "record": candle,
-                "timeframe_sec": config.timeframe,
-            }),
-        );
-    }
-    if let Some(profile) = &state.volumes {
-        let config = source_configs
-            .get(&ScriptSource::Volumes)
-            .context("missing source config for volumes")?;
-        payload.insert(
-            "volumes".to_string(),
-            json!({
-                "profile": profile,
-                "record": profile,
-                "timeframe_sec": config.require_timeframe(&ScriptSource::Volumes)?,
-            }),
-        );
-    }
+    payload.insert("sources".to_string(), Value::Object(sources));
 
     Ok(Value::Object(payload))
+}
+
+fn live_record_payload(record: &LiveRecord, config: &SourceConfig) -> Value {
+    match record {
+        LiveRecord::Candles(candle) => json!({ "candle": candle }),
+        LiveRecord::Orderbook(snapshot) => json!({ "snapshot": snapshot }),
+        LiveRecord::Vd(candle) => json!({
+            "candle": candle,
+            "record": candle,
+            "bucket": config.bucket,
+            "timeframe_sec": config.timeframe,
+        }),
+        LiveRecord::Oi(candle) => json!({
+            "candle": candle,
+            "record": candle,
+            "timeframe_sec": config.timeframe,
+        }),
+        LiveRecord::Volumes(profile) => json!({
+            "profile": profile,
+            "record": profile,
+            "timeframe_sec": config.timeframe,
+        }),
+    }
 }
 
 fn render_stream_result(
@@ -1165,4 +1250,78 @@ fn require_symbol(value: Option<&str>) -> Result<&str> {
         bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
     }
     Ok(symbol)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candle(close: f64) -> ScriptCandle {
+        ScriptCandle {
+            t: 1_780_000_000_000,
+            o: close,
+            h: close,
+            l: close,
+            c: close,
+            volume: 1.0,
+            trades: 1,
+            close_time: None,
+            vb: None,
+            vs: None,
+            tb: None,
+            ts: None,
+        }
+    }
+
+    fn cross_exchange_configs() -> SourceConfigs {
+        parse_source_configs(
+            &[
+                "candles@binancef:timeframe=60".to_string(),
+                "candles@okx:timeframe=60".to_string(),
+            ],
+            None,
+        )
+        .expect("parse source configs")
+    }
+
+    #[test]
+    fn mmt_updates_route_to_the_exchange_qualified_selector() {
+        let configs = cross_exchange_configs();
+        let update = json!({
+            "type": "data",
+            "channel": "candles",
+            "exchange": "OKX",
+            "data": {}
+        });
+
+        let config = mmt_update_config(&update, &configs, &ScriptSource::Candles)
+            .expect("route update")
+            .expect("matching source config");
+
+        assert_eq!(config.selector, "candles@okx");
+    }
+
+    #[test]
+    fn live_payload_keeps_same_kind_exchanges_separate() {
+        let configs = cross_exchange_configs();
+        let binance = LiveUpdate::new(
+            &configs["candles@binancef"],
+            LiveRecord::Candles(candle(10.0)),
+        );
+        let okx = LiveUpdate::new(&configs["candles@okx"], LiveRecord::Candles(candle(20.0)));
+        let mut state = LiveState::default();
+        state.apply(&binance);
+        state.apply(&okx);
+
+        let payload = live_stream_payload(&state, &okx, &configs, "mmt", "BTC/USDT")
+            .expect("build live payload");
+
+        assert_eq!(payload["source"], "candles@okx");
+        assert_eq!(payload["source_type"], "candles");
+        assert_eq!(payload["exchange"], "okx");
+        assert_eq!(payload["data"]["candle"]["c"], 20.0);
+        assert_eq!(payload["sources"]["candles@binancef"]["candle"]["c"], 10.0);
+        assert_eq!(payload["sources"]["candles@okx"]["candle"]["c"], 20.0);
+        assert!(payload.get("candles").is_none());
+    }
 }

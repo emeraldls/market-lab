@@ -12,7 +12,7 @@ export const script = {
   }
 }
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   const fastSize = Math.trunc(ctx.params.candles.fast)
   const slowSize = Math.trunc(ctx.params.candles.slow)
   const latest = input.candles.candles[input.candles.candles.length - 1]

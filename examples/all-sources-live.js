@@ -17,14 +17,14 @@ export const script = {
   }
 }
 
-export function onData(ctx, input) {
+export function onData(ctx, input, history) {
   if (input.mode !== "stream") {
     throw new Error("all-sources-live-check expects script run/live mode")
   }
 
-  const candle = input.candles?.candle ?? null
-  const book = input.orderbook?.snapshot ?? null
-  const vd = input.vd?.candle ?? null
+  const candle = history.source("candles", 0) ?? null
+  const book = history.source("orderbook", 0) ?? null
+  const vd = history.source("vd", 0) ?? null
 
   if (!candle || !book || !vd) {
     return {

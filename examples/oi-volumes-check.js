@@ -13,8 +13,8 @@ export const script = {
   }
 }
 
-function latestFor(input, source) {
-  if (input.mode === "stream") return input[source]?.candle ?? input[source]?.profile ?? null
+function latestFor(input, history, source) {
+  if (input.mode === "stream") return history.source(source, 0) ?? null
   const rows = source === "volumes" ? input.volumes.profiles : input.oi.candles
   return rows[rows.length - 1]
 }
@@ -43,9 +43,9 @@ function volumeStats(profile) {
   return { total_volume: totalVolume, poc, buy_volume: buyVolume, sell_volume: sellVolume }
 }
 
-export function onData(ctx, input) {
-  const oi = latestFor(input, "oi")
-  const profile = latestFor(input, "volumes")
+export function onData(ctx, input, history) {
+  const oi = latestFor(input, history, "oi")
+  const profile = latestFor(input, history, "volumes")
 
   if (!oi || !profile) {
     return {

@@ -17,8 +17,8 @@ function btcTick(price) {
   return Math.round(price * 10) / 10
 }
 
-export function onData(ctx, input) {
-  const candle = input.candles.candle
+export function onData(ctx, input, history) {
+  const candle = history.source("candles", 0)
 
   if (!ctx.params.candles.armed || entry) {
     return {

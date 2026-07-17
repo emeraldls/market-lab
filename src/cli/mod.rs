@@ -535,7 +535,7 @@ pub struct ScriptBacktestArgs {
     pub config: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = CliProviderKind::Mmt)]
     pub provider: CliProviderKind,
-    #[arg(long, required_if_eq("provider", "mmt"))]
+    #[arg(long)]
     pub exchange: Option<String>,
     #[arg(long)]
     pub symbol: String,
@@ -560,7 +560,11 @@ impl ScriptBacktestArgs {
         if self.script.trim().is_empty() {
             bail!("script path is required");
         }
-        source_exchange(self.provider, self.exchange.as_deref())?;
+        if matches!(self.provider, CliProviderKind::Bulk) {
+            source_exchange(self.provider, self.exchange.as_deref())?;
+        } else if self.exchange.as_deref().is_some_and(str::is_empty) {
+            bail!("--exchange cannot be empty");
+        }
         if !is_valid_symbol(&self.symbol) {
             bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
@@ -2597,6 +2601,43 @@ mod tests {
                 assert_eq!(args.param, vec!["candles:fast=20"]);
                 assert_eq!(args.leverage, 5.0);
                 args.validate().expect("validate should succeed");
+            }
+            _ => panic!("expected script backtest command"),
+        }
+    }
+
+    #[test]
+    fn exchange_qualified_script_sources_do_not_require_global_exchange() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "script",
+            "backtest",
+            "./scripts/cross-exchange.js",
+            "--provider",
+            "mmt",
+            "--symbol",
+            "BTC/USDT",
+            "--from",
+            "1704067200000",
+            "--to",
+            "1704067800000",
+            "--source",
+            "candles@binancef:timeframe=60",
+            "--source",
+            "candles@okx:timeframe=60",
+        ])
+        .expect("qualified script sources should parse without --exchange");
+
+        match cli.command {
+            Commands::Script {
+                command: ScriptCommands::Backtest(args),
+            } => {
+                assert!(args.exchange.is_none());
+                assert_eq!(
+                    args.source,
+                    vec!["candles@binancef:timeframe=60", "candles@okx:timeframe=60"]
+                );
+                args.validate().expect("backtest should validate");
             }
             _ => panic!("expected script backtest command"),
         }

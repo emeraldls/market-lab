@@ -10,12 +10,12 @@ export const script = {
   }
 }
 
-function candlesFrom(input) {
-  return input.mode === "stream" ? [input.candles.candle] : input.candles.candles
+function candlesFrom(input, history) {
+  return input.mode === "stream" ? [history.source("candles", 0)] : input.candles.candles
 }
 
-export function onData(ctx, input) {
-  const candles = candlesFrom(input)
+export function onData(ctx, input, history) {
+  const candles = candlesFrom(input, history)
   const filtered = candles.filter((c) => {
     return c.vb >= ctx.params.candles.min_vbuy && c.vb - c.vs >= ctx.params.candles.min_delta
   })
