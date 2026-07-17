@@ -5,7 +5,7 @@ use crate::domain::types::ProviderHealth;
 use crate::providers::{MarketDataProvider, ProviderClient};
 
 pub async fn handle(args: HealthArgs) -> Result<()> {
-    let provider_kind = args.provider.into();
+    let provider_kind = args.provider_kind()?;
     let client = ProviderClient::from_kind(provider_kind);
     let health = client.health().await?;
 

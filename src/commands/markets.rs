@@ -1,12 +1,11 @@
 use anyhow::Result;
 
-use crate::cli::{MarketCatalogProvider, MarketsArgs};
+use crate::cli::MarketsArgs;
 use crate::providers::bulk::catalog;
 
 pub fn handle(args: MarketsArgs) -> Result<()> {
-    match args.provider {
-        MarketCatalogProvider::Bulk => print_bulk_catalog(&args),
-    }
+    args.validate()?;
+    print_bulk_catalog(&args)
 }
 
 fn print_bulk_catalog(args: &MarketsArgs) -> Result<()> {

@@ -23,12 +23,10 @@ struct OrderbookItem {
 
 pub async fn handle(args: SourceOrderbookArgs) -> Result<()> {
     args.validate()?;
-    match args.provider.into() {
+    match args.provider_kind()?.into() {
         ProviderKind::Mmt => handle_mmt(args).await,
         ProviderKind::Bulk => handle_bulk(args).await,
-        ProviderKind::MarketLab => {
-            bail!("source orderbook does not support --provider market-lab")
-        }
+        ProviderKind::MarketLab => unreachable!("source routing cannot resolve to Market Lab"),
     }
 }
 

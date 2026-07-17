@@ -1,24 +1,21 @@
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::cli::{
-    CliProviderKind, ExecutionVenueArg, OutputFormat, ScriptRunArgs, mmt_timeframe_from_seconds,
-};
+use crate::cli::{ExecutionVenueArg, OutputFormat, ScriptRunArgs, mmt_timeframe_from_seconds};
 use crate::commands::script::{
     ScriptDescriptor, ScriptInputs, report_builder, write_report_best_effort,
     write_running_report_best_effort,
 };
 use crate::commands::source::common::render_terminal;
-use crate::commands::study::common::provider_name;
 use crate::core::orderbook::OrderBookState;
 use crate::domain::enums::ProviderKind;
 use crate::domain::types::{
-    OhlcvtCandle, OiCandle, OpenInterestSnapshot, OrderBookSnapshot, VdCandle, VolumeDeltaTick,
+    OiCandle, OpenInterestSnapshot, OrderBookSnapshot, TradeTick, VdCandle, VolumeDeltaTick,
     VolumeProfile,
 };
 use crate::providers::bulk::catalog;
@@ -30,14 +27,14 @@ use crate::providers::mmt::ws_client::MmtWsClient;
 use crate::scripting::engine::Script;
 use crate::scripting::execution::{ScriptExecutionCommand, ScriptExecutionContext};
 use crate::scripting::inputs::{
-    SourceConfig, SourceConfigs, parse_param_values, parse_source_configs,
-    populate_source_defaults, resolve_params, source_config, source_exchange_label,
-    validate_bulk_source_configs, validate_source_configs_for_run,
+    SourceConfig, SourceConfigs, parse_param_values, parse_source_configs, resolve_params,
+    source_config, source_configs_payload, source_exchange_label, source_provider_label,
+    source_provider_name, validate_source_configs_for_run,
 };
 use crate::scripting::jobs::ScriptJobSubmission;
 use crate::scripting::manifest::ScriptSource;
 use crate::scripting::market_data::{
-    ScriptCandle, ScriptOpenInterest, ScriptVolume, ScriptVolumeDelta,
+    ScriptCandle, ScriptOpenInterest, ScriptVolume, ScriptVolumeDelta, TradeCandleAggregator,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -78,14 +75,7 @@ where
 #[derive(Debug, Clone, Serialize)]
 struct ScriptRunOutput {
     metrics: Value,
-    signal: Value,
-    intent: Value,
     meta: Value,
-}
-
-#[derive(Debug, Clone, Default)]
-struct LiveState {
-    records: BTreeMap<String, LiveRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,12 +91,12 @@ enum LiveRecord {
 struct LiveUpdate {
     selector: String,
     source: ScriptSource,
+    provider: ProviderKind,
     exchange: String,
     record: LiveRecord,
 }
 
 struct ScriptRunMarket {
-    provider: ProviderKind,
     symbol: String,
 }
 
@@ -115,44 +105,10 @@ struct ScriptWorkerState<'a> {
     initial_event_cursor: u64,
 }
 
-pub(super) fn default_script_exchange(
-    provider: ProviderKind,
-    exchange: Option<&str>,
-) -> Result<Option<String>> {
-    match provider {
-        ProviderKind::Mmt => exchange
-            .map(|exchange| {
-                let exchange = exchange.trim().to_ascii_lowercase();
-                if exchange.is_empty() {
-                    bail!("--exchange cannot be empty");
-                }
-                Ok(exchange)
-            })
-            .transpose(),
-        ProviderKind::Bulk => {
-            if exchange.is_some_and(|exchange| !exchange.eq_ignore_ascii_case("bulk")) {
-                bail!("--exchange must be omitted or set to `bulk` with --provider bulk");
-            }
-            Ok(Some("bulk".to_string()))
-        }
-        ProviderKind::MarketLab => bail!("script run supports --provider mmt|bulk"),
-    }
-}
-
-fn uses_unqualified_source(sources: &[String]) -> bool {
-    sources.iter().any(|value| {
-        value
-            .split_once(':')
-            .map(|(selector, _)| !selector.contains('@'))
-            .unwrap_or(true)
-    })
-}
-
 #[derive(Debug, Clone, Default, Serialize)]
 struct ScriptRunSummary {
     updates: u64,
-    signals: u64,
-    intents: u64,
+    outputs: u64,
     hook_failures: u64,
     last_ts_ms: Option<u64>,
     latest_output: Option<ScriptRunOutput>,
@@ -160,9 +116,6 @@ struct ScriptRunSummary {
 
 pub async fn handle(args: ScriptRunArgs) -> Result<()> {
     args.validate()?;
-    if matches!(args.provider.into(), ProviderKind::MarketLab) {
-        bail!("script run supports --provider mmt|bulk");
-    }
     if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
         bail!("scripts currently support only --output terminal|json|jsonl");
     }
@@ -173,37 +126,26 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
         );
     }
     let script = Script::load(&args.script)?;
-    let provider: ProviderKind = args.provider.into();
-    let default_exchange = default_script_exchange(provider, args.exchange.as_deref())?;
-    let symbol = require_symbol(args.symbol.as_deref())?;
-    let symbol = match provider {
-        ProviderKind::Bulk => catalog::market(symbol)?.internal_symbol.clone(),
-        ProviderKind::Mmt => symbol.to_string(),
-        ProviderKind::MarketLab => unreachable!(),
-    };
-    let mut source_configs = parse_source_configs(&args.source, default_exchange.as_deref())?;
-    match provider {
-        ProviderKind::Mmt => validate_source_configs_for_run(&script.manifest, &source_configs)?,
-        ProviderKind::Bulk => {
-            populate_source_defaults(&script.manifest, &mut source_configs, "bulk");
-            validate_bulk_source_configs(&script.manifest, &source_configs, false)?;
-        }
-        ProviderKind::MarketLab => unreachable!(),
-    };
+    let symbol = require_symbol(args.symbol.as_deref())?.to_string();
+    let source_configs = parse_source_configs(&args.source)?;
+    validate_source_configs_for_run(&script.manifest, &source_configs)?;
     let raw_params = parse_param_values(&args.param)?;
     resolve_params(&script.manifest, &raw_params)?;
-    let exchange = if uses_unqualified_source(&args.source) {
-        default_exchange.context("unqualified script sources require --exchange")?
-    } else {
-        source_exchange_label(&source_configs)
-    };
+    let providers = source_provider_label(&source_configs)
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    let exchanges = source_exchange_label(&source_configs)
+        .split(',')
+        .map(str::to_string)
+        .collect();
 
     let submission = ScriptJobSubmission {
         script_name: script.manifest.name.clone(),
         original_path: script.path.display().to_string(),
         source: script.source().to_string(),
-        provider,
-        exchange,
+        providers,
+        exchanges,
         symbol,
         sources: args.source,
         params: args.param,
@@ -216,7 +158,7 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
             println!("script deployed");
             println!("  job:       {}", job.id);
             println!("  status:    starting");
-            println!("  provider:  {}", provider_name(job.definition.provider));
+            println!("  providers: {}", job.definition.providers.join(","));
             println!("  symbol:    {}", job.definition.symbol);
             println!(
                 "  venue:     {}",
@@ -237,21 +179,12 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
 pub async fn handle_worker(job_id: &str) -> Result<()> {
     let job = crate::runtime::get_script_job_from_running_daemon(job_id).await?;
     let script = Script::load(&job.definition.snapshot_path)?;
-    let provider = match job.definition.provider {
-        ProviderKind::Mmt => CliProviderKind::Mmt,
-        ProviderKind::Bulk => CliProviderKind::Bulk,
-        ProviderKind::MarketLab => bail!("script worker does not support marketlab provider"),
-    };
     let venue = job.definition.venue.map(|venue| match venue {
         crate::domain::execution::ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
     });
     let args = ScriptRunArgs {
         script: job.definition.snapshot_path.display().to_string(),
         config: None,
-        provider,
-        exchange: (job.definition.provider == ProviderKind::Mmt
-            && uses_unqualified_source(&job.definition.sources))
-        .then(|| job.definition.exchange.clone()),
         symbol: Some(job.definition.symbol.clone()),
         venue,
         from: None,
@@ -264,8 +197,8 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
     let mut report = report_builder(
         "script.worker",
         &script,
-        Some(provider_name(job.definition.provider).to_string()),
-        Some(job.definition.exchange.clone()),
+        Some(job.definition.providers.join(",")),
+        Some(job.definition.exchanges.join(",")),
         Some(job.definition.symbol.clone()),
     );
     let pid = std::process::id();
@@ -300,28 +233,14 @@ async fn run(
             "--from/--to are not allowed with script run; use script backtest for historical data"
         );
     }
-    let provider: ProviderKind = args.provider.into();
-    let default_exchange = default_script_exchange(provider, args.exchange.as_deref())?;
-    let symbol = require_symbol(args.symbol.as_deref())?;
-    let symbol = match provider {
-        ProviderKind::Bulk => catalog::market(symbol)?.internal_symbol.clone(),
-        ProviderKind::Mmt => symbol.to_string(),
-        ProviderKind::MarketLab => unreachable!(),
-    };
+    let symbol = require_symbol(args.symbol.as_deref())?.to_string();
 
-    let mut source_configs = parse_source_configs(&args.source, default_exchange.as_deref())?;
-    match provider {
-        ProviderKind::Mmt => validate_source_configs_for_run(&script.manifest, &source_configs)?,
-        ProviderKind::Bulk => {
-            populate_source_defaults(&script.manifest, &mut source_configs, "bulk");
-            validate_bulk_source_configs(&script.manifest, &source_configs, false)?;
-        }
-        ProviderKind::MarketLab => unreachable!(),
-    }
+    let source_configs = parse_source_configs(&args.source)?;
+    validate_source_configs_for_run(&script.manifest, &source_configs)?;
     let raw_params = parse_param_values(&args.param)?;
     let resolved_params = resolve_params(&script.manifest, &raw_params)?;
 
-    let market = ScriptRunMarket { provider, symbol };
+    let market = ScriptRunMarket { symbol };
     stream_sources(
         args,
         script,
@@ -350,8 +269,7 @@ async fn stream_sources(
     report.set_phase("connecting_streams");
     write_running_report_best_effort(report);
 
-    let mut streams =
-        ScriptLiveStreams::connect(market.provider, &source_configs, &market.symbol).await?;
+    let mut streams = ScriptLiveStreams::connect(&source_configs, &market.symbol).await?;
 
     let session = script.start_session_with_execution(
         &resolved_params,
@@ -369,7 +287,6 @@ async fn stream_sources(
     let mut rendered = VecDeque::with_capacity(50);
     let mut hooks = 0_u64;
     let mut summary = ScriptRunSummary::default();
-    let mut live_state = LiveState::default();
     let mut event_cursor = worker.initial_event_cursor;
     let mut execution_events = tokio::time::interval(std::time::Duration::from_millis(250));
     execution_events.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -414,14 +331,7 @@ async fn stream_sources(
         };
 
         let ts_ms = update.ts_ms();
-        live_state.apply(&update);
-        let payload = live_stream_payload(
-            &live_state,
-            &update,
-            &source_configs,
-            provider_name(market.provider),
-            &market.symbol,
-        )?;
+        let payload = live_stream_payload(&update, &source_configs, &market.symbol)?;
         let execution = match session.run_stream(payload) {
             Ok(execution) => execution,
             Err(err) => {
@@ -437,14 +347,19 @@ async fn stream_sources(
         };
         dispatch_execution_commands(job_id, execution.commands).await?;
         hooks += 1;
+        summary.record_update(ts_ms);
         report.record_hook(&execution.stats);
         report.set_progress("streaming_sources", hooks, hooks);
         write_running_report_best_effort(report);
 
+        if execution.output.is_empty() {
+            continue;
+        }
+
         let result = ScriptRunResult {
             r#type: "script.run.result",
             version: "1",
-            provider: provider_name(market.provider),
+            provider: source_provider_name(update.provider),
             exchange: update.exchange.clone(),
             symbol: market.symbol.clone(),
             ts_ms,
@@ -455,7 +370,7 @@ async fn stream_sources(
                     .manifest
                     .sources
                     .iter()
-                    .map(ScriptSource::as_str)
+                    .map(|source| source.as_str().to_string())
                     .collect(),
             },
             params: ScriptInputs {
@@ -463,12 +378,10 @@ async fn stream_sources(
             },
             output: ScriptRunOutput {
                 metrics: execution.output.metrics,
-                signal: execution.output.signal,
-                intent: execution.output.intent,
                 meta: execution.output.meta,
             },
         };
-        summary.record(&result);
+        summary.record_output(&result);
         crate::runtime::append_script_output(job_id, &result)?;
         render_stream_result(&result, args.output, args.verbose, &mut rendered)?;
     }
@@ -514,19 +427,21 @@ async fn dispatch_execution_events(
     let events = crate::runtime::script_execution_events(job_id, *cursor, 100).await?;
     for event in events {
         let seq = event.seq;
-        if let Some(execution) = session.run_execution_event(serde_json::to_value(&event)?)? {
+        let event_value = serde_json::to_value(&event)?;
+        let execution = session.run_execution_event(event_value.clone())?;
+        let mut record = serde_json::json!({
+            "type": "script.execution.event",
+            "version": "1",
+            "ts_ms": now_ms(),
+            "event": event_value,
+        });
+        if let Some(execution) = execution {
             dispatch_execution_commands(job_id, execution.commands).await?;
-            crate::runtime::append_script_output(
-                job_id,
-                &serde_json::json!({
-                    "type": "script.execution.result",
-                    "version": "1",
-                    "ts_ms": now_ms(),
-                    "event": event,
-                    "output": execution.output,
-                }),
-            )?;
+            if !execution.output.is_empty() {
+                record["output"] = serde_json::to_value(execution.output)?;
+            }
         }
+        crate::runtime::append_script_output(job_id, &record)?;
         crate::runtime::acknowledge_script_events(job_id, seq).await?;
         *cursor = (*cursor).max(seq);
     }
@@ -540,73 +455,133 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
-enum ScriptLiveStreams {
-    Mmt {
-        ws: MmtWsClient,
-        source_configs: SourceConfigs,
-        orderbook_states: BTreeMap<String, OrderBookState>,
-    },
-    Bulk(Box<BulkScriptStreams>),
+struct ScriptLiveStreams {
+    mmt: Option<MmtScriptStreams>,
+    bulk: Option<Box<BulkScriptStreams>>,
+}
+
+struct MmtScriptStreams {
+    ws: MmtWsClient,
+    source_configs: SourceConfigs,
+    orderbook_states: BTreeMap<String, OrderBookState>,
+    candle_aggregators: BTreeMap<String, TradeCandleAggregator>,
 }
 
 impl ScriptLiveStreams {
-    async fn connect(
-        provider: ProviderKind,
-        source_configs: &SourceConfigs,
-        symbol: &str,
-    ) -> Result<Self> {
-        match provider {
-            ProviderKind::Mmt => {
-                let ws = MmtWsClient::shared().await?;
-                subscribe_mmt_sources(&ws, source_configs, symbol).await?;
-                Ok(Self::Mmt {
-                    ws,
-                    source_configs: source_configs.clone(),
-                    orderbook_states: orderbook_states(source_configs),
-                })
-            }
-            ProviderKind::Bulk => Ok(Self::Bulk(Box::new(
-                BulkScriptStreams::connect(source_configs, symbol).await?,
-            ))),
-            ProviderKind::MarketLab => bail!("script run supports --provider mmt|bulk"),
+    async fn connect(source_configs: &SourceConfigs, symbol: &str) -> Result<Self> {
+        let mmt_configs = configs_for_provider(source_configs, ProviderKind::Mmt);
+        let bulk_configs = configs_for_provider(source_configs, ProviderKind::Bulk);
+        let mmt = if mmt_configs.is_empty() {
+            None
+        } else {
+            let ws = MmtWsClient::shared().await?;
+            subscribe_mmt_sources(&ws, &mmt_configs, symbol).await?;
+            let orderbook_states = orderbook_states(&mmt_configs);
+            let candle_aggregators = trade_candle_aggregators(&mmt_configs, now_ms())?;
+            Some(MmtScriptStreams {
+                ws,
+                source_configs: mmt_configs,
+                orderbook_states,
+                candle_aggregators,
+            })
+        };
+        let bulk = if bulk_configs.is_empty() {
+            None
+        } else {
+            let symbol = catalog::market(symbol)?.internal_symbol.clone();
+            Some(Box::new(
+                BulkScriptStreams::connect(&bulk_configs, &symbol).await?,
+            ))
+        };
+        if mmt.is_none() && bulk.is_none() {
+            bail!("script has no supported live source providers");
         }
+        Ok(Self { mmt, bulk })
     }
 
     async fn next_update(&mut self) -> Result<Option<LiveUpdate>> {
-        match self {
-            Self::Mmt {
-                ws,
-                source_configs,
-                orderbook_states,
-            } => next_mmt_update(ws, source_configs, orderbook_states).await,
-            Self::Bulk(streams) => streams.next_update().await.map(Some),
+        let has_mmt = self.mmt.is_some();
+        let has_bulk = self.bulk.is_some();
+        tokio::select! {
+            update = async { self.mmt.as_mut().expect("guarded MMT streams").next_update().await }, if has_mmt => update,
+            update = async { self.bulk.as_mut().expect("guarded BULK streams").next_update().await }, if has_bulk => update.map(Some),
+            else => bail!("script has no active live source streams"),
         }
     }
+}
+
+impl MmtScriptStreams {
+    async fn next_update(&mut self) -> Result<Option<LiveUpdate>> {
+        next_mmt_update(
+            &self.ws,
+            &self.source_configs,
+            &mut self.orderbook_states,
+            &mut self.candle_aggregators,
+        )
+        .await
+    }
+}
+
+fn configs_for_provider(configs: &SourceConfigs, provider: ProviderKind) -> SourceConfigs {
+    configs
+        .iter()
+        .filter(|(_, config)| config.provider == provider)
+        .map(|(selector, config)| (selector.clone(), config.clone()))
+        .collect()
+}
+
+fn trade_candle_aggregators(
+    source_configs: &SourceConfigs,
+    started_at_ms: u64,
+) -> Result<BTreeMap<String, TradeCandleAggregator>> {
+    source_configs
+        .values()
+        .filter(|config| config.source == ScriptSource::Candles)
+        .map(|config| {
+            let timeframe = config.require_timeframe(&config.source)?;
+            Ok((
+                config.selector.clone(),
+                TradeCandleAggregator::new(timeframe, started_at_ms),
+            ))
+        })
+        .collect()
 }
 
 struct BulkScriptStreams {
     source_configs: SourceConfigs,
-    candles: Option<BulkCandleStream>,
+    trades: Option<BulkTradesStream>,
+    candle_aggregator: Option<TradeCandleAggregator>,
     orderbook: Option<BulkOrderBookStream>,
-    vd: Option<BulkTradesStream>,
     oi: Option<BulkTickerStream>,
     volumes: Option<BulkCandleStream>,
     cumulative_delta: f64,
+    pending: VecDeque<LiveUpdate>,
 }
 
 impl BulkScriptStreams {
     async fn connect(source_configs: &SourceConfigs, symbol: &str) -> Result<Self> {
-        let candles = if source_configs
+        let candle_timeframe = if source_configs
             .values()
             .any(|config| config.source == ScriptSource::Candles)
         {
-            let seconds = source_config(source_configs, &ScriptSource::Candles)?
-                .require_timeframe(&ScriptSource::Candles)?;
-            let interval = crate::providers::bulk::market_data::timeframe_from_seconds(seconds)?;
-            Some(BulkCandleStream::connect(symbol, interval).await?)
+            Some(
+                source_config(source_configs, &ScriptSource::Candles)?
+                    .require_timeframe(&ScriptSource::Candles)?,
+            )
         } else {
             None
         };
+        let trades = if candle_timeframe.is_some()
+            || source_configs
+                .values()
+                .any(|config| config.source == ScriptSource::Vd)
+        {
+            Some(BulkTradesStream::connect(symbol).await?)
+        } else {
+            None
+        };
+        let candle_aggregator =
+            candle_timeframe.map(|timeframe| TradeCandleAggregator::new(timeframe, now_ms()));
         let orderbook = if source_configs
             .values()
             .any(|config| config.source == ScriptSource::Orderbook)
@@ -614,14 +589,6 @@ impl BulkScriptStreams {
             let depth = source_config(source_configs, &ScriptSource::Orderbook)?.depth_or_default();
             let state_cap = (depth as usize).saturating_mul(10).clamp(100, 10_000);
             Some(BulkOrderBookStream::connect(symbol, depth, state_cap).await?)
-        } else {
-            None
-        };
-        let vd = if source_configs
-            .values()
-            .any(|config| config.source == ScriptSource::Vd)
-        {
-            Some(BulkTradesStream::connect(symbol).await?)
         } else {
             None
         };
@@ -646,27 +613,33 @@ impl BulkScriptStreams {
         };
         Ok(Self {
             source_configs: source_configs.clone(),
-            candles,
+            trades,
+            candle_aggregator,
             orderbook,
-            vd,
             oi,
             volumes,
             cumulative_delta: 0.0,
+            pending: VecDeque::new(),
         })
     }
 
     async fn next_update(&mut self) -> Result<LiveUpdate> {
         loop {
-            let has_candles = self.candles.is_some();
+            if let Some(update) = self.pending.pop_front() {
+                return Ok(update);
+            }
+
+            let has_trades = self.trades.is_some();
             let has_orderbook = self.orderbook.is_some();
-            let has_vd = self.vd.is_some();
             let has_oi = self.oi.is_some();
             let has_volumes = self.volumes.is_some();
-            let candles = &mut self.candles;
+            let trades = &mut self.trades;
+            let candle_aggregator = &mut self.candle_aggregator;
             let orderbook = &mut self.orderbook;
-            let vd = &mut self.vd;
             let oi = &mut self.oi;
             let volumes = &mut self.volumes;
+            let cumulative_delta = &mut self.cumulative_delta;
+            let pending = &mut self.pending;
             let candles_config = source_config(&self.source_configs, &ScriptSource::Candles)
                 .ok()
                 .cloned();
@@ -684,16 +657,26 @@ impl BulkScriptStreams {
                 .cloned();
 
             tokio::select! {
-                candle = async { candles.as_mut().expect("guarded candle stream").next_candle().await }, if has_candles => {
-                    return Ok(LiveUpdate::new(candles_config.as_ref().expect("configured candle source"), LiveRecord::Candles(ScriptCandle::from_bulk(candle?))));
-                }
                 snapshot = async { orderbook.as_mut().expect("guarded orderbook stream").next_snapshot().await }, if has_orderbook => {
                     return Ok(LiveUpdate::new(orderbook_config.as_ref().expect("configured orderbook source"), LiveRecord::Orderbook(snapshot?)));
                 }
-                trades = async { vd.as_mut().expect("guarded trades stream").next_trades().await }, if has_vd => {
-                    let trades = trades?;
-                    if let Some(update) = bulk_vd_update(&trades, &mut self.cumulative_delta) {
-                        return Ok(LiveUpdate::new(vd_config.as_ref().expect("configured vd source"), LiveRecord::Vd(update)));
+                batch = async { trades.as_mut().expect("guarded trades stream").next_trades().await }, if has_trades => {
+                    let batch = batch?;
+                    if let (Some(aggregator), Some(config)) = (candle_aggregator.as_mut(), candles_config.as_ref()) {
+                        pending.extend(
+                            aggregator
+                                .push_batch(&batch)
+                                .into_iter()
+                                .map(|candle| LiveUpdate::new(config, LiveRecord::Candles(candle))),
+                        );
+                    }
+                    if let Some(config) = vd_config.as_ref()
+                        && let Some(update) = bulk_vd_update(&batch, cumulative_delta)
+                    {
+                        pending.push_back(LiveUpdate::new(config, LiveRecord::Vd(update)));
+                    }
+                    if let Some(update) = pending.pop_front() {
+                        return Ok(update);
                     }
                 }
                 ticker = async { oi.as_mut().expect("guarded ticker stream").next_ticker().await }, if has_oi => {
@@ -759,15 +742,11 @@ async fn subscribe_mmt_sources(
         let exchange = config.exchange.as_str();
         match &config.source {
             ScriptSource::Candles => {
-                let tf = config
-                    .require_timeframe(&config.source)
-                    .and_then(mmt_timeframe_from_seconds)?;
                 ws.subscribe(json!({
                     "type": "subscribe",
-                    "channel": "candles",
+                    "channel": "trades",
                     "exchange": exchange,
                     "symbol": symbol.as_str(),
-                    "tf": tf,
                 }))
                 .await
                 .with_context(|| format!("failed to subscribe {}", config.selector))?;
@@ -851,6 +830,7 @@ async fn next_mmt_update(
     ws: &MmtWsClient,
     source_configs: &SourceConfigs,
     orderbook_states: &mut BTreeMap<String, OrderBookState>,
+    candle_aggregators: &mut BTreeMap<String, TradeCandleAggregator>,
 ) -> Result<Option<LiveUpdate>> {
     let Some(value) = ws.next_json().await? else {
         bail!("websocket closed by server");
@@ -866,7 +846,7 @@ async fn next_mmt_update(
     }
 
     let source = match value.get("channel").and_then(Value::as_str) {
-        Some("candles") => ScriptSource::Candles,
+        Some("trades") => ScriptSource::Candles,
         Some("depth") => ScriptSource::Orderbook,
         Some("vd") => ScriptSource::Vd,
         Some("oi") => ScriptSource::Oi,
@@ -915,15 +895,37 @@ async fn next_mmt_update(
                 .map(|snapshot| LiveUpdate::new(config, LiveRecord::Orderbook(snapshot))))
         }
         ScriptSource::Candles => {
-            let payload = value.get("data").context("candles payload missing data")?;
-            let candle: OhlcvtCandle =
-                serde_json::from_value(payload.clone()).context("invalid candles candle shape")?;
-            Ok(Some(LiveUpdate::new(
-                config,
-                LiveRecord::Candles(ScriptCandle::from_mmt(candle)),
-            )))
+            let payload = value.get("data").context("trade payload missing data")?;
+            let trade: MmtTrade =
+                serde_json::from_value(payload.clone()).context("invalid MMT trade shape")?;
+            let trade = TradeTick {
+                exchange: config.exchange.clone(),
+                symbol: value
+                    .get("symbol")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                timestamp_ms: normalize_to_ms(trade.t),
+                price: trade.p,
+                size: trade.q,
+                taker_buy: trade.b,
+            };
+            let aggregator = candle_aggregators
+                .get_mut(&config.selector)
+                .context("missing MMT candle aggregator")?;
+            Ok(aggregator
+                .push(&trade)
+                .map(|candle| LiveUpdate::new(config, LiveRecord::Candles(candle))))
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct MmtTrade {
+    t: u64,
+    p: f64,
+    q: f64,
+    b: bool,
 }
 
 fn mmt_update_config<'a>(
@@ -996,6 +998,7 @@ impl LiveUpdate {
         Self {
             selector: config.selector.clone(),
             source: config.source.clone(),
+            provider: config.provider,
             exchange: config.exchange.clone(),
             record,
         }
@@ -1012,23 +1015,14 @@ impl LiveUpdate {
     }
 }
 
-impl LiveState {
-    fn apply(&mut self, update: &LiveUpdate) {
-        self.records
-            .insert(update.selector.clone(), update.record.clone());
-    }
-}
-
 impl ScriptRunSummary {
-    fn record(&mut self, result: &ScriptRunResult<ScriptInputs>) {
+    fn record_update(&mut self, ts_ms: u64) {
         self.updates += 1;
-        self.last_ts_ms = Some(result.ts_ms);
-        if !is_empty_json_value_object(&result.output.signal) {
-            self.signals += 1;
-        }
-        if !is_empty_json_value_object(&result.output.intent) {
-            self.intents += 1;
-        }
+        self.last_ts_ms = Some(ts_ms);
+    }
+
+    fn record_output(&mut self, result: &ScriptRunResult<ScriptInputs>) {
+        self.outputs += 1;
         self.latest_output = Some(result.output.clone());
     }
 }
@@ -1045,8 +1039,7 @@ fn render_run_summary(
             println!("------------------");
             println!("status: cancelled");
             println!("updates: {}", summary.updates);
-            println!("signals: {}", summary.signals);
-            println!("intents: {}", summary.intents);
+            println!("outputs: {}", summary.outputs);
             println!("hook failures: {}", summary.hook_failures);
             if let Some(ts_ms) = summary.last_ts_ms {
                 println!("last ts: {ts_ms}");
@@ -1074,10 +1067,8 @@ fn render_run_summary(
 }
 
 fn live_stream_payload(
-    state: &LiveState,
     update: &LiveUpdate,
     source_configs: &SourceConfigs,
-    provider: &str,
     symbol: &str,
 ) -> Result<Value> {
     let mut payload = serde_json::Map::new();
@@ -1087,7 +1078,10 @@ fn live_stream_payload(
         "source_type".to_string(),
         Value::String(update.source.as_str().to_string()),
     );
-    payload.insert("provider".to_string(), Value::String(provider.to_string()));
+    payload.insert(
+        "provider".to_string(),
+        Value::String(source_provider_name(update.provider).to_string()),
+    );
     payload.insert(
         "exchange".to_string(),
         Value::String(update.exchange.clone()),
@@ -1101,23 +1095,10 @@ fn live_stream_payload(
         "data".to_string(),
         live_record_payload(&update.record, current_config),
     );
-
-    let mut sources = serde_json::Map::new();
-    for (selector, record) in &state.records {
-        let config = source_configs
-            .get(selector)
-            .with_context(|| format!("missing source config for {selector}"))?;
-        let envelope = live_record_payload(record, config);
-        sources.insert(selector.clone(), envelope.clone());
-        let same_kind = source_configs
-            .values()
-            .filter(|candidate| candidate.source == config.source)
-            .count();
-        if same_kind == 1 {
-            payload.insert(config.source.as_str().to_string(), envelope);
-        }
-    }
-    payload.insert("sources".to_string(), Value::Object(sources));
+    payload.insert(
+        "source_configs".to_string(),
+        source_configs_payload(source_configs),
+    );
 
     Ok(Value::Object(payload))
 }
@@ -1162,26 +1143,12 @@ fn render_stream_result(
             }
         }
         OutputFormat::Terminal => {
-            let signal = result
-                .output
-                .signal
-                .get("event")
-                .or_else(|| result.output.signal.get("side"))
-                .and_then(Value::as_str)
-                .unwrap_or("-");
-            let triggered = result
-                .output
-                .signal
-                .get("triggered")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
             let line = format!(
-                "ts={} script={} signal={} triggered={} metrics={}",
+                "ts={} script={} metrics={} meta={}",
                 result.ts_ms,
                 result.script.name,
-                signal,
-                triggered,
-                serde_json::to_string(&result.output.metrics)?
+                serde_json::to_string(&result.output.metrics)?,
+                serde_json::to_string(&result.output.meta)?,
             );
             if rendered.len() >= 50 {
                 rendered.pop_front();
@@ -1219,10 +1186,6 @@ where
     serde_json::to_value(value)
         .map(|value| matches!(value, Value::Object(map) if map.is_empty()))
         .unwrap_or(false)
-}
-
-fn is_empty_json_value_object(value: &Value) -> bool {
-    matches!(value, Value::Object(map) if map.is_empty())
 }
 
 #[derive(Debug)]
@@ -1274,13 +1237,10 @@ mod tests {
     }
 
     fn cross_exchange_configs() -> SourceConfigs {
-        parse_source_configs(
-            &[
-                "candles@binancef:timeframe=60".to_string(),
-                "candles@okx:timeframe=60".to_string(),
-            ],
-            None,
-        )
+        parse_source_configs(&[
+            "candles@binancef@mmt:timeframe=60".to_string(),
+            "candles@okx@mmt:timeframe=60".to_string(),
+        ])
         .expect("parse source configs")
     }
 
@@ -1289,7 +1249,7 @@ mod tests {
         let configs = cross_exchange_configs();
         let update = json!({
             "type": "data",
-            "channel": "candles",
+            "channel": "trades",
             "exchange": "OKX",
             "data": {}
         });
@@ -1298,30 +1258,49 @@ mod tests {
             .expect("route update")
             .expect("matching source config");
 
-        assert_eq!(config.selector, "candles@okx");
+        assert_eq!(config.selector, "candles@okx@mmt");
     }
 
     #[test]
-    fn live_payload_keeps_same_kind_exchanges_separate() {
+    fn parses_mmt_trade_shape_used_for_live_candles() {
+        let trade: MmtTrade = serde_json::from_value(json!({
+            "id": "3065401760",
+            "t": 1_704_067_200_123_u64,
+            "p": 42_050.0,
+            "q": 0.5,
+            "b": true
+        }))
+        .expect("MMT trade should parse");
+
+        assert_eq!(trade.t, 1_704_067_200_123);
+        assert_eq!(trade.p, 42_050.0);
+        assert_eq!(trade.q, 0.5);
+        assert!(trade.b);
+    }
+
+    #[test]
+    fn live_payload_contains_current_internal_record_and_source_metadata() {
         let configs = cross_exchange_configs();
-        let binance = LiveUpdate::new(
-            &configs["candles@binancef"],
-            LiveRecord::Candles(candle(10.0)),
+        let okx = LiveUpdate::new(
+            &configs["candles@okx@mmt"],
+            LiveRecord::Candles(candle(20.0)),
         );
-        let okx = LiveUpdate::new(&configs["candles@okx"], LiveRecord::Candles(candle(20.0)));
-        let mut state = LiveState::default();
-        state.apply(&binance);
-        state.apply(&okx);
 
-        let payload = live_stream_payload(&state, &okx, &configs, "mmt", "BTC/USDT")
-            .expect("build live payload");
+        let payload = live_stream_payload(&okx, &configs, "BTC/USDT").expect("build live payload");
 
-        assert_eq!(payload["source"], "candles@okx");
+        assert_eq!(payload["source"], "candles@okx@mmt");
         assert_eq!(payload["source_type"], "candles");
         assert_eq!(payload["exchange"], "okx");
         assert_eq!(payload["data"]["candle"]["c"], 20.0);
-        assert_eq!(payload["sources"]["candles@binancef"]["candle"]["c"], 10.0);
-        assert_eq!(payload["sources"]["candles@okx"]["candle"]["c"], 20.0);
+        assert_eq!(
+            payload["source_configs"]["candles@binancef@mmt"]["exchange"],
+            "binancef"
+        );
+        assert_eq!(
+            payload["source_configs"]["candles@okx@mmt"]["exchange"],
+            "okx"
+        );
+        assert!(payload.get("sources").is_none());
         assert!(payload.get("candles").is_none());
     }
 }

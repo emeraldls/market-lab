@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use crate::cli::{BacktestSmaCrossoverArgs, CliProviderKind, OutputFormat, RunSmaCrossoverArgs};
+use crate::cli::{BacktestSmaCrossoverArgs, OutputFormat, RunSmaCrossoverArgs};
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::ws_candles::MmtCandlesStream;
 
@@ -134,7 +134,6 @@ struct PerformanceMetrics {
 
 #[derive(Debug, Clone)]
 struct StrategyCommonArgs {
-    provider: CliProviderKind,
     exchange: String,
     symbol: String,
     timeframe: u32,
@@ -149,7 +148,6 @@ struct StrategyCommonArgs {
 impl From<&RunSmaCrossoverArgs> for StrategyCommonArgs {
     fn from(value: &RunSmaCrossoverArgs) -> Self {
         Self {
-            provider: value.provider,
             exchange: value.exchange.clone(),
             symbol: value.symbol.clone(),
             timeframe: value.timeframe,
@@ -166,7 +164,6 @@ impl From<&RunSmaCrossoverArgs> for StrategyCommonArgs {
 impl From<&BacktestSmaCrossoverArgs> for StrategyCommonArgs {
     fn from(value: &BacktestSmaCrossoverArgs) -> Self {
         Self {
-            provider: value.provider,
             exchange: value.exchange.clone(),
             symbol: value.symbol.clone(),
             timeframe: value.timeframe,
@@ -202,20 +199,12 @@ pub async fn handle_run(args: RunSmaCrossoverArgs) -> Result<()> {
     args.validate()?;
     let common = StrategyCommonArgs::from(&args);
 
-    if !matches!(common.provider, CliProviderKind::Mmt) {
-        bail!("strategy sma-crossover currently supports only --provider mmt");
-    }
-
     stream_strategy(args, common).await
 }
 
 pub async fn handle_backtest(args: BacktestSmaCrossoverArgs) -> Result<()> {
     args.validate()?;
     let common = StrategyCommonArgs::from(&args);
-
-    if !matches!(common.provider, CliProviderKind::Mmt) {
-        bail!("strategy sma-crossover currently supports only --provider mmt");
-    }
 
     evaluate_window(args, common).await
 }

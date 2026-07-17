@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::enums::ProviderKind;
 use crate::domain::execution::ExecutionVenue;
 
 use super::execution::{ScriptOrderRef, ScriptTradeRequest};
@@ -16,8 +15,8 @@ pub struct ScriptJobSubmission {
     pub script_name: String,
     pub original_path: String,
     pub source: String,
-    pub provider: ProviderKind,
-    pub exchange: String,
+    pub providers: Vec<String>,
+    pub exchanges: Vec<String>,
     pub symbol: String,
     #[serde(default)]
     pub sources: Vec<String>,
@@ -56,8 +55,8 @@ pub struct ScriptJobDefinition {
     pub script_name: String,
     pub original_path: String,
     pub snapshot_path: PathBuf,
-    pub provider: ProviderKind,
-    pub exchange: String,
+    pub providers: Vec<String>,
+    pub exchanges: Vec<String>,
     pub symbol: String,
     pub sources: Vec<String>,
     pub params: Vec<String>,

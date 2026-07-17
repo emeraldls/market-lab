@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use crate::domain::types::{
-    OhlcvCandle, OhlcvtCandle, OiCandle, OpenInterestSnapshot, VdCandle, VolumeBar,
+    OhlcvCandle, OhlcvtCandle, OiCandle, OpenInterestSnapshot, TradeTick, VdCandle, VolumeBar,
     VolumeDeltaTick, VolumeProfile,
 };
 
@@ -58,6 +58,133 @@ impl ScriptCandle {
             vs: None,
             tb: None,
             ts: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TradeCandleAggregator {
+    timeframe_ms: u64,
+    accept_from_ms: u64,
+    current: Option<TradeCandle>,
+}
+
+#[derive(Debug)]
+struct TradeCandle {
+    bucket_ms: u64,
+    o: f64,
+    h: f64,
+    l: f64,
+    c: f64,
+    vb: f64,
+    vs: f64,
+    tb: u64,
+    ts: u64,
+}
+
+impl TradeCandleAggregator {
+    pub fn new(timeframe_sec: u32, started_at_ms: u64) -> Self {
+        debug_assert!(timeframe_sec > 0);
+        let timeframe_ms = u64::from(timeframe_sec) * 1_000;
+        let remainder = started_at_ms % timeframe_ms;
+        let accept_from_ms = if remainder == 0 {
+            started_at_ms
+        } else {
+            started_at_ms + (timeframe_ms - remainder)
+        };
+        Self {
+            timeframe_ms,
+            accept_from_ms,
+            current: None,
+        }
+    }
+
+    pub fn push(&mut self, trade: &TradeTick) -> Option<ScriptCandle> {
+        if trade.timestamp_ms < self.accept_from_ms
+            || !trade.price.is_finite()
+            || trade.price <= 0.0
+            || !trade.size.is_finite()
+            || trade.size <= 0.0
+        {
+            return None;
+        }
+
+        let bucket_ms = trade.timestamp_ms - (trade.timestamp_ms % self.timeframe_ms);
+        match self.current.as_mut() {
+            None => {
+                self.current = Some(TradeCandle::new(bucket_ms, trade));
+                None
+            }
+            Some(current) if bucket_ms == current.bucket_ms => {
+                current.apply(trade);
+                None
+            }
+            Some(current) if bucket_ms < current.bucket_ms => None,
+            Some(_) => {
+                let completed = self
+                    .current
+                    .take()
+                    .map(|candle| candle.complete(self.timeframe_ms));
+                self.current = Some(TradeCandle::new(bucket_ms, trade));
+                completed
+            }
+        }
+    }
+
+    pub fn push_batch(&mut self, trades: &[TradeTick]) -> Vec<ScriptCandle> {
+        let mut sorted = trades.iter().collect::<Vec<_>>();
+        sorted.sort_by_key(|trade| trade.timestamp_ms);
+        sorted
+            .into_iter()
+            .filter_map(|trade| self.push(trade))
+            .collect()
+    }
+}
+
+impl TradeCandle {
+    fn new(bucket_ms: u64, trade: &TradeTick) -> Self {
+        let mut candle = Self {
+            bucket_ms,
+            o: trade.price,
+            h: trade.price,
+            l: trade.price,
+            c: trade.price,
+            vb: 0.0,
+            vs: 0.0,
+            tb: 0,
+            ts: 0,
+        };
+        candle.apply(trade);
+        candle
+    }
+
+    fn apply(&mut self, trade: &TradeTick) {
+        self.h = self.h.max(trade.price);
+        self.l = self.l.min(trade.price);
+        self.c = trade.price;
+        if trade.taker_buy {
+            self.vb += trade.size;
+            self.tb += 1;
+        } else {
+            self.vs += trade.size;
+            self.ts += 1;
+        }
+    }
+
+    fn complete(self, timeframe_ms: u64) -> ScriptCandle {
+        ScriptCandle {
+            t: self.bucket_ms,
+            o: self.o,
+            h: self.h,
+            l: self.l,
+            c: self.c,
+            volume: self.vb + self.vs,
+            trades: self.tb + self.ts,
+            close_time: Some(self.bucket_ms + timeframe_ms),
+            vb: Some(self.vb),
+            vs: Some(self.vs),
+            tb: Some(self.tb),
+            ts: Some(self.ts),
         }
     }
 }
@@ -289,5 +416,47 @@ mod tests {
         assert_eq!(candle.volume, 5.0);
         assert!(candle.vb.is_none());
         assert!(candle.vs.is_none());
+    }
+
+    #[test]
+    fn trade_candles_discard_the_startup_partial_bucket() {
+        let mut candles = TradeCandleAggregator::new(60, 43_659_000);
+        assert!(candles.push(&trade(43_679_000, 100.0, 1.0, true)).is_none());
+        assert!(candles.push(&trade(43_680_000, 101.0, 2.0, true)).is_none());
+        assert!(candles.push(&trade(43_699_000, 99.0, 3.0, false)).is_none());
+        let candle = candles
+            .push(&trade(43_740_000, 102.0, 1.0, true))
+            .expect("the first full bucket should close");
+
+        assert_eq!(candle.t, 43_680_000);
+        assert_eq!(candle.close_time, Some(43_740_000));
+        assert_eq!(
+            (candle.o, candle.h, candle.l, candle.c),
+            (101.0, 101.0, 99.0, 99.0)
+        );
+        assert_eq!((candle.volume, candle.trades), (5.0, 2));
+        assert_eq!((candle.vb, candle.vs), (Some(2.0), Some(3.0)));
+        assert_eq!((candle.tb, candle.ts), (Some(1), Some(1)));
+    }
+
+    #[test]
+    fn trade_candles_accept_a_script_started_on_a_boundary() {
+        let mut candles = TradeCandleAggregator::new(30, 43_650_000);
+        assert!(candles.push(&trade(43_650_000, 100.0, 1.0, true)).is_none());
+        let candle = candles
+            .push(&trade(43_680_000, 101.0, 1.0, true))
+            .expect("boundary bucket should be complete");
+        assert_eq!(candle.t, 43_650_000);
+    }
+
+    fn trade(timestamp_ms: u64, price: f64, size: f64, taker_buy: bool) -> TradeTick {
+        TradeTick {
+            exchange: "test".to_string(),
+            symbol: "BTC/USDT".to_string(),
+            timestamp_ms,
+            price,
+            size,
+            taker_buy,
+        }
     }
 }

@@ -56,7 +56,7 @@ pub struct ScriptManifest {
     #[serde(default)]
     pub lookback: Option<usize>,
     #[serde(default)]
-    pub params: BTreeMap<ScriptSource, BTreeMap<String, ScriptParamSchema>>,
+    pub params: BTreeMap<String, ScriptParamSchema>,
 }
 
 impl ScriptManifest {
@@ -83,40 +83,18 @@ impl ScriptManifest {
         {
             bail!("script.lookback must be <= {SCRIPT_MAX_LOOKBACK_CANDLES}");
         }
-        for source in self.params.keys() {
-            if !self.sources.contains(source) {
-                bail!("script.params contains source not listed in script.sources");
+        for (key, schema) in &self.params {
+            if !is_valid_param_name(key) {
+                bail!("script.params key `{key}` must be snake_case");
             }
-        }
-        for (source, params) in &self.params {
-            for key in params.keys() {
-                if !is_valid_param_name(key) {
-                    bail!(
-                        "script.params.{} key `{key}` must be snake_case",
-                        source.as_str()
-                    );
-                }
-                if is_reserved_param_name(key) {
-                    bail!(
-                        "script.params.{} key `{key}` is reserved by Market Lab",
-                        source.as_str()
-                    );
-                }
+            if is_reserved_param_name(key) {
+                bail!("script.params key `{key}` is reserved by Market Lab");
             }
-            for (key, schema) in params {
-                if schema.required && schema.default.is_some() {
-                    bail!(
-                        "script.params.{}.{key} cannot be required and also have a default",
-                        source.as_str()
-                    );
-                }
-                if let Some(default) = &schema.default {
-                    validate_default_value(
-                        &format!("{}.{key}", source.as_str()),
-                        &schema.input_type,
-                        default,
-                    )?;
-                }
+            if schema.required && schema.default.is_some() {
+                bail!("script.params.{key} cannot be required and also have a default");
+            }
+            if let Some(default) = &schema.default {
+                validate_default_value(key, &schema.input_type, default)?;
             }
         }
         Ok(())
@@ -196,12 +174,16 @@ fn validate_default_value(
 mod tests {
     use super::*;
 
+    fn candle_sources() -> Vec<ScriptSource> {
+        vec![ScriptSource::Candles]
+    }
+
     #[test]
     fn manifest_requires_name() {
         let manifest = ScriptManifest {
             name: String::new(),
             version: "1".to_string(),
-            sources: vec![ScriptSource::Candles],
+            sources: candle_sources(),
             modes: vec![ScriptMode::Window],
             clock: None,
             description: None,
@@ -213,23 +195,19 @@ mod tests {
 
     #[test]
     fn manifest_rejects_bad_param_name() {
-        let mut params = BTreeMap::new();
-        params.insert(
-            ScriptSource::Candles,
-            BTreeMap::from([(
-                "min-vbuy".to_string(),
-                ScriptParamSchema {
-                    input_type: InputType::Number,
-                    required: true,
-                    default: None,
-                    description: None,
-                },
-            )]),
-        );
+        let params = BTreeMap::from([(
+            "min-vbuy".to_string(),
+            ScriptParamSchema {
+                input_type: InputType::Number,
+                required: true,
+                default: None,
+                description: None,
+            },
+        )]);
         let manifest = ScriptManifest {
             name: "x".to_string(),
             version: "1".to_string(),
-            sources: vec![ScriptSource::Candles],
+            sources: candle_sources(),
             modes: vec![ScriptMode::Window],
             clock: None,
             description: None,
@@ -241,23 +219,19 @@ mod tests {
 
     #[test]
     fn manifest_rejects_reserved_param_name() {
-        let mut params = BTreeMap::new();
-        params.insert(
-            ScriptSource::Candles,
-            BTreeMap::from([(
-                "timeframe".to_string(),
-                ScriptParamSchema {
-                    input_type: InputType::Number,
-                    required: true,
-                    default: None,
-                    description: None,
-                },
-            )]),
-        );
+        let params = BTreeMap::from([(
+            "timeframe".to_string(),
+            ScriptParamSchema {
+                input_type: InputType::Number,
+                required: true,
+                default: None,
+                description: None,
+            },
+        )]);
         let manifest = ScriptManifest {
             name: "x".to_string(),
             version: "1".to_string(),
-            sources: vec![ScriptSource::Candles],
+            sources: candle_sources(),
             modes: vec![ScriptMode::Window],
             clock: None,
             description: None,
@@ -299,7 +273,7 @@ mod tests {
         let manifest = ScriptManifest {
             name: "x".to_string(),
             version: "1".to_string(),
-            sources: vec![ScriptSource::Candles],
+            sources: candle_sources(),
             modes: vec![ScriptMode::Window],
             clock: Some(ScriptSource::Orderbook),
             description: None,
@@ -314,7 +288,7 @@ mod tests {
         let manifest = ScriptManifest {
             name: "x".to_string(),
             version: "1".to_string(),
-            sources: vec![ScriptSource::Candles],
+            sources: candle_sources(),
             modes: vec![ScriptMode::Window],
             clock: None,
             description: None,
@@ -331,7 +305,7 @@ mod tests {
         let manifest = ScriptManifest {
             name: "x".to_string(),
             version: "1".to_string(),
-            sources: vec![ScriptSource::Candles],
+            sources: candle_sources(),
             modes: vec![ScriptMode::Window],
             clock: None,
             description: None,

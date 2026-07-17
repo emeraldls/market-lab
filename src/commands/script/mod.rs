@@ -20,7 +20,7 @@ pub(crate) struct ScriptInputs {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ScriptDescriptor {
     pub(crate) name: String,
-    pub(crate) sources: Vec<&'static str>,
+    pub(crate) sources: Vec<String>,
 }
 
 pub(crate) fn report_script(script: &Script) -> ScriptReportScript {

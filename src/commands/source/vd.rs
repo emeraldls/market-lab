@@ -28,12 +28,10 @@ struct VdStreamItem {
 
 pub async fn handle(args: SourceVdArgs) -> Result<()> {
     args.validate()?;
-    match args.provider.into() {
+    match args.provider_kind()?.into() {
         ProviderKind::Mmt => handle_mmt(args).await,
         ProviderKind::Bulk => stream_bulk_vd(args).await,
-        ProviderKind::MarketLab => {
-            bail!("source vd does not support --provider market-lab")
-        }
+        ProviderKind::MarketLab => unreachable!("source routing cannot resolve to Market Lab"),
     }
 }
 

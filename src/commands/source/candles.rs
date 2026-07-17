@@ -15,12 +15,10 @@ use super::common::{SourceEnvelope, SourceMeta, render_terminal};
 
 pub async fn handle(args: SourceCandlesArgs) -> Result<()> {
     args.validate()?;
-    match args.provider.into() {
+    match args.provider_kind()?.into() {
         ProviderKind::Mmt => handle_mmt(args).await,
         ProviderKind::Bulk => handle_bulk(args).await,
-        ProviderKind::MarketLab => {
-            bail!("source candles does not support --provider market-lab")
-        }
+        ProviderKind::MarketLab => unreachable!("source routing cannot resolve to Market Lab"),
     }
 }
 

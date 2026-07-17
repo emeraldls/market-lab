@@ -1,26 +1,26 @@
 version = 1
 
 [market]
-provider = "mmt"
-exchange = "hyperliquid"
-symbol = "HYPE/USDT"
+symbol = "BTC/USDT"
 
 [output]
 format = "terminal"
 verbose = false
 
-[sources.candles]
+[sources."candles@binancef@mmt"]
 timeframe = 60
 
+[sources."orderbook@bulk"]
+depth = 20
+
 [script]
-path = "./examples/dip-tp-positions.js"
+path = "./examples/sma-crossover.js"
 
-[script.params.candles]
-drop_bps = 20
-take_profit_bps = 50
-notional = 1000
-
-[backtest]
-from = 1780497965372
-to = 1780618018000
+[script.params]
+max_spread = 1
+max_slippage = 0.1
+entry_amount_dollar = 150
 leverage = 5
+
+[execution]
+venue = "bulk"

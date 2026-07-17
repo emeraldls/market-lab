@@ -26,7 +26,7 @@ use crate::scripting::jobs::{
     ScriptManagedOrder,
 };
 
-const RUNTIME_VERSION: u8 = 5;
+const RUNTIME_VERSION: u8 = 7;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -784,8 +784,8 @@ fn create_script_job(
         script_name: submission.script_name,
         original_path: submission.original_path,
         snapshot_path,
-        provider: submission.provider,
-        exchange: submission.exchange,
+        providers: submission.providers,
+        exchanges: submission.exchanges,
         symbol: submission.symbol,
         sources: submission.sources,
         params: submission.params,

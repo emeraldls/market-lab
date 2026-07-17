@@ -77,7 +77,7 @@ fn render_jobs(jobs: &[ScriptJob], output: OutputFormat) -> Result<()> {
                     job.pid
                         .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
                     truncate(&job.definition.script_name, 22),
-                    format!("{:?}", job.definition.provider).to_ascii_lowercase(),
+                    job.definition.providers.join(","),
                     job.definition.symbol,
                 );
             }
@@ -104,8 +104,8 @@ fn render_job(job: &ScriptJob, output: OutputFormat) -> Result<()> {
                 "  snapshot:         {}",
                 job.definition.snapshot_path.display()
             );
-            println!("  provider:         {:?}", job.definition.provider);
-            println!("  exchange:         {}", job.definition.exchange);
+            println!("  providers:        {}", job.definition.providers.join(","));
+            println!("  exchanges:        {}", job.definition.exchanges.join(","));
             println!("  symbol:           {}", job.definition.symbol);
             println!(
                 "  venue:            {}",
