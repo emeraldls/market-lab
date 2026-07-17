@@ -25,6 +25,8 @@ pub struct ScriptJobSubmission {
     #[serde(default)]
     pub venue: Option<ExecutionVenue>,
     #[serde(default)]
+    pub duration_seconds: Option<u64>,
+    #[serde(default)]
     pub verbose: bool,
 }
 
@@ -45,6 +47,9 @@ impl ScriptJobSubmission {
         if self.symbol.trim().is_empty() {
             bail!("script job symbol is required");
         }
+        if self.duration_seconds == Some(0) {
+            bail!("script job duration must be at least 1 second");
+        }
         Ok(())
     }
 }
@@ -61,6 +66,8 @@ pub struct ScriptJobDefinition {
     pub sources: Vec<String>,
     pub params: Vec<String>,
     pub venue: Option<ExecutionVenue>,
+    #[serde(default)]
+    pub duration_seconds: Option<u64>,
     pub verbose: bool,
 }
 
@@ -120,6 +127,30 @@ pub struct ScriptExecutionEvent {
     pub terminal: bool,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub data: serde_json::Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn older_job_definitions_default_to_unlimited_runtime() {
+        let definition: ScriptJobDefinition = serde_json::from_value(serde_json::json!({
+            "scriptName": "maker",
+            "originalPath": "maker.js",
+            "snapshotPath": "/tmp/maker.js",
+            "providers": ["bulk"],
+            "exchanges": ["bulk"],
+            "symbol": "BTC/USDT",
+            "sources": ["orderbook@bulk:depth=20"],
+            "params": [],
+            "venue": "bulk",
+            "verbose": false
+        }))
+        .expect("older job definition should deserialize");
+
+        assert!(definition.duration_seconds.is_none());
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

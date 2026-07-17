@@ -114,6 +114,12 @@ fn render_job(job: &ScriptJob, output: OutputFormat) -> Result<()> {
                     |venue| format!("{venue:?}").to_ascii_lowercase()
                 )
             );
+            println!(
+                "  duration:         {}",
+                job.definition
+                    .duration_seconds
+                    .map_or_else(|| "forever".to_string(), |seconds| format!("{seconds}s"))
+            );
             println!("  created:          {}", format_ts(job.created_at_ms));
             println!(
                 "  started:          {}",

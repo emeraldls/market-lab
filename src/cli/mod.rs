@@ -441,6 +441,9 @@ pub struct ScriptRunArgs {
     pub source: Vec<String>,
     #[arg(long = "param")]
     pub param: Vec<String>,
+    /// Maximum live runtime in seconds. Omit to run until manually stopped.
+    #[arg(long)]
+    pub duration: Option<u64>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
     #[arg(long, default_value_t = false)]
@@ -516,6 +519,9 @@ impl ScriptRunArgs {
             && from >= to
         {
             bail!("--from must be less than --to");
+        }
+        if self.duration == Some(0) {
+            bail!("--duration must be at least 1 second");
         }
         Ok(())
     }
@@ -2700,6 +2706,8 @@ mod tests {
             "candles@bybitf@mmt:timeframe=60",
             "--param",
             "min_vbuy=50000",
+            "--duration",
+            "3600",
             "--output",
             "json",
         ])
@@ -2713,6 +2721,7 @@ mod tests {
                 assert_eq!(args.symbol.as_deref(), Some("BTC/USDT"));
                 assert_eq!(args.source, vec!["candles@bybitf@mmt:timeframe=60"]);
                 assert_eq!(args.param, vec!["min_vbuy=50000"]);
+                assert_eq!(args.duration, Some(3600));
                 args.validate().expect("validate should succeed");
             }
             _ => panic!("expected script run command"),
@@ -2732,7 +2741,31 @@ mod tests {
                 assert!(args.symbol.is_none());
                 assert!(args.from.is_none());
                 assert!(args.to.is_none());
+                assert!(args.duration.is_none());
                 args.validate().expect("base validate should succeed");
+            }
+            _ => panic!("expected script run command"),
+        }
+    }
+
+    #[test]
+    fn reject_zero_script_run_duration() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "script",
+            "run",
+            "test/market-maker.js",
+            "--duration",
+            "0",
+        ])
+        .expect("duration syntax should parse before validation");
+
+        match cli.command {
+            Commands::Script {
+                command: ScriptCommands::Run(args),
+            } => {
+                let error = args.validate().expect_err("zero duration must fail");
+                assert!(error.to_string().contains("at least 1 second"));
             }
             _ => panic!("expected script run command"),
         }

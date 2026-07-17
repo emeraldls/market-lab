@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::Ordering;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::cli::{ExecutionVenueArg, OutputFormat, ScriptRunArgs, mmt_timeframe_from_seconds};
 use crate::commands::script::{
@@ -150,6 +150,7 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
         sources: args.source,
         params: args.param,
         venue: args.venue.map(Into::into),
+        duration_seconds: args.duration,
         verbose: args.verbose,
     };
     let job = crate::runtime::submit_script_job(submission).await?;
@@ -166,6 +167,12 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
                     || "disabled".to_string(),
                     |venue| format!("{venue:?}").to_ascii_lowercase()
                 )
+            );
+            println!(
+                "  duration:  {}",
+                job.definition
+                    .duration_seconds
+                    .map_or_else(|| "forever".to_string(), |seconds| format!("{seconds}s"))
             );
             println!("  logs:      mlab script logs {} --follow", job.id);
         }
@@ -191,6 +198,7 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
         to: None,
         source: job.definition.sources.clone(),
         param: job.definition.params.clone(),
+        duration: job.definition.duration_seconds,
         output: OutputFormat::Jsonl,
         verbose: job.definition.verbose,
     };
@@ -203,7 +211,22 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
     );
     let pid = std::process::id();
     crate::runtime::script_worker_started(job_id, pid).await?;
-    let result = run(args, script, &mut report, job_id, job.worker_event_cursor).await;
+    let result = if let Some(duration_seconds) = job.definition.duration_seconds {
+        match tokio::time::timeout(
+            Duration::from_secs(duration_seconds),
+            run(args, script, &mut report, job_id, job.worker_event_cursor),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                report.set_phase("duration_elapsed");
+                Ok(())
+            }
+        }
+    } else {
+        run(args, script, &mut report, job_id, job.worker_event_cursor).await
+    };
     let error = result
         .as_ref()
         .err()

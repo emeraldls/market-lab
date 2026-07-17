@@ -790,6 +790,7 @@ fn create_script_job(
         sources: submission.sources,
         params: submission.params,
         venue: submission.venue,
+        duration_seconds: submission.duration_seconds,
         verbose: submission.verbose,
     };
     let job = ScriptJob {

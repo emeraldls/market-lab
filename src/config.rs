@@ -41,6 +41,7 @@ struct OutputConfig {
 #[serde(deny_unknown_fields)]
 struct ScriptConfig {
     path: Option<PathBuf>,
+    duration: Option<u64>,
     params: Option<BTreeMap<String, toml::Value>>,
 }
 
@@ -175,6 +176,18 @@ fn append_script_config_flags(
         for (name, value) in params {
             append_pair(args, "--param", &format!("{name}={}", scalar(value)?));
         }
+    }
+
+    if mode == "run" {
+        append_optional_owned(
+            args,
+            "--duration",
+            config
+                .script
+                .as_ref()
+                .and_then(|script| script.duration)
+                .map(|value| value.to_string()),
+        );
     }
 
     if mode == "backtest"
@@ -488,6 +501,7 @@ symbol = "BTC/USDT"
 
 [script]
 path = "strategy.js"
+duration = 3600
 
 [sources."candles@okx@mmt"]
 timeframe = 60
@@ -525,6 +539,7 @@ max_spread = 1
                     vec!["candles@okx@mmt:timeframe=60", "orderbook@bulk:depth=20",]
                 );
                 assert_eq!(args.param, vec!["max_spread=1"]);
+                assert_eq!(args.duration, Some(3600));
                 args.validate().expect("qualified bindings should validate");
                 let manifest = ScriptManifest {
                     name: "toml-multi-exchange".to_string(),
