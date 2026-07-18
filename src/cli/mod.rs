@@ -1697,11 +1697,30 @@ fn resolve_source_provider(
     if exchange.trim().is_empty() {
         bail!("--exchange cannot be empty");
     }
-    if provider.is_some() {
-        if exchange.eq_ignore_ascii_case("bulk") {
-            bail!("omit --provider for the standalone `bulk` exchange");
+    if let Some(p) = provider {
+        match p {
+            CliDataProvider::Binance => {
+                if !exchange.eq_ignore_ascii_case("binance") {
+                    bail!("--exchange must be `binance` with --provider binance");
+                }
+                return Ok(CliProviderKind::Binance);
+            }
+            CliDataProvider::BinanceFutures => {
+                if !exchange.eq_ignore_ascii_case("binance_futures")
+                    && !exchange.eq_ignore_ascii_case("binancefutures")
+                    && !exchange.eq_ignore_ascii_case("binance-futures")
+                {
+                    bail!("--exchange must be `binance_futures` with --provider binance-futures");
+                }
+                return Ok(CliProviderKind::BinanceFutures);
+            }
+            CliDataProvider::Mmt => {
+                if exchange.eq_ignore_ascii_case("bulk") {
+                    bail!("omit --provider for the standalone `bulk` exchange");
+                }
+                return Ok(CliProviderKind::Mmt);
+            }
         }
-        return Ok(CliProviderKind::Mmt);
     }
     if exchange.eq_ignore_ascii_case("bulk") {
         return Ok(CliProviderKind::Bulk);
@@ -1723,10 +1742,12 @@ fn resolve_system_provider(
     exchange: Option<&str>,
 ) -> Result<ProviderKind> {
     match (provider, exchange) {
-        (Some(_), Some(exchange)) if exchange.eq_ignore_ascii_case("bulk") => {
+        (Some(CliDataProvider::Binance), _) => Ok(ProviderKind::Binance),
+        (Some(CliDataProvider::BinanceFutures), _) => Ok(ProviderKind::BinanceFutures),
+        (Some(CliDataProvider::Mmt), Some(exchange)) if exchange.eq_ignore_ascii_case("bulk") => {
             bail!("omit --provider for the standalone `bulk` exchange")
         }
-        (Some(_), _) => Ok(ProviderKind::Mmt),
+        (Some(CliDataProvider::Mmt), _) => Ok(ProviderKind::Mmt),
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("bulk") => Ok(ProviderKind::Bulk),
         (None, Some(exchange)) => bail!("unsupported standalone exchange `{exchange}`"),
         (None, None) => Ok(ProviderKind::MarketLab),
@@ -1747,6 +1768,19 @@ fn provider_timeframe_from_seconds(
     match provider {
         CliProviderKind::Bulk => {
             crate::providers::bulk::market_data::timeframe_from_seconds(seconds)
+        }
+        CliProviderKind::Binance | CliProviderKind::BinanceFutures => {
+            // Binance spot and futures use same interval format (1h, 15m, etc)
+            match seconds {
+                60 => Ok("1m"),
+                300 => Ok("5m"),
+                900 => Ok("15m"),
+                1800 => Ok("30m"),
+                3600 => Ok("1h"),
+                14400 => Ok("4h"),
+                86400 => Ok("1d"),
+                _ => bail!("unsupported timeframe for binance: {seconds} seconds"),
+            }
         }
         CliProviderKind::Mmt | CliProviderKind::MarketLab => mmt_timeframe_from_seconds(seconds),
     }
@@ -1788,6 +1822,9 @@ pub(crate) fn mmt_timeframe_from_seconds(seconds: u32) -> Result<&'static str> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum CliDataProvider {
     Mmt,
+    Binance,
+    #[value(name = "binance-futures")]
+    BinanceFutures,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1795,12 +1832,16 @@ pub enum CliProviderKind {
     MarketLab,
     Mmt,
     Bulk,
+    Binance,
+    BinanceFutures,
 }
 
 impl From<CliDataProvider> for CliProviderKind {
     fn from(value: CliDataProvider) -> Self {
         match value {
             CliDataProvider::Mmt => Self::Mmt,
+            CliDataProvider::Binance => Self::Binance,
+            CliDataProvider::BinanceFutures => Self::BinanceFutures,
         }
     }
 }
@@ -1811,6 +1852,8 @@ impl From<CliProviderKind> for ProviderKind {
             CliProviderKind::MarketLab => ProviderKind::MarketLab,
             CliProviderKind::Mmt => ProviderKind::Mmt,
             CliProviderKind::Bulk => ProviderKind::Bulk,
+            CliProviderKind::Binance => ProviderKind::Binance,
+            CliProviderKind::BinanceFutures => ProviderKind::BinanceFutures,
         }
     }
 }

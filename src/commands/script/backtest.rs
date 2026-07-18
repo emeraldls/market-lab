@@ -7,15 +7,25 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crate::cli::{OutputFormat, ScriptBacktestArgs, mmt_timeframe_from_seconds};
+
+/// Standard timeframe mapping (1m, 5m, 15m, 30m, 1h, 4h, 1d) shared by BULK and Binance.
+/// Matches the mapping in `cli::provider_timeframe_from_seconds` for these providers.
+fn standard_timeframe_from_seconds(seconds: u32) -> Result<String> {
+    crate::providers::bulk::market_data::timeframe_from_seconds(seconds)
+        .map(|s| s.to_string())
+        .map_err(|e| anyhow::anyhow!("unsupported timeframe: {} seconds — {e}", seconds))
+}
 use crate::commands::script::{
     ScriptDescriptor, ScriptInputs, report_builder, write_report_best_effort,
     write_running_report_best_effort,
 };
 use crate::commands::study::common::is_empty_object;
 use crate::domain::enums::ProviderKind;
-use crate::domain::types::OrderBookSnapshot;
-use crate::providers::bulk::market_data::BulkProvider;
+use crate::domain::types::{CandleSeries, OhlcvtCandle, OiCandle, OrderBookSnapshot, VdCandle, VolumeProfile};
 use crate::providers::mmt::MmtProvider;
+use crate::providers::bulk::market_data::BulkProvider;
+use crate::providers::binance::market_data::BinanceProvider;
+
 use crate::scripting::engine::Script;
 use crate::scripting::execution::{
     ScriptCancelRequest, ScriptExecutionCommand, ScriptExecutionContext, ScriptOrderKind,
@@ -549,6 +559,18 @@ async fn fetch_sources(
                 .series,
         );
     }
+    if source_configs
+        .values()
+        .any(|config| {
+            config.provider == ProviderKind::Binance || config.provider == ProviderKind::BinanceFutures
+        })
+    {
+        data.series.extend(
+            fetch_binance_sources(args, source_configs, report)
+                .await?
+                .series,
+        );
+    }
     Ok(data)
 }
 
@@ -577,12 +599,15 @@ async fn fetch_mmt_sources(
                     "fetching candles exchange={} symbol={} tf={} from={} to={}",
                     exchange, args.symbol, timeframe, args.from, args.to
                 );
-                let future = MmtProvider::candles(exchange, &args.symbol, tf, args.from, args.to);
-                let series = tokio::select! {
-                    result = future => result?,
-                    _ = &mut cancel => {
-                        report.set_phase("cancelled");
-                        return Err(ScriptCancelled.into());
+                let series = {
+                    let future =
+                        MmtProvider::candles(exchange, &args.symbol, tf, args.from, args.to);
+                    tokio::select! {
+                        result = future => result?,
+                        _ = &mut cancel => {
+                            report.set_phase("cancelled");
+                            return Err(ScriptCancelled.into());
+                        }
                     }
                 };
                 eprintln!(
@@ -849,6 +874,111 @@ async fn fetch_bulk_sources(
         }
         eprintln!(
             "fetched {points} BULK {} records in {}ms",
+            source.as_str(),
+            started.elapsed().as_millis()
+        );
+        report.set_progress(
+            format!("{}_fetched", source.as_str()),
+            points as u64,
+            points as u64,
+        );
+        write_running_report_best_effort(report);
+    }
+
+    Ok(data)
+}
+
+async fn fetch_binance_sources(
+    args: &ScriptBacktestArgs,
+    source_configs: &SourceConfigs,
+    report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
+) -> Result<BacktestData> {
+    let mut data = BacktestData::default();
+    let mut cancel = Box::pin(tokio::signal::ctrl_c());
+
+    let mut configs = source_configs.values().collect::<Vec<_>>();
+    configs.retain(|config| {
+        config.provider == ProviderKind::Binance || config.provider == ProviderKind::BinanceFutures
+    });
+    configs.sort_by_key(|config| config.position);
+
+    for config in configs {
+        let source = &config.source;
+        let timeframe = config.require_timeframe(source)?;
+        let interval = standard_timeframe_from_seconds(timeframe)?;
+        let is_futures = config.provider == ProviderKind::BinanceFutures;
+
+        match source {
+            ScriptSource::Candles => {}
+            ScriptSource::Volumes => {}
+            ScriptSource::Orderbook | ScriptSource::Vd | ScriptSource::Oi => {
+                bail!(
+                    "Binance does not provide historical {} for script backtests",
+                    source.as_str()
+                );
+            }
+        }
+
+        report.set_phase("fetching_candles");
+        write_running_report_best_effort(report);
+        let started = Instant::now();
+        eprintln!(
+            "fetching Binance{} {} symbol={} tf={} from={} to={}",
+            if is_futures { " Futures" } else { "" },
+            source.as_str(),
+            args.symbol,
+            timeframe,
+            args.from,
+            args.to
+        );
+
+        let series = if is_futures {
+            let future = BinanceProvider::candles_paginated_futures(
+                &args.symbol, &interval, args.from, args.to,
+            );
+            tokio::select! {
+                result = future => result?,
+                _ = &mut cancel => {
+                    report.set_phase("cancelled");
+                    return Err(ScriptCancelled.into());
+                }
+            }
+        } else {
+            let future = BinanceProvider::candles_paginated(
+                &args.symbol, &interval, args.from, args.to,
+            );
+            tokio::select! {
+                result = future => result?,
+                _ = &mut cancel => {
+                    report.set_phase("cancelled");
+                    return Err(ScriptCancelled.into());
+                }
+            }
+        };
+
+        let points = series.data.len();
+        match source {
+            ScriptSource::Candles => {
+                data.series.insert(
+                    config.selector.clone(),
+                    BacktestSeries::Candles(
+                        series.data.into_iter().map(ScriptCandle::from_bulk).collect(),
+                    ),
+                );
+            }
+            ScriptSource::Volumes => {
+                data.series.insert(
+                    config.selector.clone(),
+                    BacktestSeries::Volumes(
+                        series.data.into_iter().map(ScriptVolume::from_bulk_candle).collect(),
+                    ),
+                );
+            }
+            _ => unreachable!(),
+        }
+        eprintln!(
+            "fetched {points} Binance{} {} records in {}ms",
+            if is_futures { " Futures" } else { "" },
             source.as_str(),
             started.elapsed().as_millis()
         );

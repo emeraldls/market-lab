@@ -18,7 +18,10 @@ pub async fn handle(args: SourceCandlesArgs) -> Result<()> {
     match args.provider_kind()?.into() {
         ProviderKind::Mmt => handle_mmt(args).await,
         ProviderKind::Bulk => handle_bulk(args).await,
-        ProviderKind::MarketLab => unreachable!("source routing cannot resolve to Market Lab"),
+        ProviderKind::Binance | ProviderKind::BinanceFutures => handle_binance(args).await,
+        ProviderKind::MarketLab => {
+            bail!("source candles does not support --provider market-lab")
+        }
     }
 }
 
@@ -264,4 +267,63 @@ async fn stream_bulk_candles(args: SourceCandlesArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn handle_binance(args: SourceCandlesArgs) -> Result<()> {
+    use crate::providers::binance::market_data::BinanceProvider;
+    use crate::domain::enums::ProviderKind;
+
+    let from = args.from
+        .ok_or_else(|| anyhow::anyhow!("--from is required for Binance"))?;
+    let to = args.to
+        .ok_or_else(|| anyhow::anyhow!("--to is required for Binance"))?;
+    let tf = args.timeframe_name()?;
+
+    let provider_kind: ProviderKind = args.provider_kind()?.into();
+    let series = match provider_kind {
+        ProviderKind::BinanceFutures => {
+            BinanceProvider::candles_paginated_futures(&args.symbol, &tf, from, to).await?
+        }
+        _ => {
+            BinanceProvider::candles_paginated(&args.symbol, &tf, from, to).await?
+        }
+    };
+    
+    let env = SourceEnvelope {
+        r#type: "source.candles.series".to_string(),
+        version: "1",
+        provider: "binance",
+        exchange: series.exchange.clone(),
+        symbol: series.symbol.clone(),
+        ts_ms: series.data.last().map(|candle| candle.t).unwrap_or(0),
+        stream: false,
+        data: &series,
+        meta: SourceMeta {
+            depth: None,
+            min_size: None,
+            max_size: None,
+            price_group: None,
+            interval_ms: None,
+            timeframe: Some(series.tf.clone()),
+            bucket: None,
+            from: Some(series.from),
+            to: Some(series.to),
+        },
+    };
+
+    match args.output {
+        OutputFormat::Terminal => {
+            println!(
+                "{} {} Binance candles tf={} points={} from={} to={}",
+                series.symbol, series.exchange, series.tf, series.points, series.from, series.to
+            );
+            Ok(())
+        }
+        OutputFormat::Json | OutputFormat::Jsonl => {
+            let json = serde_json::to_string(&env)?;
+            println!("{}", json);
+            Ok(())
+        }
+        _ => bail!("unsupported output format for Binance candles"),
+    }
 }

@@ -5,6 +5,8 @@ pub enum ProviderKind {
     MarketLab,
     Mmt,
     Bulk,
+    Binance,
+    BinanceFutures,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

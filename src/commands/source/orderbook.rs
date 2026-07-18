@@ -26,7 +26,10 @@ pub async fn handle(args: SourceOrderbookArgs) -> Result<()> {
     match args.provider_kind()?.into() {
         ProviderKind::Mmt => handle_mmt(args).await,
         ProviderKind::Bulk => handle_bulk(args).await,
-        ProviderKind::MarketLab => unreachable!("source routing cannot resolve to Market Lab"),
+        ProviderKind::Binance | ProviderKind::BinanceFutures => bail!("Binance provider does not support this source"),
+        ProviderKind::MarketLab => {
+            bail!("source orderbook does not support --provider market-lab")
+        }
     }
 }
 

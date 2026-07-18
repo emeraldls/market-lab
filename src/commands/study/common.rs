@@ -55,6 +55,8 @@ pub fn provider_name(kind: ProviderKind) -> &'static str {
         ProviderKind::Mmt => "mmt",
         ProviderKind::MarketLab => "marketlab",
         ProviderKind::Bulk => "bulk",
+        ProviderKind::Binance => "binance",
+        ProviderKind::BinanceFutures => "binance_futures",
     }
 }
 

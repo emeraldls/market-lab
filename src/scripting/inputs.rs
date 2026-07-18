@@ -185,6 +185,8 @@ pub fn source_provider_name(provider: ProviderKind) -> &'static str {
         ProviderKind::Mmt => "mmt",
         ProviderKind::Bulk => "bulk",
         ProviderKind::MarketLab => "marketlab",
+        ProviderKind::Binance => "binance",
+        ProviderKind::BinanceFutures => "binance_futures",
     }
 }
 
@@ -311,6 +313,43 @@ fn validate_source_config(config: &SourceConfig, historical: bool) -> Result<()>
             }
         },
         ProviderKind::MarketLab => bail!("marketlab is not a script source provider"),
+        ProviderKind::Binance | ProviderKind::BinanceFutures => {
+            match &config.source {
+                ScriptSource::Candles => {
+                    let timeframe = config.require_timeframe(&config.source)?;
+                    // Binance spot and futures use the same standard timeframe mapping.
+                    let _ = crate::cli::mmt_timeframe_from_seconds(timeframe);
+                }
+                ScriptSource::Orderbook if historical => {
+                    bail!("Binance does not provide historical orderbooks for script backtests");
+                }
+                ScriptSource::Vd if historical => {
+                    bail!("Binance does not provide historical volume delta for script backtests");
+                }
+                ScriptSource::Oi if historical => {
+                    bail!("Binance does not provide historical open interest for script backtests");
+                }
+                ScriptSource::Orderbook => {
+                    if config.timeframe.is_some() {
+                        bail!("Binance live orderbook does not use a timeframe");
+                    }
+                }
+                ScriptSource::Vd => {
+                    if config.timeframe.is_some() || config.bucket.is_some() {
+                        bail!("Binance live volume delta is trade-derived; omit timeframe and bucket");
+                    }
+                }
+                ScriptSource::Oi => {
+                    if config.timeframe.is_some() {
+                        bail!("Binance live open interest is snapshot-based; omit timeframe");
+                    }
+                }
+                ScriptSource::Volumes => {
+                    let timeframe = config.require_timeframe(&config.source)?;
+                    let _ = crate::cli::mmt_timeframe_from_seconds(timeframe);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -383,6 +422,8 @@ fn parse_source_selector(raw: &str) -> Result<(String, ScriptSource, ProviderKin
         ProviderKind::Mmt => format!("{}@{exchange}@mmt", source.as_str()),
         ProviderKind::Bulk => format!("{}@bulk", source.as_str()),
         ProviderKind::MarketLab => unreachable!(),
+        ProviderKind::Binance => format!("{}@binance", source.as_str()),
+        ProviderKind::BinanceFutures => format!("{}@binance_futures", source.as_str()),
     };
     Ok((selector, source, provider, exchange))
 }
@@ -391,6 +432,8 @@ fn parse_source_provider(raw: &str) -> Result<ProviderKind> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "mmt" => Ok(ProviderKind::Mmt),
         "bulk" => Ok(ProviderKind::Bulk),
+        "binance" => Ok(ProviderKind::Binance),
+        "binance_futures" | "binancefutures" => Ok(ProviderKind::BinanceFutures),
         other => bail!("unsupported script source provider `{other}`"),
     }
 }
@@ -400,6 +443,8 @@ fn provider_name_for_exchange(provider: ProviderKind) -> &'static str {
         ProviderKind::Bulk => "bulk",
         ProviderKind::Mmt => "mmt",
         ProviderKind::MarketLab => "marketlab",
+        ProviderKind::Binance => "binance",
+        ProviderKind::BinanceFutures => "binance_futures",
     }
 }
 

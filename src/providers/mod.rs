@@ -1,14 +1,16 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::domain::enums::ProviderKind;
 use crate::domain::requests::{InspectRequest, ReplayRequest};
 use crate::domain::types::{OrderBookSnapshot, ProviderHealth, TopOfBook};
 
 pub mod bulk;
+pub mod binance;
 pub mod marketlab_cloud;
 pub mod mmt;
 
 use bulk::market_data::BulkProvider;
+use binance::market_data::BinanceProvider;
 use marketlab_cloud::MarketLabProvider;
 use mmt::MmtProvider;
 
@@ -23,6 +25,7 @@ pub enum ProviderClient {
     MarketLab,
     Mmt,
     Bulk,
+    Binance,
 }
 
 impl ProviderClient {
@@ -31,6 +34,7 @@ impl ProviderClient {
             ProviderKind::MarketLab => Self::MarketLab,
             ProviderKind::Mmt => Self::Mmt,
             ProviderKind::Bulk => Self::Bulk,
+            ProviderKind::Binance | ProviderKind::BinanceFutures => Self::Binance,
         }
     }
 }
@@ -41,6 +45,7 @@ impl MarketDataProvider for ProviderClient {
             Self::MarketLab => MarketLabProvider::inspect(req).await,
             Self::Mmt => MmtProvider::inspect(req).await,
             Self::Bulk => BulkProvider::inspect_historical().await,
+            Self::Binance => bail!("Binance inspect not supported"),
         }
     }
 
@@ -49,6 +54,7 @@ impl MarketDataProvider for ProviderClient {
             Self::MarketLab => MarketLabProvider::replay(req).await,
             Self::Mmt => MmtProvider::replay(req).await,
             Self::Bulk => BulkProvider::replay_historical().await,
+            Self::Binance => bail!("Binance replay not supported"),
         }
     }
 
@@ -57,6 +63,7 @@ impl MarketDataProvider for ProviderClient {
             Self::MarketLab => MarketLabProvider::health().await,
             Self::Mmt => MmtProvider::health().await,
             Self::Bulk => BulkProvider::health().await,
+            Self::Binance => BinanceProvider::health().await,
         }
     }
 }
