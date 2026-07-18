@@ -2971,8 +2971,15 @@ mod tests {
 
     #[test]
     fn reject_script_run_with_leverage() {
-        let err = Cli::try_parse_from(["mlab", "script", "run", "./scripts/sma-cross.js"])
-            .expect_err("script run should not accept backtest leverage");
+        let err = Cli::try_parse_from([
+            "mlab",
+            "script",
+            "run",
+            "./scripts/sma-cross.js",
+            "--leverage",
+            "5",
+        ])
+        .expect_err("script run should not accept leverage");
         assert!(err.to_string().contains("--leverage"));
     }
 
