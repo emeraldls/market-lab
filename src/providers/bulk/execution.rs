@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use bulk_keychain::{
@@ -21,6 +21,8 @@ use super::client::BulkClient;
 use super::market_data::normalize_timestamp_ms;
 
 static LAST_NONCE: AtomicU64 = AtomicU64::new(0);
+const ORDER_RECONCILIATION_ATTEMPTS: usize = 4;
+const ORDER_RECONCILIATION_DELAY: Duration = Duration::from_millis(500);
 
 pub struct BulkExecutionAdapter {
     client: BulkClient,
@@ -181,9 +183,29 @@ impl BulkExecutionAdapter {
         }
 
         let signed = sign_trade_order(&mut signer, &account, plan, next_nonce()?)?;
-        let optimistic_order_id = signed.order_id.clone();
-        let response: Value = self.client.post("order", &signed).await?;
-        receipt_from_response(&plan.account, optimistic_order_id, response)
+        let optimistic_order_id = signed
+            .order_id
+            .clone()
+            .context("signed BULK order omitted its deterministic order id")?;
+        match self.client.post("order", &signed).await {
+            Ok(response) => receipt_from_response(
+                &plan.account,
+                Some(optimistic_order_id),
+                response,
+            ),
+            Err(submission_error) => self
+                .reconcile_order_submission(
+                    &plan.account,
+                    &optimistic_order_id,
+                    plan.order_kind,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "BULK order {optimistic_order_id} submission outcome is unknown after the request failed: {submission_error:#}"
+                    )
+                }),
+        }
     }
 
     pub async fn cancel_order(
@@ -203,6 +225,137 @@ impl BulkExecutionAdapter {
             .context("failed to sign BULK order cancellation")?;
         let response: Value = self.client.post("order", &signed).await?;
         receipt_from_response(&account.to_base58(), Some(order_id.to_string()), response)
+    }
+
+    async fn reconcile_order_submission(
+        &self,
+        account: &str,
+        order_id: &str,
+        order_kind: OrderKind,
+    ) -> Result<ExecutionReceipt> {
+        let mut last_lookup_errors = Vec::new();
+        for attempt in 0..ORDER_RECONCILIATION_ATTEMPTS {
+            let (history_result, open_orders_result, fills_result) = tokio::join!(
+                self.order_history(account),
+                self.open_orders(account),
+                self.fills(account),
+            );
+            last_lookup_errors.clear();
+
+            match history_result {
+                Ok(history) => {
+                    if let Some(order) =
+                        history.into_iter().find(|order| order.order_id == order_id)
+                    {
+                        return reconciled_history_receipt(account, order);
+                    }
+                }
+                Err(error) => last_lookup_errors.push(format!("orderHistory: {error:#}")),
+            }
+            match open_orders_result {
+                Ok(open_orders) => {
+                    if let Some(order) = open_orders
+                        .into_iter()
+                        .find(|order| order.order_id == order_id)
+                    {
+                        return Ok(reconciled_open_order_receipt(account, order));
+                    }
+                }
+                Err(error) => last_lookup_errors.push(format!("openOrders: {error:#}")),
+            }
+            match fills_result {
+                Ok(fills) => {
+                    if let Some(fill) = fills
+                        .into_iter()
+                        .find(|fill| fill.order_id.as_deref() == Some(order_id))
+                    {
+                        return Ok(reconciled_fill_receipt(account, order_id, order_kind, fill));
+                    }
+                }
+                Err(error) => last_lookup_errors.push(format!("fills: {error:#}")),
+            }
+
+            if attempt + 1 < ORDER_RECONCILIATION_ATTEMPTS {
+                tokio::time::sleep(ORDER_RECONCILIATION_DELAY).await;
+            }
+        }
+
+        if last_lookup_errors.is_empty() {
+            bail!(
+                "order was not visible in BULK orderHistory, openOrders, or fills after {ORDER_RECONCILIATION_ATTEMPTS} attempts; inspect order {order_id} before submitting another order"
+            );
+        }
+        bail!(
+            "could not confirm order after {ORDER_RECONCILIATION_ATTEMPTS} attempts ({}); inspect order {order_id} before submitting another order",
+            last_lookup_errors.join("; ")
+        )
+    }
+}
+
+fn reconciled_history_receipt(account: &str, order: OrderRecord) -> Result<ExecutionReceipt> {
+    if order.status.eq_ignore_ascii_case("error")
+        || order.status.to_ascii_lowercase().starts_with("rejected")
+    {
+        bail!(
+            "BULK rejected reconciled order {} with status {}{}",
+            order.order_id,
+            order.status,
+            order
+                .reason
+                .as_deref()
+                .map_or_else(String::new, |reason| format!(": {reason}"))
+        );
+    }
+    Ok(ExecutionReceipt {
+        venue: ExecutionVenue::Bulk,
+        account: account.to_string(),
+        order_id: Some(order.order_id.clone()),
+        status: order.status.clone(),
+        terminal: true,
+        submitted_at_ms: order.ts_ms,
+        raw_status: serde_json::json!({
+            "reconciled": true,
+            "source": "orderHistory",
+            "order": order,
+        }),
+    })
+}
+
+fn reconciled_open_order_receipt(account: &str, order: OpenOrder) -> ExecutionReceipt {
+    ExecutionReceipt {
+        venue: ExecutionVenue::Bulk,
+        account: account.to_string(),
+        order_id: Some(order.order_id.clone()),
+        status: order.status.clone(),
+        terminal: false,
+        submitted_at_ms: order.ts_ms,
+        raw_status: serde_json::json!({
+            "reconciled": true,
+            "source": "openOrders",
+            "order": order,
+        }),
+    }
+}
+
+fn reconciled_fill_receipt(
+    account: &str,
+    order_id: &str,
+    order_kind: OrderKind,
+    fill: Fill,
+) -> ExecutionReceipt {
+    let terminal = order_kind == OrderKind::Market;
+    ExecutionReceipt {
+        venue: ExecutionVenue::Bulk,
+        account: account.to_string(),
+        order_id: Some(order_id.to_string()),
+        status: if terminal { "filled" } else { "fillObserved" }.to_string(),
+        terminal,
+        submitted_at_ms: fill.ts_ms,
+        raw_status: serde_json::json!({
+            "reconciled": true,
+            "source": "fills",
+            "fill": fill,
+        }),
     }
 }
 
@@ -896,6 +1049,99 @@ fn normalize_account_symbol(symbol: &str) -> Result<(String, String, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconciled_terminal_order_preserves_the_deterministic_id() {
+        let receipt = reconciled_history_receipt(
+            "account",
+            OrderRecord {
+                venue: ExecutionVenue::Bulk,
+                internal_symbol: "BTC/USDT".to_string(),
+                venue_symbol: "BTC-USD".to_string(),
+                catalog_supported: true,
+                order_id: "deterministic-id".to_string(),
+                side: OrderSide::Buy,
+                order_kind: "market".to_string(),
+                time_in_force: "ioc".to_string(),
+                price: 0.0,
+                vwap: 64_000.0,
+                original_size: 0.01,
+                executed_size: 0.01,
+                reduce_only: false,
+                status: "filled".to_string(),
+                reason: None,
+                slot: 42,
+                ts_ms: 1_000,
+            },
+        )
+        .expect("reconcile terminal order");
+
+        assert_eq!(receipt.order_id.as_deref(), Some("deterministic-id"));
+        assert_eq!(receipt.status, "filled");
+        assert!(receipt.terminal);
+        assert_eq!(receipt.raw_status["reconciled"], true);
+        assert_eq!(receipt.raw_status["source"], "orderHistory");
+    }
+
+    #[test]
+    fn reconciled_fill_is_terminal_only_for_a_market_order() {
+        let fill = Fill {
+            venue: ExecutionVenue::Bulk,
+            internal_symbol: "BTC/USDT".to_string(),
+            venue_symbol: "BTC-USD".to_string(),
+            catalog_supported: true,
+            side: OrderSide::Buy,
+            amount: 0.01,
+            price: 64_000.0,
+            reason: "normal".to_string(),
+            order_id: Some("deterministic-id".to_string()),
+            maker: false,
+            slot: 42,
+            ts_ms: 1_000,
+        };
+
+        let market = reconciled_fill_receipt(
+            "account",
+            "deterministic-id",
+            OrderKind::Market,
+            fill.clone(),
+        );
+        let limit = reconciled_fill_receipt("account", "deterministic-id", OrderKind::Limit, fill);
+
+        assert!(market.terminal);
+        assert_eq!(market.status, "filled");
+        assert!(!limit.terminal);
+        assert_eq!(limit.status, "fillObserved");
+    }
+
+    #[test]
+    fn reconciled_rejection_remains_an_execution_error() {
+        let error = reconciled_history_receipt(
+            "account",
+            OrderRecord {
+                venue: ExecutionVenue::Bulk,
+                internal_symbol: "BTC/USDT".to_string(),
+                venue_symbol: "BTC-USD".to_string(),
+                catalog_supported: true,
+                order_id: "deterministic-id".to_string(),
+                side: OrderSide::Buy,
+                order_kind: "market".to_string(),
+                time_in_force: "ioc".to_string(),
+                price: 0.0,
+                vwap: 0.0,
+                original_size: 0.01,
+                executed_size: 0.0,
+                reduce_only: false,
+                status: "rejectedRiskLimit".to_string(),
+                reason: Some("risk limit".to_string()),
+                slot: 42,
+                ts_ms: 1_000,
+            },
+        )
+        .expect_err("rejected reconciled order must fail");
+
+        assert!(error.to_string().contains("rejectedRiskLimit: risk limit"));
+    }
 
     #[test]
     fn normalizes_account_timestamps_and_symbols() {

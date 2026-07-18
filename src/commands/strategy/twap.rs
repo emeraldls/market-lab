@@ -56,6 +56,7 @@ struct TwapChildEvent<'a> {
     estimated_exposure: f64,
     order_id: Option<&'a str>,
     status: &'a str,
+    reconciled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -266,6 +267,11 @@ async fn run_worker(job_id: &str, definition: &TwapJobDefinition) -> Result<()> 
                 estimated_exposure: plan.estimated_exposure,
                 order_id: receipt.order_id.as_deref(),
                 status: &receipt.status,
+                reconciled: receipt
+                    .raw_status
+                    .get("reconciled")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
             },
         )?;
     }
