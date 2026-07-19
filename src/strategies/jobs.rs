@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::execution::ExecutionVenue;
+use crate::strategies::vwap::VolumeSource;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -13,7 +14,7 @@ pub enum StrategySide {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TwapJobDefinition {
-    pub exchange: ExecutionVenue,
+    pub venue: ExecutionVenue,
     pub symbol: String,
     pub side: StrategySide,
     pub total_size: f64,
@@ -67,27 +68,92 @@ impl TwapJobDefinition {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VwapJobDefinition {
+    pub venue: ExecutionVenue,
+    pub symbol: String,
+    pub side: StrategySide,
+    pub total_size: f64,
+    pub requested_margin: Option<f64>,
+    pub target_margin: f64,
+    pub target_exposure: f64,
+    pub duration_seconds: u64,
+    pub volume_sources: Vec<VolumeSource>,
+    pub leverage: f64,
+    pub reduce_only: bool,
+}
+
+impl VwapJobDefinition {
+    pub fn validate(&self) -> Result<()> {
+        if self.symbol.trim().is_empty() {
+            bail!("VWAP job symbol is required");
+        }
+        if !self.total_size.is_finite() || self.total_size <= 0.0 {
+            bail!("VWAP job total size must be greater than zero");
+        }
+        if self
+            .requested_margin
+            .is_some_and(|margin| !margin.is_finite() || margin <= 0.0)
+        {
+            bail!("VWAP job requested margin must be greater than zero");
+        }
+        if !self.target_margin.is_finite() || self.target_margin <= 0.0 {
+            bail!("VWAP job target margin must be greater than zero");
+        }
+        if !self.target_exposure.is_finite() || self.target_exposure <= 0.0 {
+            bail!("VWAP job target exposure must be greater than zero");
+        }
+        if self.duration_seconds < 60 {
+            bail!("VWAP job duration must be at least 60 seconds");
+        }
+        if self.volume_sources.is_empty() {
+            bail!("VWAP job requires at least one volume source");
+        }
+        let mut exchanges = std::collections::HashSet::new();
+        for source in &self.volume_sources {
+            if source.exchange.trim().is_empty() || !exchanges.insert(&source.exchange) {
+                bail!("VWAP job volume sources contain an empty or duplicate exchange");
+            }
+        }
+        if !self.leverage.is_finite() || self.leverage < 1.0 {
+            bail!("VWAP job leverage must be at least 1");
+        }
+        let expected_margin = self.target_exposure / self.leverage;
+        if (self.target_margin - expected_margin).abs()
+            > 1e-8_f64.max(expected_margin.abs() * 1e-10)
+        {
+            bail!("VWAP job margin, exposure, and leverage do not agree");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "name", content = "config", rename_all = "snake_case")]
 pub enum StrategyJobDefinition {
     Twap(TwapJobDefinition),
+    Vwap(VwapJobDefinition),
 }
 
 impl StrategyJobDefinition {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Twap(_) => "twap",
+            Self::Vwap(_) => "vwap",
         }
     }
 
     pub fn symbol(&self) -> &str {
         match self {
             Self::Twap(definition) => &definition.symbol,
+            Self::Vwap(definition) => &definition.symbol,
         }
     }
 
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::Twap(definition) => definition.validate(),
+            Self::Vwap(definition) => definition.validate(),
         }
     }
 }
@@ -144,7 +210,7 @@ mod tests {
     #[test]
     fn twap_job_without_target_margin_can_be_read_from_a_running_daemon() {
         let definition: TwapJobDefinition = serde_json::from_value(json!({
-            "exchange": "bulk",
+            "venue": "bulk",
             "symbol": "BTC/USDT",
             "side": "buy",
             "totalSize": 0.01,

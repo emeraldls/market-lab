@@ -22,7 +22,7 @@ use crate::strategies::twap::TwapSchedule;
 struct TwapPlanView<'a> {
     r#type: &'static str,
     strategy: &'static str,
-    exchange: &'static str,
+    venue: &'static str,
     symbol: &'a str,
     side: &'static str,
     total_size: f64,
@@ -64,7 +64,7 @@ struct TwapRunSummary<'a> {
     r#type: &'static str,
     strategy: &'static str,
     job_id: &'a str,
-    exchange: &'static str,
+    venue: &'static str,
     symbol: &'a str,
     side: &'static str,
     status: &'static str,
@@ -128,7 +128,7 @@ pub async fn handle(args: RunTwapArgs) -> Result<()> {
 
     let submission = StrategyJobSubmission {
         definition: StrategyJobDefinition::Twap(TwapJobDefinition {
-            exchange: parent.venue,
+            venue: parent.venue,
             symbol: parent.internal_symbol,
             side: strategy_side(args.side),
             total_size: parent.size,
@@ -147,7 +147,13 @@ pub async fn handle(args: RunTwapArgs) -> Result<()> {
 
 pub async fn handle_worker(job_id: &str) -> Result<()> {
     let job = crate::runtime::get_strategy_job_from_running_daemon(job_id).await?;
-    let StrategyJobDefinition::Twap(definition) = job.definition;
+    handle_worker_job(job_id, job).await
+}
+
+pub async fn handle_worker_job(job_id: &str, job: StrategyJob) -> Result<()> {
+    let StrategyJobDefinition::Twap(definition) = job.definition else {
+        bail!("strategy worker received a non-TWAP job");
+    };
     let pid = std::process::id();
     crate::runtime::strategy_worker_started(job_id, pid).await?;
     let result = run_worker(job_id, &definition).await;
@@ -304,7 +310,7 @@ fn append_summary(
             r#type: "strategy.run.finished",
             strategy: "twap",
             job_id,
-            exchange: "bulk",
+            venue: "bulk",
             symbol: &definition.symbol,
             side: strategy_side_name(definition.side),
             status,
@@ -321,7 +327,7 @@ fn trade_args(args: &RunTwapArgs, size: Option<f64>, margin: Option<f64>) -> Tra
     TradeArgs {
         symbol: args.symbol.clone(),
         config: None,
-        venue: args.exchange,
+        venue: args.venue,
         size,
         margin,
         order_kind: TradeOrderKind::Market,
@@ -341,7 +347,7 @@ fn worker_trade_args(definition: &TwapJobDefinition, size: f64) -> TradeArgs {
     TradeArgs {
         symbol: definition.symbol.clone(),
         config: None,
-        venue: match definition.exchange {
+        venue: match definition.venue {
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
         },
         size: Some(size),
@@ -383,7 +389,7 @@ fn plan_view<'a>(
     TwapPlanView {
         r#type: "strategy.plan",
         strategy: "twap",
-        exchange: "bulk",
+        venue: "bulk",
         symbol,
         side,
         total_size: schedule.total_size,
@@ -416,7 +422,7 @@ fn render_plan(plan: &TwapPlanView<'_>, output: OutputFormat) -> Result<()> {
                     ""
                 }
             );
-            println!("  exchange:          {}", plan.exchange);
+            println!("  venue:             {}", plan.venue);
             println!("  symbol / side:     {} / {}", plan.symbol, plan.side);
             println!("  total size:        {}", plan.total_size);
             if let Some(margin) = plan.requested_margin {

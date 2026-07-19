@@ -444,7 +444,7 @@ fn validate_trade_plan(plan: &TradePlan) -> Result<()> {
         bail!("BULK market `{}` is not trading", market.venue_symbol);
     }
     if plan.venue_symbol != market.venue_symbol {
-        bail!("trade plan symbol mapping does not match the embedded market registry");
+        bail!("trade plan symbol mapping does not match the installed market snapshot");
     }
     if !plan.size.is_finite() || plan.size <= 0.0 || !is_step_aligned(plan.size, rules.lot_size) {
         bail!(
@@ -1224,7 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_account_markets_outside_embedded_market_registry() {
+    fn preserves_account_markets_outside_installed_market_snapshot() {
         let (internal, venue, supported) =
             normalize_account_symbol("GOLD-USD").expect("symbol normalizes");
         assert_eq!(internal, "GOLD/USDT");

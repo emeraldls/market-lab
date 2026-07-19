@@ -29,7 +29,7 @@ use crate::strategies::jobs::{
     StrategyJob, StrategyJobDefinition, StrategyJobStatus, StrategyJobSubmission, StrategySide,
 };
 
-const RUNTIME_VERSION: u8 = 11;
+const RUNTIME_VERSION: u8 = 12;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -177,6 +177,11 @@ enum RuntimeRequest {
         sequence: u64,
         plan: TradePlan,
     },
+    StrategyCancelOrder {
+        job_id: String,
+        sequence: u64,
+        plan: CancelPlan,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -251,6 +256,8 @@ struct RuntimeState {
     strategy_jobs: BTreeMap<String, StrategyJob>,
     #[serde(default)]
     strategy_executions: BTreeMap<String, ExecutionReceipt>,
+    #[serde(default)]
+    strategy_cancellations: BTreeMap<String, ExecutionReceipt>,
     #[serde(default)]
     script_orders: BTreeMap<String, ScriptManagedOrder>,
     #[serde(default)]
@@ -360,6 +367,7 @@ pub async fn serve() -> Result<()> {
         script_jobs: BTreeMap::new(),
         strategy_jobs: BTreeMap::new(),
         strategy_executions: BTreeMap::new(),
+        strategy_cancellations: BTreeMap::new(),
         script_orders: BTreeMap::new(),
         script_cancel_keys: BTreeMap::new(),
         account_positions: BTreeMap::new(),
@@ -713,6 +721,25 @@ pub async fn submit_strategy_trade(
     response
         .receipt
         .context("mlabd omitted the strategy execution receipt")
+}
+
+pub async fn submit_strategy_cancel(
+    job_id: &str,
+    sequence: u64,
+    plan: &CancelPlan,
+) -> Result<ExecutionReceipt> {
+    let response = request(RuntimeRequest::StrategyCancelOrder {
+        job_id: job_id.to_string(),
+        sequence,
+        plan: plan.clone(),
+    })
+    .await?;
+    if !response.ok {
+        bail!("strategy cancellation failed: {}", response.message);
+    }
+    response
+        .receipt
+        .context("mlabd omitted the strategy cancellation receipt")
 }
 
 pub async fn list_script_jobs() -> Result<Vec<ScriptJob>> {
@@ -1948,38 +1975,7 @@ async fn execute_strategy_trade(
     if !job.status.is_active() {
         bail!("strategy job `{job_id}` is not running");
     }
-    let StrategyJobDefinition::Twap(definition) = &job.definition;
-    let expected_direction = match definition.side {
-        StrategySide::Buy => crate::domain::execution::PositionDirection::Long,
-        StrategySide::Sell => crate::domain::execution::PositionDirection::Short,
-    };
-    let child_orders = definition
-        .duration_seconds
-        .div_ceil(definition.interval_seconds);
-    if sequence > child_orders {
-        bail!("TWAP child sequence {sequence} exceeds schedule length {child_orders}");
-    }
-    let market = crate::providers::bulk::markets::market(&definition.symbol)?;
-    let rules = market.execution_rules()?;
-    let schedule = crate::strategies::twap::TwapSchedule::build(
-        definition.total_size,
-        rules.lot_size,
-        plan.reference_price,
-        rules.min_notional,
-        definition.duration_seconds,
-        definition.interval_seconds,
-    )?;
-    let expected_size = schedule.children[(sequence - 1) as usize].size;
-    if plan.venue != definition.exchange
-        || plan.internal_symbol != definition.symbol
-        || plan.direction != expected_direction
-        || plan.order_kind != crate::domain::execution::OrderKind::Market
-        || plan.reduce_only != definition.reduce_only
-        || (plan.leverage - definition.leverage).abs() > f64::EPSILON
-        || (plan.size - expected_size).abs() > 1e-12_f64.max(expected_size.abs() * 1e-12)
-    {
-        bail!("strategy child order does not match its persisted TWAP definition");
-    }
+    validate_strategy_trade(&job.definition, sequence, plan)?;
 
     let execution_key = format!("{job_id}:{sequence}");
     if let Some(receipt) = state.strategy_executions.get(&execution_key) {
@@ -1988,7 +1984,7 @@ async fn execute_strategy_trade(
     if sequence > 1 {
         let previous_key = format!("{job_id}:{}", sequence - 1);
         if !state.strategy_executions.contains_key(&previous_key) {
-            bail!("TWAP child order {sequence} was submitted out of sequence");
+            bail!("strategy child order {sequence} was submitted out of sequence");
         }
     }
 
@@ -1996,6 +1992,131 @@ async fn execute_strategy_trade(
     state
         .strategy_executions
         .insert(execution_key, receipt.clone());
+    persist_state(paths, state)?;
+    Ok(receipt)
+}
+
+fn validate_strategy_trade(
+    definition: &StrategyJobDefinition,
+    sequence: u64,
+    plan: &TradePlan,
+) -> Result<()> {
+    let (venue, symbol, side, total_size, leverage, reduce_only) = match definition {
+        StrategyJobDefinition::Twap(definition) => (
+            definition.venue,
+            definition.symbol.as_str(),
+            definition.side,
+            definition.total_size,
+            definition.leverage,
+            definition.reduce_only,
+        ),
+        StrategyJobDefinition::Vwap(definition) => (
+            definition.venue,
+            definition.symbol.as_str(),
+            definition.side,
+            definition.total_size,
+            definition.leverage,
+            definition.reduce_only,
+        ),
+    };
+    let expected_direction = match side {
+        StrategySide::Buy => crate::domain::execution::PositionDirection::Long,
+        StrategySide::Sell => crate::domain::execution::PositionDirection::Short,
+    };
+    if plan.venue != venue
+        || plan.internal_symbol != symbol
+        || plan.direction != expected_direction
+        || plan.reduce_only != reduce_only
+        || (plan.leverage - leverage).abs() > f64::EPSILON
+        || plan.stop_loss_price.is_some()
+        || plan.take_profit_price.is_some()
+        || plan.size > total_size + 1e-12_f64.max(total_size.abs() * 1e-12)
+    {
+        bail!(
+            "strategy child order does not match its persisted {} definition",
+            definition.name()
+        );
+    }
+
+    match definition {
+        StrategyJobDefinition::Twap(definition) => {
+            let child_orders = definition
+                .duration_seconds
+                .div_ceil(definition.interval_seconds);
+            if sequence > child_orders {
+                bail!("TWAP child sequence {sequence} exceeds schedule length {child_orders}");
+            }
+            let market = crate::providers::bulk::markets::market(&definition.symbol)?;
+            let rules = market.execution_rules()?;
+            let schedule = crate::strategies::twap::TwapSchedule::build(
+                definition.total_size,
+                rules.lot_size,
+                plan.reference_price,
+                rules.min_notional,
+                definition.duration_seconds,
+                definition.interval_seconds,
+            )?;
+            let expected_size = schedule.children[(sequence - 1) as usize].size;
+            if plan.order_kind != crate::domain::execution::OrderKind::Market
+                || (plan.size - expected_size).abs() > 1e-12_f64.max(expected_size.abs() * 1e-12)
+            {
+                bail!("strategy child order does not match its persisted TWAP definition");
+            }
+        }
+        StrategyJobDefinition::Vwap(_) => match plan.order_kind {
+            crate::domain::execution::OrderKind::Market => {
+                if plan.price.is_some() || plan.time_in_force.is_some() {
+                    bail!("VWAP market child contains limit-order fields");
+                }
+            }
+            crate::domain::execution::OrderKind::Limit => {
+                if plan.price.is_none()
+                    || plan.time_in_force != Some(crate::domain::execution::TimeInForce::Alo)
+                {
+                    bail!("VWAP maker children must be post-only ALO limit orders");
+                }
+            }
+        },
+    }
+    Ok(())
+}
+
+async fn execute_strategy_cancel(
+    paths: &RuntimePaths,
+    adapter: &BulkExecutionAdapter,
+    state: &mut RuntimeState,
+    job_id: &str,
+    sequence: u64,
+    plan: &CancelPlan,
+) -> Result<ExecutionReceipt> {
+    if sequence == 0 {
+        bail!("strategy cancellation sequence must start at 1");
+    }
+    let job = state
+        .strategy_jobs
+        .get(job_id)
+        .with_context(|| format!("strategy job `{job_id}` was not found"))?;
+    if !job.status.is_active() {
+        bail!("strategy job `{job_id}` is not running");
+    }
+    let order_prefix = format!("{job_id}:");
+    if plan.venue != ExecutionVenue::Bulk
+        || plan.internal_symbol != job.definition.symbol()
+        || !state.strategy_executions.iter().any(|(key, receipt)| {
+            key.starts_with(&order_prefix)
+                && receipt.order_id.as_deref() == Some(plan.order_id.as_str())
+        })
+    {
+        bail!("strategy cannot cancel an order it does not own");
+    }
+    let cancellation_key = format!("{job_id}:{sequence}");
+    if let Some(receipt) = state.strategy_cancellations.get(&cancellation_key) {
+        return Ok(receipt.clone());
+    }
+    let receipt = execute_cancel(paths, adapter, state, plan).await?;
+    state
+        .strategy_cancellations
+        .insert(cancellation_key, receipt.clone());
     persist_state(paths, state)?;
     Ok(receipt)
 }
@@ -2378,6 +2499,20 @@ async fn handle_connection(
                 Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
             }
         }
+        RuntimeRequest::StrategyCancelOrder {
+            job_id,
+            sequence,
+            plan,
+        } => match execute_strategy_cancel(paths, adapter, state, &job_id, sequence, &plan).await {
+            Ok(receipt) => RuntimeResponse {
+                ok: true,
+                message: "strategy order cancelled".to_string(),
+                status: Some(runtime_status(state)),
+                receipt: Some(receipt),
+                ..RuntimeResponse::empty()
+            },
+            Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+        },
     };
     let mut encoded = serde_json::to_vec(&response).context("failed to encode mlabd response")?;
     encoded.push(b'\n');
@@ -2446,7 +2581,7 @@ async fn execute_cancel(
     }
     let market = crate::providers::bulk::markets::market(&plan.internal_symbol)?;
     if market.venue_symbol != plan.venue_symbol {
-        bail!("cancel plan symbol mapping does not match the embedded market registry");
+        bail!("cancel plan symbol mapping does not match the installed market snapshot");
     }
     let credential = credentials::active_bulk_credential()?;
     if credential.account.to_base58() != plan.account {

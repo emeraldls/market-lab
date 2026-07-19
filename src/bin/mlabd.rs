@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
             if args.next().is_some() {
                 anyhow::bail!("strategy-worker accepts exactly one job id");
             }
-            market_lab::commands::strategy::twap::handle_worker(&job_id).await
+            market_lab::commands::strategy::handle_worker(&job_id).await
         }
         Some(command) => {
             anyhow::bail!(

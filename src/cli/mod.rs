@@ -438,6 +438,7 @@ pub enum StrategyCommands {
 #[derive(Subcommand, Debug)]
 pub enum StrategyRunCommands {
     Twap(RunTwapArgs),
+    Vwap(RunVwapArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -1481,7 +1482,7 @@ pub struct DepthArgs {
 pub struct RunTwapArgs {
     pub symbol: String,
     #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
-    pub exchange: ExecutionVenueArg,
+    pub venue: ExecutionVenueArg,
     #[arg(long, value_enum)]
     pub side: CliSide,
     /// Exact total base-asset exposure; leverage does not multiply an explicit size.
@@ -1496,6 +1497,38 @@ pub struct RunTwapArgs {
     /// Seconds between child orders.
     #[arg(long, default_value_t = 60)]
     pub interval: u64,
+    /// Exposure multiplier for margin sizing and the leverage setting sent to BULK.
+    #[arg(long, default_value_t = 1.0)]
+    pub leverage: f64,
+    #[arg(long, default_value_t = false)]
+    pub reduce_only: bool,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct RunVwapArgs {
+    pub symbol: String,
+    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    pub venue: ExecutionVenueArg,
+    #[arg(long, value_enum)]
+    pub side: CliSide,
+    /// Exact total base-asset exposure; leverage does not multiply an explicit size.
+    #[arg(long, conflicts_with = "margin", required_unless_present = "margin")]
+    pub size: Option<f64>,
+    /// Total quote collateral; exposure is margin multiplied by leverage.
+    #[arg(long, conflicts_with = "size", required_unless_present = "size")]
+    pub margin: Option<f64>,
+    /// Total execution window in seconds. VWAP requires at least one minute.
+    #[arg(long)]
+    pub duration: u64,
+    /// Comma-separated volume venues, for example binancef@mmt,okxf@mmt,bulk.
+    #[arg(long, value_delimiter = ',')]
+    pub volume_sources: Vec<String>,
     /// Exposure multiplier for margin sizing and the leverage setting sent to BULK.
     #[arg(long, default_value_t = 1.0)]
     pub leverage: f64,
@@ -1606,6 +1639,58 @@ impl RunTwapArgs {
         if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("strategy run supports only --output terminal|json|jsonl");
         }
+        Ok(())
+    }
+}
+
+impl RunVwapArgs {
+    pub fn validate(&self) -> Result<()> {
+        if !is_valid_symbol(&self.symbol) {
+            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        if self
+            .size
+            .is_some_and(|size| !size.is_finite() || size <= 0.0)
+        {
+            bail!("--size must be > 0");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| !margin.is_finite() || margin <= 0.0)
+        {
+            bail!("--margin must be > 0");
+        }
+        match (self.size, self.margin) {
+            (Some(_), Some(_)) => bail!("set only one of --size or --margin"),
+            (None, None) => bail!("one of --size or --margin is required"),
+            _ => {}
+        }
+        if self.duration < 60 {
+            bail!("--duration must be at least 60 seconds for VWAP");
+        }
+        if !self.leverage.is_finite() || self.leverage < 1.0 {
+            bail!("--leverage must be at least 1");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| !(margin * self.leverage).is_finite())
+        {
+            bail!("--margin multiplied by --leverage is too large");
+        }
+        if self.dry_run && self.yes {
+            bail!("--yes is not used with --dry-run");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("strategy run supports only --output terminal|json|jsonl");
+        }
+        let execution_venue = match self.venue {
+            ExecutionVenueArg::Bulk => "bulk",
+        };
+        crate::strategies::vwap::VolumeSourceSelector::parse(
+            &self.volume_sources,
+            execution_venue,
+            &self.symbol,
+        )?;
         Ok(())
     }
 }
@@ -2716,7 +2801,7 @@ mod tests {
             "run",
             "twap",
             "BTC/USDT",
-            "--exchange",
+            "--venue",
             "bulk",
             "--side",
             "buy",
@@ -2745,6 +2830,68 @@ mod tests {
             }
             _ => panic!("expected strategy run twap command"),
         }
+    }
+
+    #[test]
+    fn parse_strategy_vwap_command_without_interval() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "strategy",
+            "run",
+            "vwap",
+            "BTC/USDT",
+            "--venue",
+            "bulk",
+            "--side",
+            "buy",
+            "--margin",
+            "1000",
+            "--duration",
+            "3600",
+            "--volume-sources",
+            "binancef@mmt,hyperliquid@mmt,bulk",
+            "--dry-run",
+        ])
+        .expect("VWAP should parse");
+
+        match cli.command {
+            Commands::Strategy {
+                command:
+                    StrategyCommands::Run {
+                        command: StrategyRunCommands::Vwap(args),
+                    },
+            } => {
+                args.validate().expect("VWAP arguments should validate");
+                assert_eq!(args.duration, 3600);
+                assert_eq!(
+                    args.volume_sources,
+                    ["binancef@mmt", "hyperliquid@mmt", "bulk"]
+                );
+                assert!(args.dry_run);
+            }
+            _ => panic!("expected strategy run vwap command"),
+        }
+    }
+
+    #[test]
+    fn strategy_vwap_does_not_accept_an_interval() {
+        let error = Cli::try_parse_from([
+            "mlab",
+            "strategy",
+            "run",
+            "vwap",
+            "BTC/USDT",
+            "--side",
+            "buy",
+            "--margin",
+            "1000",
+            "--duration",
+            "300",
+            "--interval",
+            "30",
+        ])
+        .expect_err("VWAP must not expose a child interval");
+        assert!(error.to_string().contains("--interval"));
     }
 
     #[test]

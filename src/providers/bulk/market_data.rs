@@ -26,7 +26,7 @@ impl BulkProvider {
             "symbols": {
                 "internal_format": "BASE/USDT",
                 "venue_format": "BASE-USD",
-                "market_registry": "embedded"
+                "market_registry": "installed_snapshot"
             },
             "time": {
                 "app_boundary": "milliseconds",
