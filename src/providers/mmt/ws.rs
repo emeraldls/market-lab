@@ -18,13 +18,14 @@ impl MmtDepthStream {
         depth: u16,
         state_cap: usize,
     ) -> Result<Self> {
+        let provider_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
         let client = MmtWsClient::shared().await?;
 
         let subscribe = serde_json::json!({
             "type": "subscribe",
             "channel": "depth",
             "exchange": exchange.to_lowercase(),
-            "symbol": normalize_symbol_for_mmt(symbol)?,
+            "symbol": provider_symbol,
         });
 
         client

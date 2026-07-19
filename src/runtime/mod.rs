@@ -29,7 +29,7 @@ use crate::strategies::jobs::{
     StrategyJob, StrategyJobDefinition, StrategyJobStatus, StrategyJobSubmission, StrategySide,
 };
 
-const RUNTIME_VERSION: u8 = 10;
+const RUNTIME_VERSION: u8 = 11;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -91,6 +91,7 @@ impl RuntimeStatus {
 enum RuntimeRequest {
     Ping,
     Status,
+    ReloadMarkets,
     Stop,
     TrackOrder {
         order: TrackedOrder,
@@ -518,6 +519,22 @@ pub async fn stop() -> Result<bool> {
     };
     if !response.ok {
         bail!("mlabd refused to stop: {}", response.message);
+    }
+    Ok(true)
+}
+
+pub async fn reload_markets_if_running() -> Result<bool> {
+    let Some(status) = try_status().await? else {
+        return Ok(false);
+    };
+    if status.version != RUNTIME_VERSION {
+        return Ok(false);
+    }
+    let Some(response) = try_request(RuntimeRequest::ReloadMarkets).await? else {
+        return Ok(false);
+    };
+    if !response.ok {
+        bail!("mlabd failed to reload markets: {}", response.message);
     }
     Ok(true)
 }
@@ -1860,13 +1877,13 @@ async fn execute_script_cancel(
         persist_state(paths, state)?;
         return Ok(managed);
     };
-    let market = crate::providers::bulk::catalog::market(&current.symbol)?;
+    let market = crate::providers::bulk::markets::market(&current.symbol)?;
     let plan = CancelPlan {
         created_at_ms: now_ms()?,
         venue,
         account: credentials::bulk_account()?,
-        internal_symbol: market.internal_symbol.clone(),
-        venue_symbol: market.symbol.clone(),
+        internal_symbol: market.symbol.clone(),
+        venue_symbol: market.venue_symbol.clone(),
         order_id: venue_order_id,
     };
     let receipt = match execute_cancel(paths, adapter, state, &plan).await {
@@ -1942,12 +1959,13 @@ async fn execute_strategy_trade(
     if sequence > child_orders {
         bail!("TWAP child sequence {sequence} exceeds schedule length {child_orders}");
     }
-    let market = crate::providers::bulk::catalog::market(&definition.symbol)?;
+    let market = crate::providers::bulk::markets::market(&definition.symbol)?;
+    let rules = market.execution_rules()?;
     let schedule = crate::strategies::twap::TwapSchedule::build(
         definition.total_size,
-        market.lot_size,
+        rules.lot_size,
         plan.reference_price,
-        market.min_notional,
+        rules.min_notional,
         definition.duration_seconds,
         definition.interval_seconds,
     )?;
@@ -2015,6 +2033,20 @@ async fn handle_connection(
             status: Some(runtime_status(state)),
             receipt: None,
             ..RuntimeResponse::empty()
+        },
+        RuntimeRequest::ReloadMarkets => match crate::markets::reload() {
+            Ok(()) => RuntimeResponse {
+                ok: true,
+                message: "market snapshots reloaded".to_string(),
+                status: Some(runtime_status(state)),
+                ..RuntimeResponse::empty()
+            },
+            Err(error) => RuntimeResponse {
+                ok: false,
+                message: format!("{error:#}"),
+                status: Some(runtime_status(state)),
+                ..RuntimeResponse::empty()
+            },
         },
         RuntimeRequest::Stop => RuntimeResponse {
             ok: true,
@@ -2412,9 +2444,9 @@ async fn execute_cancel(
     if plan.venue != ExecutionVenue::Bulk {
         bail!("BULK runtime received a cancel plan for another venue");
     }
-    let market = crate::providers::bulk::catalog::market(&plan.internal_symbol)?;
-    if market.symbol != plan.venue_symbol {
-        bail!("cancel plan symbol mapping does not match the embedded BULK catalog");
+    let market = crate::providers::bulk::markets::market(&plan.internal_symbol)?;
+    if market.venue_symbol != plan.venue_symbol {
+        bail!("cancel plan symbol mapping does not match the embedded market registry");
     }
     let credential = credentials::active_bulk_credential()?;
     if credential.account.to_base58() != plan.account {
@@ -2757,8 +2789,8 @@ fn route_account_event_to_scripts(
         .and_then(serde_json::Value::as_str);
     let venue_symbol = data.get("symbol").and_then(serde_json::Value::as_str);
     let internal_symbol = venue_symbol
-        .and_then(|symbol| crate::providers::bulk::catalog::market(symbol).ok())
-        .map(|market| market.internal_symbol.as_str());
+        .and_then(|symbol| crate::providers::bulk::markets::market(symbol).ok())
+        .map(|market| market.symbol.clone());
     let event_type = match kind {
         "fill" => "order.fill",
         "positionUpdate" if data.get("size").and_then(serde_json::Value::as_f64) == Some(0.0) => {
@@ -2799,7 +2831,9 @@ fn route_account_event_to_scripts(
         .filter(|job| {
             job.status.is_active()
                 && job.definition.venue == Some(ExecutionVenue::Bulk)
-                && internal_symbol.is_none_or(|symbol| job.definition.symbol == symbol)
+                && internal_symbol
+                    .as_deref()
+                    .is_none_or(|symbol| job.definition.symbol == symbol)
         })
         .map(|job| job.id.clone())
         .collect::<HashSet<_>>();

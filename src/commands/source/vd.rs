@@ -7,7 +7,7 @@ use serde::Serialize;
 use crate::cli::{OutputFormat, SourceVdArgs};
 use crate::domain::enums::ProviderKind;
 use crate::domain::types::VolumeDeltaTick;
-use crate::providers::bulk::catalog;
+use crate::providers::bulk::markets;
 use crate::providers::bulk::ws::BulkTradesStream;
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::ws_vd::MmtVdStream;
@@ -186,8 +186,8 @@ async fn stream_mmt_vd(args: SourceVdArgs) -> Result<()> {
 
 async fn stream_bulk_vd(args: SourceVdArgs) -> Result<()> {
     ensure_stream_output(args.output)?;
-    let market = catalog::market(&args.symbol)?;
-    let internal_symbol = market.internal_symbol.clone();
+    let market = markets::market(&args.symbol)?;
+    let internal_symbol = market.symbol.clone();
     let mut stream = BulkTradesStream::connect(&args.symbol).await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest: Option<VolumeDeltaTick> = None;

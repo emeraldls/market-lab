@@ -5,6 +5,7 @@ pub mod core;
 pub mod credentials;
 pub mod domain;
 pub mod functions;
+pub mod markets;
 pub mod providers;
 pub mod runtime;
 pub mod scripting;

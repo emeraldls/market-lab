@@ -1,75 +1,129 @@
 use anyhow::Result;
 
-use crate::cli::MarketsArgs;
-use crate::providers::bulk::catalog;
+use crate::cli::{CliDataProvider, MarketsArgs};
+use crate::markets::{ExchangeMarkets, Market, MarketSnapshot};
 
-pub fn handle(args: MarketsArgs) -> Result<()> {
+pub async fn handle(args: MarketsArgs) -> Result<()> {
     args.validate()?;
-    print_bulk_catalog(&args)
+    if args.refresh {
+        let provider = args.provider.map(|provider| match provider {
+            CliDataProvider::Mmt => "mmt",
+        });
+        crate::markets::refresh_route(provider, &args.exchange).await?;
+        crate::runtime::reload_markets_if_running().await?;
+    }
+
+    let (snapshot, exchange) = match args.provider {
+        Some(CliDataProvider::Mmt) => crate::markets::provider_exchange("mmt", &args.exchange)?,
+        None => crate::markets::direct_exchange(&args.exchange)?,
+    };
+
+    if let Some(symbol) = &args.symbol {
+        let market = match args.provider {
+            Some(CliDataProvider::Mmt) => {
+                crate::markets::provider_market("mmt", &args.exchange, symbol)?
+            }
+            None => crate::markets::exchange_market(&args.exchange, symbol)?,
+        };
+        return print_market(&snapshot, &exchange, &market, args.json);
+    }
+
+    print_exchange(&snapshot, &exchange, args.json)
 }
 
-fn print_bulk_catalog(args: &MarketsArgs) -> Result<()> {
-    if let Some(symbol) = &args.symbol {
-        let market = catalog::market(symbol)?;
-        if args.json {
-            println!("{}", serde_json::to_string_pretty(market)?);
-        } else {
-            println!("bulk market (local snapshot)");
-            println!("  venue symbol:    {}", market.symbol);
-            println!("  internal symbol: {}", market.internal_symbol);
-            println!("  status:          {}", market.status);
-            println!("  base:            {}", market.base_asset);
-            println!("  quote:           {}", market.quote_asset);
-            println!("  tick size:       {}", market.tick_size);
-            println!("  lot size:        {}", market.lot_size);
-            println!("  min notional:    {}", market.min_notional);
-            println!("  max leverage:    {}x", market.max_leverage);
-            println!("  price precision: {}", market.price_precision);
-            println!("  size precision:  {}", market.size_precision);
-            println!(
-                "  market orders:   {}",
-                yes_no(market.supports_order_type("MARKET"))
-            );
-            println!("  order types:     {}", market.order_types.join(", "));
-            println!("  time in force:   {}", market.time_in_forces.join(", "));
-        }
+fn print_market(
+    snapshot: &MarketSnapshot,
+    exchange: &ExchangeMarkets,
+    market: &Market,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(market)?);
         return Ok(());
     }
 
-    let catalog = catalog::market_catalog()?;
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(catalog)?);
-        return Ok(());
-    }
-
-    let trading = catalog
-        .markets
-        .iter()
-        .filter(|market| market.is_trading())
-        .count();
-    println!("bulk markets (local snapshot)");
-    println!("  fetched: {}", catalog.fetched_at);
-    println!("  source:  {}", catalog.source_url);
-    println!("  markets: {} ({trading} trading)", catalog.markets.len());
-    println!();
     println!(
-        "{:<16} {:<18} {:<10} {:>12} {:>14} {:>10}",
-        "BULK SYMBOL", "INTERNAL SYMBOL", "STATUS", "LOT SIZE", "MIN NOTIONAL", "MAX LEV"
+        "{} market ({} local snapshot)",
+        exchange.exchange, snapshot.provider
     );
-    for market in &catalog.markets {
-        println!(
-            "{:<16} {:<18} {:<10} {:>12} {:>14.2} {:>9}x",
-            market.symbol,
-            market.internal_symbol,
-            market.status,
-            market.lot_size,
-            market.min_notional,
-            market.max_leverage
-        );
+    println!("  symbol:           {}", market.symbol);
+    println!("  provider symbol:  {}", market.provider_symbol);
+    println!("  venue symbol:     {}", market.venue_symbol);
+    println!("  status:           {}", market.status);
+    println!(
+        "  base / quote:     {} / {}",
+        market.base_asset, market.quote_asset
+    );
+    if let Some(increment) = market.price_increment {
+        println!("  price increment:  {increment}");
+    }
+    if let Some(increment) = market.size_increment {
+        println!("  size increment:   {increment}");
+    }
+    if let Some(rules) = &market.execution {
+        println!("  execution:        yes");
+        println!("  tick size:        {}", rules.tick_size);
+        println!("  lot size:         {}", rules.lot_size);
+        println!("  min notional:     {}", rules.min_notional);
+        println!("  max leverage:     {}x", rules.max_leverage);
+        println!("  price precision:  {}", rules.price_precision);
+        println!("  size precision:   {}", rules.size_precision);
+        println!("  order types:      {}", rules.order_types.join(", "));
+        println!("  time in force:    {}", rules.time_in_forces.join(", "));
+    } else {
+        println!("  execution:        no (market data only)");
     }
     Ok(())
 }
 
-fn yes_no(value: bool) -> &'static str {
-    if value { "yes" } else { "no" }
+fn print_exchange(snapshot: &MarketSnapshot, exchange: &ExchangeMarkets, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(exchange)?);
+        return Ok(());
+    }
+
+    let available = exchange
+        .markets
+        .iter()
+        .filter(|market| market.is_available())
+        .count();
+    let executable = exchange
+        .markets
+        .iter()
+        .filter(|market| market.execution.is_some())
+        .count();
+    println!(
+        "{} markets ({} local snapshot)",
+        exchange.exchange, snapshot.provider
+    );
+    println!("  fetched:    {}", snapshot.fetched_at);
+    println!("  source:     {}", snapshot.source_url);
+    println!(
+        "  markets:    {} ({available} available, {executable} executable)",
+        exchange.markets.len()
+    );
+    println!();
+    println!(
+        "{:<18} {:<20} {:<12} {:>14} {:>14}",
+        "SYMBOL", "PROVIDER SYMBOL", "STATUS", "SIZE STEP", "EXECUTION"
+    );
+    for market in &exchange.markets {
+        let size_step = market
+            .size_increment
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<18} {:<20} {:<12} {:>14} {:>14}",
+            market.symbol,
+            market.provider_symbol,
+            market.status,
+            size_step,
+            if market.execution.is_some() {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+    }
+    Ok(())
 }

@@ -11,13 +11,14 @@ pub struct MmtCandlesStream {
 
 impl MmtCandlesStream {
     pub async fn connect(exchange: &str, symbol: &str, tf: &str) -> Result<Self> {
+        let provider_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
         let client = MmtWsClient::shared().await?;
 
         let subscribe = serde_json::json!({
             "type": "subscribe",
             "channel": "candles",
             "exchange": exchange.to_lowercase(),
-            "symbol": normalize_symbol_for_mmt(symbol)?,
+            "symbol": provider_symbol,
             "tf": tf,
         });
 

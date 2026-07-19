@@ -133,12 +133,13 @@ async fn handle_bulk(args: SourceOiArgs) -> Result<()> {
 
 async fn stream_oi(args: SourceOiArgs) -> Result<()> {
     let exchange = args.exchange_name()?.to_string();
+    let provider_symbol = normalize_symbol_for_mmt(&exchange, &args.symbol)?;
     let ws = MmtWsClient::shared().await?;
     ws.subscribe(serde_json::json!({
         "type": "subscribe",
         "channel": "oi",
         "exchange": exchange.to_lowercase(),
-        "symbol": normalize_symbol_for_mmt(&args.symbol)?,
+        "symbol": provider_symbol,
         "tf": args.mmt_tf()?,
     }))
     .await

@@ -13,9 +13,9 @@ use crate::domain::execution::{
     CancelPlan, ExecutionReceipt, ExecutionVenue, OpenOrder, Position, PositionDirection,
     TimeInForce, TradePlan,
 };
-use crate::providers::bulk::catalog::{self, BulkMarket};
 use crate::providers::bulk::execution::BulkExecutionAdapter;
 use crate::providers::bulk::market_data::BulkProvider;
+use crate::providers::bulk::markets::{self, BulkMarket};
 
 pub async fn handle_trade(args: TradeArgs, direction: PositionDirection) -> Result<()> {
     args.validate_shape()?;
@@ -83,7 +83,11 @@ pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
     let positions = snapshot
         .positions
         .into_iter()
-        .filter(|position| symbol.is_none_or(|symbol| position.internal_symbol == symbol))
+        .filter(|position| {
+            symbol
+                .as_deref()
+                .is_none_or(|symbol| position.internal_symbol == symbol)
+        })
         .collect::<Vec<_>>();
     render_positions(&positions, args.output)
 }
@@ -96,7 +100,11 @@ pub async fn handle_orders(args: AccountQueryArgs) -> Result<()> {
         ExecutionVenueArg::Bulk => BulkExecutionAdapter::new()?.open_orders(&account).await?,
     }
     .into_iter()
-    .filter(|order| symbol.is_none_or(|symbol| order.internal_symbol == symbol))
+    .filter(|order| {
+        symbol
+            .as_deref()
+            .is_none_or(|symbol| order.internal_symbol == symbol)
+    })
     .collect::<Vec<_>>();
     render_orders(&orders, args.output)
 }
@@ -109,7 +117,11 @@ pub async fn handle_fills(args: AccountQueryArgs) -> Result<()> {
         ExecutionVenueArg::Bulk => BulkExecutionAdapter::new()?.fills(&account).await?,
     }
     .into_iter()
-    .filter(|fill| symbol.is_none_or(|symbol| fill.internal_symbol == symbol))
+    .filter(|fill| {
+        symbol
+            .as_deref()
+            .is_none_or(|symbol| fill.internal_symbol == symbol)
+    })
     .collect::<Vec<_>>();
     render_structured(&fills, args.output, || {
         if fills.is_empty() {
@@ -133,15 +145,15 @@ pub async fn handle_fills(args: AccountQueryArgs) -> Result<()> {
 
 pub async fn handle_cancel(args: CancelOrderArgs) -> Result<()> {
     args.validate()?;
-    let market = catalog::market(&args.symbol)?;
+    let market = markets::market(&args.symbol)?;
     bulk_keychain::Hash::from_base58(&args.order_id).context("invalid BULK order id")?;
     let account = credentials::bulk_account()?;
     let plan = CancelPlan {
         created_at_ms: now_ms()?,
         venue: ExecutionVenue::Bulk,
         account,
-        internal_symbol: market.internal_symbol.clone(),
-        venue_symbol: market.symbol.clone(),
+        internal_symbol: market.symbol.clone(),
+        venue_symbol: market.venue_symbol.clone(),
         order_id: args.order_id.clone(),
     };
     if args.dry_run {
@@ -173,7 +185,11 @@ pub async fn handle_close(args: ClosePositionArgs) -> Result<()> {
     let positions = snapshot
         .positions
         .into_iter()
-        .filter(|position| requested_symbol.is_none_or(|symbol| position.internal_symbol == symbol))
+        .filter(|position| {
+            requested_symbol
+                .as_deref()
+                .is_none_or(|symbol| position.internal_symbol == symbol)
+        })
         .collect::<Vec<_>>();
     let position = choose_position(positions, args.symbol.is_some(), args.output, args.yes)?;
     let direction = match position.direction {
@@ -262,8 +278,9 @@ pub(crate) async fn build_trade_plan(
     args: &TradeArgs,
     direction: PositionDirection,
 ) -> Result<TradePlan> {
-    let market = catalog::market(&args.symbol)?;
-    validate_market_rules(market, args)?;
+    let market = markets::market(&args.symbol)?;
+    validate_market_rules(&market, args)?;
+    let rules = market.execution_rules()?;
     let account = match args.venue {
         ExecutionVenueArg::Bulk => credentials::bulk_account()?,
     };
@@ -271,50 +288,46 @@ pub(crate) async fn build_trade_plan(
         TradeOrderKind::Limit => args
             .price
             .context("--price is required with --type limit")?,
-        TradeOrderKind::Market => {
-            BulkProvider::ticker(&market.internal_symbol)
-                .await?
-                .mark_price
-        }
+        TradeOrderKind::Market => BulkProvider::ticker(&market.symbol).await?.mark_price,
     };
     if !reference_price.is_finite() || reference_price <= 0.0 {
         bail!(
             "BULK returned an invalid reference price for {}",
-            market.symbol
+            market.venue_symbol
         );
     }
-    validate_protection_prices(market, args, direction, reference_price)?;
+    validate_protection_prices(&market, args, direction, reference_price)?;
 
     let size = if let Some(size) = args.size {
-        if !is_step_aligned(size, market.lot_size) {
+        if !is_step_aligned(size, rules.lot_size) {
             bail!(
                 "--size {size} is not aligned to BULK lot size {} for {}",
-                market.lot_size,
-                market.internal_symbol
+                rules.lot_size,
+                market.symbol
             );
         }
-        round_to_precision(size, market.size_precision)
+        round_to_precision(size, rules.size_precision)
     } else {
         let margin = args
             .margin
             .context("one of --size or --margin is required")?;
         let raw_size = exposure_from_margin(margin, args.leverage)? / reference_price;
-        floor_to_step(raw_size, market.lot_size, market.size_precision)
+        floor_to_step(raw_size, rules.lot_size, rules.size_precision)
     };
     if size <= 0.0 {
         bail!(
             "requested margin and leverage produce a size below BULK lot size {} on {}",
-            market.lot_size,
-            market.internal_symbol
+            rules.lot_size,
+            market.symbol
         );
     }
     let estimated_exposure = size * reference_price;
     let estimated_margin = estimated_exposure / args.leverage;
-    if estimated_exposure + f64::EPSILON < market.min_notional {
+    if estimated_exposure + f64::EPSILON < rules.min_notional {
         bail!(
             "estimated exposure {estimated_exposure:.8} is below BULK minimum notional {} for {}",
-            market.min_notional,
-            market.internal_symbol
+            rules.min_notional,
+            market.symbol
         );
     }
 
@@ -322,8 +335,8 @@ pub(crate) async fn build_trade_plan(
         created_at_ms: now_ms()?,
         venue: ExecutionVenue::Bulk,
         account,
-        internal_symbol: market.internal_symbol.clone(),
-        venue_symbol: market.symbol.clone(),
+        internal_symbol: market.symbol.clone(),
+        venue_symbol: market.venue_symbol.clone(),
         direction,
         side: direction.into(),
         order_kind: args.order_kind.into(),
@@ -350,14 +363,15 @@ fn validate_protection_prices(
     direction: PositionDirection,
     entry_price: f64,
 ) -> Result<()> {
+    let rules = market.execution_rules()?;
     for (flag, price) in [("--sl", args.sl), ("--tp", args.tp)] {
         if let Some(price) = price
-            && !is_step_aligned(price, market.tick_size)
+            && !is_step_aligned(price, rules.tick_size)
         {
             bail!(
                 "{flag} {price} is not aligned to BULK tick size {} for {}",
-                market.tick_size,
-                market.internal_symbol
+                rules.tick_size,
+                market.symbol
             );
         }
     }
@@ -384,11 +398,12 @@ fn validate_protection_prices(
 
 fn validate_market_rules(market: &BulkMarket, args: &TradeArgs) -> Result<()> {
     let capabilities = BulkExecutionAdapter::capabilities();
+    let rules = market.execution_rules()?;
     if !capabilities.order_kinds.contains(&args.order_kind.into()) {
         bail!("BULK execution adapter does not support this order type");
     }
-    if !market.is_trading() {
-        bail!("BULK market `{}` is not trading", market.symbol);
+    if !market.is_available() {
+        bail!("BULK market `{}` is not trading", market.venue_symbol);
     }
     let order_type = match args.order_kind {
         TradeOrderKind::Market => "MARKET",
@@ -397,24 +412,24 @@ fn validate_market_rules(market: &BulkMarket, args: &TradeArgs) -> Result<()> {
     if !market.supports_order_type(order_type) {
         bail!(
             "BULK market `{}` does not support {order_type} orders",
-            market.symbol
+            market.venue_symbol
         );
     }
-    if args.leverage > f64::from(market.max_leverage) {
+    if args.leverage > f64::from(rules.max_leverage) {
         bail!(
             "--leverage {} exceeds BULK maximum {}x for {}",
             args.leverage,
-            market.max_leverage,
-            market.internal_symbol
+            rules.max_leverage,
+            market.symbol
         );
     }
     if let Some(price) = args.price
-        && !is_step_aligned(price, market.tick_size)
+        && !is_step_aligned(price, rules.tick_size)
     {
         bail!(
             "--price {price} is not aligned to BULK tick size {} for {}",
-            market.tick_size,
-            market.internal_symbol
+            rules.tick_size,
+            market.symbol
         );
     }
     if matches!(args.order_kind, TradeOrderKind::Limit) {
@@ -423,20 +438,23 @@ fn validate_market_rules(market: &BulkMarket, args: &TradeArgs) -> Result<()> {
             TradeTimeInForce::Ioc => "IOC",
             TradeTimeInForce::Alo => "ALO",
         };
-        if !market
+        if !rules
             .time_in_forces
             .iter()
             .any(|candidate| candidate.eq_ignore_ascii_case(tif))
         {
-            bail!("BULK market `{}` does not support TIF {tif}", market.symbol);
+            bail!(
+                "BULK market `{}` does not support TIF {tif}",
+                market.venue_symbol
+            );
         }
     }
     Ok(())
 }
 
-fn validate_optional_symbol(symbol: Option<&str>) -> Result<Option<&'static str>> {
+fn validate_optional_symbol(symbol: Option<&str>) -> Result<Option<String>> {
     symbol
-        .map(|symbol| catalog::market(symbol).map(|market| market.internal_symbol.as_str()))
+        .map(|symbol| markets::market(symbol).map(|market| market.symbol.clone()))
         .transpose()
 }
 

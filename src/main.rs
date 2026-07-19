@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse_from(args);
 
     match cli.command {
-        Commands::Markets(args) => commands::markets::handle(args)?,
+        Commands::Markets(args) => commands::markets::handle(args).await?,
         Commands::Trade { command } => match command {
             TradeCommands::Long(args) => {
                 commands::execution::handle_trade(args, PositionDirection::Long).await?

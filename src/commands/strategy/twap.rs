@@ -12,7 +12,7 @@ use crate::cli::{
 };
 use crate::commands::execution::build_trade_plan;
 use crate::domain::execution::{ExecutionVenue, PositionDirection};
-use crate::providers::bulk::catalog;
+use crate::providers::bulk::markets;
 use crate::strategies::jobs::{
     StrategyJob, StrategyJobDefinition, StrategyJobSubmission, StrategySide, TwapJobDefinition,
 };
@@ -90,12 +90,13 @@ pub async fn handle(args: RunTwapArgs) -> Result<()> {
     args.validate()?;
     let direction = direction(args.side);
     let parent = build_trade_plan(&trade_args(&args, args.size, args.margin), direction).await?;
-    let market = catalog::market(&parent.internal_symbol)?;
+    let market = markets::market(&parent.internal_symbol)?;
+    let rules = market.execution_rules()?;
     let schedule = TwapSchedule::build(
         parent.size,
-        market.lot_size,
+        rules.lot_size,
         parent.reference_price,
-        market.min_notional,
+        rules.min_notional,
         args.duration,
         args.interval,
     )?;
@@ -179,12 +180,13 @@ async fn run_worker(job_id: &str, definition: &TwapJobDefinition) -> Result<()> 
         direction,
     )
     .await?;
-    let market = catalog::market(&parent.internal_symbol)?;
+    let market = markets::market(&parent.internal_symbol)?;
+    let rules = market.execution_rules()?;
     let schedule = TwapSchedule::build(
         parent.size,
-        market.lot_size,
+        rules.lot_size,
         parent.reference_price,
-        market.min_notional,
+        rules.min_notional,
         definition.duration_seconds,
         definition.interval_seconds,
     )?;

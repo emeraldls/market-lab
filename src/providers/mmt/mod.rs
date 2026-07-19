@@ -61,7 +61,7 @@ impl MmtProvider {
         bucket: u8,
     ) -> Result<VdSeries> {
         let api_key = mmt_api_key()?;
-        let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
+        let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
         let exchange = exchange.trim().to_lowercase();
         let from_s = normalize_to_seconds(from);
         let to_s = normalize_to_seconds(to);
@@ -114,7 +114,7 @@ impl MmtProvider {
         to: u64,
     ) -> Result<CandleSeries> {
         let api_key = mmt_api_key()?;
-        let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
+        let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
         let exchange = exchange.trim().to_lowercase();
         let from_s = normalize_to_seconds(from);
         let to_s = normalize_to_seconds(to);
@@ -165,7 +165,7 @@ impl MmtProvider {
         to: u64,
     ) -> Result<OiSeries> {
         let api_key = mmt_api_key()?;
-        let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
+        let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
         let exchange = exchange.trim().to_lowercase();
         let from_s = normalize_to_seconds(from);
         let to_s = normalize_to_seconds(to);
@@ -216,7 +216,7 @@ impl MmtProvider {
         to: u64,
     ) -> Result<VolumeProfileSeries> {
         let api_key = mmt_api_key()?;
-        let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
+        let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
         let exchange = exchange.trim().to_lowercase();
         let from_s = normalize_to_seconds(from);
         let to_s = normalize_to_seconds(to);
@@ -359,7 +359,7 @@ async fn fetch_orderbook_snapshot(
     depth: u16,
 ) -> Result<OrderBookSnapshot> {
     let api_key = mmt_api_key()?;
-    let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
+    let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
     let exchange = exchange.trim().to_lowercase();
 
     let levels = levels_param(depth);
@@ -454,7 +454,7 @@ async fn fetch_flat_heatmap_hd_snapshot(
     depth: u16,
 ) -> Result<OrderBookSnapshot> {
     let api_key = mmt_api_key()?;
-    let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
+    let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
     let exchange = exchange.trim().to_lowercase();
 
     let tf = "1m";
@@ -514,7 +514,7 @@ async fn fetch_flat_heatmap_hd_series(
     depth: u16,
 ) -> Result<Vec<OrderBookSnapshot>> {
     let api_key = mmt_api_key()?;
-    let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
+    let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
     let exchange = exchange.trim().to_lowercase();
     let from_s = normalize_to_seconds(from);
     let to_s = normalize_to_seconds(to);
@@ -616,7 +616,7 @@ mod tests {
 
     #[test]
     fn normalize_symbol_maps_usdt_to_usd() {
-        let got = normalize_symbol_for_mmt("BTC/USDT").expect("must normalize");
+        let got = normalize_symbol_for_mmt("binancef", "BTC/USDT").expect("must normalize");
         assert_eq!(got, "btc/usd");
     }
 

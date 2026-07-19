@@ -331,17 +331,25 @@ impl From<TradeTimeInForce> for TimeInForce {
 
 #[derive(Clone, Debug, Args)]
 pub struct MarketsArgs {
+    #[arg(long, value_enum)]
+    pub provider: Option<CliDataProvider>,
     #[arg(long)]
     pub exchange: String,
     #[arg(long)]
     pub symbol: Option<String>,
+    /// Replace the installed snapshot with current provider markets.
+    #[arg(long, default_value_t = false)]
+    pub refresh: bool,
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }
 
 impl MarketsArgs {
     pub fn validate(&self) -> Result<()> {
-        validate_bulk_exchange(&self.exchange, "markets")
+        if self.exchange.trim().is_empty() {
+            bail!("--exchange cannot be empty");
+        }
+        Ok(())
     }
 }
 
@@ -1874,10 +1882,59 @@ mod tests {
 
         match cli.command {
             Commands::Markets(args) => {
+                assert!(args.provider.is_none());
                 assert_eq!(args.exchange, "bulk");
                 assert_eq!(args.symbol.as_deref(), Some("BTC/USDT"));
+                assert!(!args.refresh);
                 assert!(args.json);
                 args.validate().expect("BULK markets should validate");
+            }
+            _ => panic!("expected markets command"),
+        }
+    }
+
+    #[test]
+    fn parse_markets_refresh_command() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "markets",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "binancef",
+            "--refresh",
+        ])
+        .expect("markets refresh command should parse");
+
+        match cli.command {
+            Commands::Markets(args) => {
+                assert_eq!(args.provider, Some(CliDataProvider::Mmt));
+                assert_eq!(args.exchange, "binancef");
+                assert!(args.refresh);
+            }
+            _ => panic!("expected markets command"),
+        }
+    }
+
+    #[test]
+    fn parse_mmt_markets_command() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "markets",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "binancef",
+            "--symbol",
+            "BTC/USDT",
+        ])
+        .expect("MMT markets command should parse");
+
+        match cli.command {
+            Commands::Markets(args) => {
+                assert_eq!(args.provider, Some(CliDataProvider::Mmt));
+                assert_eq!(args.exchange, "binancef");
+                args.validate().expect("MMT snapshot should validate");
             }
             _ => panic!("expected markets command"),
         }

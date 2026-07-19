@@ -145,12 +145,13 @@ fn render_bulk_volume_bars(series: &VolumeBarSeries, output: OutputFormat) -> Re
 
 async fn stream_volumes(args: SourceVolumesArgs) -> Result<()> {
     let exchange = args.exchange_name()?.to_string();
+    let provider_symbol = normalize_symbol_for_mmt(&exchange, &args.symbol)?;
     let ws = MmtWsClient::shared().await?;
     ws.subscribe(serde_json::json!({
         "type": "subscribe",
         "channel": "volumes",
         "exchange": exchange.to_lowercase(),
-        "symbol": normalize_symbol_for_mmt(&args.symbol)?,
+        "symbol": provider_symbol,
         "tf": args.timeframe_name()?,
     }))
     .await
@@ -235,7 +236,7 @@ fn parse_volumes_message(value: serde_json::Value) -> Result<Option<VolumeProfil
 }
 
 async fn stream_bulk_volume_bars(args: SourceVolumesArgs) -> Result<()> {
-    let market = crate::providers::bulk::catalog::market(&args.symbol)?;
+    let market = crate::providers::bulk::markets::market(&args.symbol)?;
     let mut stream = BulkCandleStream::connect(&args.symbol, args.timeframe_name()?).await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest = None;
@@ -263,7 +264,7 @@ async fn stream_bulk_volume_bars(args: SourceVolumesArgs) -> Result<()> {
                     version: "1",
                     provider: "bulk",
                     exchange: "bulk".to_string(),
-                    symbol: market.internal_symbol.clone(),
+                    symbol: market.symbol.clone(),
                     ts_ms: bar.t,
                     stream: true,
                     data: bar.clone(),

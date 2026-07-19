@@ -39,6 +39,17 @@ pub fn mmt_api_key() -> Result<String> {
     Ok(key)
 }
 
+pub fn mmt_is_configured() -> Result<bool> {
+    if std::env::var(MMT_API_KEY_ENV).is_ok_and(|key| !key.trim().is_empty()) {
+        return Ok(true);
+    }
+    match mmt_entry()?.get_password() {
+        Ok(key) => Ok(!key.trim().is_empty()),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(error) => Err(error).context("failed to read MMT keychain status"),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum BulkCredentialStatus {
@@ -133,6 +144,10 @@ pub async fn handle_set(args: AuthSetArgs) -> Result<()> {
             mmt_entry()?
                 .set_password(&key)
                 .context("failed to store MMT API key in the OS keychain")?;
+            crate::markets::refresh_mmt()
+                .await
+                .context("MMT was configured, but its market snapshot could not be initialized")?;
+            crate::runtime::reload_markets_if_running().await?;
             println!("mmt: configured");
         }
         AuthProvider::Bulk => handle_set_bulk(args.reauthorize).await?,

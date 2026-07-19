@@ -19,7 +19,7 @@ use crate::domain::types::{
     OiCandle, OpenInterestSnapshot, OrderBookSnapshot, TradeTick, VdCandle, VolumeDeltaTick,
     VolumeProfile,
 };
-use crate::providers::bulk::catalog;
+use crate::providers::bulk::markets;
 use crate::providers::bulk::ws::{
     BulkCandleStream, BulkOrderBookStream, BulkTickerStream, BulkTradesStream,
 };
@@ -500,6 +500,9 @@ impl ScriptLiveStreams {
         let mmt = if mmt_configs.is_empty() {
             None
         } else {
+            for config in mmt_configs.values() {
+                normalize_symbol_for_mmt(&config.exchange, symbol)?;
+            }
             let ws = MmtWsClient::shared().await?;
             subscribe_mmt_sources(&ws, &mmt_configs, symbol).await?;
             let orderbook_states = orderbook_states(&mmt_configs);
@@ -514,7 +517,7 @@ impl ScriptLiveStreams {
         let bulk = if bulk_configs.is_empty() {
             None
         } else {
-            let symbol = catalog::market(symbol)?.internal_symbol.clone();
+            let symbol = markets::market(symbol)?.symbol.clone();
             Some(Box::new(
                 BulkScriptStreams::connect(&bulk_configs, &symbol).await?,
             ))
@@ -761,18 +764,18 @@ async fn subscribe_mmt_sources(
     source_configs: &SourceConfigs,
     symbol: &str,
 ) -> Result<()> {
-    let symbol = normalize_symbol_for_mmt(symbol)?;
     let mut configs = source_configs.values().collect::<Vec<_>>();
     configs.sort_by_key(|config| config.position);
     for config in configs {
         let exchange = config.exchange.as_str();
+        let provider_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
         match &config.source {
             ScriptSource::Candles => {
                 ws.subscribe(json!({
                     "type": "subscribe",
                     "channel": "trades",
                     "exchange": exchange,
-                    "symbol": symbol.as_str(),
+                    "symbol": provider_symbol.as_str(),
                 }))
                 .await
                 .with_context(|| format!("failed to subscribe {}", config.selector))?;
@@ -782,7 +785,7 @@ async fn subscribe_mmt_sources(
                     "type": "subscribe",
                     "channel": "depth",
                     "exchange": exchange,
-                    "symbol": symbol.as_str(),
+                    "symbol": provider_symbol.as_str(),
                 }))
                 .await
                 .with_context(|| format!("failed to subscribe {}", config.selector))?;
@@ -796,7 +799,7 @@ async fn subscribe_mmt_sources(
                     "type": "subscribe",
                     "channel": "vd",
                     "exchange": exchange,
-                    "symbol": symbol.as_str(),
+                    "symbol": provider_symbol.as_str(),
                     "tf": tf,
                     "bucket": bucket,
                 }))
@@ -811,7 +814,7 @@ async fn subscribe_mmt_sources(
                     "type": "subscribe",
                     "channel": "oi",
                     "exchange": exchange,
-                    "symbol": symbol.as_str(),
+                    "symbol": provider_symbol.as_str(),
                     "tf": tf,
                 }))
                 .await
@@ -825,7 +828,7 @@ async fn subscribe_mmt_sources(
                     "type": "subscribe",
                     "channel": "volumes",
                     "exchange": exchange,
-                    "symbol": symbol.as_str(),
+                    "symbol": provider_symbol.as_str(),
                     "tf": tf,
                 }))
                 .await

@@ -230,7 +230,7 @@ async fn stream_bulk_candles(args: SourceCandlesArgs) -> Result<()> {
                     version: "1",
                     provider: "bulk",
                     exchange: "bulk".to_string(),
-                    symbol: crate::providers::bulk::catalog::market(&args.symbol)?.internal_symbol.clone(),
+                    symbol: crate::providers::bulk::markets::market(&args.symbol)?.symbol.clone(),
                     ts_ms: candle.t,
                     stream: true,
                     data: candle.clone(),

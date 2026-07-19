@@ -9,8 +9,8 @@ use crate::domain::types::{
     TopOfBook, VolumeBar, VolumeBarSeries,
 };
 
-use super::catalog;
 use super::client::BulkClient;
+use super::markets;
 
 const EXCHANGE: &str = "bulk";
 
@@ -26,7 +26,7 @@ impl BulkProvider {
             "symbols": {
                 "internal_format": "BASE/USDT",
                 "venue_format": "BASE-USD",
-                "catalog": "embedded"
+                "market_registry": "embedded"
             },
             "time": {
                 "app_boundary": "milliseconds",
@@ -90,7 +90,7 @@ impl BulkProvider {
         }
 
         let query = [
-            ("symbol", market.symbol.clone()),
+            ("symbol", market.provider_symbol.clone()),
             ("interval", interval.to_string()),
             ("startTime", from.to_string()),
             ("endTime", to.to_string()),
@@ -102,7 +102,7 @@ impl BulkProvider {
 
         Ok(OhlcvSeries {
             exchange: EXCHANGE.to_string(),
-            symbol: market.internal_symbol.clone(),
+            symbol: market.symbol.clone(),
             tf: interval.to_string(),
             from,
             to,
@@ -150,7 +150,7 @@ impl BulkProvider {
         let market = require_market(symbol)?;
         let mut query = vec![
             ("type", "l2book".to_string()),
-            ("coin", market.symbol.clone()),
+            ("coin", market.provider_symbol.clone()),
             ("nlevels", depth.to_string()),
         ];
         if let Some(aggregation) = aggregation {
@@ -162,16 +162,16 @@ impl BulkProvider {
 
         let client = BulkClient::new()?;
         let raw: BulkL2Book = client.get("l2book", &query).await?;
-        raw.into_snapshot(&market.internal_symbol, depth)
+        raw.into_snapshot(&market.symbol, depth)
     }
 
     pub async fn ticker(symbol: &str) -> Result<MarketTicker> {
         let market = require_market(symbol)?;
         let client = BulkClient::new()?;
         let raw: BulkTicker = client
-            .get_without_query(&format!("ticker/{}", market.symbol))
+            .get_without_query(&format!("ticker/{}", market.provider_symbol))
             .await?;
-        raw.into_ticker(&market.internal_symbol)
+        raw.into_ticker(&market.symbol)
     }
 
     pub async fn open_interest(symbol: &str) -> Result<OpenInterestSnapshot> {
@@ -200,7 +200,7 @@ impl BulkProvider {
     pub async fn statistics(period: &str, symbol: Option<&str>) -> Result<ExchangeStatistics> {
         let mut query = vec![("period", period.to_string())];
         if let Some(symbol) = symbol {
-            query.push(("symbol", require_market(symbol)?.symbol.clone()));
+            query.push(("symbol", require_market(symbol)?.provider_symbol.clone()));
         }
         let client = BulkClient::new()?;
         let raw: BulkStatistics = client.get("stats", &query).await?;
@@ -216,10 +216,10 @@ impl BulkProvider {
     }
 }
 
-fn require_market(symbol: &str) -> Result<&'static catalog::BulkMarket> {
-    let market = catalog::market(symbol)?;
-    if !market.is_trading() {
-        bail!("BULK market `{}` is not trading", market.symbol);
+fn require_market(symbol: &str) -> Result<std::sync::Arc<markets::BulkMarket>> {
+    let market = markets::market(symbol)?;
+    if !market.is_available() {
+        bail!("BULK market `{}` is not trading", market.venue_symbol);
     }
     Ok(market)
 }
@@ -311,7 +311,8 @@ impl BulkL2Book {
         if self.levels.len() != 2 {
             bail!("BULK l2book must contain exactly bid and ask arrays");
         }
-        let expected = catalog::market(internal_symbol)?.symbol.as_str();
+        let market = markets::market(internal_symbol)?;
+        let expected = market.venue_symbol.as_str();
         if self.symbol != expected {
             bail!(
                 "BULK l2book returned symbol `{}`; expected `{expected}`",
@@ -389,17 +390,17 @@ pub(crate) struct BulkTicker {
 
 impl BulkTicker {
     pub(crate) fn into_ticker(self, internal_symbol: &str) -> Result<MarketTicker> {
-        let market = catalog::market(internal_symbol)?;
-        if self.symbol != market.symbol {
+        let market = markets::market(internal_symbol)?;
+        if self.symbol != market.venue_symbol {
             bail!(
                 "BULK ticker returned symbol `{}`; expected `{}`",
                 self.symbol,
-                market.symbol
+                market.venue_symbol
             );
         }
         Ok(MarketTicker {
             exchange: EXCHANGE.to_string(),
-            symbol: market.internal_symbol.clone(),
+            symbol: market.symbol.clone(),
             timestamp_ms: normalize_timestamp_ms(self.timestamp),
             price_change: self.price_change,
             price_change_percent: self.price_change_percent,
@@ -447,12 +448,12 @@ impl BulkStatistics {
             .rates
             .into_iter()
             .map(|(venue_symbol, rate)| {
-                let market = catalog::market(&venue_symbol).with_context(|| {
+                let market = markets::market(&venue_symbol).with_context(|| {
                     format!("BULK stats returned unknown market `{venue_symbol}`")
                 })?;
                 Ok(FundingRateSnapshot {
                     exchange: EXCHANGE.to_string(),
-                    symbol: market.internal_symbol.clone(),
+                    symbol: market.symbol.clone(),
                     timestamp_ms,
                     current: rate.current,
                     annualized: Some(rate.annualized),
@@ -504,10 +505,10 @@ struct BulkMarketStatistics {
 
 impl BulkMarketStatistics {
     fn into_statistics(self) -> Result<MarketStatistics> {
-        let market = catalog::market(&self.symbol)
+        let market = markets::market(&self.symbol)
             .with_context(|| format!("BULK stats returned unknown market `{}`", self.symbol))?;
         Ok(MarketStatistics {
-            symbol: market.internal_symbol.clone(),
+            symbol: market.symbol.clone(),
             volume: self.volume,
             quote_volume: self.quote_volume,
             open_interest: self.open_interest,

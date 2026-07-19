@@ -10,8 +10,8 @@ use crate::domain::types::{
     MarketTicker, OhlcvCandle, OrderBookLevel, OrderBookSnapshot, TradeTick,
 };
 
-use super::catalog;
 use super::market_data::{BulkKline, BulkTicker, normalize_timestamp_ms};
+use super::markets;
 
 const BULK_WS_URL: &str = "wss://exchange-ws1.bulk.trade";
 
@@ -89,10 +89,10 @@ pub struct BulkCandleStream {
 
 impl BulkCandleStream {
     pub async fn connect(symbol: &str, interval: &str) -> Result<Self> {
-        let market = catalog::market(symbol)?;
+        let market = markets::market(symbol)?;
         let client = BulkWsClient::subscribe(serde_json::json!({
             "type": "candle",
-            "symbol": market.symbol,
+            "symbol": market.provider_symbol,
             "interval": interval,
         }))
         .await?;
@@ -129,15 +129,15 @@ pub struct BulkTickerStream {
 
 impl BulkTickerStream {
     pub async fn connect(symbol: &str) -> Result<Self> {
-        let market = catalog::market(symbol)?;
+        let market = markets::market(symbol)?;
         let client = BulkWsClient::subscribe(serde_json::json!({
             "type": "ticker",
-            "symbol": market.symbol,
+            "symbol": market.provider_symbol,
         }))
         .await?;
         Ok(Self {
             client,
-            internal_symbol: market.internal_symbol.clone(),
+            internal_symbol: market.symbol.clone(),
         })
     }
     pub async fn next_ticker(&mut self) -> Result<MarketTicker> {
@@ -171,17 +171,17 @@ pub struct BulkOrderBookStream {
 
 impl BulkOrderBookStream {
     pub async fn connect(symbol: &str, depth: u16, state_cap: usize) -> Result<Self> {
-        let market = catalog::market(symbol)?;
+        let market = markets::market(symbol)?;
         let client = BulkWsClient::subscribe(serde_json::json!({
             "type": "l2Delta",
-            "symbol": market.symbol,
+            "symbol": market.provider_symbol,
         }))
         .await?;
         Ok(Self {
             client,
             state: OrderBookState::with_max_levels_per_side(state_cap),
-            internal_symbol: market.internal_symbol.clone(),
-            venue_symbol: market.symbol.clone(),
+            internal_symbol: market.symbol.clone(),
+            venue_symbol: market.venue_symbol.clone(),
             depth,
         })
     }
@@ -312,16 +312,16 @@ impl BulkAccountStream {
 
 impl BulkTradesStream {
     pub async fn connect(symbol: &str) -> Result<Self> {
-        let market = catalog::market(symbol)?;
+        let market = markets::market(symbol)?;
         let client = BulkWsClient::subscribe(serde_json::json!({
             "type": "trades",
-            "symbol": market.symbol,
+            "symbol": market.provider_symbol,
         }))
         .await?;
         Ok(Self {
             client,
-            internal_symbol: market.internal_symbol.clone(),
-            venue_symbol: market.symbol.clone(),
+            internal_symbol: market.symbol.clone(),
+            venue_symbol: market.venue_symbol.clone(),
         })
     }
 

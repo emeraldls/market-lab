@@ -5,10 +5,10 @@ use bulk_keychain::{Keypair, Pubkey, SignedTransaction, Signer};
 use reqwest::Client;
 use serde_json::Value;
 
-pub mod catalog;
 pub mod client;
 pub mod execution;
 pub mod market_data;
+pub mod markets;
 pub mod ws;
 
 const DEFAULT_BULK_API_URL: &str = "https://exchange-api.bulk.trade/api/v1";
