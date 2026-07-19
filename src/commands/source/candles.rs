@@ -319,7 +319,12 @@ async fn handle_binance(args: SourceCandlesArgs) -> Result<()> {
             );
             Ok(())
         }
-        OutputFormat::Json | OutputFormat::Jsonl => {
+        OutputFormat::Json => {
+            let json = serde_json::to_string_pretty(&env)?;
+            println!("{}", json);
+            Ok(())
+        }
+        OutputFormat::Jsonl => {
             let json = serde_json::to_string(&env)?;
             println!("{}", json);
             Ok(())

@@ -21,7 +21,7 @@ use crate::commands::script::{
 };
 use crate::commands::study::common::is_empty_object;
 use crate::domain::enums::ProviderKind;
-use crate::domain::types::{CandleSeries, OhlcvtCandle, OiCandle, OrderBookSnapshot, VdCandle, VolumeProfile};
+use crate::domain::types::{CandleSeries, OhlcvtCandle, OhlcvSeries, OiCandle, OrderBookSnapshot, VdCandle, VolumeProfile};
 use crate::providers::mmt::MmtProvider;
 use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::binance::market_data::BinanceProvider;
@@ -908,18 +908,18 @@ async fn fetch_binance_sources(
         let interval = standard_timeframe_from_seconds(timeframe)?;
         let is_futures = config.provider == ProviderKind::BinanceFutures;
 
-        match source {
-            ScriptSource::Candles => {}
-            ScriptSource::Volumes => {}
+        let phase = match source {
+            ScriptSource::Candles => "fetching_candles",
+            ScriptSource::Volumes => "fetching_volumes",
             ScriptSource::Orderbook | ScriptSource::Vd | ScriptSource::Oi => {
                 bail!(
                     "Binance does not provide historical {} for script backtests",
                     source.as_str()
                 );
             }
-        }
+        };
 
-        report.set_phase("fetching_candles");
+        report.set_phase(phase);
         write_running_report_best_effort(report);
         let started = Instant::now();
         eprintln!(
@@ -932,21 +932,17 @@ async fn fetch_binance_sources(
             args.to
         );
 
-        let series = if is_futures {
-            let future = BinanceProvider::candles_paginated_futures(
-                &args.symbol, &interval, args.from, args.to,
-            );
-            tokio::select! {
-                result = future => result?,
-                _ = &mut cancel => {
-                    report.set_phase("cancelled");
-                    return Err(ScriptCancelled.into());
-                }
-            }
-        } else {
-            let future = BinanceProvider::candles_paginated(
-                &args.symbol, &interval, args.from, args.to,
-            );
+        let series = {
+            let future: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<OhlcvSeries>> + Send>> =
+                if is_futures {
+                    Box::pin(BinanceProvider::candles_paginated_futures(
+                        &args.symbol, &interval, args.from, args.to,
+                    ))
+                } else {
+                    Box::pin(BinanceProvider::candles_paginated(
+                        &args.symbol, &interval, args.from, args.to,
+                    ))
+                };
             tokio::select! {
                 result = future => result?,
                 _ = &mut cancel => {

@@ -70,18 +70,23 @@ where
     T: DeserializeOwned,
 {
     let status = response.status();
-    let body: Value = response
-        .json()
+    let bytes = response
+        .bytes()
         .await
-        .with_context(|| format!("failed to decode Binance {operation} response"))?;
+        .with_context(|| format!("failed to read Binance {operation} response body"))?;
+
     if !status.is_success() {
+        // Binance error responses are usually JSON with a `msg`/`message` field,
+        // but gateways may return HTML/text on 502/503. Fall back to raw text.
+        let body: Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
         bail!(
             "Binance {operation} returned HTTP {status}: {}",
             response_message(&body)
         );
     }
 
-    serde_json::from_value(body)
+    serde_json::from_slice(&bytes)
         .with_context(|| format!("Binance {operation} returned an unexpected payload"))
 }
 

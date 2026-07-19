@@ -317,8 +317,8 @@ fn validate_source_config(config: &SourceConfig, historical: bool) -> Result<()>
             match &config.source {
                 ScriptSource::Candles => {
                     let timeframe = config.require_timeframe(&config.source)?;
-                    // Binance spot and futures use the same standard timeframe mapping.
-                    let _ = crate::cli::mmt_timeframe_from_seconds(timeframe);
+                    // Binance spot and futures use the same standard timeframe mapping; validate it.
+                    let _ = crate::cli::mmt_timeframe_from_seconds(timeframe)?;
                 }
                 ScriptSource::Orderbook if historical => {
                     bail!("Binance does not provide historical orderbooks for script backtests");
@@ -346,7 +346,7 @@ fn validate_source_config(config: &SourceConfig, historical: bool) -> Result<()>
                 }
                 ScriptSource::Volumes => {
                     let timeframe = config.require_timeframe(&config.source)?;
-                    let _ = crate::cli::mmt_timeframe_from_seconds(timeframe);
+                    let _ = crate::cli::mmt_timeframe_from_seconds(timeframe)?;
                 }
             }
         }

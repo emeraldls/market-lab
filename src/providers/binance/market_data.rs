@@ -4,6 +4,11 @@ use crate::domain::types::{OhlcvtCandle, OhlcvCandle, OhlcvSeries, ProviderHealt
 use crate::providers::binance::client::BinanceClient;
 
 const EXCHANGE: &str = "binance";
+const FUTURES_EXCHANGE: &str = "binance_futures";
+/// Maximum candles Binance returns per klines request.
+const BINANCE_KLINES_LIMIT: usize = 1000;
+/// Hard cap on total candles fetched via pagination to bound runtime and memory.
+const BINANCE_MAX_CANDLES: usize = 5000;
 
 pub struct BinanceProvider;
 
@@ -48,21 +53,43 @@ impl From<BinanceKline> for OhlcvCandle {
     }
 }
 
+/// Normalizes a symbol to Binance's uppercase form with separators removed (e.g. "btc/usdt" -> "BTCUSDT").
+fn binance_symbol(symbol: &str) -> String {
+    symbol.replace('/', "").replace('-', "").to_uppercase()
+}
+
+/// Selects the spot or futures client and returns the exchange label to attach to the series.
+fn client_for(futures: bool) -> Result<(BinanceClient, &'static str)> {
+    if futures {
+        Ok((BinanceClient::new_futures()?, FUTURES_EXCHANGE))
+    } else {
+        Ok((BinanceClient::new()?, EXCHANGE))
+    }
+}
+
+async fn ping_health(futures: bool) -> Result<ProviderHealth> {
+    let (client, label) = client_for(futures)?;
+    let url = client.url("ping");
+    let response = client.http().get(&url).send().await
+        .with_context(|| format!("failed to call Binance {} ping", label))?;
+    let status = if response.status().is_success() { "ok" } else { "degraded" };
+    let details = response.json::<serde_json::Value>().await
+        .unwrap_or(serde_json::json!({}));
+    Ok(ProviderHealth {
+        provider: label.to_string(),
+        status: status.to_string(),
+        details,
+    })
+}
+
 impl BinanceProvider {
     pub async fn health() -> Result<ProviderHealth> {
-        let client = BinanceClient::new()?;
-        // Binance /ping returns {} on success — no query params needed.
-        let url = client.url("ping");
-        let response = client.http().get(&url).send().await
-            .context("failed to call Binance ping")?;
-        let status = if response.status().is_success() { "ok" } else { "degraded" };
-        let details = response.json::<serde_json::Value>().await
-            .unwrap_or(serde_json::json!({}));
-        Ok(ProviderHealth {
-            provider: EXCHANGE.to_string(),
-            status: status.to_string(),
-            details,
-        })
+        ping_health(false).await
+    }
+
+    /// Futures health check targeting fapi.binance.com/fapi/v1/ping.
+    pub async fn health_futures() -> Result<ProviderHealth> {
+        ping_health(true).await
     }
 
     pub async fn candles(symbol: &str, interval: &str, from: u64, to: u64) -> Result<OhlcvSeries> {
@@ -80,24 +107,16 @@ impl BinanceProvider {
             bail!("candle start time must be less than end time");
         }
 
-        // Binance symbol format: BTCUSDT (no separator)
-        let binance_symbol = symbol.replace('/', "").replace('-', "").to_uppercase();
+        let binance_symbol = binance_symbol(symbol);
+        let (client, exchange_label) = client_for(futures)?;
 
         let query = [
             ("symbol", binance_symbol.clone()),
             ("interval", interval.to_string()),
             ("startTime", from.to_string()),
             ("endTime", to.to_string()),
-            ("limit", "1000".to_string()),
+            ("limit", BINANCE_KLINES_LIMIT.to_string()),
         ];
-
-        let client = if futures {
-            BinanceClient::new_futures()?
-        } else {
-            BinanceClient::new()?
-        };
-
-        let exchange_label = if futures { "binance_futures" } else { EXCHANGE };
 
         let raw: Vec<Vec<serde_json::Value>> = client.get("klines", &query).await?;
         let mut data: Vec<OhlcvCandle> = raw.into_iter().map(|k| OhlcvCandle::from(BinanceKline(k))).collect();
@@ -123,16 +142,12 @@ impl BinanceProvider {
     }
 
     async fn fetch_paginated(symbol: &str, interval: &str, from: u64, to: u64, futures: bool) -> Result<OhlcvSeries> {
-        // Fetch up to 5000 candles by paginating Binance's 1000-candle limit.
-        let binance_symbol = symbol.replace('/', "").replace('-', "").to_uppercase();
-        let client = if futures {
-            BinanceClient::new_futures()?
-        } else {
-            BinanceClient::new()?
-        };
-        let exchange_label = if futures { "binance_futures" } else { EXCHANGE };
+        // Fetch up to BINANCE_MAX_CANDLES candles by paginating Binance's per-request limit.
+        let binance_symbol = binance_symbol(symbol);
+        let (client, exchange_label) = client_for(futures)?;
         let mut all_data: Vec<OhlcvCandle> = Vec::new();
         let mut current_from = from;
+        let mut truncated = false;
 
         loop {
             let query = [
@@ -140,7 +155,7 @@ impl BinanceProvider {
                 ("interval", interval.to_string()),
                 ("startTime", current_from.to_string()),
                 ("endTime", to.to_string()),
-                ("limit", "1000".to_string()),
+                ("limit", BINANCE_KLINES_LIMIT.to_string()),
             ];
 
             let raw: Vec<Vec<serde_json::Value>> = client.get("klines", &query).await?;
@@ -151,13 +166,28 @@ impl BinanceProvider {
             let last_close_time = batch.last().map(|c| c.close_time).unwrap_or(0);
             all_data.extend(batch);
 
-            // Binance returns at most 1000 per call; if we got fewer, no more data.
-            if batch_len < 1000 || last_close_time >= to || all_data.len() >= 5000 { break; }
+            // Binance returns at most BINANCE_KLINES_LIMIT per call; if we got fewer, no more data.
+            if batch_len < BINANCE_KLINES_LIMIT || last_close_time >= to {
+                break;
+            }
+            if all_data.len() >= BINANCE_MAX_CANDLES {
+                // Stop paginating but flag that the requested range was not fully covered.
+                truncated = true;
+                break;
+            }
             current_from = last_close_time + 1;
         }
 
         all_data.sort_by_key(|c| c.t);
         all_data.dedup_by_key(|c| c.t);
+
+        if truncated {
+            bail!(
+                "Binance {} candles truncated at {} records; requested range from={from} to={to} was not fully covered. \
+                 Narrow the range or use a larger timeframe.",
+                exchange_label, BINANCE_MAX_CANDLES,
+            );
+        }
 
         Ok(OhlcvSeries {
             exchange: exchange_label.to_string(),
