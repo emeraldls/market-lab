@@ -250,6 +250,14 @@ pub fn validate_source_configs_for_run(
 }
 
 fn validate_source_config(config: &SourceConfig, historical: bool) -> Result<()> {
+    if config.source == ScriptSource::Oi && !crate::markets::is_futures_exchange(&config.exchange)?
+    {
+        bail!(
+            "--source {} requires a futures exchange; `{}` is spot",
+            config.selector,
+            config.exchange
+        );
+    }
     match config.provider {
         ProviderKind::Mmt => match &config.source {
             ScriptSource::Candles => {
@@ -618,6 +626,17 @@ mod tests {
             .expect("BULK live configs should validate");
         assert!(configs.contains_key("vd@bulk"));
         assert!(configs.contains_key("oi@bulk"));
+    }
+
+    #[test]
+    fn rejects_open_interest_on_a_spot_exchange() {
+        let manifest = manifest(vec![ScriptSource::Oi]);
+        let configs = parse_source_configs(&["oi@binance@mmt:timeframe=60".to_string()])
+            .expect("spot OI binding parses before capability validation");
+
+        let error = validate_source_configs_for_run(&manifest, &configs)
+            .expect_err("spot exchange must not provide open interest");
+        assert!(error.to_string().contains("requires a futures exchange"));
     }
 
     #[test]

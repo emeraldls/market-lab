@@ -46,6 +46,7 @@ fn print_market(
         "{} market ({} local snapshot)",
         exchange.exchange, snapshot.provider
     );
+    println!("  market type:      {}", exchange.market_type.as_str());
     println!("  symbol:           {}", market.symbol);
     println!("  provider symbol:  {}", market.provider_symbol);
     println!("  venue symbol:     {}", market.venue_symbol);
@@ -98,6 +99,7 @@ fn print_exchange(snapshot: &MarketSnapshot, exchange: &ExchangeMarkets, json: b
     );
     println!("  fetched:    {}", snapshot.fetched_at);
     println!("  source:     {}", snapshot.source_url);
+    println!("  type:       {}", exchange.market_type.as_str());
     println!(
         "  markets:    {} ({available} available, {executable} executable)",
         exchange.markets.len()

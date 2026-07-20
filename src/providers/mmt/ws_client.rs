@@ -53,19 +53,30 @@ impl MmtWsClient {
 
     pub async fn next_json(&self) -> Result<Option<serde_json::Value>> {
         let mut ws = self.inner.lock().await;
-        let Some(msg) = ws.next().await else {
-            return Ok(None);
-        };
-        let msg = msg.context("websocket read error")?;
-        let text = match msg {
-            Message::Text(t) => t,
-            Message::Binary(_)
-            | Message::Ping(_)
-            | Message::Pong(_)
-            | Message::Close(_)
-            | Message::Frame(_) => return Ok(Some(serde_json::Value::Null)),
-        };
-        let v: serde_json::Value = serde_json::from_str(&text).context("invalid websocket JSON")?;
-        Ok(Some(v))
+        loop {
+            let Some(msg) = ws.next().await else {
+                return Ok(None);
+            };
+            let msg = msg.context("websocket read error")?;
+            match msg {
+                Message::Text(text) => {
+                    return serde_json::from_str(&text)
+                        .context("invalid websocket JSON")
+                        .map(Some);
+                }
+                Message::Binary(bytes) => {
+                    return serde_json::from_slice(&bytes)
+                        .context("invalid websocket binary JSON")
+                        .map(Some);
+                }
+                Message::Ping(payload) => {
+                    ws.send(Message::Pong(payload))
+                        .await
+                        .context("failed to answer websocket ping")?;
+                }
+                Message::Close(_) => return Ok(None),
+                Message::Pong(_) | Message::Frame(_) => {}
+            }
+        }
     }
 }

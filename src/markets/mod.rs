@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::credentials::mmt_api_key;
@@ -28,6 +28,26 @@ pub enum ProviderType {
     Aggregator,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketType {
+    Spot,
+    Futures,
+}
+
+impl MarketType {
+    pub fn is_futures(self) -> bool {
+        self == Self::Futures
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spot => "spot",
+            Self::Futures => "futures",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarketSnapshot {
@@ -39,12 +59,39 @@ pub struct MarketSnapshot {
     pub exchanges: Vec<ExchangeMarkets>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExchangeMarkets {
     pub exchange: String,
     pub name: String,
+    pub market_type: MarketType,
     pub markets: Vec<Market>,
+}
+
+impl<'de> Deserialize<'de> for ExchangeMarkets {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct WireExchangeMarkets {
+            exchange: String,
+            name: String,
+            market_type: Option<MarketType>,
+            markets: Vec<Market>,
+        }
+
+        let wire = WireExchangeMarkets::deserialize(deserializer)?;
+        Ok(Self {
+            market_type: wire
+                .market_type
+                .unwrap_or_else(|| classify_exchange_name(&wire.exchange)),
+            exchange: wire.exchange,
+            name: wire.name,
+            markets: wire.markets,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -97,6 +144,7 @@ struct MarketRegistry {
     provider_exchanges: HashMap<String, HashMap<String, ExchangeLocation>>,
     exchange_markets: HashMap<String, HashMap<String, Arc<Market>>>,
     direct_exchanges: HashMap<String, ExchangeLocation>,
+    exchange_types: HashMap<String, MarketType>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -320,6 +368,7 @@ impl MarketRegistry {
             provider_exchanges: HashMap::new(),
             exchange_markets: HashMap::new(),
             direct_exchanges: HashMap::new(),
+            exchange_types: HashMap::new(),
         };
         registry.build_indexes()?;
         Ok(registry)
@@ -334,6 +383,16 @@ impl MarketRegistry {
 
             for (exchange_index, exchange) in snapshot.exchanges.iter().enumerate() {
                 let exchange_key = key(&exchange.exchange);
+                if let Some(existing) = self
+                    .exchange_types
+                    .insert(exchange_key.clone(), exchange.market_type)
+                    && existing != exchange.market_type
+                {
+                    bail!(
+                        "exchange {} has conflicting market types across installed snapshots",
+                        exchange.exchange
+                    );
+                }
                 let exchange_location = ExchangeLocation {
                     snapshot: snapshot_index,
                     exchange: exchange_index,
@@ -481,6 +540,20 @@ pub fn direct_exchange(exchange: &str) -> Result<(MarketSnapshot, ExchangeMarket
     Ok(registry.exchange(*location))
 }
 
+pub fn is_futures_exchange(exchange: &str) -> Result<bool> {
+    let registry = market_registry()?;
+    registry
+        .exchange_types
+        .get(&key(exchange))
+        .copied()
+        .map(MarketType::is_futures)
+        .with_context(|| {
+            format!(
+                "exchange `{exchange}` is not present in the installed market snapshots; refresh its markets first"
+            )
+        })
+}
+
 pub async fn refresh_route(provider: Option<&str>, exchange: &str) -> Result<MarketSnapshot> {
     let snapshot = match provider.map(key).as_deref() {
         Some("mmt") => fetch_mmt_snapshot().await?,
@@ -604,6 +677,7 @@ async fn fetch_bulk_snapshot() -> Result<MarketSnapshot> {
         exchanges: vec![ExchangeMarkets {
             exchange: "bulk".to_string(),
             name: "BULK".to_string(),
+            market_type: MarketType::Futures,
             markets,
         }],
     };
@@ -658,6 +732,7 @@ async fn fetch_mmt_snapshot() -> Result<MarketSnapshot> {
                 });
             }
             ExchangeMarkets {
+                market_type: classify_mmt_exchange(&exchange.id),
                 exchange: exchange.id,
                 name: exchange.name,
                 markets: markets.into_values().collect(),
@@ -802,6 +877,20 @@ fn key(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
+fn classify_mmt_exchange(exchange: &str) -> MarketType {
+    classify_exchange_name(exchange)
+}
+
+fn classify_exchange_name(exchange: &str) -> MarketType {
+    let exchange = key(exchange);
+    let family = exchange.split('-').next().unwrap_or(exchange.as_str());
+    if family.ends_with('f') || matches!(family, "bulk" | "hyperliquid") {
+        MarketType::Futures
+    } else {
+        MarketType::Spot
+    }
+}
+
 #[cfg(test)]
 fn test_snapshots() -> Vec<MarketSnapshot> {
     let bulk_market = Market {
@@ -851,6 +940,7 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
             exchanges: vec![ExchangeMarkets {
                 exchange: "bulk".to_string(),
                 name: "BULK".to_string(),
+                market_type: MarketType::Futures,
                 markets: vec![bulk_market],
             }],
         },
@@ -864,11 +954,19 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
                 ExchangeMarkets {
                     exchange: "binancef".to_string(),
                     name: "binancef".to_string(),
+                    market_type: MarketType::Futures,
+                    markets: vec![mmt_market.clone()],
+                },
+                ExchangeMarkets {
+                    exchange: "binance".to_string(),
+                    name: "binance".to_string(),
+                    market_type: MarketType::Spot,
                     markets: vec![mmt_market.clone()],
                 },
                 ExchangeMarkets {
                     exchange: "hyperliquid".to_string(),
                     name: "hyperliquid".to_string(),
+                    market_type: MarketType::Futures,
                     markets: vec![mmt_market],
                 },
             ],
@@ -911,5 +1009,47 @@ mod tests {
         let usd = exchange_market("bulk", "BTC/USD").expect("USD alias resolves");
         assert_eq!(native.symbol, "BTC/USDT");
         assert_eq!(native.symbol, usd.symbol);
+    }
+
+    #[test]
+    fn exchange_market_type_is_available_in_constant_time() {
+        assert!(is_futures_exchange("bulk").expect("BULK type resolves"));
+        assert!(is_futures_exchange("binancef").expect("Binance Futures type resolves"));
+        assert!(is_futures_exchange("hyperliquid").expect("Hyperliquid type resolves"));
+        assert!(!is_futures_exchange("binance").expect("Binance spot type resolves"));
+        assert!(is_futures_exchange("missing").is_err());
+    }
+
+    #[test]
+    fn snapshots_serialize_market_type_and_classify_legacy_exchange_entries() {
+        let exchange = ExchangeMarkets {
+            exchange: "bybitf".to_string(),
+            name: "Bybit Futures".to_string(),
+            market_type: MarketType::Futures,
+            markets: Vec::new(),
+        };
+        let encoded = serde_json::to_value(&exchange).expect("exchange serializes");
+        assert_eq!(encoded["marketType"], "futures");
+
+        let legacy: ExchangeMarkets = serde_json::from_value(serde_json::json!({
+            "exchange": "bybitf",
+            "name": "Bybit Futures",
+            "markets": []
+        }))
+        .expect("legacy exchange entry parses");
+        assert_eq!(legacy.market_type, MarketType::Futures);
+    }
+
+    #[test]
+    fn mmt_exchange_families_distinguish_spot_and_futures() {
+        assert_eq!(classify_mmt_exchange("binance"), MarketType::Spot);
+        assert_eq!(classify_mmt_exchange("bybit"), MarketType::Spot);
+        assert_eq!(classify_mmt_exchange("okx"), MarketType::Spot);
+        assert_eq!(classify_mmt_exchange("binancef"), MarketType::Futures);
+        assert_eq!(classify_mmt_exchange("bybitf-inverse"), MarketType::Futures);
+        assert_eq!(
+            classify_mmt_exchange("hyperliquid-xyz"),
+            MarketType::Futures
+        );
     }
 }

@@ -226,6 +226,17 @@ impl VolumeCurve {
             .sum()
     }
 
+    pub fn forecast_between(&self, from_ms: u64, to_ms: u64) -> f64 {
+        if to_ms <= from_ms {
+            return 0.0;
+        }
+        (self.forecast_elapsed(to_ms) - self.forecast_elapsed(from_ms)).max(0.0)
+    }
+
+    pub fn forecast_remaining(&self, at_ms: u64) -> f64 {
+        (self.total_forecast_volume - self.forecast_elapsed(at_ms)).max(0.0)
+    }
+
     pub fn target_fraction(&self, at_ms: u64, actual_volume: f64, degraded: bool) -> f64 {
         if at_ms >= self.end_ms {
             return 1.0;
@@ -236,7 +247,7 @@ impl VolumeCurve {
         } else {
             actual_volume.max(0.0)
         };
-        let forecast_remaining = (self.total_forecast_volume - forecast_elapsed).max(0.0);
+        let forecast_remaining = self.forecast_remaining(at_ms);
         let denominator = actual + forecast_remaining;
         if denominator <= f64::EPSILON {
             return 1.0;

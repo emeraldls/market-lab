@@ -88,6 +88,12 @@ impl StrategyOrderManager {
         self.working.is_some()
     }
 
+    pub fn working_remaining_size(&self) -> f64 {
+        self.working
+            .as_ref()
+            .map_or(0.0, |order| order.remaining_size)
+    }
+
     pub fn working_needs_replace(
         &self,
         price: f64,

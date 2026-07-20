@@ -814,6 +814,12 @@ pub struct SourceOiArgs {
 impl SourceOiArgs {
     pub fn validate(&self) -> Result<()> {
         let provider = validate_source_identity(self.provider, &self.exchange, &self.symbol)?;
+        if !crate::markets::is_futures_exchange(&self.exchange)? {
+            bail!(
+                "open interest requires a futures exchange; `{}` is spot",
+                self.exchange
+            );
+        }
         if provider == CliProviderKind::Bulk {
             if self.timeframe.is_some() || self.from.is_some() || self.to.is_some() {
                 bail!("BULK open interest is current/live only; omit --timeframe/--from/--to");
@@ -2391,6 +2397,36 @@ mod tests {
             }
             _ => panic!("expected source oi command"),
         }
+    }
+
+    #[test]
+    fn reject_source_oi_for_spot_exchange() {
+        let cli = Cli::try_parse_from([
+            "market-lab",
+            "source",
+            "oi",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "binance",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+            "--stream",
+        ])
+        .expect("source OI shape parses");
+
+        let Commands::Source {
+            command: SourceCommands::Oi(args),
+        } = cli.command
+        else {
+            panic!("expected source OI command");
+        };
+        let error = args
+            .validate()
+            .expect_err("spot exchange must reject open interest");
+        assert!(error.to_string().contains("requires a futures exchange"));
     }
 
     #[test]
