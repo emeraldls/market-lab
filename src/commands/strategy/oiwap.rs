@@ -11,13 +11,15 @@ use crate::cli::{
 };
 use crate::commands::execution::build_trade_plan;
 use crate::domain::execution::PositionDirection;
+use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::utils::normalize_to_ms;
 use crate::strategies::jobs::{
     OiwapJobDefinition, StrategyJob, StrategyJobDefinition, StrategyJobSubmission, StrategySide,
 };
 use crate::strategies::oiwap::{
-    OpenInterestSource, OpenInterestSourceSelector, open_interest_activity,
+    DIRECTIONAL_CONTEXT_WINDOW_SECS, DirectionalBias, DirectionalContext, OpenInterestSource,
+    OpenInterestSourceSelector, OpenInterestWindow, open_interest_activity,
 };
 use crate::strategies::vwap::{HistoricalVolume, VolumeCurve};
 
@@ -30,6 +32,41 @@ use super::vwap::{
 const HISTORY_DAYS: u64 = 28;
 const EXECUTION_HISTORY_DAYS: u64 = 7;
 const MINUTE_MS: u64 = 60_000;
+
+#[derive(Debug)]
+struct OpenInterestHistory {
+    activity: Vec<HistoricalVolume>,
+    directional_windows: Vec<OpenInterestWindow>,
+    expected_directional_sources: usize,
+}
+
+#[derive(Debug)]
+struct DirectionalAssessment {
+    context: Option<DirectionalContext>,
+    unavailable_reason: Option<String>,
+}
+
+struct OiwapModel {
+    curves: WeightedCurves,
+    directional: DirectionalAssessment,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OiwapDirectionalView {
+    available: bool,
+    window_secs: u64,
+    price_change_pct: Option<f64>,
+    open_interest_change_pct: Option<f64>,
+    source_agreement: Option<String>,
+    regime: &'static str,
+    bias: &'static str,
+    requested_side: &'static str,
+    alignment: &'static str,
+    confidence: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,6 +87,7 @@ struct OiwapPlanView<'a> {
     oi_activity: &'static str,
     history_days: u64,
     forecast_oi_activity: f64,
+    directional_context: OiwapDirectionalView,
     execution_venue_forecast_volume: f64,
     required_participation_rate: f64,
     max_participation_rate: f64,
@@ -70,6 +108,7 @@ struct PlanInput<'a> {
     duration_secs: u64,
     sources: &'a [OpenInterestSource],
     curves: &'a WeightedCurves,
+    directional: &'a DirectionalAssessment,
     reduce_only: bool,
     dry_run: bool,
 }
@@ -83,21 +122,22 @@ pub async fn handle(args: RunOiwapArgs) -> Result<()> {
     )
     .await?;
     let start_ms = now_ms()?;
-    let curves = build_curves(
+    let model = build_curves(
         start_ms,
         args.duration,
         selector.sources(),
         &parent.internal_symbol,
     )
     .await?;
-    let feasibility = VwapFeasibility::assess(parent.size, &curves.execution);
+    let feasibility = VwapFeasibility::assess(parent.size, &model.curves.execution);
     let view = plan_view(PlanInput {
         symbol: &args.symbol,
         side: side_name(args.side),
         parent: &parent,
         duration_secs: args.duration,
         sources: selector.sources(),
-        curves: &curves,
+        curves: &model.curves,
+        directional: &model.directional,
         reduce_only: args.reduce_only,
         dry_run: args.dry_run,
     });
@@ -179,7 +219,7 @@ pub async fn handle_worker_job(job_id: &str, job: StrategyJob) -> Result<()> {
 async fn run_worker(job_id: &str, definition: &OiwapJobDefinition) -> Result<()> {
     let start_ms = now_ms()?;
     let weighted = WeightedJobDefinition::from(definition);
-    let curves = build_curves(
+    let model = build_curves(
         start_ms,
         definition.duration_seconds,
         &definition.oi_sources,
@@ -191,7 +231,7 @@ async fn run_worker(job_id: &str, definition: &OiwapJobDefinition) -> Result<()>
         strategy_direction(weighted.side),
     )
     .await?;
-    let feasibility = VwapFeasibility::assess(parent.size, &curves.execution);
+    let feasibility = VwapFeasibility::assess(parent.size, &model.curves.execution);
     if !feasibility.feasible() {
         bail!(
             "OIWAP became infeasible before worker start: forecast execution capacity is {} with a shortfall of {}",
@@ -205,7 +245,8 @@ async fn run_worker(job_id: &str, definition: &OiwapJobDefinition) -> Result<()>
         parent: &parent,
         duration_secs: definition.duration_seconds,
         sources: &definition.oi_sources,
-        curves: &curves,
+        curves: &model.curves,
+        directional: &model.directional,
         reduce_only: definition.reduce_only,
         dry_run: false,
     });
@@ -215,7 +256,7 @@ async fn run_worker(job_id: &str, definition: &OiwapJobDefinition) -> Result<()>
         job_id,
         &weighted,
         start_ms,
-        curves,
+        model.curves,
         parent,
         TrajectoryFeed::OpenInterest(definition.oi_sources.clone()),
     )
@@ -227,24 +268,64 @@ async fn build_curves(
     duration_secs: u64,
     sources: &[OpenInterestSource],
     symbol: &str,
-) -> Result<WeightedCurves> {
+) -> Result<OiwapModel> {
     let history_to = start_ms / MINUTE_MS * MINUTE_MS;
     let history_from = history_to.saturating_sub(HISTORY_DAYS * 86_400_000);
     let execution_history_from = history_to.saturating_sub(EXECUTION_HISTORY_DAYS * 86_400_000);
-    let (oi_history, execution_history) = tokio::try_join!(
+    let (oi_history, execution_history, price_window) = tokio::join!(
         fetch_open_interest_activity(sources, symbol, history_from, history_to),
         fetch_bulk_volume_history(symbol, execution_history_from, history_to),
-    )?;
+        fetch_bulk_directional_price_window(symbol, history_to),
+    );
+    let oi_history = oi_history?;
+    let execution_history = execution_history?;
+    let directional = match price_window {
+        Ok((price_open, price_close))
+            if oi_history.directional_windows.len() == oi_history.expected_directional_sources =>
+        {
+            match DirectionalContext::assess(
+                price_open,
+                price_close,
+                &oi_history.directional_windows,
+            ) {
+                Ok(context) => DirectionalAssessment {
+                    context: Some(context),
+                    unavailable_reason: None,
+                },
+                Err(error) => DirectionalAssessment {
+                    context: None,
+                    unavailable_reason: Some(format!(
+                        "recent price/OI context could not be evaluated: {error}"
+                    )),
+                },
+            }
+        }
+        Ok(_) => DirectionalAssessment {
+            context: None,
+            unavailable_reason: Some(
+                "recent OI data is incomplete for one or more selected sources".to_string(),
+            ),
+        },
+        Err(error) => DirectionalAssessment {
+            context: None,
+            unavailable_reason: Some(format!(
+                "recent execution-venue price context is unavailable: {error}"
+            )),
+        },
+    };
 
-    Ok(WeightedCurves {
-        trajectory: VolumeCurve::build_for(
-            "OIWAP",
-            "open-interest activity",
-            start_ms,
-            duration_secs,
-            &oi_history,
-        )?,
-        execution: VolumeCurve::build(start_ms, duration_secs, &execution_history)?,
+    Ok(OiwapModel {
+        curves: WeightedCurves {
+            trajectory: VolumeCurve::build_for(
+                "OIWAP",
+                "open-interest activity",
+                start_ms,
+                duration_secs,
+                &oi_history.activity,
+            )?,
+            execution: VolumeCurve::build(start_ms, duration_secs, &execution_history)?,
+        },
+        directional,
     })
 }
 
@@ -253,7 +334,7 @@ async fn fetch_open_interest_activity(
     symbol: &str,
     from_ms: u64,
     to_ms: u64,
-) -> Result<Vec<HistoricalVolume>> {
+) -> Result<OpenInterestHistory> {
     let series = stream::iter(sources.iter())
         .map(|source| async move {
             MmtProvider::oi(&source.exchange, symbol, "1m", from_ms, to_ms)
@@ -264,6 +345,26 @@ async fn fetch_open_interest_activity(
         .try_collect::<Vec<_>>()
         .await?;
 
+    let directional_from = to_ms.saturating_sub(DIRECTIONAL_CONTEXT_WINDOW_SECS * 1_000);
+    let mut directional_windows = Vec::with_capacity(series.len());
+    for source_series in &series {
+        let recent = source_series.data.iter().filter(|candle| {
+            let ts_ms = normalize_to_ms(candle.t);
+            ts_ms >= directional_from && ts_ms < to_ms
+        });
+        let first = recent
+            .clone()
+            .min_by_key(|candle| normalize_to_ms(candle.t));
+        let last = recent.max_by_key(|candle| normalize_to_ms(candle.t));
+        if let (Some(first), Some(last)) = (first, last) {
+            directional_windows.push(OpenInterestWindow {
+                open: first.o,
+                close: last.c,
+            });
+        }
+    }
+
+    let expected_directional_sources = series.len();
     let mut activity_by_minute = BTreeMap::<u64, f64>::new();
     for source_series in series {
         for candle in source_series.data {
@@ -275,10 +376,33 @@ async fn fetch_open_interest_activity(
         }
     }
 
-    Ok(activity_by_minute
-        .into_iter()
-        .map(|(ts_ms, volume)| HistoricalVolume { ts_ms, volume })
-        .collect())
+    Ok(OpenInterestHistory {
+        activity: activity_by_minute
+            .into_iter()
+            .map(|(ts_ms, volume)| HistoricalVolume { ts_ms, volume })
+            .collect(),
+        directional_windows,
+        expected_directional_sources,
+    })
+}
+
+async fn fetch_bulk_directional_price_window(symbol: &str, to_ms: u64) -> Result<(f64, f64)> {
+    let from_ms = to_ms.saturating_sub(DIRECTIONAL_CONTEXT_WINDOW_SECS * 1_000);
+    let series = BulkProvider::candles(symbol, "1m", from_ms, to_ms)
+        .await
+        .context("failed to fetch recent BULK candles")?;
+    let completed = series
+        .data
+        .iter()
+        .filter(|candle| candle.t >= from_ms && candle.t < to_ms);
+    let first = completed
+        .clone()
+        .min_by_key(|candle| candle.t)
+        .context("recent completed BULK candle window is empty")?;
+    let last = completed
+        .max_by_key(|candle| candle.t)
+        .context("recent completed BULK candle window is empty")?;
+    Ok((first.o, last.c))
 }
 
 fn plan_view(input: PlanInput<'_>) -> OiwapPlanView<'_> {
@@ -304,6 +428,7 @@ fn plan_view(input: PlanInput<'_>) -> OiwapPlanView<'_> {
         oi_activity: "absolute_open_to_close_change",
         history_days: HISTORY_DAYS,
         forecast_oi_activity: input.curves.trajectory.total_forecast_volume(),
+        directional_context: directional_view(input.side, input.directional),
         execution_venue_forecast_volume: input.curves.execution.total_forecast_volume(),
         required_participation_rate: feasibility.required_participation_rate,
         max_participation_rate: MAX_PARTICIPATION_RATE,
@@ -315,6 +440,60 @@ fn plan_view(input: PlanInput<'_>) -> OiwapPlanView<'_> {
         leverage: input.parent.leverage,
         reduce_only: input.reduce_only,
         dry_run: input.dry_run,
+    }
+}
+
+fn directional_view(
+    requested_side: &'static str,
+    assessment: &DirectionalAssessment,
+) -> OiwapDirectionalView {
+    let Some(context) = &assessment.context else {
+        return OiwapDirectionalView {
+            available: false,
+            window_secs: DIRECTIONAL_CONTEXT_WINDOW_SECS,
+            price_change_pct: None,
+            open_interest_change_pct: None,
+            source_agreement: None,
+            regime: "unavailable",
+            bias: "neutral",
+            requested_side,
+            alignment: "not_evaluated",
+            confidence: "none",
+            note: assessment.unavailable_reason.clone(),
+        };
+    };
+
+    let alignment = match (context.bias, requested_side) {
+        (DirectionalBias::Buy, "buy") | (DirectionalBias::Sell, "sell") => "aligned",
+        (DirectionalBias::Buy | DirectionalBias::Sell, _) => "countertrend",
+        (DirectionalBias::Neutral, _) => "neutral",
+    };
+    let note = match alignment {
+        "countertrend" => Some(format!(
+            "requested {requested_side} is countertrend to the current price/OI context; this is advisory and does not block submission"
+        )),
+        "neutral" => Some(
+            "recent price or OI change is below the directional noise floor; no side is suggested"
+                .to_string(),
+        ),
+        _ => None,
+    };
+
+    OiwapDirectionalView {
+        available: true,
+        window_secs: context.window_secs,
+        price_change_pct: Some(context.price_change_pct),
+        open_interest_change_pct: Some(context.open_interest_change_pct),
+        source_agreement: Some(format!(
+            "{}/{}",
+            context.agreeing_sources, context.total_sources
+        )),
+        regime: context.regime.label(),
+        bias: context.bias.as_str(),
+        requested_side,
+        alignment,
+        confidence: context.confidence.as_str(),
+        note,
     }
 }
 
@@ -346,6 +525,46 @@ fn render_plan(plan: &OiwapPlanView<'_>, output: OutputFormat) -> Result<()> {
             println!("  OI activity:       absolute one-minute open-to-close change");
             println!("  history:           {} days", plan.history_days);
             println!("  forecast activity: {}", plan.forecast_oi_activity);
+            println!(
+                "  context window:     {}m",
+                plan.directional_context.window_secs / 60
+            );
+            if plan.directional_context.available {
+                println!(
+                    "  price change:       {:+.2}%",
+                    plan.directional_context
+                        .price_change_pct
+                        .unwrap_or_default()
+                );
+                println!(
+                    "  OI change:          {:+.2}%",
+                    plan.directional_context
+                        .open_interest_change_pct
+                        .unwrap_or_default()
+                );
+                if let Some(agreement) = &plan.directional_context.source_agreement {
+                    println!("  source agreement:   {agreement}");
+                }
+                println!("  market regime:      {}", plan.directional_context.regime);
+                println!("  directional bias:   {}", plan.directional_context.bias);
+                println!(
+                    "  requested side:     {} ({})",
+                    plan.directional_context.requested_side, plan.directional_context.alignment
+                );
+                println!(
+                    "  bias confidence:    {}",
+                    plan.directional_context.confidence
+                );
+            } else {
+                println!("  directional bias:   unavailable");
+                println!(
+                    "  requested side:     {} (not evaluated)",
+                    plan.directional_context.requested_side
+                );
+            }
+            if let Some(note) = &plan.directional_context.note {
+                println!("  advisory:           {note}");
+            }
             println!(
                 "  venue volume:      {}",
                 plan.execution_venue_forecast_volume
@@ -487,5 +706,47 @@ mod tests {
         }))
         .expect("MMT OI candle");
         assert_eq!(candle.c, 103.0);
+    }
+
+    #[test]
+    fn directional_view_warns_without_blocking_a_countertrend_side() {
+        let assessment = DirectionalAssessment {
+            context: Some(
+                DirectionalContext::assess(
+                    100.0,
+                    101.0,
+                    &[OpenInterestWindow {
+                        open: 1_000.0,
+                        close: 1_010.0,
+                    }],
+                )
+                .expect("directional context"),
+            ),
+            unavailable_reason: None,
+        };
+
+        let view = directional_view("sell", &assessment);
+
+        assert_eq!(view.bias, "buy");
+        assert_eq!(view.alignment, "countertrend");
+        assert!(view.note.as_deref().is_some_and(|note| {
+            note.contains("advisory") && note.contains("does not block submission")
+        }));
+    }
+
+    #[test]
+    fn directional_view_does_not_invent_a_bias_when_data_is_unavailable() {
+        let view = directional_view(
+            "buy",
+            &DirectionalAssessment {
+                context: None,
+                unavailable_reason: Some("price data unavailable".to_string()),
+            },
+        );
+
+        assert!(!view.available);
+        assert_eq!(view.bias, "neutral");
+        assert_eq!(view.alignment, "not_evaluated");
+        assert_eq!(view.note.as_deref(), Some("price data unavailable"));
     }
 }
