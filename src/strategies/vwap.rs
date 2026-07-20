@@ -130,20 +130,30 @@ pub struct VolumeCurve {
 
 impl VolumeCurve {
     pub fn build(start_ms: u64, duration_secs: u64, points: &[HistoricalVolume]) -> Result<Self> {
+        Self::build_for("VWAP", "volume", start_ms, duration_secs, points)
+    }
+
+    pub fn build_for(
+        strategy: &str,
+        activity: &str,
+        start_ms: u64,
+        duration_secs: u64,
+        points: &[HistoricalVolume],
+    ) -> Result<Self> {
         if duration_secs < 60 {
-            bail!("VWAP duration must be at least 60 seconds");
+            bail!("{strategy} duration must be at least 60 seconds");
         }
         let duration_ms = duration_secs
             .checked_mul(1_000)
-            .context("VWAP duration is too large")?;
+            .with_context(|| format!("{strategy} duration is too large"))?;
         let end_ms = start_ms
             .checked_add(duration_ms)
-            .context("VWAP deadline overflowed")?;
+            .with_context(|| format!("{strategy} deadline overflowed"))?;
 
         let mut daily_minutes: BTreeMap<(u64, u16), f64> = BTreeMap::new();
         for point in points {
             if !point.volume.is_finite() || point.volume < 0.0 {
-                bail!("VWAP history contains invalid volume");
+                bail!("{strategy} history contains invalid {activity}");
             }
             let day = point.ts_ms / DAY_MS;
             let minute = ((point.ts_ms % DAY_MS) / MINUTE_MS) as u16;
@@ -180,7 +190,9 @@ impl VolumeCurve {
             .map(|segment| segment.forecast_volume)
             .sum::<f64>();
         if total_forecast_volume <= f64::EPSILON {
-            bail!("VWAP could not construct a non-zero volume curve for the execution window");
+            bail!(
+                "{strategy} could not construct a non-zero {activity} curve for the execution window"
+            );
         }
 
         Ok(Self {

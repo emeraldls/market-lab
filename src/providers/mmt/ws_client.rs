@@ -21,6 +21,17 @@ pub struct MmtWsClient {
 static SHARED_WS: OnceLock<Arc<Mutex<WsStream>>> = OnceLock::new();
 
 impl MmtWsClient {
+    pub async fn connect() -> Result<Self> {
+        let api_key = mmt_api_key()?;
+        let ws_url = format!("{MMT_WS_URL}?api_key={}", api_key);
+        let (ws_stream, _) = connect_async(ws_url)
+            .await
+            .context("failed to connect websocket")?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(ws_stream)),
+        })
+    }
+
     pub async fn shared() -> Result<Self> {
         if let Some(inner) = SHARED_WS.get() {
             return Ok(Self {
@@ -28,12 +39,8 @@ impl MmtWsClient {
             });
         }
 
-        let api_key = mmt_api_key()?;
-        let ws_url = format!("{MMT_WS_URL}?api_key={}", api_key);
-        let (ws_stream, _) = connect_async(ws_url)
-            .await
-            .context("failed to connect websocket")?;
-        let arc = Arc::new(Mutex::new(ws_stream));
+        let client = Self::connect().await?;
+        let arc = Arc::clone(&client.inner);
         let _ = SHARED_WS.set(Arc::clone(&arc));
 
         let inner = SHARED_WS

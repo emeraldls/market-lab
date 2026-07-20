@@ -131,6 +131,28 @@ fn render_job(job: &StrategyJob, output: OutputFormat) -> Result<()> {
                     println!("  leverage:         {}x", definition.leverage);
                     println!("  reduce only:      {}", definition.reduce_only);
                 }
+                StrategyJobDefinition::Oiwap(definition) => {
+                    println!("  venue:            bulk");
+                    println!("  side:             {:?}", definition.side);
+                    println!("  total size:       {}", definition.total_size);
+                    if let Some(margin) = definition.requested_margin {
+                        println!("  requested margin: {margin}");
+                    }
+                    println!("  target margin:    {}", definition.target_margin);
+                    println!("  target exposure:  {}", definition.target_exposure);
+                    println!("  duration:         {}s", definition.duration_seconds);
+                    println!(
+                        "  OI sources:       {}",
+                        definition
+                            .oi_sources
+                            .iter()
+                            .map(crate::strategies::oiwap::OpenInterestSource::selector)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                    println!("  leverage:         {}x", definition.leverage);
+                    println!("  reduce only:      {}", definition.reduce_only);
+                }
             }
             println!("  created:          {}", format_ts(job.created_at_ms));
             println!(

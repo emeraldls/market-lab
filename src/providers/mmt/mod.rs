@@ -21,6 +21,7 @@ use utils::{normalize_symbol_for_mmt, normalize_to_ms, normalize_to_seconds, par
 
 const MMT_BASE_URL: &str = "https://eu-central-1.mmt.gg/api/v1";
 const MMT_HTTP_TIMEOUT_SECS: u64 = 8;
+const MMT_OI_HTTP_TIMEOUT_SECS: u64 = 60;
 
 pub struct MmtProvider;
 
@@ -173,7 +174,7 @@ impl MmtProvider {
         let url = format!("{MMT_BASE_URL}/oi");
         let resp = Client::new()
             .get(url)
-            .timeout(std::time::Duration::from_secs(MMT_HTTP_TIMEOUT_SECS))
+            .timeout(std::time::Duration::from_secs(MMT_OI_HTTP_TIMEOUT_SECS))
             .header("X-API-Key", api_key)
             .query(&[
                 ("exchange", exchange.as_str()),

@@ -439,6 +439,7 @@ pub enum StrategyCommands {
 pub enum StrategyRunCommands {
     Twap(RunTwapArgs),
     Vwap(RunVwapArgs),
+    Oiwap(RunOiwapArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -1549,6 +1550,38 @@ pub struct RunVwapArgs {
 }
 
 #[derive(Clone, Debug, Args)]
+pub struct RunOiwapArgs {
+    pub symbol: String,
+    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    pub venue: ExecutionVenueArg,
+    #[arg(long, value_enum)]
+    pub side: CliSide,
+    /// Exact total base-asset exposure; leverage does not multiply an explicit size.
+    #[arg(long, conflicts_with = "margin", required_unless_present = "margin")]
+    pub size: Option<f64>,
+    /// Total quote collateral; exposure is margin multiplied by leverage.
+    #[arg(long, conflicts_with = "size", required_unless_present = "size")]
+    pub margin: Option<f64>,
+    /// Total execution window in seconds. OIWAP requires at least one minute.
+    #[arg(long)]
+    pub duration: u64,
+    /// Comma-separated normalized MMT OI venues, for example binancef@mmt,bybitf@mmt.
+    #[arg(long, value_delimiter = ',')]
+    pub oi_sources: Vec<String>,
+    /// Exposure multiplier for margin sizing and the leverage setting sent to the venue.
+    #[arg(long, default_value_t = 1.0)]
+    pub leverage: f64,
+    #[arg(long, default_value_t = false)]
+    pub reduce_only: bool,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
 pub struct StrategyJobsArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
@@ -1695,6 +1728,54 @@ impl RunVwapArgs {
         crate::strategies::vwap::VolumeSourceSelector::parse(
             &self.volume_sources,
             execution_venue,
+            &self.symbol,
+        )?;
+        Ok(())
+    }
+}
+
+impl RunOiwapArgs {
+    pub fn validate(&self) -> Result<()> {
+        if !is_valid_symbol(&self.symbol) {
+            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        if self
+            .size
+            .is_some_and(|size| !size.is_finite() || size <= 0.0)
+        {
+            bail!("--size must be > 0");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| !margin.is_finite() || margin <= 0.0)
+        {
+            bail!("--margin must be > 0");
+        }
+        match (self.size, self.margin) {
+            (Some(_), Some(_)) => bail!("set only one of --size or --margin"),
+            (None, None) => bail!("one of --size or --margin is required"),
+            _ => {}
+        }
+        if self.duration < 60 {
+            bail!("--duration must be at least 60 seconds for OIWAP");
+        }
+        if !self.leverage.is_finite() || self.leverage < 1.0 {
+            bail!("--leverage must be at least 1");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| !(margin * self.leverage).is_finite())
+        {
+            bail!("--margin multiplied by --leverage is too large");
+        }
+        if self.dry_run && self.yes {
+            bail!("--yes is not used with --dry-run");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("strategy run supports only --output terminal|json|jsonl");
+        }
+        crate::strategies::oiwap::OpenInterestSourceSelector::parse(
+            &self.oi_sources,
             &self.symbol,
         )?;
         Ok(())
@@ -2927,6 +3008,100 @@ mod tests {
             "30",
         ])
         .expect_err("VWAP must not expose a child interval");
+        assert!(error.to_string().contains("--interval"));
+    }
+
+    #[test]
+    fn parse_strategy_oiwap_command_without_interval() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "strategy",
+            "run",
+            "oiwap",
+            "BTC/USDT",
+            "--venue",
+            "bulk",
+            "--side",
+            "buy",
+            "--margin",
+            "1000",
+            "--duration",
+            "3600",
+            "--oi-sources",
+            "binancef@mmt,hyperliquid@mmt",
+            "--dry-run",
+        ])
+        .expect("OIWAP should parse");
+
+        match cli.command {
+            Commands::Strategy {
+                command:
+                    StrategyCommands::Run {
+                        command: StrategyRunCommands::Oiwap(args),
+                    },
+            } => {
+                args.validate().expect("OIWAP arguments should validate");
+                assert_eq!(args.duration, 3600);
+                assert_eq!(args.oi_sources, ["binancef@mmt", "hyperliquid@mmt"]);
+                assert!(args.dry_run);
+            }
+            _ => panic!("expected strategy run oiwap command"),
+        }
+    }
+
+    #[test]
+    fn strategy_oiwap_requires_explicit_oi_sources() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "strategy",
+            "run",
+            "oiwap",
+            "BTC/USDT",
+            "--side",
+            "buy",
+            "--margin",
+            "1000",
+            "--duration",
+            "300",
+        ])
+        .expect("CLI shape parses before semantic validation");
+        let Commands::Strategy {
+            command:
+                StrategyCommands::Run {
+                    command: StrategyRunCommands::Oiwap(args),
+                },
+        } = cli.command
+        else {
+            panic!("expected strategy run oiwap command");
+        };
+        assert!(
+            args.validate()
+                .expect_err("OI sources must be explicit")
+                .to_string()
+                .contains("requires --oi-sources")
+        );
+    }
+
+    #[test]
+    fn strategy_oiwap_does_not_accept_an_interval() {
+        let error = Cli::try_parse_from([
+            "mlab",
+            "strategy",
+            "run",
+            "oiwap",
+            "BTC/USDT",
+            "--side",
+            "buy",
+            "--margin",
+            "1000",
+            "--duration",
+            "300",
+            "--oi-sources",
+            "binancef@mmt",
+            "--interval",
+            "30",
+        ])
+        .expect_err("OIWAP must not expose a child interval");
         assert!(error.to_string().contains("--interval"));
     }
 

@@ -29,7 +29,8 @@ use crate::strategies::jobs::{
     StrategyJob, StrategyJobDefinition, StrategyJobStatus, StrategyJobSubmission, StrategySide,
 };
 
-const RUNTIME_VERSION: u8 = 12;
+// Bump whenever the IPC request/response or persisted runtime schema changes.
+const RUNTIME_VERSION: u8 = 13;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -456,10 +457,12 @@ pub async fn ensure_running() -> Result<RuntimeStatus> {
         }
         let _ = stop().await;
         for _ in 0..20 {
-            if try_status().await?.is_none() {
-                break;
+            match try_status().await {
+                Ok(None) => break,
+                Ok(Some(_)) | Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
     let paths = RuntimePaths::load()?;
@@ -2018,6 +2021,14 @@ fn validate_strategy_trade(
             definition.leverage,
             definition.reduce_only,
         ),
+        StrategyJobDefinition::Oiwap(definition) => (
+            definition.venue,
+            definition.symbol.as_str(),
+            definition.side,
+            definition.total_size,
+            definition.leverage,
+            definition.reduce_only,
+        ),
     };
     let expected_direction = match side {
         StrategySide::Buy => crate::domain::execution::PositionDirection::Long,
@@ -2063,17 +2074,17 @@ fn validate_strategy_trade(
                 bail!("strategy child order does not match its persisted TWAP definition");
             }
         }
-        StrategyJobDefinition::Vwap(_) => match plan.order_kind {
+        StrategyJobDefinition::Vwap(_) | StrategyJobDefinition::Oiwap(_) => match plan.order_kind {
             crate::domain::execution::OrderKind::Market => {
                 if plan.price.is_some() || plan.time_in_force.is_some() {
-                    bail!("VWAP market child contains limit-order fields");
+                    bail!("weighted strategy market child contains limit-order fields");
                 }
             }
             crate::domain::execution::OrderKind::Limit => {
                 if plan.price.is_none()
                     || plan.time_in_force != Some(crate::domain::execution::TimeInForce::Alo)
                 {
-                    bail!("VWAP maker children must be post-only ALO limit orders");
+                    bail!("weighted strategy maker children must be post-only ALO limit orders");
                 }
             }
         },
@@ -2138,7 +2149,23 @@ async fn handle_connection(
     if line.len() > MAX_RUNTIME_REQUEST_BYTES {
         bail!("mlabd request exceeds the runtime request limit");
     }
-    let request: RuntimeRequest = serde_json::from_str(&line).context("invalid mlabd request")?;
+    let request: RuntimeRequest = match serde_json::from_str(&line) {
+        Ok(request) => request,
+        Err(error) => {
+            let message = format!("invalid mlabd request: {error}");
+            record_runtime_error(paths, state, message.clone());
+            let response = RuntimeResponse::error(message, state);
+            let mut encoded =
+                serde_json::to_vec(&response).context("failed to encode mlabd error response")?;
+            encoded.push(b'\n');
+            writer
+                .write_all(&encoded)
+                .await
+                .context("failed to write mlabd error response")?;
+            writer.shutdown().await.ok();
+            return Ok(false);
+        }
+    };
     let should_stop = matches!(request, RuntimeRequest::Stop);
     let response = match request {
         RuntimeRequest::Ping => RuntimeResponse {
@@ -3148,10 +3175,13 @@ async fn try_request(request: RuntimeRequest) -> Result<Option<RuntimeResponse>>
         .context("failed to write mlabd request")?;
     writer.shutdown().await.ok();
     let mut line = String::new();
-    BufReader::new(reader)
+    let bytes_read = BufReader::new(reader)
         .read_line(&mut line)
         .await
         .context("failed to read mlabd response")?;
+    if bytes_read == 0 {
+        bail!("mlabd closed the local connection without a response");
+    }
     let response = serde_json::from_str(&line).context("invalid mlabd response")?;
     Ok(Some(response))
 }
@@ -3288,5 +3318,42 @@ mod tests {
         assert!(status.last_recovery_ms.is_none());
         assert!(status.script_jobs.is_empty());
         assert!(status.strategy_jobs.is_empty());
+    }
+
+    #[test]
+    fn runtime_protocol_v13_decodes_oiwap_submissions() {
+        assert_eq!(RUNTIME_VERSION, 13);
+
+        let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
+            "type": "submit_strategy_job",
+            "submission": {
+                "definition": {
+                    "name": "oiwap",
+                    "config": {
+                        "venue": "bulk",
+                        "symbol": "ZEC/USDT",
+                        "side": "buy",
+                        "totalSize": 1.0,
+                        "requestedMargin": 50.0,
+                        "targetMargin": 50.0,
+                        "targetExposure": 500.0,
+                        "durationSeconds": 3_900,
+                        "oiSources": [{"exchange": "hyperliquid", "provider": "mmt"}],
+                        "leverage": 10.0,
+                        "reduceOnly": false
+                    }
+                }
+            }
+        }))
+        .expect("runtime protocol should decode OIWAP submissions");
+
+        assert!(matches!(
+            request,
+            RuntimeRequest::SubmitStrategyJob {
+                submission: StrategyJobSubmission {
+                    definition: StrategyJobDefinition::Oiwap(_)
+                }
+            }
+        ));
     }
 }

@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::execution::ExecutionVenue;
+use crate::strategies::oiwap::OpenInterestSource;
 use crate::strategies::vwap::VolumeSource;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -129,10 +130,72 @@ impl VwapJobDefinition {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OiwapJobDefinition {
+    pub venue: ExecutionVenue,
+    pub symbol: String,
+    pub side: StrategySide,
+    pub total_size: f64,
+    pub requested_margin: Option<f64>,
+    pub target_margin: f64,
+    pub target_exposure: f64,
+    pub duration_seconds: u64,
+    pub oi_sources: Vec<OpenInterestSource>,
+    pub leverage: f64,
+    pub reduce_only: bool,
+}
+
+impl OiwapJobDefinition {
+    pub fn validate(&self) -> Result<()> {
+        if self.symbol.trim().is_empty() {
+            bail!("OIWAP job symbol is required");
+        }
+        if !self.total_size.is_finite() || self.total_size <= 0.0 {
+            bail!("OIWAP job total size must be greater than zero");
+        }
+        if self
+            .requested_margin
+            .is_some_and(|margin| !margin.is_finite() || margin <= 0.0)
+        {
+            bail!("OIWAP job requested margin must be greater than zero");
+        }
+        if !self.target_margin.is_finite() || self.target_margin <= 0.0 {
+            bail!("OIWAP job target margin must be greater than zero");
+        }
+        if !self.target_exposure.is_finite() || self.target_exposure <= 0.0 {
+            bail!("OIWAP job target exposure must be greater than zero");
+        }
+        if self.duration_seconds < 60 {
+            bail!("OIWAP job duration must be at least 60 seconds");
+        }
+        if self.oi_sources.is_empty() {
+            bail!("OIWAP job requires at least one OI source");
+        }
+        let mut exchanges = std::collections::HashSet::new();
+        for source in &self.oi_sources {
+            if source.exchange.trim().is_empty() || !exchanges.insert(&source.exchange) {
+                bail!("OIWAP job OI sources contain an empty or duplicate exchange");
+            }
+        }
+        if !self.leverage.is_finite() || self.leverage < 1.0 {
+            bail!("OIWAP job leverage must be at least 1");
+        }
+        let expected_margin = self.target_exposure / self.leverage;
+        if (self.target_margin - expected_margin).abs()
+            > 1e-8_f64.max(expected_margin.abs() * 1e-10)
+        {
+            bail!("OIWAP job margin, exposure, and leverage do not agree");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "name", content = "config", rename_all = "snake_case")]
 pub enum StrategyJobDefinition {
     Twap(TwapJobDefinition),
     Vwap(VwapJobDefinition),
+    Oiwap(OiwapJobDefinition),
 }
 
 impl StrategyJobDefinition {
@@ -140,6 +203,7 @@ impl StrategyJobDefinition {
         match self {
             Self::Twap(_) => "twap",
             Self::Vwap(_) => "vwap",
+            Self::Oiwap(_) => "oiwap",
         }
     }
 
@@ -147,6 +211,7 @@ impl StrategyJobDefinition {
         match self {
             Self::Twap(definition) => &definition.symbol,
             Self::Vwap(definition) => &definition.symbol,
+            Self::Oiwap(definition) => &definition.symbol,
         }
     }
 
@@ -154,6 +219,7 @@ impl StrategyJobDefinition {
         match self {
             Self::Twap(definition) => definition.validate(),
             Self::Vwap(definition) => definition.validate(),
+            Self::Oiwap(definition) => definition.validate(),
         }
     }
 }

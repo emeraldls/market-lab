@@ -1,4 +1,5 @@
 pub mod jobs;
+pub mod oiwap;
 pub mod twap;
 pub mod vwap;
 
@@ -10,6 +11,9 @@ pub async fn handle_worker(job_id: &str) -> anyhow::Result<()> {
         }
         crate::strategies::jobs::StrategyJobDefinition::Vwap(_) => {
             vwap::handle_worker_job(job_id, job).await
+        }
+        crate::strategies::jobs::StrategyJobDefinition::Oiwap(_) => {
+            oiwap::handle_worker_job(job_id, job).await
         }
     }
 }

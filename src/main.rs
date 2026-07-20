@@ -76,6 +76,7 @@ async fn main() -> Result<()> {
             StrategyCommands::Run { command } => match command {
                 StrategyRunCommands::Twap(args) => commands::strategy::twap::handle(args).await?,
                 StrategyRunCommands::Vwap(args) => commands::strategy::vwap::handle(args).await?,
+                StrategyRunCommands::Oiwap(args) => commands::strategy::oiwap::handle(args).await?,
             },
             StrategyCommands::Jobs(args) => commands::strategy::jobs::handle_list(args).await?,
             StrategyCommands::Status(args) => commands::strategy::jobs::handle_status(args).await?,

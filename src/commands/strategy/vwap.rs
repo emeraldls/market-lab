@@ -13,8 +13,8 @@ use crate::cli::{
     TradeTimeInForce,
 };
 use crate::commands::execution::build_trade_plan;
-use crate::domain::execution::{ExecutionVenue, PositionDirection};
-use crate::domain::types::{OrderBookLevel, OrderBookSnapshot};
+use crate::domain::execution::{ExecutionVenue, PositionDirection, TradePlan};
+use crate::domain::types::{OiCandle, OrderBookLevel, OrderBookSnapshot};
 use crate::providers::bulk::execution::BulkExecutionAdapter;
 use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::bulk::markets;
@@ -24,7 +24,11 @@ use crate::providers::mmt::utils::{normalize_symbol_for_mmt, normalize_to_ms};
 use crate::providers::mmt::ws_client::MmtWsClient;
 use crate::strategies::execution::{FillProgress, StrategyOrderManager};
 use crate::strategies::jobs::{
-    StrategyJob, StrategyJobDefinition, StrategyJobSubmission, StrategySide, VwapJobDefinition,
+    OiwapJobDefinition, StrategyJob, StrategyJobDefinition, StrategyJobSubmission, StrategySide,
+    VwapJobDefinition,
+};
+use crate::strategies::oiwap::{
+    LiveOpenInterestActivity, OpenInterestProvider, OpenInterestSource,
 };
 use crate::strategies::vwap::{
     HistoricalVolume, VolumeCurve, VolumeProvider, VolumeSource, VolumeSourceSelector,
@@ -38,24 +42,24 @@ const CONTROL_INTERVAL_MS: u64 = 1_000;
 const MAKER_STALE_SECS: u64 = 15;
 const MAKER_FORECAST_HORIZON_MS: u64 = MINUTE_MS;
 const TRAJECTORY_BAND_FRACTION: f64 = 0.005;
-const MAX_PARTICIPATION_RATE: f64 = 0.10;
-const MAX_TAKER_SLIPPAGE_BPS: f64 = 20.0;
+pub(super) const MAX_PARTICIPATION_RATE: f64 = 0.10;
+pub(super) const MAX_TAKER_SLIPPAGE_BPS: f64 = 20.0;
 const FINAL_FILL_WAIT_SECS: u64 = 10;
 
-struct VwapCurves {
-    trajectory: VolumeCurve,
-    execution: VolumeCurve,
+pub(super) struct WeightedCurves {
+    pub(super) trajectory: VolumeCurve,
+    pub(super) execution: VolumeCurve,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct VwapFeasibility {
-    required_participation_rate: f64,
-    forecast_execution_capacity: f64,
-    forecast_shortfall: f64,
+pub(super) struct VwapFeasibility {
+    pub(super) required_participation_rate: f64,
+    pub(super) forecast_execution_capacity: f64,
+    pub(super) forecast_shortfall: f64,
 }
 
 impl VwapFeasibility {
-    fn assess(parent_size: f64, execution_curve: &VolumeCurve) -> Self {
+    pub(super) fn assess(parent_size: f64, execution_curve: &VolumeCurve) -> Self {
         let execution_volume = execution_curve.total_forecast_volume();
         let required_participation_rate = parent_size / execution_volume;
         let forecast_execution_capacity = execution_volume * MAX_PARTICIPATION_RATE;
@@ -66,8 +70,65 @@ impl VwapFeasibility {
         }
     }
 
-    fn feasible(self) -> bool {
+    pub(super) fn feasible(self) -> bool {
         self.forecast_shortfall <= f64::EPSILON
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct WeightedJobDefinition {
+    pub(super) strategy: &'static str,
+    pub(super) venue: ExecutionVenue,
+    pub(super) symbol: String,
+    pub(super) side: StrategySide,
+    pub(super) total_size: f64,
+    pub(super) duration_seconds: u64,
+    pub(super) leverage: f64,
+    pub(super) reduce_only: bool,
+}
+
+impl From<&VwapJobDefinition> for WeightedJobDefinition {
+    fn from(definition: &VwapJobDefinition) -> Self {
+        Self {
+            strategy: "vwap",
+            venue: definition.venue,
+            symbol: definition.symbol.clone(),
+            side: definition.side,
+            total_size: definition.total_size,
+            duration_seconds: definition.duration_seconds,
+            leverage: definition.leverage,
+            reduce_only: definition.reduce_only,
+        }
+    }
+}
+
+impl From<&OiwapJobDefinition> for WeightedJobDefinition {
+    fn from(definition: &OiwapJobDefinition) -> Self {
+        Self {
+            strategy: "oiwap",
+            venue: definition.venue,
+            symbol: definition.symbol.clone(),
+            side: definition.side,
+            total_size: definition.total_size,
+            duration_seconds: definition.duration_seconds,
+            leverage: definition.leverage,
+            reduce_only: definition.reduce_only,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum TrajectoryFeed {
+    Volume(Vec<VolumeSource>),
+    OpenInterest(Vec<OpenInterestSource>),
+}
+
+impl TrajectoryFeed {
+    fn metric(&self) -> &'static str {
+        match self {
+            Self::Volume(_) => "volume",
+            Self::OpenInterest(_) => "absolute_open_interest_change",
+        }
     }
 }
 
@@ -138,7 +199,8 @@ struct VwapOrderEvent<'a> {
     price: Option<f64>,
     target_size: f64,
     filled_size: f64,
-    trajectory_volume: f64,
+    trajectory_metric: &'static str,
+    trajectory_activity: f64,
     execution_venue_volume: f64,
     participation_rate: f64,
     participation_credit: f64,
@@ -147,6 +209,7 @@ struct VwapOrderEvent<'a> {
 }
 
 struct OrderEventDetails<'a> {
+    strategy: &'static str,
     action: &'static str,
     sequence: u64,
     receipt: &'a crate::domain::execution::ExecutionReceipt,
@@ -154,7 +217,8 @@ struct OrderEventDetails<'a> {
     price: Option<f64>,
     target_size: f64,
     filled_size: f64,
-    trajectory_volume: f64,
+    trajectory_metric: &'static str,
+    trajectory_activity: f64,
     execution_venue_volume: f64,
     participation_rate: f64,
     participation_credit: f64,
@@ -199,7 +263,7 @@ struct VwapRunSummary<'a> {
 }
 
 #[derive(Debug)]
-struct StrategyStopped;
+pub(super) struct StrategyStopped;
 
 impl fmt::Display for StrategyStopped {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -232,6 +296,12 @@ enum LiveVolumeEvent {
         ts_ms: u64,
         size: f64,
     },
+    Adjustment {
+        role: LiveVolumeRole,
+        source: String,
+        ts_ms: u64,
+        delta: f64,
+    },
     Degraded {
         role: LiveVolumeRole,
         source: String,
@@ -242,7 +312,9 @@ enum LiveVolumeEvent {
 impl LiveVolumeEvent {
     fn role(&self) -> LiveVolumeRole {
         match self {
-            Self::Trade { role, .. } | Self::Degraded { role, .. } => *role,
+            Self::Trade { role, .. }
+            | Self::Adjustment { role, .. }
+            | Self::Degraded { role, .. } => *role,
         }
     }
 }
@@ -271,7 +343,7 @@ impl LiveVolumeTracker {
                 ts_ms,
                 size,
             } => {
-                if !size.is_finite() || size <= 0.0 {
+                if !size.is_finite() || size < 0.0 {
                     self.degraded.insert(source.clone());
                     return Some((source, "received invalid live trade size".to_string()));
                 }
@@ -279,6 +351,34 @@ impl LiveVolumeTracker {
                     return None;
                 }
                 *self.source_totals.entry(source.clone()).or_default() += size;
+                self.degraded.remove(&source);
+                None
+            }
+            LiveVolumeEvent::Adjustment {
+                role: _,
+                source,
+                ts_ms,
+                delta,
+            } => {
+                if !delta.is_finite() {
+                    self.degraded.insert(source.clone());
+                    return Some((
+                        source,
+                        "received invalid live activity adjustment".to_string(),
+                    ));
+                }
+                if ts_ms < self.start_ms {
+                    return None;
+                }
+                let total = self.source_totals.entry(source.clone()).or_default();
+                if *total + delta < -f64::EPSILON {
+                    self.degraded.insert(source.clone());
+                    return Some((
+                        source,
+                        "live activity revision exceeded accumulated activity".to_string(),
+                    ));
+                }
+                *total = (*total + delta).max(0.0);
                 self.degraded.remove(&source);
                 None
             }
@@ -404,6 +504,7 @@ pub async fn handle_worker_job(job_id: &str, job: StrategyJob) -> Result<()> {
 
 async fn run_worker(job_id: &str, definition: &VwapJobDefinition) -> Result<()> {
     let start_ms = now_ms()?;
+    let weighted = WeightedJobDefinition::from(definition);
     let curves = build_curves(
         start_ms,
         definition.duration_seconds,
@@ -411,14 +512,12 @@ async fn run_worker(job_id: &str, definition: &VwapJobDefinition) -> Result<()> 
         &definition.symbol,
     )
     .await?;
-    let direction = strategy_direction(definition.side);
+    let direction = strategy_direction(weighted.side);
     let parent = build_trade_plan(
-        &worker_trade_args(definition, definition.total_size, None),
+        &worker_trade_args(&weighted, weighted.total_size, None),
         direction,
     )
     .await?;
-    let market = markets::market(&definition.symbol)?;
-    let rules = market.execution_rules()?;
     let feasibility = VwapFeasibility::assess(parent.size, &curves.execution);
     if !feasibility.feasible() {
         bail!(
@@ -440,6 +539,37 @@ async fn run_worker(job_id: &str, definition: &VwapJobDefinition) -> Result<()> 
     });
     crate::runtime::append_strategy_output(job_id, &plan)?;
 
+    run_weighted_execution(
+        job_id,
+        &weighted,
+        start_ms,
+        curves,
+        parent,
+        TrajectoryFeed::Volume(definition.volume_sources.clone()),
+    )
+    .await
+}
+
+pub(super) async fn run_weighted_execution(
+    job_id: &str,
+    definition: &WeightedJobDefinition,
+    start_ms: u64,
+    curves: WeightedCurves,
+    parent: TradePlan,
+    feed: TrajectoryFeed,
+) -> Result<()> {
+    let direction = strategy_direction(definition.side);
+    let market = markets::market(&definition.symbol)?;
+    let rules = market.execution_rules()?;
+    let feasibility = VwapFeasibility::assess(parent.size, &curves.execution);
+    if !feasibility.feasible() {
+        bail!(
+            "{} became infeasible before worker start: forecast BULK capacity is {} with a shortfall of {}",
+            definition.strategy.to_ascii_uppercase(),
+            feasibility.forecast_execution_capacity,
+            feasibility.forecast_shortfall,
+        );
+    }
     let arrival_price = parent.reference_price;
     let adapter = BulkExecutionAdapter::new()?;
     let mut orders = StrategyOrderManager::new(job_id, &parent);
@@ -448,7 +578,8 @@ async fn run_worker(job_id: &str, definition: &VwapJobDefinition) -> Result<()> 
         BulkOrderBookStream::connect(&definition.symbol, ORDERBOOK_DEPTH, ORDERBOOK_STATE_CAP)
             .await?;
     let (volume_tx, mut volume_rx) = mpsc::channel(256);
-    spawn_live_trade_feeds(&definition.volume_sources, &definition.symbol, volume_tx)?;
+    let trajectory_metric = feed.metric();
+    spawn_live_feeds(&feed, &definition.symbol, start_ms, volume_tx)?;
     let mut trajectory_volume = LiveVolumeTracker::new(start_ms);
     let mut execution_volume = LiveVolumeTracker::new(start_ms);
     let mut participation = ParticipationLedger::default();
@@ -475,7 +606,7 @@ async fn run_worker(job_id: &str, definition: &VwapJobDefinition) -> Result<()> 
                     if let Some((source, error)) = tracker.apply(event) {
                         crate::runtime::append_strategy_output(job_id, &serde_json::json!({
                             "type": "strategy.market_data.degraded",
-                            "strategy": "vwap",
+                            "strategy": definition.strategy,
                             "jobId": job_id,
                             "role": role.name(),
                             "source": source,
@@ -514,7 +645,8 @@ async fn run_worker(job_id: &str, definition: &VwapJobDefinition) -> Result<()> 
                         )?;
                         if size < remainder - rules.lot_size / 2.0 {
                             bail!(
-                                "VWAP deadline reached but only {size} of {remainder} can execute within the {:.2}% BULK participation cap and {MAX_TAKER_SLIPPAGE_BPS} bps depth guard",
+                                "{} deadline reached but only {size} of {remainder} can execute within the {:.2}% BULK participation cap and {MAX_TAKER_SLIPPAGE_BPS} bps depth guard",
+                                definition.strategy.to_ascii_uppercase(),
                                 MAX_PARTICIPATION_RATE * 100.0,
                             );
                         }
@@ -527,6 +659,7 @@ async fn run_worker(job_id: &str, definition: &VwapJobDefinition) -> Result<()> 
                         ).await?;
                         taker_orders += 1;
                         append_order_event(job_id, OrderEventDetails {
+                            strategy: definition.strategy,
                             action: "deadline_taker",
                             sequence: orders.submitted_orders(),
                             receipt: &receipt,
@@ -534,7 +667,8 @@ async fn run_worker(job_id: &str, definition: &VwapJobDefinition) -> Result<()> 
                             price: None,
                             target_size: definition.total_size,
                             filled_size: progress.filled_size,
-                            trajectory_volume: trajectory_volume.total(),
+                            trajectory_metric,
+                            trajectory_activity: trajectory_volume.total(),
                             execution_venue_volume: execution_volume.total(),
                             participation_rate: MAX_PARTICIPATION_RATE,
                             participation_credit: participation.credit,
@@ -550,7 +684,8 @@ async fn run_worker(job_id: &str, definition: &VwapJobDefinition) -> Result<()> 
                     ).await?;
                     if progress.filled_size + rules.lot_size / 2.0 < definition.total_size {
                         bail!(
-                            "VWAP ended with {} filled of {} after final reconciliation",
+                            "{} ended with {} filled of {} after final reconciliation",
+                            definition.strategy.to_ascii_uppercase(),
                             progress.filled_size,
                             definition.total_size
                         );
@@ -612,6 +747,7 @@ async fn run_worker(job_id: &str, definition: &VwapJobDefinition) -> Result<()> 
                         ).await?;
                         taker_orders += 1;
                         append_order_event(job_id, OrderEventDetails {
+                            strategy: definition.strategy,
                             action: "catch_up_taker",
                             sequence: orders.submitted_orders(),
                             receipt: &receipt,
@@ -619,7 +755,8 @@ async fn run_worker(job_id: &str, definition: &VwapJobDefinition) -> Result<()> 
                             price: None,
                             target_size,
                             filled_size: progress.filled_size,
-                            trajectory_volume: trajectory_volume.total(),
+                            trajectory_metric,
+                            trajectory_activity: trajectory_volume.total(),
                             execution_venue_volume: execution_volume.total(),
                             participation_rate,
                             participation_credit: participation.credit,
@@ -675,6 +812,7 @@ async fn run_worker(job_id: &str, definition: &VwapJobDefinition) -> Result<()> 
                     ).await?;
                     maker_orders += 1;
                     append_order_event(job_id, OrderEventDetails {
+                        strategy: definition.strategy,
                         action: "maker",
                         sequence: orders.submitted_orders(),
                         receipt: &receipt,
@@ -682,7 +820,8 @@ async fn run_worker(job_id: &str, definition: &VwapJobDefinition) -> Result<()> 
                         price: Some(maker_price),
                         target_size,
                         filled_size: progress.filled_size,
-                        trajectory_volume: trajectory_volume.total(),
+                        trajectory_metric,
+                        trajectory_activity: trajectory_volume.total(),
                         execution_venue_volume: execution_volume.total(),
                         participation_rate,
                         participation_credit: participation.credit,
@@ -742,7 +881,7 @@ async fn build_curves(
     duration_secs: u64,
     sources: &[VolumeSource],
     symbol: &str,
-) -> Result<VwapCurves> {
+) -> Result<WeightedCurves> {
     let history_to = start_ms / MINUTE_MS * MINUTE_MS;
     let history_from = history_to.saturating_sub(HISTORY_DAYS * 86_400_000);
     let mmt_exchanges = sources
@@ -778,7 +917,7 @@ async fn build_curves(
     if includes_bulk {
         trajectory_history.extend(bulk_history.iter().copied());
     }
-    Ok(VwapCurves {
+    Ok(WeightedCurves {
         trajectory: VolumeCurve::build(start_ms, duration_secs, &trajectory_history)?,
         execution: VolumeCurve::build(start_ms, duration_secs, &bulk_history)?,
     })
@@ -801,7 +940,7 @@ async fn fetch_mmt_volume_history(
         .collect())
 }
 
-async fn fetch_bulk_volume_history(
+pub(super) async fn fetch_bulk_volume_history(
     symbol: &str,
     from_ms: u64,
     to_ms: u64,
@@ -826,7 +965,21 @@ async fn fetch_bulk_volume_history(
         .collect())
 }
 
-fn spawn_live_trade_feeds(
+fn spawn_live_feeds(
+    feed: &TrajectoryFeed,
+    symbol: &str,
+    start_ms: u64,
+    sender: mpsc::Sender<LiveVolumeEvent>,
+) -> Result<()> {
+    match feed {
+        TrajectoryFeed::Volume(sources) => spawn_live_volume_feeds(sources, symbol, sender),
+        TrajectoryFeed::OpenInterest(sources) => {
+            spawn_live_open_interest_feeds(sources, symbol, start_ms, sender)
+        }
+    }
+}
+
+fn spawn_live_volume_feeds(
     sources: &[VolumeSource],
     symbol: &str,
     sender: mpsc::Sender<LiveVolumeEvent>,
@@ -889,13 +1042,60 @@ fn spawn_live_trade_feeds(
     Ok(())
 }
 
+fn spawn_live_open_interest_feeds(
+    sources: &[OpenInterestSource],
+    symbol: &str,
+    start_ms: u64,
+    sender: mpsc::Sender<LiveVolumeEvent>,
+) -> Result<()> {
+    if sources
+        .iter()
+        .any(|source| source.provider != OpenInterestProvider::Mmt)
+    {
+        bail!("OIWAP currently supports only exchange@mmt OI sources");
+    }
+    let exchanges = sources
+        .iter()
+        .map(|source| source.exchange.clone())
+        .collect::<Vec<_>>();
+    let oi_symbol = symbol.to_string();
+    let oi_sender = sender.clone();
+    tokio::spawn(async move {
+        if let Err(error) =
+            stream_mmt_open_interest(&exchanges, &oi_symbol, start_ms, oi_sender.clone()).await
+        {
+            let _ = oi_sender
+                .send(LiveVolumeEvent::Degraded {
+                    role: LiveVolumeRole::Trajectory,
+                    source: "mmt_oi".to_string(),
+                    error: format!("{error:#}"),
+                })
+                .await;
+        }
+    });
+
+    let execution_symbol = symbol.to_string();
+    tokio::spawn(async move {
+        if let Err(error) = stream_bulk_trades(&execution_symbol, false, sender.clone()).await {
+            let _ = sender
+                .send(LiveVolumeEvent::Degraded {
+                    role: LiveVolumeRole::Execution,
+                    source: "bulk".to_string(),
+                    error: format!("{error:#}"),
+                })
+                .await;
+        }
+    });
+    Ok(())
+}
+
 async fn stream_mmt_trades(
     exchanges: &[String],
     symbol: &str,
     sender: mpsc::Sender<LiveVolumeEvent>,
 ) -> Result<()> {
     let mut selected = HashSet::new();
-    let ws = MmtWsClient::shared().await?;
+    let ws = MmtWsClient::connect().await?;
     for exchange in exchanges {
         let exchange = exchange.to_ascii_lowercase();
         let provider_symbol = normalize_symbol_for_mmt(&exchange, symbol)?;
@@ -928,6 +1128,55 @@ async fn stream_mmt_trades(
             })
             .await
             .context("VWAP worker stopped receiving MMT trades")?;
+    }
+}
+
+async fn stream_mmt_open_interest(
+    exchanges: &[String],
+    symbol: &str,
+    start_ms: u64,
+    sender: mpsc::Sender<LiveVolumeEvent>,
+) -> Result<()> {
+    let mut selected = HashSet::new();
+    let ws = MmtWsClient::connect().await?;
+    for exchange in exchanges {
+        let exchange = exchange.to_ascii_lowercase();
+        let provider_symbol = normalize_symbol_for_mmt(&exchange, symbol)?;
+        ws.subscribe(serde_json::json!({
+            "type": "subscribe",
+            "channel": "oi",
+            "exchange": exchange,
+            "symbol": provider_symbol,
+            "tf": "1m",
+        }))
+        .await
+        .with_context(|| format!("failed to subscribe to {exchange}@mmt OI"))?;
+        selected.insert(exchange);
+    }
+
+    let mut activity = LiveOpenInterestActivity::new(start_ms);
+    loop {
+        let Some(value) = ws.next_json().await? else {
+            bail!("MMT WebSocket closed");
+        };
+        let Some((exchange, candle)) = parse_mmt_open_interest(value)? else {
+            continue;
+        };
+        if !selected.contains(&exchange) {
+            continue;
+        }
+        let Some((ts_ms, change)) = activity.apply(&exchange, candle)? else {
+            continue;
+        };
+        sender
+            .send(LiveVolumeEvent::Adjustment {
+                role: LiveVolumeRole::Trajectory,
+                source: format!("{exchange}@mmt"),
+                ts_ms,
+                delta: change,
+            })
+            .await
+            .context("OIWAP worker stopped receiving MMT OI activity")?;
     }
 }
 
@@ -994,9 +1243,32 @@ fn parse_mmt_trade(value: serde_json::Value) -> Result<Option<(String, MmtTrade)
     )))
 }
 
+fn parse_mmt_open_interest(value: serde_json::Value) -> Result<Option<(String, OiCandle)>> {
+    if value.is_null()
+        || value.get("type").and_then(serde_json::Value::as_str) == Some("subscribed")
+    {
+        return Ok(None);
+    }
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("data")
+        || value.get("channel").and_then(serde_json::Value::as_str) != Some("oi")
+    {
+        return Ok(None);
+    }
+    let exchange = value
+        .get("exchange")
+        .and_then(serde_json::Value::as_str)
+        .context("MMT OI message omitted exchange")?
+        .to_ascii_lowercase();
+    let candle = value.get("data").context("MMT OI message omitted data")?;
+    Ok(Some((
+        exchange,
+        serde_json::from_value(candle.clone()).context("invalid MMT OI candle shape")?,
+    )))
+}
+
 async fn submit_child(
     orders: &mut StrategyOrderManager,
-    definition: &VwapJobDefinition,
+    definition: &WeightedJobDefinition,
     direction: PositionDirection,
     size: f64,
     maker_price: Option<f64>,
@@ -1125,7 +1397,7 @@ fn append_order_event(job_id: &str, details: OrderEventDetails<'_>) -> Result<()
         job_id,
         &VwapOrderEvent {
             r#type: "strategy.child_order",
-            strategy: "vwap",
+            strategy: details.strategy,
             job_id,
             action: details.action,
             sequence: details.sequence,
@@ -1134,7 +1406,8 @@ fn append_order_event(job_id: &str, details: OrderEventDetails<'_>) -> Result<()
             price: details.price,
             target_size: details.target_size,
             filled_size: details.filled_size,
-            trajectory_volume: details.trajectory_volume,
+            trajectory_metric: details.trajectory_metric,
+            trajectory_activity: details.trajectory_activity,
             execution_venue_volume: details.execution_venue_volume,
             participation_rate: details.participation_rate,
             participation_credit: details.participation_credit,
@@ -1147,7 +1420,7 @@ fn append_order_event(job_id: &str, details: OrderEventDetails<'_>) -> Result<()
 #[allow(clippy::too_many_arguments)]
 fn append_summary(
     job_id: &str,
-    definition: &VwapJobDefinition,
+    definition: &WeightedJobDefinition,
     status: &'static str,
     progress: FillProgress,
     arrival_price: f64,
@@ -1167,7 +1440,7 @@ fn append_summary(
         job_id,
         &VwapRunSummary {
             r#type: "strategy.run.finished",
-            strategy: "vwap",
+            strategy: definition.strategy,
             job_id,
             venue: "bulk",
             symbol: &definition.symbol,
@@ -1278,7 +1551,7 @@ fn render_plan(plan: &VwapPlanView<'_>, output: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-fn render_submission(job: &StrategyJob, output: OutputFormat) -> Result<()> {
+pub(super) fn render_submission(job: &StrategyJob, output: OutputFormat) -> Result<()> {
     match output {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(job)?),
         OutputFormat::Jsonl => println!("{}", serde_json::to_string(job)?),
@@ -1316,8 +1589,8 @@ fn trade_args(args: &RunVwapArgs, size: Option<f64>, margin: Option<f64>) -> Tra
     }
 }
 
-fn worker_trade_args(
-    definition: &VwapJobDefinition,
+pub(super) fn worker_trade_args(
+    definition: &WeightedJobDefinition,
     size: f64,
     maker_price: Option<f64>,
 ) -> TradeArgs {
@@ -1372,7 +1645,7 @@ fn direction(side: CliSide) -> PositionDirection {
     }
 }
 
-fn strategy_direction(side: StrategySide) -> PositionDirection {
+pub(super) fn strategy_direction(side: StrategySide) -> PositionDirection {
     match side {
         StrategySide::Buy => PositionDirection::Long,
         StrategySide::Sell => PositionDirection::Short,
@@ -1434,6 +1707,24 @@ mod tests {
             size: 1.5,
         });
         assert!((tracker.total() - 3.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn live_activity_revisions_do_not_double_count_a_forming_oi_candle() {
+        let mut tracker = LiveVolumeTracker::new(120_000);
+        tracker.apply(LiveVolumeEvent::Adjustment {
+            role: LiveVolumeRole::Trajectory,
+            source: "binancef@mmt".to_string(),
+            ts_ms: 120_000,
+            delta: 5.0,
+        });
+        tracker.apply(LiveVolumeEvent::Adjustment {
+            role: LiveVolumeRole::Trajectory,
+            source: "binancef@mmt".to_string(),
+            ts_ms: 120_000,
+            delta: -2.0,
+        });
+        assert!((tracker.total() - 3.0).abs() < 1e-9);
     }
 
     #[test]
