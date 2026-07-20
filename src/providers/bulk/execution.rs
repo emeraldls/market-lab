@@ -894,8 +894,10 @@ struct BulkFill {
     symbol: String,
     amount: f64,
     price: f64,
-    #[serde(default, alias = "reasonCode")]
+    #[serde(default)]
     reason: Option<BulkFillReason>,
+    #[serde(default)]
+    reason_code: Option<BulkFillReason>,
     slot: u64,
     timestamp: u64,
 }
@@ -923,6 +925,7 @@ impl BulkFill {
             price: self.price,
             reason: self
                 .reason
+                .or(self.reason_code)
                 .map(BulkFillReason::into_display)
                 .unwrap_or_else(|| "unknown".to_string()),
             order_id: Some(if is_maker {
@@ -1220,6 +1223,31 @@ mod tests {
 
         let normalized = fill.into_fill("account").expect("fill normalizes");
         assert_eq!(normalized.reason, "normal");
+        assert_eq!(normalized.order_id.as_deref(), Some("oid"));
+    }
+
+    #[test]
+    fn decodes_fill_with_reason_and_reason_code() {
+        let fill: BulkFill = serde_json::from_str(
+            r#"{
+                "maker": "account",
+                "taker": "counterparty",
+                "orderIdMaker": "oid",
+                "orderIdTaker": "other-oid",
+                "isBuy": true,
+                "symbol": "BTC-USD",
+                "amount": 0.001,
+                "price": 65000.0,
+                "reason": "liquidation",
+                "reasonCode": 0,
+                "slot": 123,
+                "timestamp": 1699564800000000000
+            }"#,
+        )
+        .expect("fill with both reason fields decodes");
+
+        let normalized = fill.into_fill("account").expect("fill normalizes");
+        assert_eq!(normalized.reason, "liquidation");
         assert_eq!(normalized.order_id.as_deref(), Some("oid"));
     }
 
