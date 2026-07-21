@@ -2,8 +2,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use bulk_keychain::{Keypair, Pubkey, SignedTransaction, Signer};
-use reqwest::Client;
 use serde_json::Value;
+
+use self::client::BulkClient;
+use self::ws::{BulkTradingClient, is_trading_acknowledgement};
 
 pub mod client;
 pub mod execution;
@@ -11,8 +13,8 @@ pub mod market_data;
 pub mod markets;
 pub mod ws;
 
-const DEFAULT_BULK_API_URL: &str = "https://exchange-api.bulk.trade/api/v1";
-const BULK_HTTP_TIMEOUT_SECS: u64 = 10;
+const AGENT_CONFIRMATION_ATTEMPTS: usize = 10;
+const AGENT_CONFIRMATION_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRegistration {
@@ -37,12 +39,53 @@ async fn set_agent_authorization(
     let signed = sign_agent_authorization(master, agent, delete)?;
     let account = signed.account.clone();
     let body = submit_transaction(&signed).await?;
-    validate_agent_response(&body, &expected_agent, delete)?;
+    if is_trading_acknowledgement(&body) {
+        confirm_agent_authorization(&account, &expected_agent, delete).await?;
+    } else {
+        validate_agent_response(&body, &expected_agent, delete)?;
+    }
 
     Ok(AgentRegistration {
         account,
         agent_public_key: expected_agent,
     })
+}
+
+async fn confirm_agent_authorization(account: &str, agent: &str, delete: bool) -> Result<()> {
+    let client = BulkClient::new()?;
+    for attempt in 0..AGENT_CONFIRMATION_ATTEMPTS {
+        let body: Value = client
+            .post(
+                "account",
+                &serde_json::json!({ "type": "fullAccount", "user": account }),
+            )
+            .await
+            .context("failed to verify BULK agent-wallet authorization")?;
+        if agent_authorization_matches(&body, agent, delete)? {
+            return Ok(());
+        }
+        if attempt + 1 < AGENT_CONFIRMATION_ATTEMPTS {
+            tokio::time::sleep(AGENT_CONFIRMATION_DELAY).await;
+        }
+    }
+    bail!(
+        "BULK acknowledged the agent-wallet transaction but the account snapshot did not confirm that agent {agent} was {}",
+        if delete { "removed" } else { "authorized" }
+    )
+}
+
+fn agent_authorization_matches(body: &Value, agent: &str, delete: bool) -> Result<bool> {
+    let wallets = body
+        .as_array()
+        .and_then(|entries| entries.iter().find_map(|entry| entry.get("fullAccount")))
+        .and_then(|account| account.get("authorizedAgentWallets"))
+        .and_then(Value::as_array)
+        .context("BULK full-account response omitted authorizedAgentWallets")?;
+    let authorized = wallets.iter().any(|wallet| {
+        wallet.as_str() == Some(agent)
+            || wallet.get("pubkey").and_then(Value::as_str) == Some(agent)
+    });
+    Ok(authorized != delete)
 }
 
 fn sign_agent_authorization(
@@ -57,31 +100,10 @@ fn sign_agent_authorization(
 }
 
 async fn submit_transaction(transaction: &SignedTransaction) -> Result<Value> {
-    let base_url = DEFAULT_BULK_API_URL;
-    let url = format!("{}/order", base_url.trim_end_matches('/'));
-
-    let response = Client::new()
-        .post(url)
-        .timeout(Duration::from_secs(BULK_HTTP_TIMEOUT_SECS))
-        .json(transaction)
-        .send()
+    BulkTradingClient::new()
+        .post(transaction)
         .await
-        .context("failed to submit BULK agent-wallet authorization")?;
-
-    let status = response.status();
-    let body: Value = response
-        .json()
-        .await
-        .context("failed to decode BULK agent-wallet response")?;
-
-    if !status.is_success() {
-        bail!(
-            "BULK agent-wallet authorization returned HTTP {status}: {}",
-            response_message(&body)
-        );
-    }
-
-    Ok(body)
+        .context("failed to submit BULK agent-wallet authorization")
 }
 
 fn validate_agent_response(body: &Value, expected_agent: &str, delete: bool) -> Result<()> {
@@ -193,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_failed_agent_response_even_when_http_body_status_is_ok() {
+    fn rejects_failed_agent_response_even_when_envelope_status_is_ok() {
         let body = json!({
             "status": "ok",
             "response": {
@@ -208,5 +230,32 @@ mod tests {
         let error = validate_agent_response(&body, "agent-public-key", false)
             .expect_err("failure status must be rejected");
         assert!(error.to_string().contains("Unauthorized"));
+    }
+
+    #[test]
+    fn confirms_acknowledged_agent_state_from_account_snapshot() {
+        let authorized = json!([{
+            "fullAccount": {
+                "authorizedAgentWallets": ["agent-public-key"]
+            }
+        }]);
+        assert!(
+            agent_authorization_matches(&authorized, "agent-public-key", false)
+                .expect("authorization state parses")
+        );
+        assert!(
+            !agent_authorization_matches(&authorized, "agent-public-key", true)
+                .expect("revocation state parses")
+        );
+
+        let revoked = json!([{
+            "fullAccount": {
+                "authorizedAgentWallets": []
+            }
+        }]);
+        assert!(
+            agent_authorization_matches(&revoked, "agent-public-key", true)
+                .expect("revocation state parses")
+        );
     }
 }

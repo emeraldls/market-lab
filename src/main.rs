@@ -3,8 +3,9 @@ use clap::Parser;
 use mimalloc::MiMalloc;
 
 use market_lab::cli::{
-    AuthCommands, Cli, Commands, DaemonCommands, ScriptCommands, ScriptRunHistoryCommands,
-    SourceCommands, StrategyCommands, StrategyRunCommands, StudyCommands, TradeCommands,
+    AuthCommands, BotCommands, BotRunCommands, Cli, Commands, DaemonCommands, ScriptCommands,
+    ScriptRunHistoryCommands, SourceCommands, StrategyCommands, StrategyRunCommands, StudyCommands,
+    TradeCommands,
 };
 use market_lab::commands;
 use market_lab::config;
@@ -82,6 +83,20 @@ async fn main() -> Result<()> {
             StrategyCommands::Status(args) => commands::strategy::jobs::handle_status(args).await?,
             StrategyCommands::Logs(args) => commands::strategy::jobs::handle_logs(args).await?,
             StrategyCommands::Stop(args) => commands::strategy::jobs::handle_stop(args).await?,
+        },
+        Commands::Bot { command: bot } => match bot {
+            BotCommands::Run { command } => match command {
+                BotRunCommands::MidPrice(args) => {
+                    commands::bot::mid_price::handle_mid_price(args).await?
+                }
+                BotRunCommands::VolumeMid(args) => {
+                    commands::bot::mid_price::handle_volume_mid(args).await?
+                }
+            },
+            BotCommands::Jobs(args) => commands::bot::jobs::handle_list(args).await?,
+            BotCommands::Status(args) => commands::bot::jobs::handle_status(args).await?,
+            BotCommands::Logs(args) => commands::bot::jobs::handle_logs(args).await?,
+            BotCommands::Stop(args) => commands::bot::jobs::handle_stop(args).await?,
         },
         Commands::Health(args) => commands::system::health::handle(args).await?,
         Commands::Status(args) => commands::system::status::handle(args).await?,

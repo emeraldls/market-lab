@@ -52,6 +52,10 @@ pub enum Commands {
         #[command(subcommand)]
         command: StrategyCommands,
     },
+    Bot {
+        #[command(subcommand)]
+        command: BotCommands,
+    },
     Health(HealthArgs),
     Status(StatusArgs),
     Upgrade(UpgradeArgs),
@@ -440,6 +444,24 @@ pub enum StrategyRunCommands {
     Twap(RunTwapArgs),
     Vwap(RunVwapArgs),
     Oiwap(RunOiwapArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BotCommands {
+    Run {
+        #[command(subcommand)]
+        command: BotRunCommands,
+    },
+    Jobs(BotJobsArgs),
+    Status(BotJobArgs),
+    Logs(BotLogsArgs),
+    Stop(BotJobArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BotRunCommands {
+    MidPrice(RunMidPriceArgs),
+    VolumeMid(RunVolumeMidArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -1582,6 +1604,51 @@ pub struct RunOiwapArgs {
 }
 
 #[derive(Clone, Debug, Args)]
+pub struct RunMidPriceArgs {
+    pub symbol: String,
+    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    pub venue: ExecutionVenueArg,
+    /// Hard one-sided inventory limit in base-asset units.
+    #[arg(long, conflicts_with = "margin", required_unless_present = "margin")]
+    pub size: Option<f64>,
+    /// Collateral allocated to the one-sided inventory limit.
+    #[arg(long, conflicts_with = "size", required_unless_present = "size")]
+    pub margin: Option<f64>,
+    /// Maximum bot runtime in seconds.
+    #[arg(long)]
+    pub duration: u64,
+    /// Total distance between bid and ask around the current midpoint.
+    #[arg(long, default_value_t = 2.0)]
+    pub spread_bps: f64,
+    /// Percentage size bias: -100 favors asks, +100 favors bids, 0 is neutral.
+    #[arg(long = "directional-bias", alias = "bias", default_value_t = 0.0)]
+    pub directional_bias: f64,
+    #[arg(long, default_value_t = 1.0)]
+    pub leverage: f64,
+    /// Stop after net bot PnL loses this percentage of allocated margin. Zero disables it.
+    #[arg(long)]
+    pub stop_loss_pct: Option<f64>,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct RunVolumeMidArgs {
+    #[command(flatten)]
+    pub common: RunMidPriceArgs,
+    /// Minimum lifetime of each working quote, in seconds.
+    #[arg(long)]
+    pub refresh_time: f64,
+    /// Price drift allowed before a quote moving away from the market is replaced.
+    #[arg(long)]
+    pub refresh_tolerance_bps: f64,
+}
+
+#[derive(Clone, Debug, Args)]
 pub struct StrategyJobsArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
@@ -1615,6 +1682,60 @@ pub struct StrategyLogsArgs {
     pub follow: bool,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct BotJobsArgs {
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct BotJobArgs {
+    pub job: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl BotJobArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.job.trim().is_empty() {
+            bail!("bot job id is required");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("bot job commands support only --output terminal|json|jsonl");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct BotLogsArgs {
+    pub job: String,
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
+    #[arg(long, default_value_t = false)]
+    pub follow: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl BotLogsArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.job.trim().is_empty() {
+            bail!("bot job id is required");
+        }
+        if self.limit == 0 {
+            bail!("--limit must be >= 1");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("bot logs supports only --output terminal|json|jsonl");
+        }
+        if self.follow && matches!(self.output, OutputFormat::Json) {
+            bail!("--follow supports terminal or jsonl output");
+        }
+        Ok(())
+    }
 }
 
 impl StrategyLogsArgs {
@@ -1778,6 +1899,76 @@ impl RunOiwapArgs {
             &self.oi_sources,
             &self.symbol,
         )?;
+        Ok(())
+    }
+}
+
+impl RunMidPriceArgs {
+    pub fn validate(&self) -> Result<()> {
+        if !is_valid_symbol(&self.symbol) {
+            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        if self
+            .size
+            .is_some_and(|size| !size.is_finite() || size <= 0.0)
+        {
+            bail!("--size must be > 0");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| !margin.is_finite() || margin <= 0.0)
+        {
+            bail!("--margin must be > 0");
+        }
+        match (self.size, self.margin) {
+            (Some(_), Some(_)) => bail!("set only one of --size or --margin"),
+            (None, None) => bail!("one of --size or --margin is required"),
+            _ => {}
+        }
+        if self.duration == 0 {
+            bail!("--duration must be >= 1 second");
+        }
+        if !self.spread_bps.is_finite() || self.spread_bps < 0.0 {
+            bail!("--spread-bps must be zero or greater");
+        }
+        if !self.directional_bias.is_finite() || !(-100.0..=100.0).contains(&self.directional_bias)
+        {
+            bail!("--directional-bias must be between -100 and 100 percent");
+        }
+        if !self.leverage.is_finite() || self.leverage < 1.0 {
+            bail!("--leverage must be at least 1");
+        }
+        if self
+            .stop_loss_pct
+            .is_some_and(|percent| !percent.is_finite() || !(0.0..=100.0).contains(&percent))
+        {
+            bail!("--stop-loss-pct must be between 0 and 100 percent");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| !(margin * self.leverage).is_finite())
+        {
+            bail!("--margin multiplied by --leverage is too large");
+        }
+        if self.dry_run && self.yes {
+            bail!("--yes is not used with --dry-run");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("bot run supports only --output terminal|json|jsonl");
+        }
+        Ok(())
+    }
+}
+
+impl RunVolumeMidArgs {
+    pub fn validate(&self) -> Result<()> {
+        self.common.validate()?;
+        if !self.refresh_time.is_finite() || self.refresh_time <= 0.0 {
+            bail!("--refresh-time must be greater than zero seconds");
+        }
+        if !self.refresh_tolerance_bps.is_finite() || self.refresh_tolerance_bps < 0.0 {
+            bail!("--refresh-tolerance-bps must be zero or greater");
+        }
         Ok(())
     }
 }
@@ -2946,6 +3137,88 @@ mod tests {
                 assert!(args.dry_run);
             }
             _ => panic!("expected strategy run twap command"),
+        }
+    }
+
+    #[test]
+    fn parse_mid_price_bot_command_without_a_side() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "bot",
+            "run",
+            "mid-price",
+            "BTC/USDT",
+            "--venue",
+            "bulk",
+            "--margin",
+            "100",
+            "--duration",
+            "300",
+            "--spread-bps",
+            "2",
+            "--leverage",
+            "10",
+            "--stop-loss-pct",
+            "5",
+            "--dry-run",
+        ])
+        .expect("mid-price bot should parse");
+
+        match cli.command {
+            Commands::Bot {
+                command:
+                    BotCommands::Run {
+                        command: BotRunCommands::MidPrice(args),
+                    },
+            } => {
+                args.validate()
+                    .expect("mid-price arguments should validate");
+                assert_eq!(args.margin, Some(100.0));
+                assert_eq!(args.duration, 300);
+                assert_eq!(args.spread_bps, 2.0);
+                assert_eq!(args.directional_bias, 0.0);
+                assert_eq!(args.leverage, 10.0);
+                assert_eq!(args.stop_loss_pct, Some(5.0));
+                assert!(args.dry_run);
+            }
+            _ => panic!("expected bot run mid-price command"),
+        }
+    }
+
+    #[test]
+    fn parse_volume_mid_bot_with_fill_priority_refresh_controls() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "bot",
+            "run",
+            "volume-mid",
+            "BTC/USDT",
+            "--margin",
+            "100",
+            "--duration",
+            "300",
+            "--refresh-time",
+            "5",
+            "--refresh-tolerance-bps",
+            "0.5",
+            "--dry-run",
+        ])
+        .expect("volume-mid bot should parse");
+
+        match cli.command {
+            Commands::Bot {
+                command:
+                    BotCommands::Run {
+                        command: BotRunCommands::VolumeMid(args),
+                    },
+            } => {
+                args.validate()
+                    .expect("volume-mid arguments should validate");
+                assert_eq!(args.common.margin, Some(100.0));
+                assert_eq!(args.refresh_time, 5.0);
+                assert_eq!(args.refresh_tolerance_bps, 0.5);
+            }
+            _ => panic!("expected bot run volume-mid command"),
         }
     }
 

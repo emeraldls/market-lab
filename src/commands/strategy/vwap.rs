@@ -37,7 +37,6 @@ use crate::strategies::vwap::{
 const HISTORY_DAYS: u64 = 7;
 const MINUTE_MS: u64 = 60_000;
 const ORDERBOOK_DEPTH: u16 = 100;
-const ORDERBOOK_STATE_CAP: usize = 2_000;
 const CONTROL_INTERVAL_MS: u64 = 1_000;
 const MAKER_STALE_SECS: u64 = 15;
 const MAKER_FORECAST_HORIZON_MS: u64 = MINUTE_MS;
@@ -574,9 +573,7 @@ pub(super) async fn run_weighted_execution(
     let adapter = BulkExecutionAdapter::new()?;
     let mut orders = StrategyOrderManager::new(job_id, &parent);
     let started = Instant::now();
-    let mut book_stream =
-        BulkOrderBookStream::connect(&definition.symbol, ORDERBOOK_DEPTH, ORDERBOOK_STATE_CAP)
-            .await?;
+    let mut book_stream = BulkOrderBookStream::connect(&definition.symbol, ORDERBOOK_DEPTH).await?;
     let (volume_tx, mut volume_rx) = mpsc::channel(256);
     let trajectory_metric = feed.metric();
     spawn_live_feeds(&feed, &definition.symbol, start_ms, volume_tx)?;

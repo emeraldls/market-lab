@@ -68,10 +68,8 @@ async fn stream_mmt_orderbook(args: SourceOrderbookArgs) -> Result<()> {
         bail!("stream mode currently supports only --output terminal|json|jsonl");
     }
 
-    let state_cap = (args.depth as usize).saturating_mul(10).clamp(100, 10_000);
     let exchange = args.exchange_name()?.to_string();
-    let mut stream =
-        MmtDepthStream::connect(&exchange, &args.symbol, args.depth, state_cap).await?;
+    let mut stream = MmtDepthStream::connect(&exchange, &args.symbol, args.depth).await?;
 
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest: Option<OrderBookSnapshot> = None;
@@ -107,8 +105,7 @@ async fn stream_mmt_orderbook(args: SourceOrderbookArgs) -> Result<()> {
 }
 
 async fn stream_bulk_orderbook(args: SourceOrderbookArgs) -> Result<()> {
-    let state_cap = (args.depth as usize).saturating_mul(10).clamp(100, 10_000);
-    let mut stream = BulkOrderBookStream::connect(&args.symbol, args.depth, state_cap).await?;
+    let mut stream = BulkOrderBookStream::connect(&args.symbol, args.depth).await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest: Option<OrderBookSnapshot> = None;
     let mut buf: VecDeque<String> = VecDeque::with_capacity(args.buffer_size as usize);

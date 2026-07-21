@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8,6 +9,7 @@ use bulk_keychain::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 use crate::credentials::ActiveBulkCredential;
 use crate::domain::execution::{
@@ -19,6 +21,7 @@ use crate::domain::execution::{
 use super::client::BulkClient;
 use super::market_data::normalize_timestamp_ms;
 use super::markets;
+use super::ws::{BulkTradingClient, is_trading_acknowledgement};
 
 static LAST_NONCE: AtomicU64 = AtomicU64::new(0);
 const ORDER_RECONCILIATION_ATTEMPTS: usize = 4;
@@ -26,6 +29,8 @@ const ORDER_RECONCILIATION_DELAY: Duration = Duration::from_millis(500);
 
 pub struct BulkExecutionAdapter {
     client: BulkClient,
+    trading: BulkTradingClient,
+    leverage_settings: Mutex<HashMap<(String, String), f64>>,
 }
 
 impl BulkExecutionAdapter {
@@ -50,6 +55,8 @@ impl BulkExecutionAdapter {
     pub fn new() -> Result<Self> {
         Ok(Self {
             client: BulkClient::new()?,
+            trading: BulkTradingClient::new(),
+            leverage_settings: Mutex::new(HashMap::new()),
         })
     }
 
@@ -172,14 +179,7 @@ impl BulkExecutionAdapter {
         let mut signer = Signer::new(credential.agent);
 
         if !plan.reduce_only {
-            let leverage_action = Action::UpdateUserSettings(
-                bulk_keychain::UserSettings::set_leverage(plan.venue_symbol.clone(), plan.leverage),
-            );
-            let leverage_tx = signer
-                .sign_action(&leverage_action, next_nonce()?, &account)
-                .context("failed to sign BULK leverage update")?;
-            let leverage_response: Value = self.client.post("order", &leverage_tx).await?;
-            validate_transaction_response(&leverage_response, "leverage update")?;
+            self.ensure_leverage(&mut signer, &account, plan).await?;
         }
 
         let signed = sign_trade_order(&mut signer, &account, plan, next_nonce()?)?;
@@ -187,12 +187,16 @@ impl BulkExecutionAdapter {
             .order_id
             .clone()
             .context("signed BULK order omitted its deterministic order id")?;
-        match self.client.post("order", &signed).await {
-            Ok(response) => receipt_from_response(
+        match self.trading.post(&signed).await {
+            Ok(response) if is_trading_acknowledgement(&response) => acknowledged_receipt(
                 &plan.account,
-                Some(optimistic_order_id),
+                optimistic_order_id,
+                "submitted",
                 response,
             ),
+            Ok(response) => {
+                receipt_from_response(&plan.account, Some(optimistic_order_id), response)
+            }
             Err(submission_error) => self
                 .reconcile_order_submission(
                     &plan.account,
@@ -206,6 +210,36 @@ impl BulkExecutionAdapter {
                     )
                 }),
         }
+    }
+
+    async fn ensure_leverage(
+        &self,
+        signer: &mut Signer,
+        account: &Pubkey,
+        plan: &TradePlan,
+    ) -> Result<()> {
+        let key = (plan.account.clone(), plan.venue_symbol.clone());
+        let mut settings = self.leverage_settings.lock().await;
+        if settings
+            .get(&key)
+            .is_some_and(|leverage| (*leverage - plan.leverage).abs() <= f64::EPSILON)
+        {
+            return Ok(());
+        }
+
+        let action = Action::UpdateUserSettings(bulk_keychain::UserSettings::set_leverage(
+            plan.venue_symbol.clone(),
+            plan.leverage,
+        ));
+        let transaction = signer
+            .sign_action(&action, next_nonce()?, account)
+            .context("failed to sign BULK leverage update")?;
+        let response = self.trading.post(&transaction).await?;
+        if !is_trading_acknowledgement(&response) {
+            validate_transaction_response(&response, "leverage update")?;
+        }
+        settings.insert(key, plan.leverage);
+        Ok(())
     }
 
     pub async fn cancel_order(
@@ -223,8 +257,17 @@ impl BulkExecutionAdapter {
         let signed = signer
             .sign_action(&action, next_nonce()?, &account)
             .context("failed to sign BULK order cancellation")?;
-        let response: Value = self.client.post("order", &signed).await?;
-        receipt_from_response(&account.to_base58(), Some(order_id.to_string()), response)
+        let response = self.trading.post(&signed).await?;
+        if is_trading_acknowledgement(&response) {
+            acknowledged_receipt(
+                &account.to_base58(),
+                order_id.to_string(),
+                "cancelSubmitted",
+                response,
+            )
+        } else {
+            receipt_from_response(&account.to_base58(), Some(order_id.to_string()), response)
+        }
     }
 
     async fn reconcile_order_submission(
@@ -660,11 +703,33 @@ fn receipt_from_response(
     })
 }
 
+fn acknowledged_receipt(
+    account: &str,
+    order_id: String,
+    status: &str,
+    response: Value,
+) -> Result<ExecutionReceipt> {
+    Ok(ExecutionReceipt {
+        venue: ExecutionVenue::Bulk,
+        account: account.to_string(),
+        order_id: Some(order_id),
+        status: status.to_string(),
+        terminal: false,
+        submitted_at_ms: now_ms()?,
+        raw_status: response,
+    })
+}
+
 fn status_error(status: &Value) -> Option<String> {
     let object = status.as_object()?;
     let (name, details) = object.iter().next()?;
-    (name == "error" || name.starts_with("rejected") || name.ends_with("Failed"))
-        .then(|| response_message(details))
+    if name == "error" {
+        Some(response_message(details))
+    } else if name.starts_with("rejected") || name.ends_with("Failed") {
+        Some(format!("{name}: {}", response_message(details)))
+    } else {
+        None
+    }
 }
 
 fn response_message(value: &Value) -> String {
@@ -1058,6 +1123,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejected_status_keeps_its_name_when_bulk_only_returns_an_order_id() {
+        let error = status_error(&serde_json::json!({
+            "rejectedCrossing": { "oid": "order-id" }
+        }))
+        .expect("rejection");
+
+        assert_eq!(error, r#"rejectedCrossing: {"oid":"order-id"}"#);
+    }
+
+    #[test]
     fn reconciled_terminal_order_preserves_the_deterministic_id() {
         let receipt = reconciled_history_receipt(
             "account",
@@ -1354,6 +1429,26 @@ mod tests {
             error
                 .to_string()
                 .contains("mlab auth set bulk --reauthorize")
+        );
+    }
+
+    #[test]
+    fn acknowledgement_creates_a_non_terminal_optimistic_receipt() {
+        let response = serde_json::json!({
+            "type": "post",
+            "id": 7,
+            "data": { "type": "ack", "ok": true }
+        });
+        let receipt =
+            acknowledged_receipt("account", "order-id".to_string(), "submitted", response)
+                .expect("acknowledgement creates a receipt");
+
+        assert_eq!(receipt.order_id.as_deref(), Some("order-id"));
+        assert_eq!(receipt.status, "submitted");
+        assert!(!receipt.terminal);
+        assert_eq!(
+            receipt.raw_status.pointer("/data/ok"),
+            Some(&Value::Bool(true))
         );
     }
 }
