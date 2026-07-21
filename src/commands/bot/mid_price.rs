@@ -327,7 +327,7 @@ fn plan_view<'a>(
         duration_secs: definition.duration_seconds,
         leverage: parent.leverage,
         execution: "maker-only post-only ALO quotes",
-        shutdown: "cancel owned quotes, then flatten residual inventory",
+        shutdown: "cancel owned quotes, then unwind bot-owned inventory",
         dry_run,
     }
 }
@@ -892,27 +892,6 @@ async fn run_worker(job_id: &str, mode: MidMode, definition: &MidPriceJobDefinit
     let market = markets::market(&definition.symbol)?;
     let rules = market.execution_rules()?;
     let adapter = BulkExecutionAdapter::new()?;
-    let account = adapter.account_snapshot(&parent.account).await?;
-    if account
-        .positions
-        .iter()
-        .any(|position| position.internal_symbol == definition.symbol)
-    {
-        bail!(
-            "mid-price bot requires a flat {} position before it starts",
-            definition.symbol
-        );
-    }
-    if account
-        .open_orders
-        .iter()
-        .any(|order| order.internal_symbol == definition.symbol)
-    {
-        bail!(
-            "mid-price bot requires no existing {} orders before it starts",
-            definition.symbol
-        );
-    }
 
     let initial_book = BulkProvider::live_orderbook(&definition.symbol, BOOK_DEPTH, None).await?;
     let initial_quotes = quote_prices(
@@ -1554,7 +1533,7 @@ fn quote_plan(parent: &TradePlan, side: QuoteSide, size: f64, price: f64) -> Res
     })
 }
 
-fn cleanup_plan(
+fn inventory_unwind_plan(
     parent: &TradePlan,
     direction: PositionDirection,
     size: f64,
@@ -1580,7 +1559,9 @@ fn cleanup_plan(
         estimated_exposure: exposure,
         projected_liquidation_price: None,
         leverage: parent.leverage,
-        reduce_only: true,
+        // This closes the bot's virtual inventory, not necessarily the account's net position.
+        // With another strategy on the opposite side, an unwind can increase the account net.
+        reduce_only: false,
         stop_loss_price: None,
         take_profit_price: None,
     })
@@ -1980,66 +1961,59 @@ async fn cleanup(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let account = adapter.account_snapshot(&parent.account).await?;
-    let position = account
-        .positions
-        .into_iter()
-        .find(|position| position.internal_symbol == definition.symbol);
-    if let Some(position) = position {
-        let market = markets::market(&definition.symbol)?;
-        let rules = market.execution_rules()?;
-        let size = floor_to_step(position.size, rules.lot_size, rules.size_precision);
-        if size >= rules.lot_size / 2.0 {
-            if size * position.mark_price < rules.min_notional {
-                bail!(
-                    "residual {} position {} is below the venue minimum and could not be flattened automatically",
-                    definition.symbol,
-                    position.size
-                );
-            }
-            let direction = match position.direction {
-                PositionDirection::Long => PositionDirection::Short,
-                PositionDirection::Short => PositionDirection::Long,
-            };
-            let plan = cleanup_plan(parent, direction, size, position.mark_price)?;
-            let receipt = adapter
-                .submit_trade(crate::credentials::active_bulk_credential()?, &plan)
-                .await
-                .context("failed to flatten mid-price residual inventory")?;
-            if let Some(order_id) = receipt.order_id {
-                owned_orders.insert(order_id);
-            }
+    let market = markets::market(&definition.symbol)?;
+    let rules = market.execution_rules()?;
+    let inventory = ledger.inventory();
+    let size = floor_to_step(inventory.abs(), rules.lot_size, rules.size_precision);
+    if size < rules.lot_size / 2.0 {
+        return Ok(());
+    }
+    if size * mark_price < rules.min_notional {
+        bail!(
+            "bot-owned residual {} inventory {} is below the venue minimum and could not be unwound automatically",
+            definition.symbol,
+            inventory
+        );
+    }
 
-            let deadline = Instant::now() + CLEANUP_TIMEOUT;
-            loop {
-                let (snapshot, fills) = tokio::join!(
-                    adapter.account_snapshot(&parent.account),
-                    adapter.fills(&parent.account),
-                );
-                reconcile_recovery(
-                    job_id,
-                    bot,
-                    mark_price,
-                    &[],
-                    fills?,
-                    owned_orders,
-                    buy,
-                    sell,
-                    ledger,
-                )?;
-                if !snapshot?
-                    .positions
-                    .iter()
-                    .any(|position| position.internal_symbol == definition.symbol)
-                {
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    bail!("timed out waiting for residual inventory to flatten");
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+    let direction = if inventory > 0.0 {
+        PositionDirection::Short
+    } else {
+        PositionDirection::Long
+    };
+    let plan = inventory_unwind_plan(parent, direction, size, mark_price)?;
+    let receipt = adapter
+        .submit_trade(crate::credentials::active_bulk_credential()?, &plan)
+        .await
+        .context("failed to unwind mid-price bot-owned inventory")?;
+    let order_id = receipt
+        .order_id
+        .context("mid-price inventory unwind omitted its order id")?;
+    owned_orders.insert(order_id);
+
+    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    loop {
+        reconcile_recovery(
+            job_id,
+            bot,
+            mark_price,
+            &[],
+            adapter.fills(&parent.account).await?,
+            owned_orders,
+            buy,
+            sell,
+            ledger,
+        )?;
+        if ledger.inventory().abs() < rules.lot_size / 2.0 {
+            break;
         }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for bot-owned residual inventory to unwind; remaining={}",
+                ledger.inventory()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Ok(())
 }
@@ -2322,6 +2296,40 @@ mod tests {
             1,
         ));
         assert!(!stop_loss_triggered(&incomplete.performance(80.0), 10.0));
+    }
+
+    #[test]
+    fn inventory_unwind_is_not_reduce_only_or_account_position_dependent() {
+        let parent = TradePlan {
+            created_at_ms: 1,
+            venue: ExecutionVenue::Bulk,
+            account: "account".to_string(),
+            internal_symbol: "BTC/USDT".to_string(),
+            venue_symbol: "BTC-USD".to_string(),
+            direction: PositionDirection::Long,
+            side: OrderSide::Buy,
+            order_kind: OrderKind::Market,
+            time_in_force: None,
+            requested_size: Some(1.0),
+            size: 1.0,
+            price: None,
+            reference_price: 100.0,
+            requested_margin: Some(10.0),
+            estimated_margin: 10.0,
+            estimated_exposure: 100.0,
+            projected_liquidation_price: None,
+            leverage: 10.0,
+            reduce_only: false,
+            stop_loss_price: None,
+            take_profit_price: None,
+        };
+
+        let plan = inventory_unwind_plan(&parent, PositionDirection::Short, 0.25, 100.0)
+            .expect("job inventory should produce an unwind plan");
+        assert_eq!(plan.direction, PositionDirection::Short);
+        assert_eq!(plan.side, OrderSide::Sell);
+        assert_eq!(plan.size, 0.25);
+        assert!(!plan.reduce_only);
     }
 
     #[test]

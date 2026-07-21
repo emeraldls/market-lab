@@ -2814,8 +2814,8 @@ fn validate_bot_trade(definition: &BotJobDefinition, plan: &TradePlan) -> Result
             }
         }
         crate::domain::execution::OrderKind::Market => {
-            if !plan.reduce_only || plan.price.is_some() || plan.time_in_force.is_some() {
-                bail!("mid-price cleanup orders must be reduce-only market orders");
+            if plan.reduce_only || plan.price.is_some() || plan.time_in_force.is_some() {
+                bail!("mid-price inventory unwinds must be non-reduce-only market orders");
             }
         }
     }
