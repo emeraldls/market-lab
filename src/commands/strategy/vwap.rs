@@ -15,10 +15,11 @@ use crate::cli::{
 use crate::commands::execution::build_trade_plan;
 use crate::domain::execution::{ExecutionVenue, PositionDirection, TradePlan};
 use crate::domain::types::{OiCandle, OrderBookLevel, OrderBookSnapshot};
-use crate::providers::bulk::execution::BulkExecutionAdapter;
 use crate::providers::bulk::market_data::BulkProvider;
-use crate::providers::bulk::markets;
 use crate::providers::bulk::ws::{BulkOrderBookStream, BulkTradesStream};
+use crate::providers::execution::ExecutionAdapter;
+use crate::providers::hyperliquid::market_data::HyperliquidProvider;
+use crate::providers::hyperliquid::ws::{HyperliquidOrderBookStream, HyperliquidTradesStream};
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::utils::{normalize_symbol_for_mmt, normalize_to_ms};
 use crate::providers::mmt::ws_client::MmtWsClient;
@@ -44,6 +45,55 @@ const TRAJECTORY_BAND_FRACTION: f64 = 0.005;
 pub(super) const MAX_PARTICIPATION_RATE: f64 = 0.10;
 pub(super) const MAX_TAKER_SLIPPAGE_BPS: f64 = 20.0;
 const FINAL_FILL_WAIT_SECS: u64 = 10;
+
+enum WeightedOrderBookStream {
+    Bulk(BulkOrderBookStream),
+    Hyperliquid(HyperliquidOrderBookStream),
+}
+
+impl WeightedOrderBookStream {
+    async fn connect(venue: ExecutionVenue, symbol: &str, depth: u16) -> Result<Self> {
+        match venue {
+            ExecutionVenue::Bulk => Ok(Self::Bulk(
+                BulkOrderBookStream::connect(symbol, depth).await?,
+            )),
+            ExecutionVenue::Hyperliquid => Ok(Self::Hyperliquid(
+                HyperliquidOrderBookStream::connect(symbol, depth.min(20)).await?,
+            )),
+        }
+    }
+
+    async fn next_snapshot(&mut self) -> Result<OrderBookSnapshot> {
+        match self {
+            Self::Bulk(stream) => stream.next_snapshot().await,
+            Self::Hyperliquid(stream) => stream.next_snapshot().await,
+        }
+    }
+}
+
+enum WeightedTradesStream {
+    Bulk(BulkTradesStream),
+    Hyperliquid(HyperliquidTradesStream),
+}
+
+impl WeightedTradesStream {
+    async fn connect(exchange: &str, symbol: &str) -> Result<Self> {
+        match exchange {
+            "bulk" => Ok(Self::Bulk(BulkTradesStream::connect(symbol).await?)),
+            "hyperliquid" => Ok(Self::Hyperliquid(
+                HyperliquidTradesStream::connect(symbol).await?,
+            )),
+            _ => bail!("standalone live trade adapter for `{exchange}` is not implemented"),
+        }
+    }
+
+    async fn next_trades(&mut self) -> Result<Vec<crate::domain::types::TradeTick>> {
+        match self {
+            Self::Bulk(stream) => stream.next_trades().await,
+            Self::Hyperliquid(stream) => stream.next_trades().await,
+        }
+    }
+}
 
 pub(super) struct WeightedCurves {
     pub(super) trajectory: VolumeCurve,
@@ -403,7 +453,12 @@ impl LiveVolumeTracker {
 
 pub async fn handle(args: RunVwapArgs) -> Result<()> {
     args.validate()?;
-    let selector = VolumeSourceSelector::parse(&args.volume_sources, "bulk", &args.symbol)?;
+    let execution_venue = ExecutionVenue::from(args.venue);
+    let selector = VolumeSourceSelector::parse(
+        &args.volume_sources,
+        execution_venue_name(execution_venue),
+        &args.symbol,
+    )?;
     let direction = direction(args.side);
     let parent = build_trade_plan(&trade_args(&args, args.size, args.margin), direction).await?;
     let start_ms = now_ms()?;
@@ -412,6 +467,7 @@ pub async fn handle(args: RunVwapArgs) -> Result<()> {
         args.duration,
         selector.sources(),
         &parent.internal_symbol,
+        parent.venue,
     )
     .await?;
     let feasibility = VwapFeasibility::assess(parent.size, &curves.execution);
@@ -436,7 +492,7 @@ pub async fn handle(args: RunVwapArgs) -> Result<()> {
             render_plan(&view, args.output)?;
         }
         bail!(
-            "VWAP is not feasible within the {:.2}% BULK participation cap: forecast capacity is {} with an expected shortfall of {}; reduce the amount or increase --duration",
+            "VWAP is not feasible within the {:.2}% execution-venue participation cap: forecast capacity is {} with an expected shortfall of {}; reduce the amount or increase --duration",
             MAX_PARTICIPATION_RATE * 100.0,
             feasibility.forecast_execution_capacity,
             feasibility.forecast_shortfall,
@@ -447,7 +503,7 @@ pub async fn handle(args: RunVwapArgs) -> Result<()> {
     }
     if matches!(args.output, OutputFormat::Terminal) {
         render_plan(&view, args.output)?;
-        if !args.yes && !confirm_live_execution()? {
+        if !args.yes && !confirm_live_execution(parent.venue)? {
             println!("cancelled; no strategy job was submitted");
             return Ok(());
         }
@@ -509,6 +565,7 @@ async fn run_worker(job_id: &str, definition: &VwapJobDefinition) -> Result<()> 
         definition.duration_seconds,
         &definition.volume_sources,
         &definition.symbol,
+        definition.venue,
     )
     .await?;
     let direction = strategy_direction(weighted.side);
@@ -520,7 +577,7 @@ async fn run_worker(job_id: &str, definition: &VwapJobDefinition) -> Result<()> 
     let feasibility = VwapFeasibility::assess(parent.size, &curves.execution);
     if !feasibility.feasible() {
         bail!(
-            "VWAP became infeasible before worker start: forecast BULK capacity is {} with a shortfall of {}",
+            "VWAP became infeasible before worker start: forecast execution-venue capacity is {} with a shortfall of {}",
             feasibility.forecast_execution_capacity,
             feasibility.forecast_shortfall,
         );
@@ -558,25 +615,36 @@ pub(super) async fn run_weighted_execution(
     feed: TrajectoryFeed,
 ) -> Result<()> {
     let direction = strategy_direction(definition.side);
-    let market = markets::market(&definition.symbol)?;
+    let market = crate::markets::exchange_market(
+        execution_venue_name(definition.venue),
+        &definition.symbol,
+    )?;
     let rules = market.execution_rules()?;
     let feasibility = VwapFeasibility::assess(parent.size, &curves.execution);
     if !feasibility.feasible() {
         bail!(
-            "{} became infeasible before worker start: forecast BULK capacity is {} with a shortfall of {}",
+            "{} became infeasible before worker start: forecast execution-venue capacity is {} with a shortfall of {}",
             definition.strategy.to_ascii_uppercase(),
             feasibility.forecast_execution_capacity,
             feasibility.forecast_shortfall,
         );
     }
     let arrival_price = parent.reference_price;
-    let adapter = BulkExecutionAdapter::new()?;
+    let adapter = ExecutionAdapter::new(definition.venue).await?;
     let mut orders = StrategyOrderManager::new(job_id, &parent);
     let started = Instant::now();
-    let mut book_stream = BulkOrderBookStream::connect(&definition.symbol, ORDERBOOK_DEPTH).await?;
+    let mut book_stream =
+        WeightedOrderBookStream::connect(definition.venue, &definition.symbol, ORDERBOOK_DEPTH)
+            .await?;
     let (volume_tx, mut volume_rx) = mpsc::channel(256);
     let trajectory_metric = feed.metric();
-    spawn_live_feeds(&feed, &definition.symbol, start_ms, volume_tx)?;
+    spawn_live_feeds(
+        &feed,
+        definition.venue,
+        &definition.symbol,
+        start_ms,
+        volume_tx,
+    )?;
     let mut trajectory_volume = LiveVolumeTracker::new(start_ms);
     let mut execution_volume = LiveVolumeTracker::new(start_ms);
     let mut participation = ParticipationLedger::default();
@@ -642,7 +710,7 @@ pub(super) async fn run_weighted_execution(
                         )?;
                         if size < remainder - rules.lot_size / 2.0 {
                             bail!(
-                                "{} deadline reached but only {size} of {remainder} can execute within the {:.2}% BULK participation cap and {MAX_TAKER_SLIPPAGE_BPS} bps depth guard",
+                                "{} deadline reached but only {size} of {remainder} can execute within the {:.2}% execution-venue participation cap and {MAX_TAKER_SLIPPAGE_BPS} bps depth guard",
                                 definition.strategy.to_ascii_uppercase(),
                                 MAX_PARTICIPATION_RATE * 100.0,
                             );
@@ -878,6 +946,7 @@ async fn build_curves(
     duration_secs: u64,
     sources: &[VolumeSource],
     symbol: &str,
+    execution_venue: ExecutionVenue,
 ) -> Result<WeightedCurves> {
     let history_to = start_ms / MINUTE_MS * MINUTE_MS;
     let history_from = history_to.saturating_sub(HISTORY_DAYS * 86_400_000);
@@ -886,37 +955,31 @@ async fn build_curves(
         .filter(|source| source.provider == VolumeProvider::Mmt)
         .map(|source| source.exchange.clone())
         .collect::<Vec<_>>();
-    let (bulk_history, mmt_history) = if mmt_exchanges.is_empty() {
-        (
-            fetch_bulk_volume_history(symbol, history_from, history_to).await?,
-            Vec::new(),
-        )
+    let execution_history =
+        fetch_execution_volume_history(execution_venue, symbol, history_from, history_to).await?;
+    let mmt_history = if mmt_exchanges.is_empty() {
+        Vec::new()
     } else {
-        tokio::try_join!(
-            fetch_bulk_volume_history(symbol, history_from, history_to),
-            fetch_mmt_volume_history(&mmt_exchanges, symbol, history_from, history_to),
-        )?
+        fetch_mmt_volume_history(&mmt_exchanges, symbol, history_from, history_to).await?
     };
 
     let mut trajectory_history = mmt_history;
-    let mut includes_bulk = false;
     for source in sources
         .iter()
         .filter(|source| source.provider == VolumeProvider::Direct)
     {
-        match source.exchange.as_str() {
-            "bulk" => includes_bulk = true,
-            exchange => bail!(
-                "standalone volume adapter for `{exchange}` is not implemented; use `{exchange}@mmt`"
-            ),
+        if source.exchange == execution_venue_name(execution_venue) {
+            trajectory_history.extend(execution_history.iter().copied());
+        } else {
+            trajectory_history.extend(
+                fetch_direct_volume_history(&source.exchange, symbol, history_from, history_to)
+                    .await?,
+            );
         }
-    }
-    if includes_bulk {
-        trajectory_history.extend(bulk_history.iter().copied());
     }
     Ok(WeightedCurves {
         trajectory: VolumeCurve::build(start_ms, duration_secs, &trajectory_history)?,
-        execution: VolumeCurve::build(start_ms, duration_secs, &bulk_history)?,
+        execution: VolumeCurve::build(start_ms, duration_secs, &execution_history)?,
     })
 }
 
@@ -937,18 +1000,34 @@ async fn fetch_mmt_volume_history(
         .collect())
 }
 
-pub(super) async fn fetch_bulk_volume_history(
+pub(super) async fn fetch_execution_volume_history(
+    venue: ExecutionVenue,
     symbol: &str,
     from_ms: u64,
     to_ms: u64,
 ) -> Result<Vec<HistoricalVolume>> {
-    const BULK_CHUNK_MINUTES: u64 = 2_000;
-    let chunk_ms = BULK_CHUNK_MINUTES * MINUTE_MS;
+    fetch_direct_volume_history(execution_venue_name(venue), symbol, from_ms, to_ms).await
+}
+
+async fn fetch_direct_volume_history(
+    exchange: &str,
+    symbol: &str,
+    from_ms: u64,
+    to_ms: u64,
+) -> Result<Vec<HistoricalVolume>> {
+    const CHUNK_MINUTES: u64 = 2_000;
+    let chunk_ms = CHUNK_MINUTES * MINUTE_MS;
     let mut cursor = from_ms;
     let mut points = BTreeMap::new();
     while cursor < to_ms {
         let chunk_to = cursor.saturating_add(chunk_ms).min(to_ms);
-        let series = BulkProvider::volume_bars(symbol, "1m", cursor, chunk_to).await?;
+        let series = match exchange {
+            "bulk" => BulkProvider::volume_bars(symbol, "1m", cursor, chunk_to).await?,
+            "hyperliquid" => {
+                HyperliquidProvider::volume_bars(symbol, "1m", cursor, chunk_to).await?
+            }
+            _ => bail!("standalone volume adapter for `{exchange}` is not implemented"),
+        };
         for bar in series.data {
             if bar.t >= from_ms && bar.t < to_ms {
                 points.insert(bar.t, bar.volume);
@@ -964,20 +1043,24 @@ pub(super) async fn fetch_bulk_volume_history(
 
 fn spawn_live_feeds(
     feed: &TrajectoryFeed,
+    execution_venue: ExecutionVenue,
     symbol: &str,
     start_ms: u64,
     sender: mpsc::Sender<LiveVolumeEvent>,
 ) -> Result<()> {
     match feed {
-        TrajectoryFeed::Volume(sources) => spawn_live_volume_feeds(sources, symbol, sender),
+        TrajectoryFeed::Volume(sources) => {
+            spawn_live_volume_feeds(sources, execution_venue, symbol, sender)
+        }
         TrajectoryFeed::OpenInterest(sources) => {
-            spawn_live_open_interest_feeds(sources, symbol, start_ms, sender)
+            spawn_live_open_interest_feeds(sources, execution_venue, symbol, start_ms, sender)
         }
     }
 }
 
 fn spawn_live_volume_feeds(
     sources: &[VolumeSource],
+    execution_venue: ExecutionVenue,
     symbol: &str,
     sender: mpsc::Sender<LiveVolumeEvent>,
 ) -> Result<()> {
@@ -1001,46 +1084,65 @@ fn spawn_live_volume_feeds(
             }
         });
     }
-    let includes_bulk_trajectory = sources.iter().any(|source| {
-        source.provider == VolumeProvider::Direct && source.exchange.as_str() == "bulk"
+    let execution_exchange = execution_venue_name(execution_venue).to_string();
+    let includes_execution_trajectory = sources.iter().any(|source| {
+        source.provider == VolumeProvider::Direct && source.exchange == execution_exchange
     });
-    if let Some(source) = sources.iter().find(|source| {
-        source.provider == VolumeProvider::Direct && source.exchange.as_str() != "bulk"
-    }) {
-        bail!(
-            "standalone live volume adapter for `{}` is not implemented",
-            source.exchange
-        );
-    }
-    let symbol = symbol.to_string();
+    let execution_symbol = symbol.to_string();
+    let execution_sender = sender.clone();
+    let execution_source = execution_exchange.clone();
     tokio::spawn(async move {
-        if let Err(error) =
-            stream_bulk_trades(&symbol, includes_bulk_trajectory, sender.clone()).await
+        if let Err(error) = stream_direct_trades(
+            &execution_source,
+            &execution_symbol,
+            includes_execution_trajectory,
+            execution_sender.clone(),
+        )
+        .await
         {
             let error = format!("{error:#}");
-            let _ = sender
+            let _ = execution_sender
                 .send(LiveVolumeEvent::Degraded {
                     role: LiveVolumeRole::Execution,
-                    source: "bulk".to_string(),
+                    source: execution_source.clone(),
                     error: error.clone(),
                 })
                 .await;
-            if includes_bulk_trajectory {
-                let _ = sender
+            if includes_execution_trajectory {
+                let _ = execution_sender
                     .send(LiveVolumeEvent::Degraded {
                         role: LiveVolumeRole::Trajectory,
-                        source: "bulk".to_string(),
+                        source: execution_source,
                         error,
                     })
                     .await;
             }
         }
     });
+    for source in sources.iter().filter(|source| {
+        source.provider == VolumeProvider::Direct && source.exchange != execution_exchange
+    }) {
+        let source = source.exchange.clone();
+        let symbol = symbol.to_string();
+        let sender = sender.clone();
+        tokio::spawn(async move {
+            if let Err(error) = stream_direct_trades(&source, &symbol, true, sender.clone()).await {
+                let _ = sender
+                    .send(LiveVolumeEvent::Degraded {
+                        role: LiveVolumeRole::Trajectory,
+                        source,
+                        error: format!("{error:#}"),
+                    })
+                    .await;
+            }
+        });
+    }
     Ok(())
 }
 
 fn spawn_live_open_interest_feeds(
     sources: &[OpenInterestSource],
+    execution_venue: ExecutionVenue,
     symbol: &str,
     start_ms: u64,
     sender: mpsc::Sender<LiveVolumeEvent>,
@@ -1072,12 +1174,15 @@ fn spawn_live_open_interest_feeds(
     });
 
     let execution_symbol = symbol.to_string();
+    let execution_source = execution_venue_name(execution_venue).to_string();
     tokio::spawn(async move {
-        if let Err(error) = stream_bulk_trades(&execution_symbol, false, sender.clone()).await {
+        if let Err(error) =
+            stream_direct_trades(&execution_source, &execution_symbol, false, sender.clone()).await
+        {
             let _ = sender
                 .send(LiveVolumeEvent::Degraded {
                     role: LiveVolumeRole::Execution,
-                    source: "bulk".to_string(),
+                    source: execution_source,
                     error: format!("{error:#}"),
                 })
                 .await;
@@ -1177,33 +1282,36 @@ async fn stream_mmt_open_interest(
     }
 }
 
-async fn stream_bulk_trades(
+async fn stream_direct_trades(
+    exchange: &str,
     symbol: &str,
     include_trajectory: bool,
     sender: mpsc::Sender<LiveVolumeEvent>,
 ) -> Result<()> {
-    let mut stream = BulkTradesStream::connect(symbol).await?;
+    let mut stream = WeightedTradesStream::connect(exchange, symbol).await?;
     loop {
         for trade in stream.next_trades().await? {
             sender
                 .send(LiveVolumeEvent::Trade {
                     role: LiveVolumeRole::Execution,
-                    source: "bulk".to_string(),
+                    source: exchange.to_string(),
                     ts_ms: trade.timestamp_ms,
                     size: trade.size.abs(),
                 })
                 .await
-                .context("VWAP worker stopped receiving BULK trades")?;
+                .with_context(|| format!("VWAP worker stopped receiving {exchange} trades"))?;
             if include_trajectory {
                 sender
                     .send(LiveVolumeEvent::Trade {
                         role: LiveVolumeRole::Trajectory,
-                        source: "bulk".to_string(),
+                        source: exchange.to_string(),
                         ts_ms: trade.timestamp_ms,
                         size: trade.size.abs(),
                     })
                     .await
-                    .context("VWAP worker stopped receiving BULK trajectory trades")?;
+                    .with_context(|| {
+                        format!("VWAP worker stopped receiving {exchange} trajectory trades")
+                    })?;
             }
         }
     }
@@ -1280,7 +1388,7 @@ fn passive_price(side: StrategySide, book: &OrderBookSnapshot) -> Result<f64> {
         StrategySide::Buy => book.bids.first(),
         StrategySide::Sell => book.asks.first(),
     }
-    .context("BULK order book has no passive-side level")?;
+    .context("execution order book has no passive-side level")?;
     Ok(level.price)
 }
 
@@ -1337,7 +1445,7 @@ fn taker_size_within_guard(
     };
     let best = levels
         .first()
-        .context("BULK order book has no taker-side liquidity")?
+        .context("execution order book has no taker-side liquidity")?
         .price;
     let guarded_depth = levels
         .iter()
@@ -1439,7 +1547,7 @@ fn append_summary(
             r#type: "strategy.run.finished",
             strategy: definition.strategy,
             job_id,
-            venue: "bulk",
+            venue: execution_venue_name(definition.venue),
             symbol: &definition.symbol,
             side: strategy_side_name(definition.side),
             status,
@@ -1465,7 +1573,7 @@ fn plan_view(input: PlanInput<'_>) -> VwapPlanView<'_> {
     VwapPlanView {
         r#type: "strategy.plan",
         strategy: "vwap",
-        venue: "bulk",
+        venue: execution_venue_name(input.parent.venue),
         symbol: input.symbol,
         side: input.side,
         total_size: input.parent.size,
@@ -1520,7 +1628,7 @@ fn render_plan(plan: &VwapPlanView<'_>, output: OutputFormat) -> Result<()> {
             println!("  history:           {} days", plan.history_days);
             println!("  trajectory volume: {}", plan.forecast_volume);
             println!(
-                "  BULK volume:       {}",
+                "  venue volume:      {}",
                 plan.execution_venue_forecast_volume
             );
             println!(
@@ -1596,6 +1704,7 @@ pub(super) fn worker_trade_args(
         config: None,
         venue: match definition.venue {
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
+            ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
         },
         size: Some(size),
         margin: None,
@@ -1620,8 +1729,11 @@ pub(super) fn worker_trade_args(
     }
 }
 
-fn confirm_live_execution() -> Result<bool> {
-    print!("Submit a live maker-first VWAP job on BULK? [y/N]: ");
+fn confirm_live_execution(venue: ExecutionVenue) -> Result<bool> {
+    print!(
+        "Submit a live maker-first VWAP job on {}? [y/N]: ",
+        execution_venue_name(venue)
+    );
     io::stdout()
         .flush()
         .context("failed to flush confirmation prompt")?;
@@ -1633,6 +1745,13 @@ fn confirm_live_execution() -> Result<bool> {
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
+}
+
+pub(super) fn execution_venue_name(venue: ExecutionVenue) -> &'static str {
+    match venue {
+        ExecutionVenue::Bulk => "bulk",
+        ExecutionVenue::Hyperliquid => "hyperliquid",
+    }
 }
 
 fn direction(side: CliSide) -> PositionDirection {

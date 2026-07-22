@@ -5,6 +5,7 @@ pub enum ProviderKind {
     MarketLab,
     Mmt,
     Bulk,
+    Hyperliquid,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

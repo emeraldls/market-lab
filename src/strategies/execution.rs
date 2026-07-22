@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 
 use crate::domain::execution::{CancelPlan, ExecutionReceipt, ExecutionVenue, Fill, TradePlan};
-use crate::providers::bulk::execution::BulkExecutionAdapter;
+use crate::providers::execution::ExecutionAdapter;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FillProgress {
@@ -166,7 +166,7 @@ impl StrategyOrderManager {
         Ok(true)
     }
 
-    pub async fn reconcile(&mut self, adapter: &BulkExecutionAdapter) -> Result<FillProgress> {
+    pub async fn reconcile(&mut self, adapter: &ExecutionAdapter) -> Result<FillProgress> {
         if let Some(current) = self.working.as_mut() {
             let open = adapter
                 .open_orders(&self.account)
@@ -191,7 +191,7 @@ impl StrategyOrderManager {
 
     pub async fn wait_for_target(
         &mut self,
-        adapter: &BulkExecutionAdapter,
+        adapter: &ExecutionAdapter,
         target_size: f64,
         lot_size: f64,
         timeout: Duration,
@@ -296,6 +296,7 @@ mod tests {
             reason: "normal".to_string(),
             order_id: Some("owned".to_string()),
             maker: true,
+            fee: None,
             slot: 7,
             ts_ms: 1_000,
         };

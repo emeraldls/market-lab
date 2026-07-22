@@ -10,8 +10,9 @@ use crate::cli::{
     CliSide, OutputFormat, RunOiwapArgs, TradeArgs, TradeOrderKind, TradeTimeInForce,
 };
 use crate::commands::execution::build_trade_plan;
-use crate::domain::execution::PositionDirection;
+use crate::domain::execution::{ExecutionVenue, PositionDirection};
 use crate::providers::bulk::market_data::BulkProvider;
+use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::utils::normalize_to_ms;
 use crate::strategies::jobs::{
@@ -25,8 +26,9 @@ use crate::strategies::vwap::{HistoricalVolume, VolumeCurve};
 
 use super::vwap::{
     MAX_PARTICIPATION_RATE, MAX_TAKER_SLIPPAGE_BPS, StrategyStopped, TrajectoryFeed,
-    VwapFeasibility, WeightedCurves, WeightedJobDefinition, fetch_bulk_volume_history,
-    render_submission, run_weighted_execution, strategy_direction, worker_trade_args,
+    VwapFeasibility, WeightedCurves, WeightedJobDefinition, execution_venue_name,
+    fetch_execution_volume_history, render_submission, run_weighted_execution, strategy_direction,
+    worker_trade_args,
 };
 
 const HISTORY_DAYS: u64 = 28;
@@ -127,6 +129,7 @@ pub async fn handle(args: RunOiwapArgs) -> Result<()> {
         args.duration,
         selector.sources(),
         &parent.internal_symbol,
+        parent.venue,
     )
     .await?;
     let feasibility = VwapFeasibility::assess(parent.size, &model.curves.execution);
@@ -162,7 +165,7 @@ pub async fn handle(args: RunOiwapArgs) -> Result<()> {
     }
     if matches!(args.output, OutputFormat::Terminal) {
         render_plan(&view, args.output)?;
-        if !args.yes && !confirm_live_execution()? {
+        if !args.yes && !confirm_live_execution(parent.venue)? {
             println!("cancelled; no strategy job was submitted");
             return Ok(());
         }
@@ -224,6 +227,7 @@ async fn run_worker(job_id: &str, definition: &OiwapJobDefinition) -> Result<()>
         definition.duration_seconds,
         &definition.oi_sources,
         &definition.symbol,
+        definition.venue,
     )
     .await?;
     let parent = build_trade_plan(
@@ -268,14 +272,15 @@ async fn build_curves(
     duration_secs: u64,
     sources: &[OpenInterestSource],
     symbol: &str,
+    execution_venue: ExecutionVenue,
 ) -> Result<OiwapModel> {
     let history_to = start_ms / MINUTE_MS * MINUTE_MS;
     let history_from = history_to.saturating_sub(HISTORY_DAYS * 86_400_000);
     let execution_history_from = history_to.saturating_sub(EXECUTION_HISTORY_DAYS * 86_400_000);
     let (oi_history, execution_history, price_window) = tokio::join!(
         fetch_open_interest_activity(sources, symbol, history_from, history_to),
-        fetch_bulk_volume_history(symbol, execution_history_from, history_to),
-        fetch_bulk_directional_price_window(symbol, history_to),
+        fetch_execution_volume_history(execution_venue, symbol, execution_history_from, history_to,),
+        fetch_directional_price_window(execution_venue, symbol, history_to),
     );
     let oi_history = oi_history?;
     let execution_history = execution_history?;
@@ -386,11 +391,18 @@ async fn fetch_open_interest_activity(
     })
 }
 
-async fn fetch_bulk_directional_price_window(symbol: &str, to_ms: u64) -> Result<(f64, f64)> {
+async fn fetch_directional_price_window(
+    venue: ExecutionVenue,
+    symbol: &str,
+    to_ms: u64,
+) -> Result<(f64, f64)> {
     let from_ms = to_ms.saturating_sub(DIRECTIONAL_CONTEXT_WINDOW_SECS * 1_000);
-    let series = BulkProvider::candles(symbol, "1m", from_ms, to_ms)
-        .await
-        .context("failed to fetch recent BULK candles")?;
+    let series = match venue {
+        ExecutionVenue::Bulk => BulkProvider::candles(symbol, "1m", from_ms, to_ms).await?,
+        ExecutionVenue::Hyperliquid => {
+            HyperliquidProvider::candles(symbol, "1m", from_ms, to_ms).await?
+        }
+    };
     let completed = series
         .data
         .iter()
@@ -398,10 +410,10 @@ async fn fetch_bulk_directional_price_window(symbol: &str, to_ms: u64) -> Result
     let first = completed
         .clone()
         .min_by_key(|candle| candle.t)
-        .context("recent completed BULK candle window is empty")?;
+        .context("recent completed execution-venue candle window is empty")?;
     let last = completed
         .max_by_key(|candle| candle.t)
-        .context("recent completed BULK candle window is empty")?;
+        .context("recent completed execution-venue candle window is empty")?;
     Ok((first.o, last.c))
 }
 
@@ -410,7 +422,7 @@ fn plan_view(input: PlanInput<'_>) -> OiwapPlanView<'_> {
     OiwapPlanView {
         r#type: "strategy.plan",
         strategy: "oiwap",
-        venue: "bulk",
+        venue: execution_venue_name(input.parent.venue),
         symbol: input.symbol,
         side: input.side,
         total_size: input.parent.size,
@@ -614,8 +626,11 @@ fn trade_args(args: &RunOiwapArgs, size: Option<f64>, margin: Option<f64>) -> Tr
     }
 }
 
-fn confirm_live_execution() -> Result<bool> {
-    print!("Submit a live maker-first OIWAP job on BULK? [y/N]: ");
+fn confirm_live_execution(venue: ExecutionVenue) -> Result<bool> {
+    print!(
+        "Submit a live maker-first OIWAP job on {}? [y/N]: ",
+        execution_venue_name(venue)
+    );
     io::stdout()
         .flush()
         .context("failed to flush confirmation prompt")?;

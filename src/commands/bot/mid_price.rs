@@ -23,11 +23,12 @@ use crate::domain::execution::{
     CancelPlan, ExecutionReceipt, ExecutionVenue, Fill, OpenOrder, OrderKind, OrderSide,
     PositionDirection, TimeInForce, TradePlan,
 };
-use crate::domain::types::TopOfBook;
-use crate::providers::bulk::execution::BulkExecutionAdapter;
+use crate::domain::types::{OrderBookSnapshot, TopOfBook};
 use crate::providers::bulk::market_data::{BulkProvider, normalize_timestamp_ms};
-use crate::providers::bulk::markets;
 use crate::providers::bulk::ws::{BulkAccountStream, BulkOrderBookStream};
+use crate::providers::execution::ExecutionAdapter;
+use crate::providers::hyperliquid::market_data::HyperliquidProvider;
+use crate::providers::hyperliquid::ws::{HyperliquidAccountStream, HyperliquidOrderBookStream};
 
 const BOOK_DEPTH: u16 = 1;
 const RECONNECT_MAX_SECONDS: u64 = 5;
@@ -138,11 +139,19 @@ async fn handle(
         PositionDirection::Long,
     )
     .await?;
-    let market = markets::market(&parent.internal_symbol)?;
+    let market = execution_market(parent.venue, &parent.internal_symbol)?;
     let rules = market.execution_rules()?;
-    let top = BulkProvider::live_orderbook(&parent.internal_symbol, BOOK_DEPTH, None).await?;
-    let best_bid = top.bids.first().copied().context("BULK book has no bid")?;
-    let best_ask = top.asks.first().copied().context("BULK book has no ask")?;
+    let top = live_orderbook(parent.venue, &parent.internal_symbol).await?;
+    let best_bid = top
+        .bids
+        .first()
+        .copied()
+        .with_context(|| format!("{} book has no bid", venue_label(parent.venue)))?;
+    let best_ask = top
+        .asks
+        .first()
+        .copied()
+        .with_context(|| format!("{} book has no ask", venue_label(parent.venue)))?;
     let quotes = quote_prices(
         best_bid,
         best_ask,
@@ -202,7 +211,7 @@ async fn handle(
     }
     if matches!(args.output, OutputFormat::Terminal) {
         render_plan(&view, args.output)?;
-        if !args.yes && !confirm_live_execution()? {
+        if !args.yes && !confirm_live_execution(parent.venue)? {
             println!("cancelled; no bot job was submitted");
             return Ok(());
         }
@@ -274,6 +283,7 @@ fn worker_trade_args(definition: &MidPriceJobDefinition) -> TradeArgs {
         config: None,
         venue: match definition.venue {
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
+            ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
         },
         size: Some(definition.max_inventory_size),
         margin: None,
@@ -304,7 +314,7 @@ fn plan_view<'a>(
     MidPricePlanView {
         r#type: "bot.plan",
         bot,
-        venue: "bulk",
+        venue: venue_key(parent.venue),
         symbol: &parent.internal_symbol,
         max_inventory_size: definition.max_inventory_size,
         requested_margin: definition.requested_margin,
@@ -414,8 +424,11 @@ fn render_submission(job: &BotJob, output: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-fn confirm_live_execution() -> Result<bool> {
-    print!("Deploy this live maker-only bot on BULK? [y/N]: ");
+fn confirm_live_execution(venue: ExecutionVenue) -> Result<bool> {
+    print!(
+        "Deploy this live maker-only bot on {}? [y/N]: ",
+        venue_label(venue)
+    );
     io::stdout()
         .flush()
         .context("failed to flush confirmation prompt")?;
@@ -427,6 +440,36 @@ fn confirm_live_execution() -> Result<bool> {
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
+}
+
+fn venue_key(venue: ExecutionVenue) -> &'static str {
+    match venue {
+        ExecutionVenue::Bulk => "bulk",
+        ExecutionVenue::Hyperliquid => "hyperliquid",
+    }
+}
+
+fn venue_label(venue: ExecutionVenue) -> &'static str {
+    match venue {
+        ExecutionVenue::Bulk => "BULK",
+        ExecutionVenue::Hyperliquid => "Hyperliquid testnet",
+    }
+}
+
+fn execution_market(
+    venue: ExecutionVenue,
+    symbol: &str,
+) -> Result<std::sync::Arc<crate::markets::Market>> {
+    crate::markets::exchange_market(venue_key(venue), symbol)
+}
+
+async fn live_orderbook(venue: ExecutionVenue, symbol: &str) -> Result<OrderBookSnapshot> {
+    match venue {
+        ExecutionVenue::Bulk => BulkProvider::live_orderbook(symbol, BOOK_DEPTH, None).await,
+        ExecutionVenue::Hyperliquid => {
+            HyperliquidProvider::live_orderbook(symbol, BOOK_DEPTH, None).await
+        }
+    }
 }
 
 fn bias_name(bias: f64) -> &'static str {
@@ -728,13 +771,38 @@ impl FillLedger {
     }
 }
 
-fn spawn_book_feed(symbol: String) -> watch::Receiver<BookFeedState> {
+enum BotOrderBookStream {
+    Bulk(BulkOrderBookStream),
+    Hyperliquid(HyperliquidOrderBookStream),
+}
+
+impl BotOrderBookStream {
+    async fn connect(venue: ExecutionVenue, symbol: &str) -> Result<Self> {
+        match venue {
+            ExecutionVenue::Bulk => Ok(Self::Bulk(
+                BulkOrderBookStream::connect(symbol, BOOK_DEPTH).await?,
+            )),
+            ExecutionVenue::Hyperliquid => Ok(Self::Hyperliquid(
+                HyperliquidOrderBookStream::connect(symbol, BOOK_DEPTH).await?,
+            )),
+        }
+    }
+
+    async fn next_top(&mut self) -> Result<TopOfBook> {
+        match self {
+            Self::Bulk(stream) => stream.next_top().await,
+            Self::Hyperliquid(stream) => stream.next_top().await,
+        }
+    }
+}
+
+fn spawn_book_feed(venue: ExecutionVenue, symbol: String) -> watch::Receiver<BookFeedState> {
     let (sender, receiver) = watch::channel(BookFeedState::default());
     tokio::spawn(async move {
         let mut delay = 1_u64;
         let mut revision = 0_u64;
         loop {
-            match BulkOrderBookStream::connect(&symbol, BOOK_DEPTH).await {
+            match BotOrderBookStream::connect(venue, &symbol).await {
                 Ok(mut stream) => {
                     delay = 1;
                     loop {
@@ -788,10 +856,35 @@ fn spawn_book_feed(symbol: String) -> watch::Receiver<BookFeedState> {
     receiver
 }
 
-fn spawn_account_feed(account: String) -> mpsc::Receiver<AccountFeedEvent> {
+enum BotAccountStream {
+    Bulk(BulkAccountStream),
+    Hyperliquid(HyperliquidAccountStream),
+}
+
+impl BotAccountStream {
+    async fn connect(venue: ExecutionVenue, account: &str) -> Result<Self> {
+        match venue {
+            ExecutionVenue::Bulk => Ok(Self::Bulk(BulkAccountStream::connect(account).await?)),
+            ExecutionVenue::Hyperliquid => Ok(Self::Hyperliquid(
+                HyperliquidAccountStream::connect(account).await?,
+            )),
+        }
+    }
+
+    async fn next_events(&mut self) -> Result<Vec<Value>> {
+        match self {
+            Self::Bulk(stream) => Ok(vec![stream.next_event().await?]),
+            Self::Hyperliquid(stream) => {
+                normalize_hyperliquid_account_events(stream.next_event().await?)
+            }
+        }
+    }
+}
+
+fn spawn_account_feed(venue: ExecutionVenue, account: String) -> mpsc::Receiver<AccountFeedEvent> {
     let (sender, receiver) = mpsc::channel(1024);
     tokio::spawn(async move {
-        let adapter = match BulkExecutionAdapter::new() {
+        let adapter = match ExecutionAdapter::new(venue).await {
             Ok(adapter) => adapter,
             Err(error) => {
                 let _ = sender
@@ -802,7 +895,7 @@ fn spawn_account_feed(account: String) -> mpsc::Receiver<AccountFeedEvent> {
         };
         let mut delay = 1_u64;
         loop {
-            match BulkAccountStream::connect(&account).await {
+            match BotAccountStream::connect(venue, &account).await {
                 Ok(mut stream) => {
                     let (open_orders, fills) =
                         tokio::join!(adapter.open_orders(&account), adapter.fills(&account),);
@@ -837,10 +930,12 @@ fn spawn_account_feed(account: String) -> mpsc::Receiver<AccountFeedEvent> {
                     }
                     delay = 1;
                     loop {
-                        match stream.next_event().await {
-                            Ok(value) => {
-                                if sender.send(AccountFeedEvent::Data(value)).await.is_err() {
-                                    return;
+                        match stream.next_events().await {
+                            Ok(values) => {
+                                for value in values {
+                                    if sender.send(AccountFeedEvent::Data(value)).await.is_err() {
+                                        return;
+                                    }
                                 }
                             }
                             Err(error) => {
@@ -877,6 +972,108 @@ fn result_error<T>(result: Result<T>) -> String {
     result.map_or_else(|error| format!("{error:#}"), |_| "ok".to_string())
 }
 
+fn normalize_hyperliquid_account_events(value: Value) -> Result<Vec<Value>> {
+    match value.get("channel").and_then(Value::as_str) {
+        Some("orderUpdates") => value
+            .get("data")
+            .and_then(Value::as_array)
+            .context("Hyperliquid orderUpdates omitted its update list")?
+            .iter()
+            .map(normalize_hyperliquid_order_update)
+            .collect(),
+        Some("user") => value
+            .pointer("/data/fills")
+            .and_then(Value::as_array)
+            .map_or_else(
+                || Ok(Vec::new()),
+                |fills| fills.iter().map(normalize_hyperliquid_fill).collect(),
+            ),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn normalize_hyperliquid_order_update(update: &Value) -> Result<Value> {
+    let order = update
+        .get("order")
+        .context("Hyperliquid order update omitted order")?;
+    let order_id = json_identifier(
+        order
+            .get("oid")
+            .context("Hyperliquid order update omitted oid")?,
+    )?;
+    let raw_status = update
+        .get("status")
+        .and_then(Value::as_str)
+        .context("Hyperliquid order update omitted status")?;
+    let size = json_number(order.get("sz"), "order size")?.unwrap_or_default();
+    let original_size = json_number(order.get("origSz"), "original order size")?.unwrap_or(size);
+    let is_buy = order.get("side").and_then(Value::as_str) != Some("A");
+    let signed_size = if is_buy { size } else { -size };
+    Ok(serde_json::json!({
+        "type": "orderUpdate",
+        "oid": order_id,
+        "status": normalize_hyperliquid_order_status(raw_status),
+        "ts": update.get("statusTimestamp").and_then(Value::as_u64).unwrap_or_default(),
+        "px": json_number(order.get("limitPx"), "order price")?.unwrap_or_default(),
+        "origSz": original_size,
+        "sz": signed_size,
+        "isBuy": is_buy,
+    }))
+}
+
+fn normalize_hyperliquid_fill(fill: &Value) -> Result<Value> {
+    let order_id = json_identifier(fill.get("oid").context("Hyperliquid fill omitted oid")?)?;
+    let raw_fee = json_number(fill.get("fee"), "fill fee")?;
+    Ok(serde_json::json!({
+        "type": "fill",
+        "orderId": order_id,
+        "timestamp": fill.get("time").and_then(Value::as_u64).unwrap_or_default(),
+        "isBuy": fill.get("side").and_then(Value::as_str) == Some("B"),
+        "size": json_number(fill.get("sz"), "fill size")?.unwrap_or_default(),
+        "price": json_number(fill.get("px"), "fill price")?.unwrap_or_default(),
+        // Hyperliquid reports a positive number for a cost and a negative number
+        // for a rebate. Market Lab's performance ledger uses the opposite sign.
+        "fee": raw_fee.map(|fee| -fee),
+    }))
+}
+
+fn json_identifier(value: &Value) -> Result<String> {
+    match value {
+        Value::String(value) => Ok(value.clone()),
+        Value::Number(value) => Ok(value.to_string()),
+        _ => bail!("Hyperliquid order id is neither a string nor an integer"),
+    }
+}
+
+fn json_number(value: Option<&Value>, field: &str) -> Result<Option<f64>> {
+    value
+        .map(|value| match value {
+            Value::Number(number) => number
+                .as_f64()
+                .with_context(|| format!("invalid Hyperliquid {field}")),
+            Value::String(number) => number
+                .parse::<f64>()
+                .with_context(|| format!("invalid Hyperliquid {field} `{number}`")),
+            Value::Null => Ok(0.0),
+            _ => bail!("invalid Hyperliquid {field}"),
+        })
+        .transpose()
+}
+
+fn normalize_hyperliquid_order_status(status: &str) -> &str {
+    if status.eq_ignore_ascii_case("open") {
+        "resting"
+    } else if status.eq_ignore_ascii_case("filled") {
+        "filled"
+    } else if status.eq_ignore_ascii_case("canceled") || status.eq_ignore_ascii_case("cancelled") {
+        "cancelled"
+    } else if status.eq_ignore_ascii_case("rejected") || status.ends_with("Canceled") {
+        "rejected"
+    } else {
+        status
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ObservedFill {
     timestamp: u64,
@@ -889,22 +1086,22 @@ struct ObservedFill {
 
 async fn run_worker(job_id: &str, mode: MidMode, definition: &MidPriceJobDefinition) -> Result<()> {
     let parent = build_trade_plan(&worker_trade_args(definition), PositionDirection::Long).await?;
-    let market = markets::market(&definition.symbol)?;
+    let market = execution_market(definition.venue, &definition.symbol)?;
     let rules = market.execution_rules()?;
-    let adapter = BulkExecutionAdapter::new()?;
+    let adapter = ExecutionAdapter::new(definition.venue).await?;
 
-    let initial_book = BulkProvider::live_orderbook(&definition.symbol, BOOK_DEPTH, None).await?;
+    let initial_book = live_orderbook(definition.venue, &definition.symbol).await?;
     let initial_quotes = quote_prices(
         initial_book
             .bids
             .first()
             .copied()
-            .context("BULK book has no bid")?,
+            .with_context(|| format!("{} book has no bid", venue_label(definition.venue)))?,
         initial_book
             .asks
             .first()
             .copied()
-            .context("BULK book has no ask")?,
+            .with_context(|| format!("{} book has no ask", venue_label(definition.venue)))?,
         definition.spread_bps,
         rules.tick_size,
         rules.price_precision,
@@ -945,8 +1142,8 @@ async fn run_worker(job_id: &str, mode: MidMode, definition: &MidPriceJobDefinit
 
     let started = Instant::now();
     let deadline = started + Duration::from_secs(definition.duration_seconds);
-    let mut book = spawn_book_feed(definition.symbol.clone());
-    let mut account_events = spawn_account_feed(parent.account.clone());
+    let mut book = spawn_book_feed(definition.venue, definition.symbol.clone());
+    let mut account_events = spawn_account_feed(definition.venue, parent.account.clone());
     let mut account_connected = false;
     let mut buy = QuoteSlot::default();
     let mut sell = QuoteSlot::default();
@@ -994,12 +1191,14 @@ async fn run_worker(job_id: &str, mode: MidMode, definition: &MidPriceJobDefinit
                         }
                         AccountFeedEvent::Recovery { open_orders, fills } => {
                             reconcile_recovery(
-                                job_id,
-                                mode.name(),
-                                current_mark(&book, parent.reference_price),
-                                &open_orders,
+                                RecoveryContext {
+                                    job_id,
+                                    bot: mode.name(),
+                                    mark_price: current_mark(&book, parent.reference_price),
+                                    open_orders: &open_orders,
+                                    owned_orders: &owned_orders,
+                                },
                                 fills,
-                                &owned_orders,
                                 &mut buy,
                                 &mut sell,
                                 &mut ledger,
@@ -1279,7 +1478,8 @@ fn quote_is_stale_away_from_market(
     moved_away && (proposed_price - current_price).abs() / current_price * 10_000.0 > tolerance_bps
 }
 
-fn should_refresh_quote_price(
+#[derive(Clone, Copy)]
+struct QuoteRefreshCheck {
     mode: MidMode,
     side: QuoteSide,
     current_price: f64,
@@ -1288,19 +1488,24 @@ fn should_refresh_quote_price(
     tolerance_bps: f64,
     resting_age: Duration,
     minimum_age: Duration,
-) -> bool {
-    if resting_age < minimum_age {
+}
+
+fn should_refresh_quote_price(check: QuoteRefreshCheck) -> bool {
+    if check.resting_age < check.minimum_age {
         return false;
     }
-    match mode {
+    match check.mode {
         MidMode::QuoteProtection => {
-            let absolute_threshold =
-                (tick_size * 2.0).max(current_price * STRICT_REFRESH_TOLERANCE_BPS / 10_000.0);
-            (proposed_price - current_price).abs() >= absolute_threshold
+            let absolute_threshold = (check.tick_size * 2.0)
+                .max(check.current_price * STRICT_REFRESH_TOLERANCE_BPS / 10_000.0);
+            (check.proposed_price - check.current_price).abs() >= absolute_threshold
         }
-        MidMode::FillPriority => {
-            quote_is_stale_away_from_market(side, current_price, proposed_price, tolerance_bps)
-        }
+        MidMode::FillPriority => quote_is_stale_away_from_market(
+            check.side,
+            check.current_price,
+            check.proposed_price,
+            check.tolerance_bps,
+        ),
     }
 }
 
@@ -1330,16 +1535,16 @@ fn reconcile_quote(
     if let Some(live) = slot.live.as_mut() {
         let replace = desired.is_none_or(|(price, size)| {
             let price_moved = policy.replace_price
-                && should_refresh_quote_price(
+                && should_refresh_quote_price(QuoteRefreshCheck {
                     mode,
                     side,
-                    live.price,
-                    price,
+                    current_price: live.price,
+                    proposed_price: price,
                     tick_size,
-                    refresh_tolerance_bps,
-                    live.submitted_at.elapsed(),
-                    minimum_quote_age,
-                );
+                    tolerance_bps: refresh_tolerance_bps,
+                    resting_age: live.submitted_at.elapsed(),
+                    minimum_age: minimum_quote_age,
+                });
             let size_difference = (live.size - size).abs();
             let size_changed = policy.replace_size
                 && size_difference >= lot_size
@@ -1458,7 +1663,7 @@ fn apply_action_completion(
             },
             Err(error),
         ) => {
-            let crossing = error.to_ascii_lowercase().contains("rejectedcrossing");
+            let crossing = is_post_only_crossing_message(&error);
             append_quote(
                 job_id,
                 bot,
@@ -1492,6 +1697,16 @@ fn apply_action_completion(
             }
         }
         (ActionKind::Cancel { order_id }, Err(error)) => {
+            if is_order_gone_message(&error) {
+                if slot
+                    .live
+                    .as_ref()
+                    .is_some_and(|quote| quote.order_id == order_id)
+                {
+                    slot.live = None;
+                }
+                return Ok(());
+            }
             if let Some(live) = slot.live.as_mut()
                 && live.order_id == order_id
             {
@@ -1626,21 +1841,39 @@ fn apply_account_event(
             let Some(status) = value.get("status").and_then(Value::as_str) else {
                 return Ok(());
             };
+            let working_size = [&*buy, &*sell]
+                .into_iter()
+                .filter_map(|slot| slot.live.as_ref())
+                .find(|quote| quote.order_id == order_id)
+                .map(|quote| quote.size);
             if is_terminal_order_status(status) {
                 terminal_statuses.insert(order_id.to_string(), status.to_string());
                 clear_live_order(order_id, buy, sell);
             }
             if owned_orders.contains(order_id) && is_terminal_order_status(status) {
                 let side = value
-                    .get("sz")
-                    .and_then(Value::as_f64)
-                    .map_or(QuoteSide::Buy, |size| {
-                        if size < 0.0 {
-                            QuoteSide::Sell
-                        } else {
-                            QuoteSide::Buy
-                        }
+                    .get("isBuy")
+                    .and_then(Value::as_bool)
+                    .map(|buy| if buy { QuoteSide::Buy } else { QuoteSide::Sell })
+                    .unwrap_or_else(|| {
+                        value
+                            .get("sz")
+                            .and_then(Value::as_f64)
+                            .map_or(QuoteSide::Buy, |size| {
+                                if size < 0.0 {
+                                    QuoteSide::Sell
+                                } else {
+                                    QuoteSide::Buy
+                                }
+                            })
                     });
+                let original_size = value
+                    .get("origSz")
+                    .and_then(Value::as_f64)
+                    .filter(|size| *size > 0.0)
+                    .or(working_size)
+                    .unwrap_or_default()
+                    .abs();
                 append_quote(
                     job_id,
                     bot,
@@ -1648,11 +1881,7 @@ fn apply_account_event(
                     status,
                     order_id,
                     value.get("px").and_then(Value::as_f64).unwrap_or(0.0),
-                    value
-                        .get("origSz")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0)
-                        .abs(),
+                    original_size,
                 )?;
             }
         }
@@ -1661,18 +1890,23 @@ fn apply_account_event(
     Ok(())
 }
 
-fn reconcile_recovery(
-    job_id: &str,
-    bot: &str,
+struct RecoveryContext<'a> {
+    job_id: &'a str,
+    bot: &'a str,
     mark_price: f64,
-    open_orders: &[OpenOrder],
+    open_orders: &'a [OpenOrder],
+    owned_orders: &'a HashSet<String>,
+}
+
+fn reconcile_recovery(
+    context: RecoveryContext<'_>,
     fills: Vec<Fill>,
-    owned_orders: &HashSet<String>,
     buy: &mut QuoteSlot,
     sell: &mut QuoteSlot,
     ledger: &mut FillLedger,
 ) -> Result<()> {
-    let open_ids = open_orders
+    let open_ids = context
+        .open_orders
         .iter()
         .map(|order| order.order_id.as_str())
         .collect::<HashSet<_>>();
@@ -1690,7 +1924,7 @@ fn reconcile_recovery(
         let Some(order_id) = fill.order_id.as_deref() else {
             continue;
         };
-        if !owned_orders.contains(order_id) {
+        if !context.owned_orders.contains(order_id) {
             continue;
         }
         let observed = ObservedFill {
@@ -1698,7 +1932,7 @@ fn reconcile_recovery(
             buy: fill.side == OrderSide::Buy,
             size: fill.amount,
             price: fill.price,
-            fee: None,
+            fee: fill.fee,
         };
         let Some(key) = FillLedger::key(
             order_id,
@@ -1712,7 +1946,14 @@ fn reconcile_recovery(
         let occurrence = response_counts.entry(key).or_default();
         *occurrence += 1;
         if ledger.record_recovery_occurrence(order_id, &observed, *occurrence) {
-            append_fill(job_id, bot, mark_price, ledger, order_id, &observed)?;
+            append_fill(
+                context.job_id,
+                context.bot,
+                context.mark_price,
+                ledger,
+                order_id,
+                &observed,
+            )?;
             apply_fill_to_working_quote(order_id, observed.size, buy, sell);
         }
     }
@@ -1898,7 +2139,7 @@ async fn cleanup(
     mark_price: f64,
     definition: &MidPriceJobDefinition,
     parent: &TradePlan,
-    adapter: &BulkExecutionAdapter,
+    adapter: &ExecutionAdapter,
     buy: &mut QuoteSlot,
     sell: &mut QuoteSlot,
     ledger: &mut FillLedger,
@@ -1912,12 +2153,14 @@ async fn cleanup(
         );
         let open_orders = open_orders?;
         reconcile_recovery(
-            job_id,
-            bot,
-            mark_price,
-            &open_orders,
+            RecoveryContext {
+                job_id,
+                bot,
+                mark_price,
+                open_orders: &open_orders,
+                owned_orders,
+            },
             fills?,
-            owned_orders,
             buy,
             sell,
             ledger,
@@ -1930,14 +2173,8 @@ async fn cleanup(
             break;
         }
         for order in remaining {
-            match adapter
-                .cancel_order(
-                    crate::credentials::active_bulk_credential()?,
-                    &parent.venue_symbol,
-                    &order.order_id,
-                )
-                .await
-            {
+            let plan = cancel_plan(parent, order.order_id.clone())?;
+            match adapter.cancel_order(&plan).await {
                 Ok(receipt) => append_quote(
                     job_id,
                     bot,
@@ -1961,7 +2198,7 @@ async fn cleanup(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let market = markets::market(&definition.symbol)?;
+    let market = execution_market(definition.venue, &definition.symbol)?;
     let rules = market.execution_rules()?;
     let inventory = ledger.inventory();
     let size = floor_to_step(inventory.abs(), rules.lot_size, rules.size_precision);
@@ -1983,7 +2220,7 @@ async fn cleanup(
     };
     let plan = inventory_unwind_plan(parent, direction, size, mark_price)?;
     let receipt = adapter
-        .submit_trade(crate::credentials::active_bulk_credential()?, &plan)
+        .submit_trade(&plan)
         .await
         .context("failed to unwind mid-price bot-owned inventory")?;
     let order_id = receipt
@@ -1994,12 +2231,14 @@ async fn cleanup(
     let deadline = Instant::now() + CLEANUP_TIMEOUT;
     loop {
         reconcile_recovery(
-            job_id,
-            bot,
-            mark_price,
-            &[],
+            RecoveryContext {
+                job_id,
+                bot,
+                mark_price,
+                open_orders: &[],
+                owned_orders,
+            },
             adapter.fills(&parent.account).await?,
-            owned_orders,
             buy,
             sell,
             ledger,
@@ -2019,8 +2258,21 @@ async fn cleanup(
 }
 
 fn is_order_gone_error(error: &anyhow::Error) -> bool {
-    let message = format!("{error:#}").to_ascii_lowercase();
+    is_order_gone_message(&format!("{error:#}"))
+}
+
+fn is_post_only_crossing_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("rejectedcrossing")
+        || message.contains("post only order would have immediately matched")
+        || message.contains("post-only order would have immediately matched")
+}
+
+fn is_order_gone_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
     message.contains("not found")
+        || message.contains("order was never placed")
+        || message.contains("already canceled")
         || message.contains("already filled")
         || message.contains("already cancelled")
 }
@@ -2041,6 +2293,29 @@ fn now_ms() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_hyperliquid_cancel_rejection_is_not_fatal() {
+        assert!(is_order_gone_message(
+            "Hyperliquid rejected cancellation: Order was never placed, already canceled, or filled. asset=3"
+        ));
+        assert!(!is_order_gone_message(
+            "Hyperliquid rejected cancellation: invalid signature"
+        ));
+    }
+
+    #[test]
+    fn hyperliquid_post_only_crossing_is_retryable() {
+        assert!(is_post_only_crossing_message(
+            "Hyperliquid rejected order: Post only order would have immediately matched, bbo was 66621@66642. asset=3"
+        ));
+        assert!(is_post_only_crossing_message(
+            "BULK rejected order: rejectedCrossing"
+        ));
+        assert!(!is_post_only_crossing_message(
+            "Hyperliquid rejected order: invalid signature"
+        ));
+    }
 
     #[test]
     fn fill_ledger_reconciles_recovery_counts_without_losing_identical_fills() {
@@ -2184,26 +2459,21 @@ mod tests {
 
     #[test]
     fn refresh_time_is_the_minimum_lifetime_of_each_quote() {
-        assert!(!should_refresh_quote_price(
-            MidMode::FillPriority,
-            QuoteSide::Buy,
-            100.0,
-            101.0,
-            0.01,
-            0.5,
-            Duration::from_millis(999),
-            Duration::from_secs(1),
-        ));
-        assert!(should_refresh_quote_price(
-            MidMode::FillPriority,
-            QuoteSide::Buy,
-            100.0,
-            101.0,
-            0.01,
-            0.5,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-        ));
+        let check = QuoteRefreshCheck {
+            mode: MidMode::FillPriority,
+            side: QuoteSide::Buy,
+            current_price: 100.0,
+            proposed_price: 101.0,
+            tick_size: 0.01,
+            tolerance_bps: 0.5,
+            resting_age: Duration::from_millis(999),
+            minimum_age: Duration::from_secs(1),
+        };
+        assert!(!should_refresh_quote_price(check));
+        assert!(should_refresh_quote_price(QuoteRefreshCheck {
+            resting_age: Duration::from_secs(1),
+            ..check
+        }));
     }
 
     #[test]
@@ -2214,41 +2484,95 @@ mod tests {
             (QuoteSide::Sell, 99.99),
             (QuoteSide::Sell, 100.01),
         ] {
-            assert!(should_refresh_quote_price(
-                MidMode::QuoteProtection,
+            assert!(should_refresh_quote_price(QuoteRefreshCheck {
+                mode: MidMode::QuoteProtection,
                 side,
-                100.0,
+                current_price: 100.0,
                 proposed_price,
-                0.001,
-                999.0,
-                STRICT_MINIMUM_QUOTE_AGE,
-                STRICT_MINIMUM_QUOTE_AGE,
-            ));
+                tick_size: 0.001,
+                tolerance_bps: 999.0,
+                resting_age: STRICT_MINIMUM_QUOTE_AGE,
+                minimum_age: STRICT_MINIMUM_QUOTE_AGE,
+            }));
         }
     }
 
     #[test]
     fn quote_protection_uses_the_larger_of_two_ticks_and_quarter_basis_point() {
-        assert!(!should_refresh_quote_price(
-            MidMode::QuoteProtection,
-            QuoteSide::Buy,
-            100.0,
-            100.019,
-            0.01,
-            999.0,
-            STRICT_MINIMUM_QUOTE_AGE,
-            STRICT_MINIMUM_QUOTE_AGE,
-        ));
-        assert!(should_refresh_quote_price(
-            MidMode::QuoteProtection,
-            QuoteSide::Buy,
-            100.0,
-            100.026,
-            0.001,
-            999.0,
-            STRICT_MINIMUM_QUOTE_AGE,
-            STRICT_MINIMUM_QUOTE_AGE,
-        ));
+        let check = QuoteRefreshCheck {
+            mode: MidMode::QuoteProtection,
+            side: QuoteSide::Buy,
+            current_price: 100.0,
+            proposed_price: 100.019,
+            tick_size: 0.01,
+            tolerance_bps: 999.0,
+            resting_age: STRICT_MINIMUM_QUOTE_AGE,
+            minimum_age: STRICT_MINIMUM_QUOTE_AGE,
+        };
+        assert!(!should_refresh_quote_price(check));
+        assert!(should_refresh_quote_price(QuoteRefreshCheck {
+            proposed_price: 100.026,
+            tick_size: 0.001,
+            ..check
+        }));
+    }
+
+    #[test]
+    fn hyperliquid_account_events_normalize_orders_fills_and_fee_signs() {
+        let orders = normalize_hyperliquid_account_events(serde_json::json!({
+            "channel": "orderUpdates",
+            "data": [{
+                "order": {
+                    "oid": 42,
+                    "side": "A",
+                    "limitPx": "101.25",
+                    "sz": "0.5"
+                },
+                "status": "open",
+                "statusTimestamp": 123
+            }]
+        }))
+        .expect("order event normalizes");
+        assert_eq!(orders[0]["oid"], "42");
+        assert_eq!(orders[0]["status"], "resting");
+        assert_eq!(orders[0]["sz"], -0.5);
+        assert_eq!(orders[0]["origSz"], 0.5);
+        assert_eq!(orders[0]["isBuy"], false);
+
+        let filled_orders = normalize_hyperliquid_account_events(serde_json::json!({
+            "channel": "orderUpdates",
+            "data": [{
+                "order": {
+                    "oid": 43,
+                    "side": "A",
+                    "limitPx": "101.25",
+                    "sz": "0",
+                    "origSz": "0.5"
+                },
+                "status": "filled",
+                "statusTimestamp": 124
+            }]
+        }))
+        .expect("filled order event normalizes");
+        assert_eq!(filled_orders[0]["status"], "filled");
+        assert_eq!(filled_orders[0]["origSz"], 0.5);
+        assert_eq!(filled_orders[0]["isBuy"], false);
+
+        let fills = normalize_hyperliquid_account_events(serde_json::json!({
+            "channel": "user",
+            "data": {"fills": [{
+                "oid": 42,
+                "side": "B",
+                "px": "100.5",
+                "sz": "0.25",
+                "fee": "0.01",
+                "time": 124
+            }]}
+        }))
+        .expect("fill event normalizes");
+        assert_eq!(fills[0]["orderId"], "42");
+        assert_eq!(fills[0]["isBuy"], true);
+        assert_eq!(fills[0]["fee"], -0.01);
     }
 
     #[test]

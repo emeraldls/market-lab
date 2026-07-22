@@ -12,7 +12,6 @@ use crate::cli::{
 };
 use crate::commands::execution::build_trade_plan;
 use crate::domain::execution::{ExecutionVenue, PositionDirection};
-use crate::providers::bulk::markets;
 use crate::strategies::jobs::{
     StrategyJob, StrategyJobDefinition, StrategyJobSubmission, StrategySide, TwapJobDefinition,
 };
@@ -90,7 +89,8 @@ pub async fn handle(args: RunTwapArgs) -> Result<()> {
     args.validate()?;
     let direction = direction(args.side);
     let parent = build_trade_plan(&trade_args(&args, args.size, args.margin), direction).await?;
-    let market = markets::market(&parent.internal_symbol)?;
+    let market =
+        crate::markets::exchange_market(venue_name(parent.venue), &parent.internal_symbol)?;
     let rules = market.execution_rules()?;
     let schedule = TwapSchedule::build(
         parent.size,
@@ -102,6 +102,7 @@ pub async fn handle(args: RunTwapArgs) -> Result<()> {
     )?;
     let view = plan_view(
         &args.symbol,
+        parent.venue,
         side_name(args.side),
         &schedule,
         parent.reference_price,
@@ -120,7 +121,7 @@ pub async fn handle(args: RunTwapArgs) -> Result<()> {
     }
     if matches!(args.output, OutputFormat::Terminal) {
         render_plan(&view, args.output)?;
-        if !args.yes && !confirm_live_execution(schedule.children.len())? {
+        if !args.yes && !confirm_live_execution(parent.venue, schedule.children.len())? {
             println!("cancelled; no strategy job was submitted");
             return Ok(());
         }
@@ -186,7 +187,8 @@ async fn run_worker(job_id: &str, definition: &TwapJobDefinition) -> Result<()> 
         direction,
     )
     .await?;
-    let market = markets::market(&parent.internal_symbol)?;
+    let market =
+        crate::markets::exchange_market(venue_name(parent.venue), &parent.internal_symbol)?;
     let rules = market.execution_rules()?;
     let schedule = TwapSchedule::build(
         parent.size,
@@ -198,6 +200,7 @@ async fn run_worker(job_id: &str, definition: &TwapJobDefinition) -> Result<()> 
     )?;
     let view = plan_view(
         &definition.symbol,
+        definition.venue,
         strategy_side_name(definition.side),
         &schedule,
         parent.reference_price,
@@ -310,7 +313,7 @@ fn append_summary(
             r#type: "strategy.run.finished",
             strategy: "twap",
             job_id,
-            venue: "bulk",
+            venue: venue_name(definition.venue),
             symbol: &definition.symbol,
             side: strategy_side_name(definition.side),
             status,
@@ -349,6 +352,7 @@ fn worker_trade_args(definition: &TwapJobDefinition, size: f64) -> TradeArgs {
         config: None,
         venue: match definition.venue {
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
+            ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
         },
         size: Some(size),
         margin: None,
@@ -368,6 +372,7 @@ fn worker_trade_args(definition: &TwapJobDefinition, size: f64) -> TradeArgs {
 #[allow(clippy::too_many_arguments)]
 fn plan_view<'a>(
     symbol: &'a str,
+    venue: ExecutionVenue,
     side: &'static str,
     schedule: &TwapSchedule,
     reference_price: f64,
@@ -389,7 +394,7 @@ fn plan_view<'a>(
     TwapPlanView {
         r#type: "strategy.plan",
         strategy: "twap",
-        venue: "bulk",
+        venue: venue_name(venue),
         symbol,
         side,
         total_size: schedule.total_size,
@@ -439,7 +444,10 @@ fn render_plan(plan: &TwapPlanView<'_>, output: OutputFormat) -> Result<()> {
                 plan.smallest_child_size, plan.largest_child_size
             );
             println!("  leverage:          {}x", plan.leverage);
-            println!("  liquidation price: determined by BULK after fills");
+            println!(
+                "  liquidation price: determined by {} after fills",
+                plan.venue
+            );
             println!("  reduce only:       {}", plan.reduce_only);
         }
         OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
@@ -465,8 +473,11 @@ fn render_submission(job: &StrategyJob, output: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-fn confirm_live_execution(children: usize) -> Result<bool> {
-    print!("Submit a live TWAP job with {children} BULK market orders? [y/N]: ");
+fn confirm_live_execution(venue: ExecutionVenue, children: usize) -> Result<bool> {
+    print!(
+        "Submit a live TWAP job with {children} {} market orders? [y/N]: ",
+        venue_name(venue)
+    );
     io::stdout()
         .flush()
         .context("failed to flush confirmation prompt")?;
@@ -478,6 +489,13 @@ fn confirm_live_execution(children: usize) -> Result<bool> {
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
+}
+
+fn venue_name(venue: ExecutionVenue) -> &'static str {
+    match venue {
+        ExecutionVenue::Bulk => "bulk",
+        ExecutionVenue::Hyperliquid => "hyperliquid",
+    }
 }
 
 fn direction(side: CliSide) -> PositionDirection {

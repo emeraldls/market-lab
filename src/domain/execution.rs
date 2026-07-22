@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionVenue {
     Bulk,
+    Hyperliquid,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -160,6 +161,9 @@ pub struct Fill {
     pub reason: String,
     pub order_id: Option<String>,
     pub maker: bool,
+    /// Signed venue fee: negative is a cost and positive is a rebate.
+    #[serde(default)]
+    pub fee: Option<f64>,
     pub slot: u64,
     pub ts_ms: u64,
 }

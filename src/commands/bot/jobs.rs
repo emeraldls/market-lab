@@ -57,17 +57,18 @@ fn render_jobs(jobs: &[BotJob], output: OutputFormat) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<36} {:<11} {:>8} {:<14} {:<14}",
-                "JOB", "STATUS", "PID", "BOT", "SYMBOL"
+                "{:<36} {:<11} {:>8} {:<14} {:<13} {:<14}",
+                "JOB", "STATUS", "PID", "BOT", "EXCHANGE", "SYMBOL"
             );
             for job in jobs {
                 println!(
-                    "{:<36} {:<11} {:>8} {:<14} {:<14}",
+                    "{:<36} {:<11} {:>8} {:<14} {:<13} {:<14}",
                     job.id,
                     status_name(job.status),
                     job.pid
                         .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
                     job.definition.name(),
+                    venue_name(job.definition.venue()),
                     job.definition.symbol(),
                 );
             }
@@ -94,7 +95,7 @@ fn render_job(job: &BotJob, output: OutputFormat) -> Result<()> {
             match &job.definition {
                 BotJobDefinition::MidPrice(definition)
                 | BotJobDefinition::VolumeMid(definition) => {
-                    println!("  venue:            bulk");
+                    println!("  venue:            {}", venue_name(definition.venue));
                     println!("  max inventory:    {}", definition.max_inventory_size);
                     if let Some(margin) = definition.requested_margin {
                         println!("  requested margin: {margin}");
@@ -184,6 +185,13 @@ fn render_job(job: &BotJob, output: OutputFormat) -> Result<()> {
     Ok(())
 }
 
+fn venue_name(venue: crate::domain::execution::ExecutionVenue) -> &'static str {
+    match venue {
+        crate::domain::execution::ExecutionVenue::Bulk => "bulk",
+        crate::domain::execution::ExecutionVenue::Hyperliquid => "hyperliquid",
+    }
+}
+
 fn render_log_values(values: &[serde_json::Value], output: OutputFormat) -> Result<()> {
     match output {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(values)?),
@@ -207,7 +215,7 @@ fn terminal_log_line(value: &serde_json::Value) -> String {
         .get("type")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("bot.event");
-    match kind {
+    let message = match kind {
         "bot.quote" => format!(
             "{} {} {} @ {} size={}",
             value
@@ -282,7 +290,25 @@ fn terminal_log_line(value: &serde_json::Value) -> String {
                 .unwrap_or("bot failed")
         ),
         _ => serde_json::to_string(value).unwrap_or_else(|_| kind.to_string()),
-    }
+    };
+    format!("[{}] {message}", log_datetime(value))
+}
+
+fn log_datetime(value: &serde_json::Value) -> String {
+    value
+        .get("tsMs")
+        .or_else(|| value.get("ts_ms"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|ts_ms| chrono::DateTime::<Utc>::from_timestamp_millis(ts_ms as i64))
+        .map_or_else(
+            || "time unavailable".to_string(),
+            |date_time| {
+                date_time
+                    .with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M:%S%.3f %Z")
+                    .to_string()
+            },
+        )
 }
 
 fn number(value: &serde_json::Value, key: &str) -> String {
@@ -333,4 +359,36 @@ fn validate_output(output: OutputFormat) -> Result<()> {
         bail!("bot job commands support only --output terminal|json|jsonl");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_bot_logs_include_the_stored_local_datetime() {
+        let ts_ms = 1_780_000_000_123_u64;
+        let expected = chrono::DateTime::<Utc>::from_timestamp_millis(ts_ms as i64)
+            .expect("test timestamp should be valid")
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M:%S%.3f %Z")
+            .to_string();
+        let line = terminal_log_line(&serde_json::json!({
+            "type": "bot.market_data",
+            "tsMs": ts_ms,
+            "status": "connected",
+        }));
+
+        assert_eq!(line, format!("[{expected}] market data connected"));
+    }
+
+    #[test]
+    fn legacy_bot_logs_mark_a_missing_timestamp() {
+        let line = terminal_log_line(&serde_json::json!({
+            "type": "bot.market_data",
+            "status": "connected",
+        }));
+
+        assert_eq!(line, "[time unavailable] market data connected");
+    }
 }

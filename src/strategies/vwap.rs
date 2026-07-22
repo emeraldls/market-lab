@@ -53,7 +53,7 @@ impl VolumeSourceSelector {
             let source = match parts.as_slice() {
                 [exchange] if !exchange.is_empty() => {
                     crate::markets::exchange_market(exchange, symbol)?;
-                    if *exchange != "bulk" {
+                    if !matches!(*exchange, "bulk" | "hyperliquid") {
                         bail!(
                             "standalone volume adapter for `{exchange}` is not implemented; use `{exchange}@mmt`"
                         );
@@ -73,7 +73,9 @@ impl VolumeSourceSelector {
                 [_, provider] => bail!(
                     "unsupported volume provider `{provider}` in `{value}`; only `exchange@mmt` is valid"
                 ),
-                _ => bail!("invalid volume source `{value}`; use `bulk` or `exchange@mmt`"),
+                _ => bail!(
+                    "invalid volume source `{value}`; use a standalone exchange or `exchange@mmt`"
+                ),
             };
             if !exchanges.insert(source.exchange.clone()) {
                 bail!(
@@ -277,6 +279,10 @@ mod tests {
         let selector =
             VolumeSourceSelector::parse(&[], "bulk", "BTC/USDT").expect("BULK default selector");
         assert_eq!(selector.sources()[0].selector(), "bulk");
+
+        let selector = VolumeSourceSelector::parse(&[], "hyperliquid", "BTC/USDT")
+            .expect("Hyperliquid default selector");
+        assert_eq!(selector.sources()[0].selector(), "hyperliquid");
     }
 
     #[test]

@@ -999,6 +999,7 @@ impl BulkFill {
                 self.order_id_taker
             }),
             maker: is_maker,
+            fee: None,
             slot: self.slot,
             ts_ms: normalize_timestamp_ms(self.timestamp),
         })
@@ -1178,6 +1179,7 @@ mod tests {
             reason: "normal".to_string(),
             order_id: Some("deterministic-id".to_string()),
             maker: false,
+            fee: None,
             slot: 42,
             ts_ms: 1_000,
         };

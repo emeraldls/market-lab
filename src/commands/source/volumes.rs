@@ -8,6 +8,8 @@ use crate::domain::enums::ProviderKind;
 use crate::domain::types::{VolumeBarSeries, VolumeProfile};
 use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::bulk::ws::BulkCandleStream;
+use crate::providers::hyperliquid::market_data::HyperliquidProvider;
+use crate::providers::hyperliquid::ws::HyperliquidCandleStream;
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::utils::normalize_symbol_for_mmt;
 use crate::providers::mmt::ws_client::MmtWsClient;
@@ -19,6 +21,7 @@ pub async fn handle(args: SourceVolumesArgs) -> Result<()> {
     match args.provider_kind()?.into() {
         ProviderKind::Mmt => handle_mmt(args).await,
         ProviderKind::Bulk => handle_bulk(args).await,
+        ProviderKind::Hyperliquid => handle_hyperliquid(args).await,
         ProviderKind::MarketLab => unreachable!("source routing cannot resolve to Market Lab"),
     }
 }
@@ -106,11 +109,39 @@ async fn handle_bulk(args: SourceVolumesArgs) -> Result<()> {
     render_bulk_volume_bars(&series, args.output)
 }
 
+async fn handle_hyperliquid(args: SourceVolumesArgs) -> Result<()> {
+    if args.stream {
+        if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("stream mode currently supports only --output terminal|json|jsonl");
+        }
+        return stream_hyperliquid_volume_bars(args).await;
+    }
+    let series = HyperliquidProvider::volume_bars(
+        &args.symbol,
+        args.timeframe_name()?,
+        args.from
+            .ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?,
+        args.to
+            .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?,
+    )
+    .await?;
+    render_direct_volume_bars(&series, args.output, "hyperliquid", "Hyperliquid")
+}
+
 fn render_bulk_volume_bars(series: &VolumeBarSeries, output: OutputFormat) -> Result<()> {
+    render_direct_volume_bars(series, output, "bulk", "BULK")
+}
+
+fn render_direct_volume_bars(
+    series: &VolumeBarSeries,
+    output: OutputFormat,
+    provider: &'static str,
+    label: &str,
+) -> Result<()> {
     let env = SourceEnvelope {
         r#type: "source.volume-bars.series".to_string(),
         version: "1",
-        provider: "bulk",
+        provider,
         exchange: series.exchange.clone(),
         symbol: series.symbol.clone(),
         ts_ms: series.data.last().map(|bar| bar.t).unwrap_or(0),
@@ -133,8 +164,8 @@ fn render_bulk_volume_bars(series: &VolumeBarSeries, output: OutputFormat) -> Re
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&env)?),
         OutputFormat::Jsonl => println!("{}", serde_json::to_string(&env)?),
         OutputFormat::Terminal => println!(
-            "{} BULK volume bars tf={} points={} from={} to={}",
-            env.symbol, series.tf, series.points, series.from, series.to
+            "{} {} volume bars tf={} points={} from={} to={}",
+            env.symbol, label, series.tf, series.points, series.from, series.to
         ),
         OutputFormat::Csv | OutputFormat::Parquet => {
             println!("TODO source volume-bars export: {output:?}")
@@ -288,6 +319,51 @@ async fn stream_bulk_volume_bars(args: SourceVolumesArgs) -> Result<()> {
                         if buf.len() >= args.buffer_size as usize { buf.pop_front(); }
                         buf.push_back(line);
                         render_terminal("market-lab source BULK volume-bars stream", &buf)?;
+                    }
+                    OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn stream_hyperliquid_volume_bars(args: SourceVolumesArgs) -> Result<()> {
+    let market = crate::providers::hyperliquid::markets::market(&args.symbol)?;
+    let mut stream = HyperliquidCandleStream::connect(&args.symbol, args.timeframe_name()?).await?;
+    let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
+    let mut latest = None;
+    let mut buf = VecDeque::with_capacity(args.buffer_size as usize);
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\nstream stopped");
+                break;
+            }
+            candle = stream.next_candle() => {
+                let candle = candle?;
+                latest = Some(crate::domain::types::VolumeBar {
+                    t: candle.t, close_time: candle.close_time,
+                    volume: candle.volume, trades: candle.trades,
+                });
+            }
+            _ = ticker.tick() => {
+                let Some(bar) = latest.as_ref() else { continue; };
+                let env = SourceEnvelope {
+                    r#type: "source.volume-bars.stream".to_string(), version: "1",
+                    provider: "hyperliquid", exchange: "hyperliquid".to_string(),
+                    symbol: market.symbol.clone(), ts_ms: bar.t, stream: true, data: bar.clone(),
+                    meta: SourceMeta { depth: None, min_size: None, max_size: None, price_group: None,
+                        interval_ms: Some(args.interval_ms), timeframe: Some(args.timeframe_name()?.to_string()),
+                        bucket: None, from: None, to: None },
+                };
+                match args.output {
+                    OutputFormat::Json | OutputFormat::Jsonl => println!("{}", serde_json::to_string(&env)?),
+                    OutputFormat::Terminal => {
+                        let line = format!("t={} volume={} trades={}", bar.t, bar.volume, bar.trades);
+                        if buf.len() >= args.buffer_size as usize { buf.pop_front(); }
+                        buf.push_back(line);
+                        render_terminal("market-lab source Hyperliquid volume-bars stream", &buf)?;
                     }
                     OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
                 }

@@ -16,6 +16,7 @@ use crate::credentials::mmt_api_key;
 
 const SNAPSHOT_SCHEMA_VERSION: u8 = 1;
 const BULK_MARKETS_URL: &str = "https://exchange-api.bulk.trade/api/v1/exchangeInfo";
+const HYPERLIQUID_INFO_URL: &str = "https://api.hyperliquid-testnet.xyz/info";
 const MMT_MARKETS_URL: &str = "https://eu-central-1.mmt.gg/api/v1/markets";
 const MARKET_HTTP_TIMEOUT_SECS: u64 = 15;
 
@@ -103,6 +104,9 @@ pub struct Market {
     pub provider_symbol: String,
     /// Exchange-native ticker when it differs from the provider symbol.
     pub venue_symbol: String,
+    /// Native numeric asset identifier when the venue signs orders by index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub venue_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aliases: Vec<String>,
     pub base_asset: String,
@@ -127,6 +131,8 @@ pub struct ExecutionRules {
     pub lot_size: f64,
     pub min_notional: f64,
     pub max_leverage: u16,
+    #[serde(default = "default_true")]
+    pub cross_margin: bool,
     pub order_types: Vec<String>,
     pub time_in_forces: Vec<String>,
 }
@@ -186,6 +192,24 @@ struct BulkMarket {
     max_leverage: u16,
     order_types: Vec<String>,
     time_in_forces: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HyperliquidMarket {
+    name: String,
+    sz_decimals: u8,
+    max_leverage: u16,
+    #[serde(default)]
+    is_delisted: bool,
+    #[serde(default)]
+    only_isolated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HyperliquidAssetContext {
+    mark_px: String,
 }
 
 impl Market {
@@ -559,6 +583,9 @@ pub async fn refresh_route(provider: Option<&str>, exchange: &str) -> Result<Mar
         Some("mmt") => fetch_mmt_snapshot().await?,
         Some(provider) => bail!("market refresh is not implemented for provider `{provider}`"),
         None if exchange.eq_ignore_ascii_case("bulk") => fetch_bulk_snapshot().await?,
+        None if exchange.eq_ignore_ascii_case("hyperliquid") => {
+            fetch_hyperliquid_snapshot().await?
+        }
         None => bail!("market refresh is not implemented for standalone exchange `{exchange}`"),
     };
     write_snapshot(&snapshot)?;
@@ -568,6 +595,10 @@ pub async fn refresh_route(provider: Option<&str>, exchange: &str) -> Result<Mar
 
 pub async fn refresh_bulk() -> Result<MarketSnapshot> {
     refresh_route(None, "bulk").await
+}
+
+pub async fn refresh_hyperliquid() -> Result<MarketSnapshot> {
+    refresh_route(None, "hyperliquid").await
 }
 
 pub async fn refresh_mmt() -> Result<MarketSnapshot> {
@@ -643,6 +674,7 @@ async fn fetch_bulk_snapshot() -> Result<MarketSnapshot> {
                 ),
                 provider_symbol: market.symbol.clone(),
                 venue_symbol: market.symbol,
+                venue_id: None,
                 aliases: vec![format!(
                     "{}/{}",
                     market.base_asset.to_ascii_uppercase(),
@@ -662,6 +694,7 @@ async fn fetch_bulk_snapshot() -> Result<MarketSnapshot> {
                     lot_size: market.lot_size,
                     min_notional: market.min_notional,
                     max_leverage: market.max_leverage,
+                    cross_margin: true,
                     order_types: market.order_types,
                     time_in_forces: market.time_in_forces,
                 }),
@@ -683,6 +716,132 @@ async fn fetch_bulk_snapshot() -> Result<MarketSnapshot> {
     };
     snapshot.validate()?;
     Ok(snapshot)
+}
+
+async fn fetch_hyperliquid_snapshot() -> Result<MarketSnapshot> {
+    let response = Client::new()
+        .post(HYPERLIQUID_INFO_URL)
+        .timeout(Duration::from_secs(MARKET_HTTP_TIMEOUT_SECS))
+        .json(&serde_json::json!({ "type": "metaAndAssetCtxs" }))
+        .send()
+        .await
+        .context("failed to fetch Hyperliquid testnet markets")?;
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .context("failed to decode Hyperliquid testnet markets response")?;
+    if !status.is_success() {
+        bail!("Hyperliquid testnet markets returned HTTP {status} body={body}");
+    }
+
+    let entries = body
+        .as_array()
+        .context("invalid Hyperliquid metaAndAssetCtxs response")?;
+    if entries.len() != 2 {
+        bail!("Hyperliquid metaAndAssetCtxs must contain metadata and asset contexts");
+    }
+    let universe = entries[0]
+        .get("universe")
+        .cloned()
+        .context("Hyperliquid metadata omitted universe")?;
+    let raw = serde_json::from_value::<Vec<HyperliquidMarket>>(universe)
+        .context("invalid Hyperliquid perpetual universe")?;
+    let contexts = serde_json::from_value::<Vec<HyperliquidAssetContext>>(entries[1].clone())
+        .context("invalid Hyperliquid perpetual asset contexts")?;
+    if raw.len() != contexts.len() {
+        bail!("Hyperliquid perpetual metadata and asset contexts are out of sync");
+    }
+
+    let markets = raw
+        .into_iter()
+        .zip(contexts)
+        .enumerate()
+        .filter(|(_, (market, _))| !market.is_delisted)
+        .map(|(asset_index, (market, context))| {
+            let mark_price = context
+                .mark_px
+                .parse::<f64>()
+                .with_context(|| format!("invalid Hyperliquid mark price for {}", market.name))?;
+            let tick_size = hyperliquid_price_increment(mark_price, market.sz_decimals)?;
+            let lot_size = 10_f64.powi(-i32::from(market.sz_decimals));
+            let symbol = format!("{}/USDT", market.name.to_ascii_uppercase());
+            Ok(Market {
+                symbol,
+                provider_symbol: market.name.clone(),
+                venue_symbol: market.name.clone(),
+                venue_id: Some(
+                    u32::try_from(asset_index)
+                        .context("Hyperliquid perpetual asset index exceeds u32")?,
+                ),
+                aliases: vec![
+                    format!("{}/USD", market.name.to_ascii_uppercase()),
+                    format!("{}/USDC", market.name.to_ascii_uppercase()),
+                ],
+                base_asset: market.name.to_ascii_uppercase(),
+                quote_asset: "USDT".to_string(),
+                venue_base_asset: market.name.to_ascii_uppercase(),
+                venue_quote_asset: "USDC".to_string(),
+                status: "TRADING".to_string(),
+                price_increment: Some(tick_size),
+                size_increment: Some(lot_size),
+                execution: Some(ExecutionRules {
+                    price_precision: decimal_places(tick_size),
+                    size_precision: market.sz_decimals,
+                    tick_size,
+                    lot_size,
+                    min_notional: 10.0,
+                    max_leverage: market.max_leverage,
+                    cross_margin: !market.only_isolated,
+                    order_types: vec!["LIMIT".to_string(), "MARKET".to_string()],
+                    time_in_forces: vec!["GTC".to_string(), "IOC".to_string(), "ALO".to_string()],
+                }),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if markets.is_empty() {
+        bail!("Hyperliquid testnet returned no active native perpetual markets");
+    }
+
+    let snapshot = MarketSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        provider: "hyperliquid".to_string(),
+        provider_type: ProviderType::Standalone,
+        source_url: HYPERLIQUID_INFO_URL.to_string(),
+        fetched_at: fetched_at(),
+        exchanges: vec![ExchangeMarkets {
+            exchange: "hyperliquid".to_string(),
+            name: "Hyperliquid Testnet".to_string(),
+            market_type: MarketType::Futures,
+            markets,
+        }],
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
+}
+
+fn hyperliquid_price_increment(mark_price: f64, size_decimals: u8) -> Result<f64> {
+    if !mark_price.is_finite() || mark_price <= 0.0 || size_decimals > 6 {
+        bail!("invalid Hyperliquid price or size precision");
+    }
+    let decimal_tick = 10_f64.powi(-(6_i32 - i32::from(size_decimals)));
+    let significant_tick = 10_f64.powi(mark_price.log10().floor() as i32 - 4);
+    Ok(decimal_tick.max(significant_tick))
+}
+
+fn decimal_places(value: f64) -> u8 {
+    let mut value = value;
+    for decimals in 0..=8 {
+        if (value.round() - value).abs() <= 1e-9 {
+            return decimals;
+        }
+        value *= 10.0;
+    }
+    8
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 async fn fetch_mmt_snapshot() -> Result<MarketSnapshot> {
@@ -716,6 +875,7 @@ async fn fetch_mmt_snapshot() -> Result<MarketSnapshot> {
                     symbol,
                     provider_symbol: market.symbol,
                     venue_symbol: market.exchange_ticker,
+                    venue_id: None,
                     aliases: vec![format!(
                         "{}/{}",
                         market.base.to_ascii_uppercase(),
@@ -897,6 +1057,7 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
         symbol: "BTC/USDT".to_string(),
         provider_symbol: "BTC-USD".to_string(),
         venue_symbol: "BTC-USD".to_string(),
+        venue_id: None,
         aliases: vec!["BTC/USD".to_string()],
         base_asset: "BTC".to_string(),
         quote_asset: "USDT".to_string(),
@@ -912,6 +1073,7 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
             lot_size: 0.000001,
             min_notional: 1.0,
             max_leverage: 40,
+            cross_margin: true,
             order_types: vec!["LIMIT".to_string(), "MARKET".to_string()],
             time_in_forces: vec!["GTC".to_string(), "IOC".to_string(), "ALO".to_string()],
         }),
@@ -920,6 +1082,7 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
         symbol: "BTC/USDT".to_string(),
         provider_symbol: "btc/usd".to_string(),
         venue_symbol: "btc/usd".to_string(),
+        venue_id: None,
         aliases: vec!["BTC/USDT".to_string()],
         base_asset: "BTC".to_string(),
         quote_asset: "USDT".to_string(),
@@ -929,6 +1092,31 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
         price_increment: Some(0.1),
         size_increment: Some(0.001),
         execution: None,
+    };
+    let hyperliquid_market = Market {
+        symbol: "BTC/USDT".to_string(),
+        provider_symbol: "BTC".to_string(),
+        venue_symbol: "BTC".to_string(),
+        venue_id: Some(0),
+        aliases: vec!["BTC/USD".to_string(), "BTC/USDC".to_string()],
+        base_asset: "BTC".to_string(),
+        quote_asset: "USDT".to_string(),
+        venue_base_asset: "BTC".to_string(),
+        venue_quote_asset: "USDC".to_string(),
+        status: "TRADING".to_string(),
+        price_increment: Some(1.0),
+        size_increment: Some(0.00001),
+        execution: Some(ExecutionRules {
+            price_precision: 0,
+            size_precision: 5,
+            tick_size: 1.0,
+            lot_size: 0.00001,
+            min_notional: 10.0,
+            max_leverage: 40,
+            cross_margin: true,
+            order_types: vec!["LIMIT".to_string(), "MARKET".to_string()],
+            time_in_forces: vec!["GTC".to_string(), "IOC".to_string(), "ALO".to_string()],
+        }),
     };
     vec![
         MarketSnapshot {
@@ -942,6 +1130,19 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
                 name: "BULK".to_string(),
                 market_type: MarketType::Futures,
                 markets: vec![bulk_market],
+            }],
+        },
+        MarketSnapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            provider: "hyperliquid".to_string(),
+            provider_type: ProviderType::Standalone,
+            source_url: HYPERLIQUID_INFO_URL.to_string(),
+            fetched_at: "2026-07-19T00:00:00Z".to_string(),
+            exchanges: vec![ExchangeMarkets {
+                exchange: "hyperliquid".to_string(),
+                name: "Hyperliquid Testnet".to_string(),
+                market_type: MarketType::Futures,
+                markets: vec![hyperliquid_market],
             }],
         },
         MarketSnapshot {
@@ -981,7 +1182,7 @@ mod tests {
     #[test]
     fn snapshots_build_provider_and_direct_indexes() {
         let registry = MarketRegistry::new(test_snapshots()).expect("snapshots index");
-        assert_eq!(registry.snapshots.len(), 2);
+        assert_eq!(registry.snapshots.len(), 3);
 
         let bulk = exchange_market("bulk", "btc/usdt").expect("BULK market resolves");
         assert_eq!(bulk.symbol, "BTC/USDT");
@@ -999,7 +1200,10 @@ mod tests {
     #[test]
     fn provider_and_direct_routes_are_distinct() {
         assert!(provider_market("mmt", "hyperliquid", "BTC/USDT").is_ok());
-        assert!(exchange_market("hyperliquid", "BTC/USDT").is_err());
+        let direct = exchange_market("hyperliquid", "BTC/USDT")
+            .expect("standalone Hyperliquid market resolves");
+        assert_eq!(direct.venue_symbol, "BTC");
+        assert_eq!(direct.venue_id, Some(0));
         assert!(provider_market("mmt", "missing", "BTC/USDT").is_err());
     }
 

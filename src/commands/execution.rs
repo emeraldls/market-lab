@@ -5,17 +5,17 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::cli::{
-    AccountQueryArgs, CancelOrderArgs, ClosePositionArgs, ExecutionVenueArg, OutputFormat,
-    TradeArgs, TradeOrderKind, TradeTimeInForce,
+    AccountQueryArgs, CancelOrderArgs, ClosePositionArgs, OutputFormat, TradeArgs, TradeOrderKind,
+    TradeTimeInForce,
 };
-use crate::credentials;
 use crate::domain::execution::{
     CancelPlan, ExecutionReceipt, ExecutionVenue, OpenOrder, Position, PositionDirection,
     TimeInForce, TradePlan,
 };
-use crate::providers::bulk::execution::BulkExecutionAdapter;
+use crate::markets::Market;
 use crate::providers::bulk::market_data::BulkProvider;
-use crate::providers::bulk::markets::{self, BulkMarket};
+use crate::providers::execution::ExecutionAdapter;
+use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 
 pub async fn handle_trade(args: TradeArgs, direction: PositionDirection) -> Result<()> {
     args.validate_shape()?;
@@ -32,7 +32,7 @@ pub async fn handle_trade(args: TradeArgs, direction: PositionDirection) -> Resu
         if !matches!(args.output, OutputFormat::Terminal) {
             bail!("live execution with structured output requires --yes");
         }
-        print!("Submit this order to BULK? [y/N]: ");
+        print!("Submit this order to {}? [y/N]: ", venue_label(plan.venue));
         io::stdout()
             .flush()
             .context("failed to flush confirmation prompt")?;
@@ -48,7 +48,7 @@ pub async fn handle_trade(args: TradeArgs, direction: PositionDirection) -> Resu
 
     let receipt = crate::runtime::submit_trade(&plan).await?;
     let post_trade_position = if matches!(receipt.status.as_str(), "filled" | "partiallyFilled") {
-        match BulkExecutionAdapter::new() {
+        match ExecutionAdapter::new(plan.venue).await {
             Ok(adapter) => {
                 adapter
                     .account_snapshot(&plan.account)
@@ -72,14 +72,12 @@ pub async fn handle_trade(args: TradeArgs, direction: PositionDirection) -> Resu
 pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
     args.validate()?;
     let symbol = validate_optional_symbol(args.symbol.as_deref())?;
-    let account = credentials::bulk_account()?;
-    let snapshot = match args.venue {
-        ExecutionVenueArg::Bulk => {
-            BulkExecutionAdapter::new()?
-                .account_snapshot(&account)
-                .await?
-        }
-    };
+    let venue = ExecutionVenue::from(args.venue);
+    let account = ExecutionAdapter::configured_account(venue)?;
+    let snapshot = ExecutionAdapter::new(venue)
+        .await?
+        .account_snapshot(&account)
+        .await?;
     let positions = snapshot
         .positions
         .into_iter()
@@ -95,34 +93,38 @@ pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
 pub async fn handle_orders(args: AccountQueryArgs) -> Result<()> {
     args.validate()?;
     let symbol = validate_optional_symbol(args.symbol.as_deref())?;
-    let account = credentials::bulk_account()?;
-    let orders = match args.venue {
-        ExecutionVenueArg::Bulk => BulkExecutionAdapter::new()?.open_orders(&account).await?,
-    }
-    .into_iter()
-    .filter(|order| {
-        symbol
-            .as_deref()
-            .is_none_or(|symbol| order.internal_symbol == symbol)
-    })
-    .collect::<Vec<_>>();
+    let venue = ExecutionVenue::from(args.venue);
+    let account = ExecutionAdapter::configured_account(venue)?;
+    let orders = ExecutionAdapter::new(venue)
+        .await?
+        .open_orders(&account)
+        .await?
+        .into_iter()
+        .filter(|order| {
+            symbol
+                .as_deref()
+                .is_none_or(|symbol| order.internal_symbol == symbol)
+        })
+        .collect::<Vec<_>>();
     render_orders(&orders, args.output)
 }
 
 pub async fn handle_fills(args: AccountQueryArgs) -> Result<()> {
     args.validate()?;
     let symbol = validate_optional_symbol(args.symbol.as_deref())?;
-    let account = credentials::bulk_account()?;
-    let fills = match args.venue {
-        ExecutionVenueArg::Bulk => BulkExecutionAdapter::new()?.fills(&account).await?,
-    }
-    .into_iter()
-    .filter(|fill| {
-        symbol
-            .as_deref()
-            .is_none_or(|symbol| fill.internal_symbol == symbol)
-    })
-    .collect::<Vec<_>>();
+    let venue = ExecutionVenue::from(args.venue);
+    let account = ExecutionAdapter::configured_account(venue)?;
+    let fills = ExecutionAdapter::new(venue)
+        .await?
+        .fills(&account)
+        .await?
+        .into_iter()
+        .filter(|fill| {
+            symbol
+                .as_deref()
+                .is_none_or(|symbol| fill.internal_symbol == symbol)
+        })
+        .collect::<Vec<_>>();
     render_structured(&fills, args.output, || {
         if fills.is_empty() {
             println!("no fills");
@@ -145,12 +147,19 @@ pub async fn handle_fills(args: AccountQueryArgs) -> Result<()> {
 
 pub async fn handle_cancel(args: CancelOrderArgs) -> Result<()> {
     args.validate()?;
-    let market = markets::market(&args.symbol)?;
-    bulk_keychain::Hash::from_base58(&args.order_id).context("invalid BULK order id")?;
-    let account = credentials::bulk_account()?;
+    let venue = ExecutionVenue::from(args.venue);
+    let market = execution_market(venue, &args.symbol)?;
+    if venue == ExecutionVenue::Bulk {
+        bulk_keychain::Hash::from_base58(&args.order_id).context("invalid BULK order id")?;
+    } else {
+        args.order_id
+            .parse::<u64>()
+            .context("Hyperliquid order id must be an unsigned integer")?;
+    }
+    let account = ExecutionAdapter::configured_account(venue)?;
     let plan = CancelPlan {
         created_at_ms: now_ms()?,
-        venue: ExecutionVenue::Bulk,
+        venue,
         account,
         internal_symbol: market.symbol.clone(),
         venue_symbol: market.venue_symbol.clone(),
@@ -163,7 +172,8 @@ pub async fn handle_cancel(args: CancelOrderArgs) -> Result<()> {
     if matches!(args.output, OutputFormat::Terminal) {
         render_cancel_plan(&plan, false, args.output)?;
     }
-    if !args.yes && !confirm_live_action(args.output, "Cancel this BULK order?")? {
+    let prompt = format!("Cancel this {} order?", venue_label(venue));
+    if !args.yes && !confirm_live_action(args.output, &prompt)? {
         println!("cancelled; the order was not changed");
         return Ok(());
     }
@@ -174,14 +184,12 @@ pub async fn handle_cancel(args: CancelOrderArgs) -> Result<()> {
 pub async fn handle_close(args: ClosePositionArgs) -> Result<()> {
     args.validate()?;
     let requested_symbol = validate_optional_symbol(args.symbol.as_deref())?;
-    let account = credentials::bulk_account()?;
-    let snapshot = match args.venue {
-        ExecutionVenueArg::Bulk => {
-            BulkExecutionAdapter::new()?
-                .account_snapshot(&account)
-                .await?
-        }
-    };
+    let venue = ExecutionVenue::from(args.venue);
+    let account = ExecutionAdapter::configured_account(venue)?;
+    let snapshot = ExecutionAdapter::new(venue)
+        .await?
+        .account_snapshot(&account)
+        .await?;
     let positions = snapshot
         .positions
         .into_iter()
@@ -236,7 +244,7 @@ fn choose_position(
         _ => {}
     }
     if symbol_was_explicit {
-        bail!("BULK returned multiple open positions for the selected symbol");
+        bail!("the venue returned multiple open positions for the selected symbol");
     }
     if !matches!(output, OutputFormat::Terminal) || yes {
         bail!("multiple positions are open; pass the symbol to select one");
@@ -278,30 +286,38 @@ pub(crate) async fn build_trade_plan(
     args: &TradeArgs,
     direction: PositionDirection,
 ) -> Result<TradePlan> {
-    let market = markets::market(&args.symbol)?;
-    validate_market_rules(&market, args)?;
+    let venue = ExecutionVenue::from(args.venue);
+    let market = execution_market(venue, &args.symbol)?;
+    validate_market_rules(venue, &market, args)?;
     let rules = market.execution_rules()?;
-    let account = match args.venue {
-        ExecutionVenueArg::Bulk => credentials::bulk_account()?,
-    };
+    let account = ExecutionAdapter::configured_account(venue)?;
     let reference_price = match args.order_kind {
         TradeOrderKind::Limit => args
             .price
             .context("--price is required with --type limit")?,
-        TradeOrderKind::Market => BulkProvider::ticker(&market.symbol).await?.mark_price,
+        TradeOrderKind::Market => match venue {
+            ExecutionVenue::Bulk => BulkProvider::ticker(&market.symbol).await?.mark_price,
+            ExecutionVenue::Hyperliquid => {
+                HyperliquidProvider::ticker(&market.symbol)
+                    .await?
+                    .mark_price
+            }
+        },
     };
     if !reference_price.is_finite() || reference_price <= 0.0 {
         bail!(
-            "BULK returned an invalid reference price for {}",
+            "{} returned an invalid reference price for {}",
+            venue_label(venue),
             market.venue_symbol
         );
     }
-    validate_protection_prices(&market, args, direction, reference_price)?;
+    validate_protection_prices(venue, &market, args, direction, reference_price)?;
 
     let size = if let Some(size) = args.size {
         if !is_step_aligned(size, rules.lot_size) {
             bail!(
-                "--size {size} is not aligned to BULK lot size {} for {}",
+                "--size {size} is not aligned to {} lot size {} for {}",
+                venue_label(venue),
                 rules.lot_size,
                 market.symbol
             );
@@ -316,7 +332,8 @@ pub(crate) async fn build_trade_plan(
     };
     if size <= 0.0 {
         bail!(
-            "requested margin and leverage produce a size below BULK lot size {} on {}",
+            "requested margin and leverage produce a size below {} lot size {} on {}",
+            venue_label(venue),
             rules.lot_size,
             market.symbol
         );
@@ -325,7 +342,8 @@ pub(crate) async fn build_trade_plan(
     let estimated_margin = estimated_exposure / args.leverage;
     if estimated_exposure + f64::EPSILON < rules.min_notional {
         bail!(
-            "estimated exposure {estimated_exposure:.8} is below BULK minimum notional {} for {}",
+            "estimated exposure {estimated_exposure:.8} is below {} minimum notional {} for {}",
+            venue_label(venue),
             rules.min_notional,
             market.symbol
         );
@@ -333,7 +351,7 @@ pub(crate) async fn build_trade_plan(
 
     Ok(TradePlan {
         created_at_ms: now_ms()?,
-        venue: ExecutionVenue::Bulk,
+        venue,
         account,
         internal_symbol: market.symbol.clone(),
         venue_symbol: market.venue_symbol.clone(),
@@ -358,7 +376,8 @@ pub(crate) async fn build_trade_plan(
 }
 
 fn validate_protection_prices(
-    market: &BulkMarket,
+    venue: ExecutionVenue,
+    market: &Market,
     args: &TradeArgs,
     direction: PositionDirection,
     entry_price: f64,
@@ -366,11 +385,11 @@ fn validate_protection_prices(
     let rules = market.execution_rules()?;
     for (flag, price) in [("--sl", args.sl), ("--tp", args.tp)] {
         if let Some(price) = price
-            && !is_step_aligned(price, rules.tick_size)
+            && !is_price_aligned(venue, price, rules)
         {
             bail!(
-                "{flag} {price} is not aligned to BULK tick size {} for {}",
-                rules.tick_size,
+                "{flag} {price} is not aligned to {} price rules for {}",
+                venue_label(venue),
                 market.symbol
             );
         }
@@ -396,14 +415,21 @@ fn validate_protection_prices(
     Ok(())
 }
 
-fn validate_market_rules(market: &BulkMarket, args: &TradeArgs) -> Result<()> {
-    let capabilities = BulkExecutionAdapter::capabilities();
+fn validate_market_rules(venue: ExecutionVenue, market: &Market, args: &TradeArgs) -> Result<()> {
+    let capabilities = ExecutionAdapter::capabilities(venue);
     let rules = market.execution_rules()?;
     if !capabilities.order_kinds.contains(&args.order_kind.into()) {
-        bail!("BULK execution adapter does not support this order type");
+        bail!(
+            "{} execution adapter does not support this order type",
+            venue_label(venue)
+        );
     }
     if !market.is_available() {
-        bail!("BULK market `{}` is not trading", market.venue_symbol);
+        bail!(
+            "{} market `{}` is not trading",
+            venue_label(venue),
+            market.venue_symbol
+        );
     }
     let order_type = match args.order_kind {
         TradeOrderKind::Market => "MARKET",
@@ -411,25 +437,31 @@ fn validate_market_rules(market: &BulkMarket, args: &TradeArgs) -> Result<()> {
     };
     if !market.supports_order_type(order_type) {
         bail!(
-            "BULK market `{}` does not support {order_type} orders",
+            "{} market `{}` does not support {order_type} orders",
+            venue_label(venue),
             market.venue_symbol
         );
     }
     if args.leverage > f64::from(rules.max_leverage) {
         bail!(
-            "--leverage {} exceeds BULK maximum {}x for {}",
+            "--leverage {} exceeds {} maximum {}x for {}",
             args.leverage,
+            venue_label(venue),
             rules.max_leverage,
             market.symbol
         );
     }
+    if venue == ExecutionVenue::Hyperliquid && args.leverage.fract().abs() > f64::EPSILON {
+        bail!("Hyperliquid leverage must be a whole number");
+    }
     if let Some(price) = args.price
-        && !is_step_aligned(price, rules.tick_size)
+        && !is_price_aligned(venue, price, rules)
     {
         bail!(
-            "--price {price} is not aligned to BULK tick size {} for {}",
+            "--price {price} is not aligned to {} price rules for {} (snapshot tick {})",
+            venue_label(venue),
+            market.symbol,
             rules.tick_size,
-            market.symbol
         );
     }
     if matches!(args.order_kind, TradeOrderKind::Limit) {
@@ -444,7 +476,8 @@ fn validate_market_rules(market: &BulkMarket, args: &TradeArgs) -> Result<()> {
             .any(|candidate| candidate.eq_ignore_ascii_case(tif))
         {
             bail!(
-                "BULK market `{}` does not support TIF {tif}",
+                "{} market `{}` does not support TIF {tif}",
+                venue_label(venue),
                 market.venue_symbol
             );
         }
@@ -452,10 +485,51 @@ fn validate_market_rules(market: &BulkMarket, args: &TradeArgs) -> Result<()> {
     Ok(())
 }
 
+fn is_price_aligned(
+    venue: ExecutionVenue,
+    price: f64,
+    rules: &crate::markets::ExecutionRules,
+) -> bool {
+    match venue {
+        ExecutionVenue::Bulk => is_step_aligned(price, rules.tick_size),
+        ExecutionVenue::Hyperliquid => {
+            crate::providers::hyperliquid::execution::validate_price(price, rules.size_precision)
+                .is_ok()
+        }
+    }
+}
+
 fn validate_optional_symbol(symbol: Option<&str>) -> Result<Option<String>> {
-    symbol
-        .map(|symbol| markets::market(symbol).map(|market| market.symbol.clone()))
-        .transpose()
+    symbol.map(canonical_symbol).transpose()
+}
+
+fn execution_market(venue: ExecutionVenue, symbol: &str) -> Result<std::sync::Arc<Market>> {
+    crate::markets::exchange_market(venue_key(venue), symbol)
+}
+
+fn venue_key(venue: ExecutionVenue) -> &'static str {
+    match venue {
+        ExecutionVenue::Bulk => "bulk",
+        ExecutionVenue::Hyperliquid => "hyperliquid",
+    }
+}
+
+fn venue_label(venue: ExecutionVenue) -> &'static str {
+    match venue {
+        ExecutionVenue::Bulk => "BULK",
+        ExecutionVenue::Hyperliquid => "Hyperliquid testnet",
+    }
+}
+
+fn canonical_symbol(symbol: &str) -> Result<String> {
+    let normalized = symbol.trim().to_ascii_uppercase().replace('-', "/");
+    let mut parts = normalized.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(base), Some(quote), None) if !base.is_empty() && !quote.is_empty() => {
+            Ok(format!("{base}/{quote}"))
+        }
+        _ => bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT"),
+    }
 }
 
 fn is_step_aligned(value: f64, step: f64) -> bool {
@@ -494,7 +568,7 @@ fn render_trade_plan(plan: &TradePlan, dry_run: bool, output: OutputFormat) -> R
                     "trade plan"
                 }
             );
-            println!("  venue:             bulk");
+            println!("  venue:             {}", venue_key(plan.venue));
             println!("  account:           {}", plan.account);
             println!(
                 "  symbol:            {} ({})",
@@ -519,7 +593,10 @@ fn render_trade_plan(plan: &TradePlan, dry_run: bool, output: OutputFormat) -> R
             println!("  est. margin:       {:.8}", plan.estimated_margin);
             println!("  est. exposure:     {:.8}", plan.estimated_exposure);
             println!("  leverage:          {}x", plan.leverage);
-            println!("  liquidation price: determined by BULK after fill");
+            println!(
+                "  liquidation price: determined by {} after fill",
+                venue_label(plan.venue)
+            );
             println!("  reduce only:       {}", plan.reduce_only);
             if let Some(price) = plan.stop_loss_price {
                 println!("  stop loss:         {price} (native on-fill trigger)");
@@ -546,7 +623,7 @@ fn render_cancel_plan(plan: &CancelPlan, dry_run: bool, output: OutputFormat) ->
                     "cancel plan"
                 }
             );
-            println!("  venue:    bulk");
+            println!("  venue:    {}", venue_key(plan.venue));
             println!("  account:  {}", plan.account);
             println!(
                 "  symbol:   {} ({})",
@@ -610,7 +687,10 @@ fn render_trade_result(
                 println!("  position leverage: {}x", position.leverage);
                 println!("  liquidation price: {}", position.liquidation_price);
             } else if matches!(receipt.status.as_str(), "filled" | "partiallyFilled") {
-                println!("  liquidation price: not yet available from BULK");
+                println!(
+                    "  liquidation price: not yet available from {}",
+                    venue_label(plan.venue)
+                );
             }
         }
         OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
@@ -634,7 +714,7 @@ fn render_cancel_result(
 }
 
 fn render_terminal_receipt(receipt: &ExecutionReceipt) {
-    println!("bulk: order {}", receipt.status);
+    println!("{}: order {}", venue_key(receipt.venue), receipt.status);
     if let Some(order_id) = &receipt.order_id {
         println!("  order id: {order_id}");
     }

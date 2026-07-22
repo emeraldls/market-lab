@@ -215,6 +215,14 @@ impl StrategyJobDefinition {
         }
     }
 
+    pub fn venue(&self) -> ExecutionVenue {
+        match self {
+            Self::Twap(definition) => definition.venue,
+            Self::Vwap(definition) => definition.venue,
+            Self::Oiwap(definition) => definition.venue,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::Twap(definition) => definition.validate(),

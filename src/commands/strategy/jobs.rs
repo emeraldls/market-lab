@@ -60,17 +60,18 @@ fn render_jobs(jobs: &[StrategyJob], output: OutputFormat) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<36} {:<11} {:>8} {:<14} {:<14}",
-                "JOB", "STATUS", "PID", "STRATEGY", "SYMBOL"
+                "{:<36} {:<11} {:>8} {:<14} {:<13} {:<14}",
+                "JOB", "STATUS", "PID", "STRATEGY", "EXCHANGE", "SYMBOL"
             );
             for job in jobs {
                 println!(
-                    "{:<36} {:<11} {:>8} {:<14} {:<14}",
+                    "{:<36} {:<11} {:>8} {:<14} {:<13} {:<14}",
                     job.id,
                     status_name(job.status),
                     job.pid
                         .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
                     job.definition.name(),
+                    venue_name(job.definition.venue()),
                     job.definition.symbol(),
                 );
             }
@@ -96,7 +97,7 @@ fn render_job(job: &StrategyJob, output: OutputFormat) -> Result<()> {
             println!("  symbol:           {}", job.definition.symbol());
             match &job.definition {
                 StrategyJobDefinition::Twap(definition) => {
-                    println!("  venue:            bulk");
+                    println!("  venue:            {}", venue_name(definition.venue));
                     println!("  side:             {:?}", definition.side);
                     println!("  total size:       {}", definition.total_size);
                     if let Some(margin) = definition.requested_margin {
@@ -110,7 +111,7 @@ fn render_job(job: &StrategyJob, output: OutputFormat) -> Result<()> {
                     println!("  reduce only:      {}", definition.reduce_only);
                 }
                 StrategyJobDefinition::Vwap(definition) => {
-                    println!("  venue:            bulk");
+                    println!("  venue:            {}", venue_name(definition.venue));
                     println!("  side:             {:?}", definition.side);
                     println!("  total size:       {}", definition.total_size);
                     if let Some(margin) = definition.requested_margin {
@@ -132,7 +133,7 @@ fn render_job(job: &StrategyJob, output: OutputFormat) -> Result<()> {
                     println!("  reduce only:      {}", definition.reduce_only);
                 }
                 StrategyJobDefinition::Oiwap(definition) => {
-                    println!("  venue:            bulk");
+                    println!("  venue:            {}", venue_name(definition.venue));
                     println!("  side:             {:?}", definition.side);
                     println!("  total size:       {}", definition.total_size);
                     if let Some(margin) = definition.requested_margin {
@@ -172,6 +173,13 @@ fn render_job(job: &StrategyJob, output: OutputFormat) -> Result<()> {
         OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
     }
     Ok(())
+}
+
+fn venue_name(venue: crate::domain::execution::ExecutionVenue) -> &'static str {
+    match venue {
+        crate::domain::execution::ExecutionVenue::Bulk => "bulk",
+        crate::domain::execution::ExecutionVenue::Hyperliquid => "hyperliquid",
+    }
 }
 
 fn render_log_values(values: &[serde_json::Value], output: OutputFormat) -> Result<()> {

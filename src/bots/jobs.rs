@@ -106,6 +106,18 @@ impl BotJobDefinition {
         }
     }
 
+    pub fn venue(&self) -> ExecutionVenue {
+        match self {
+            Self::MidPrice(definition) | Self::VolumeMid(definition) => definition.venue,
+        }
+    }
+
+    pub fn leverage(&self) -> f64 {
+        match self {
+            Self::MidPrice(definition) | Self::VolumeMid(definition) => definition.leverage,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::MidPrice(definition) | Self::VolumeMid(definition) => definition.validate(),

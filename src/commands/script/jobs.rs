@@ -69,17 +69,18 @@ fn render_jobs(jobs: &[ScriptJob], output: OutputFormat) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<31} {:<11} {:>8} {:<22} {:<12} {:<14}",
-                "JOB", "STATUS", "PID", "SCRIPT", "PROVIDER", "SYMBOL"
+                "{:<31} {:<11} {:>8} {:<22} {:<13} {:<12} {:<14}",
+                "JOB", "STATUS", "PID", "SCRIPT", "EXCHANGE", "PROVIDER", "SYMBOL"
             );
             for job in jobs {
                 println!(
-                    "{:<31} {:<11} {:>8} {:<22} {:<12} {:<14}",
+                    "{:<31} {:<11} {:>8} {:<22} {:<13} {:<12} {:<14}",
                     job.id,
                     status_name(job.status),
                     job.pid
                         .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
                     truncate(&job.definition.script_name, 22),
+                    job.definition.venue.map_or("-", venue_name),
                     job.definition.providers.join(","),
                     job.definition.symbol,
                 );
@@ -88,6 +89,13 @@ fn render_jobs(jobs: &[ScriptJob], output: OutputFormat) -> Result<()> {
         OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
     }
     Ok(())
+}
+
+fn venue_name(venue: crate::domain::execution::ExecutionVenue) -> &'static str {
+    match venue {
+        crate::domain::execution::ExecutionVenue::Bulk => "bulk",
+        crate::domain::execution::ExecutionVenue::Hyperliquid => "hyperliquid",
+    }
 }
 
 fn render_job(job: &ScriptJob, output: OutputFormat) -> Result<()> {

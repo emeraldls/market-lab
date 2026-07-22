@@ -15,6 +15,7 @@ use crate::commands::study::common::is_empty_object;
 use crate::domain::enums::ProviderKind;
 use crate::domain::types::OrderBookSnapshot;
 use crate::providers::bulk::market_data::BulkProvider;
+use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 use crate::providers::mmt::MmtProvider;
 use crate::scripting::engine::Script;
 use crate::scripting::execution::{
@@ -573,7 +574,17 @@ async fn fetch_sources(
         .any(|config| config.provider == ProviderKind::Bulk)
     {
         data.series.extend(
-            fetch_bulk_sources(args, source_configs, report)
+            fetch_direct_sources(args, source_configs, report, ProviderKind::Bulk)
+                .await?
+                .series,
+        );
+    }
+    if source_configs
+        .values()
+        .any(|config| config.provider == ProviderKind::Hyperliquid)
+    {
+        data.series.extend(
+            fetch_direct_sources(args, source_configs, report, ProviderKind::Hyperliquid)
                 .await?
                 .series,
         );
@@ -804,28 +815,43 @@ async fn fetch_mmt_sources(
     Ok(data)
 }
 
-async fn fetch_bulk_sources(
+async fn fetch_direct_sources(
     args: &ScriptBacktestArgs,
     source_configs: &SourceConfigs,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
+    provider: ProviderKind,
 ) -> Result<BacktestData> {
     let mut data = BacktestData::default();
     let mut cancel = Box::pin(tokio::signal::ctrl_c());
 
     let mut configs = source_configs.values().collect::<Vec<_>>();
-    configs.retain(|config| config.provider == ProviderKind::Bulk);
+    configs.retain(|config| config.provider == provider);
     configs.sort_by_key(|config| config.position);
     for config in configs {
         let source = &config.source;
         let timeframe = config.require_timeframe(source)?;
-        let interval = crate::providers::bulk::market_data::timeframe_from_seconds(timeframe)?;
+        let provider_name = match provider {
+            ProviderKind::Bulk => "BULK",
+            ProviderKind::Hyperliquid => "Hyperliquid",
+            _ => bail!("historical direct source provider is invalid"),
+        };
+        let interval = match provider {
+            ProviderKind::Bulk => {
+                crate::providers::bulk::market_data::timeframe_from_seconds(timeframe)?
+            }
+            ProviderKind::Hyperliquid => {
+                crate::providers::hyperliquid::market_data::timeframe_from_seconds(timeframe)?
+            }
+            _ => unreachable!(),
+        };
         let phase = match source {
             ScriptSource::Candles => "fetching_candles",
             ScriptSource::Volumes => "fetching_volumes",
             ScriptSource::Orderbook | ScriptSource::Vd | ScriptSource::Oi => {
                 bail!(
-                    "BULK does not provide historical {} for script backtests",
-                    source.as_str()
+                    "{} does not provide historical {} for script backtests",
+                    provider_name,
+                    source.as_str(),
                 );
             }
         };
@@ -833,14 +859,25 @@ async fn fetch_bulk_sources(
         write_running_report_best_effort(report);
         let started = Instant::now();
         eprintln!(
-            "fetching BULK {} symbol={} tf={} from={} to={}",
+            "fetching {} {} symbol={} tf={} from={} to={}",
+            provider_name,
             source.as_str(),
             args.symbol,
             timeframe,
             args.from,
             args.to
         );
-        let future = BulkProvider::candles(&args.symbol, interval, args.from, args.to);
+        let future = async {
+            match provider {
+                ProviderKind::Bulk => {
+                    BulkProvider::candles(&args.symbol, interval, args.from, args.to).await
+                }
+                ProviderKind::Hyperliquid => {
+                    HyperliquidProvider::candles(&args.symbol, interval, args.from, args.to).await
+                }
+                _ => unreachable!(),
+            }
+        };
         let series = tokio::select! {
             result = future => result?,
             _ = &mut cancel => {
@@ -877,7 +914,8 @@ async fn fetch_bulk_sources(
             ScriptSource::Orderbook | ScriptSource::Vd | ScriptSource::Oi => unreachable!(),
         }
         eprintln!(
-            "fetched {points} BULK {} records in {}ms",
+            "fetched {points} {} {} records in {}ms",
+            provider_name,
             source.as_str(),
             started.elapsed().as_millis()
         );

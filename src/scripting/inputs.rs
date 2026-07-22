@@ -184,6 +184,7 @@ pub fn source_provider_name(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Mmt => "mmt",
         ProviderKind::Bulk => "bulk",
+        ProviderKind::Hyperliquid => "hyperliquid",
         ProviderKind::MarketLab => "marketlab",
     }
 }
@@ -282,39 +283,50 @@ fn validate_source_config(config: &SourceConfig, historical: bool) -> Result<()>
                 config.require_timeframe(&config.source)?;
             }
         },
-        ProviderKind::Bulk => match &config.source {
+        ProviderKind::Bulk | ProviderKind::Hyperliquid => match &config.source {
             ScriptSource::Candles => {
                 let timeframe = config.require_timeframe(&config.source)?;
                 if historical {
-                    bulk_timeframe_from_seconds(timeframe)?;
+                    direct_timeframe_from_seconds(config.provider, timeframe)?;
                 }
             }
             ScriptSource::Volumes => {
                 let timeframe = config.require_timeframe(&config.source)?;
-                bulk_timeframe_from_seconds(timeframe)?;
+                direct_timeframe_from_seconds(config.provider, timeframe)?;
             }
             ScriptSource::Orderbook if historical => {
-                bail!("BULK does not provide historical orderbooks for script backtests");
+                bail!(
+                    "{} does not provide historical orderbooks for script backtests",
+                    source_provider_name(config.provider)
+                );
             }
             ScriptSource::Vd if historical => {
-                bail!("BULK does not provide historical volume delta for script backtests");
+                bail!(
+                    "{} does not provide historical volume delta for script backtests",
+                    source_provider_name(config.provider)
+                );
             }
             ScriptSource::Oi if historical => {
-                bail!("BULK does not provide historical open interest for script backtests");
+                bail!(
+                    "{} does not provide historical open interest for script backtests",
+                    source_provider_name(config.provider)
+                );
             }
             ScriptSource::Orderbook => {
                 if config.timeframe.is_some() {
-                    bail!("BULK live orderbook does not use a timeframe");
+                    bail!("standalone live orderbook does not use a timeframe");
                 }
             }
             ScriptSource::Vd => {
                 if config.timeframe.is_some() || config.bucket.is_some() {
-                    bail!("BULK live volume delta is trade-derived; omit timeframe and bucket");
+                    bail!(
+                        "standalone live volume delta is trade-derived; omit timeframe and bucket"
+                    );
                 }
             }
             ScriptSource::Oi => {
                 if config.timeframe.is_some() {
-                    bail!("BULK live open interest is snapshot-based; omit timeframe");
+                    bail!("standalone live open interest is snapshot-based; omit timeframe");
                 }
             }
         },
@@ -390,6 +402,7 @@ fn parse_source_selector(raw: &str) -> Result<(String, ScriptSource, ProviderKin
     let selector = match provider {
         ProviderKind::Mmt => format!("{}@{exchange}@mmt", source.as_str()),
         ProviderKind::Bulk => format!("{}@bulk", source.as_str()),
+        ProviderKind::Hyperliquid => format!("{}@hyperliquid", source.as_str()),
         ProviderKind::MarketLab => unreachable!(),
     };
     Ok((selector, source, provider, exchange))
@@ -399,6 +412,7 @@ fn parse_source_provider(raw: &str) -> Result<ProviderKind> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "mmt" => Ok(ProviderKind::Mmt),
         "bulk" => Ok(ProviderKind::Bulk),
+        "hyperliquid" => Ok(ProviderKind::Hyperliquid),
         other => bail!("unsupported script source provider `{other}`"),
     }
 }
@@ -406,8 +420,19 @@ fn parse_source_provider(raw: &str) -> Result<ProviderKind> {
 fn provider_name_for_exchange(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Bulk => "bulk",
+        ProviderKind::Hyperliquid => "hyperliquid",
         ProviderKind::Mmt => "mmt",
         ProviderKind::MarketLab => "marketlab",
+    }
+}
+
+fn direct_timeframe_from_seconds(provider: ProviderKind, seconds: u32) -> Result<&'static str> {
+    match provider {
+        ProviderKind::Bulk => bulk_timeframe_from_seconds(seconds),
+        ProviderKind::Hyperliquid => {
+            crate::providers::hyperliquid::market_data::timeframe_from_seconds(seconds)
+        }
+        ProviderKind::Mmt | ProviderKind::MarketLab => unreachable!("direct provider required"),
     }
 }
 
@@ -608,7 +633,7 @@ mod tests {
 
     #[test]
     fn validates_bare_bulk_bindings_for_snapshot_sources() {
-        let manifest = manifest(vec![
+        let live_manifest = manifest(vec![
             ScriptSource::Candles,
             ScriptSource::Orderbook,
             ScriptSource::Vd,
@@ -622,10 +647,46 @@ mod tests {
         ])
         .unwrap();
 
-        validate_source_configs_for_run(&manifest, &configs)
+        validate_source_configs_for_run(&live_manifest, &configs)
             .expect("BULK live configs should validate");
         assert!(configs.contains_key("vd@bulk"));
         assert!(configs.contains_key("oi@bulk"));
+    }
+
+    #[test]
+    fn validates_standalone_hyperliquid_bindings() {
+        let live_manifest = manifest(vec![
+            ScriptSource::Candles,
+            ScriptSource::Orderbook,
+            ScriptSource::Vd,
+            ScriptSource::Oi,
+            ScriptSource::Volumes,
+        ]);
+        let configs = parse_source_configs(&[
+            "candles@hyperliquid:timeframe=60".to_string(),
+            "orderbook@hyperliquid:depth=20".to_string(),
+            "vd@hyperliquid".to_string(),
+            "oi@hyperliquid".to_string(),
+            "volumes@hyperliquid:timeframe=60".to_string(),
+        ])
+        .expect("standalone Hyperliquid selectors should parse");
+
+        validate_source_configs_for_run(&live_manifest, &configs)
+            .expect("standalone Hyperliquid live configs should validate");
+        assert_eq!(
+            configs["candles@hyperliquid"].provider,
+            ProviderKind::Hyperliquid
+        );
+        assert_eq!(configs["orderbook@hyperliquid"].depth, Some(20));
+
+        let historical_manifest = manifest(vec![ScriptSource::Candles, ScriptSource::Volumes]);
+        let historical_configs = parse_source_configs(&[
+            "candles@hyperliquid:timeframe=60".to_string(),
+            "volumes@hyperliquid:timeframe=60".to_string(),
+        ])
+        .expect("historical Hyperliquid selectors should parse");
+        validate_source_configs(&historical_manifest, &historical_configs)
+            .expect("Hyperliquid candles and volume should support backtests");
     }
 
     #[test]

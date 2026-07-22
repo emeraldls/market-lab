@@ -5,10 +5,13 @@ use crate::domain::requests::{InspectRequest, ReplayRequest};
 use crate::domain::types::{OrderBookSnapshot, ProviderHealth, TopOfBook};
 
 pub mod bulk;
+pub mod execution;
+pub mod hyperliquid;
 pub mod marketlab_cloud;
 pub mod mmt;
 
 use bulk::market_data::BulkProvider;
+use hyperliquid::market_data::HyperliquidProvider;
 use marketlab_cloud::MarketLabProvider;
 use mmt::MmtProvider;
 
@@ -23,6 +26,7 @@ pub enum ProviderClient {
     MarketLab,
     Mmt,
     Bulk,
+    Hyperliquid,
 }
 
 impl ProviderClient {
@@ -31,6 +35,7 @@ impl ProviderClient {
             ProviderKind::MarketLab => Self::MarketLab,
             ProviderKind::Mmt => Self::Mmt,
             ProviderKind::Bulk => Self::Bulk,
+            ProviderKind::Hyperliquid => Self::Hyperliquid,
         }
     }
 }
@@ -41,6 +46,7 @@ impl MarketDataProvider for ProviderClient {
             Self::MarketLab => MarketLabProvider::inspect(req).await,
             Self::Mmt => MmtProvider::inspect(req).await,
             Self::Bulk => BulkProvider::inspect_historical().await,
+            Self::Hyperliquid => HyperliquidProvider::inspect_historical().await,
         }
     }
 
@@ -49,6 +55,7 @@ impl MarketDataProvider for ProviderClient {
             Self::MarketLab => MarketLabProvider::replay(req).await,
             Self::Mmt => MmtProvider::replay(req).await,
             Self::Bulk => BulkProvider::replay_historical().await,
+            Self::Hyperliquid => HyperliquidProvider::replay_historical().await,
         }
     }
 
@@ -57,6 +64,7 @@ impl MarketDataProvider for ProviderClient {
             Self::MarketLab => MarketLabProvider::health().await,
             Self::Mmt => MmtProvider::health().await,
             Self::Bulk => BulkProvider::health().await,
+            Self::Hyperliquid => HyperliquidProvider::health().await,
         }
     }
 }

@@ -183,6 +183,7 @@ async fn self_update(url: &str) -> Result<PathBuf> {
 
 async fn refresh_market_snapshots(cli: &Path) -> Result<()> {
     refresh_market_snapshot(cli, &["--exchange", "bulk", "--refresh", "--json"]).await?;
+    refresh_market_snapshot(cli, &["--exchange", "hyperliquid", "--refresh", "--json"]).await?;
     if crate::credentials::mmt_is_configured()? {
         refresh_market_snapshot(
             cli,

@@ -291,12 +291,14 @@ impl AccountQueryArgs {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum ExecutionVenueArg {
     Bulk,
+    Hyperliquid,
 }
 
 impl From<ExecutionVenueArg> for ExecutionVenue {
     fn from(value: ExecutionVenueArg) -> Self {
         match value {
             ExecutionVenueArg::Bulk => ExecutionVenue::Bulk,
+            ExecutionVenueArg::Hyperliquid => ExecutionVenue::Hyperliquid,
         }
     }
 }
@@ -383,6 +385,7 @@ pub struct AuthProviderArgs {
 pub enum AuthProvider {
     Mmt,
     Bulk,
+    Hyperliquid,
 }
 
 #[derive(Subcommand, Debug)]
@@ -670,12 +673,15 @@ pub struct SourceVdArgs {
 impl SourceVdArgs {
     pub fn validate(&self) -> Result<()> {
         let provider = validate_source_identity(self.provider, &self.exchange, &self.symbol)?;
-        if provider == CliProviderKind::Bulk {
+        if matches!(
+            provider,
+            CliProviderKind::Bulk | CliProviderKind::Hyperliquid
+        ) {
             if !self.stream {
-                bail!("BULK volume delta is derived from live trades and requires --stream");
+                bail!("standalone volume delta is derived from live trades and requires --stream");
             }
             if self.timeframe.is_some() || self.from.is_some() || self.to.is_some() {
-                bail!("BULK live volume delta does not use --timeframe/--from/--to");
+                bail!("standalone live volume delta does not use --timeframe/--from/--to");
             }
         } else {
             mmt_timeframe_from_seconds(
@@ -1101,7 +1107,7 @@ pub struct SourceStatsArgs {
 
 impl SourceStatsArgs {
     pub fn validate(&self) -> Result<()> {
-        validate_bulk_exchange(&self.exchange, "source stats")?;
+        resolve_source_provider(None, &self.exchange)?;
         if let Some(symbol) = &self.symbol
             && !is_valid_symbol(symbol)
         {
@@ -1114,12 +1120,16 @@ impl SourceStatsArgs {
             bail!("--period must be one of 1d,7d,30d,90d,1y,all");
         }
         if self.stream && self.symbol.is_none() {
-            bail!("--symbol is required when streaming BULK statistics");
+            bail!("--symbol is required when streaming statistics");
         }
         if self.stream && matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("stream mode currently supports only --output terminal|json|jsonl");
         }
         validate_stream_controls(self.buffer_size, self.interval_ms)
+    }
+
+    pub fn provider_kind(&self) -> Result<CliProviderKind> {
+        resolve_source_provider(None, &self.exchange)
     }
 }
 
@@ -1141,7 +1151,7 @@ pub struct SourceFundingArgs {
 
 impl SourceFundingArgs {
     pub fn validate(&self) -> Result<()> {
-        validate_bulk_exchange(&self.exchange, "source funding")?;
+        resolve_source_provider(None, &self.exchange)?;
         if !is_valid_symbol(&self.symbol) {
             bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
@@ -1149,6 +1159,10 @@ impl SourceFundingArgs {
             bail!("stream mode currently supports only --output terminal|json|jsonl");
         }
         validate_stream_controls(self.buffer_size, self.interval_ms)
+    }
+
+    pub fn provider_kind(&self) -> Result<CliProviderKind> {
+        resolve_source_provider(None, &self.exchange)
     }
 }
 
@@ -1845,6 +1859,7 @@ impl RunVwapArgs {
         }
         let execution_venue = match self.venue {
             ExecutionVenueArg::Bulk => "bulk",
+            ExecutionVenueArg::Hyperliquid => "hyperliquid",
         };
         crate::strategies::vwap::VolumeSourceSelector::parse(
             &self.volume_sources,
@@ -2069,13 +2084,19 @@ fn resolve_source_provider(
         bail!("--exchange cannot be empty");
     }
     if provider.is_some() {
-        if exchange.eq_ignore_ascii_case("bulk") {
-            bail!("omit --provider for the standalone `bulk` exchange");
+        if matches!(
+            exchange.to_ascii_lowercase().as_str(),
+            "bulk" | "hyperliquid"
+        ) {
+            bail!("omit --provider for the standalone `{exchange}` exchange");
         }
         return Ok(CliProviderKind::Mmt);
     }
     if exchange.eq_ignore_ascii_case("bulk") {
         return Ok(CliProviderKind::Bulk);
+    }
+    if exchange.eq_ignore_ascii_case("hyperliquid") {
+        return Ok(CliProviderKind::Hyperliquid);
     }
     bail!(
         "standalone exchange `{exchange}` is not supported yet; use --provider mmt when `{exchange}` is routed through MMT"
@@ -2094,21 +2115,22 @@ fn resolve_system_provider(
     exchange: Option<&str>,
 ) -> Result<ProviderKind> {
     match (provider, exchange) {
-        (Some(_), Some(exchange)) if exchange.eq_ignore_ascii_case("bulk") => {
-            bail!("omit --provider for the standalone `bulk` exchange")
+        (Some(_), Some(exchange))
+            if matches!(
+                exchange.to_ascii_lowercase().as_str(),
+                "bulk" | "hyperliquid"
+            ) =>
+        {
+            bail!("omit --provider for the standalone `{exchange}` exchange")
         }
         (Some(_), _) => Ok(ProviderKind::Mmt),
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("bulk") => Ok(ProviderKind::Bulk),
+        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquid") => {
+            Ok(ProviderKind::Hyperliquid)
+        }
         (None, Some(exchange)) => bail!("unsupported standalone exchange `{exchange}`"),
         (None, None) => Ok(ProviderKind::MarketLab),
     }
-}
-
-fn validate_bulk_exchange(exchange: &str, command: &str) -> Result<()> {
-    if !exchange.eq_ignore_ascii_case("bulk") {
-        bail!("{command} currently supports only --exchange bulk");
-    }
-    Ok(())
 }
 
 fn provider_timeframe_from_seconds(
@@ -2118,6 +2140,9 @@ fn provider_timeframe_from_seconds(
     match provider {
         CliProviderKind::Bulk => {
             crate::providers::bulk::market_data::timeframe_from_seconds(seconds)
+        }
+        CliProviderKind::Hyperliquid => {
+            crate::providers::hyperliquid::market_data::timeframe_from_seconds(seconds)
         }
         CliProviderKind::Mmt | CliProviderKind::MarketLab => mmt_timeframe_from_seconds(seconds),
     }
@@ -2166,6 +2191,7 @@ pub enum CliProviderKind {
     MarketLab,
     Mmt,
     Bulk,
+    Hyperliquid,
 }
 
 impl From<CliDataProvider> for CliProviderKind {
@@ -2182,6 +2208,7 @@ impl From<CliProviderKind> for ProviderKind {
             CliProviderKind::MarketLab => ProviderKind::MarketLab,
             CliProviderKind::Mmt => ProviderKind::Mmt,
             CliProviderKind::Bulk => ProviderKind::Bulk,
+            CliProviderKind::Hyperliquid => ProviderKind::Hyperliquid,
         }
     }
 }
@@ -2253,6 +2280,74 @@ mod tests {
                 args.validate().expect("BULK markets should validate");
             }
             _ => panic!("expected markets command"),
+        }
+    }
+
+    #[test]
+    fn parse_hyperliquid_standalone_commands() {
+        let markets =
+            Cli::try_parse_from(["mlab", "markets", "--exchange", "hyperliquid", "--refresh"])
+                .expect("Hyperliquid markets command should parse");
+        match markets.command {
+            Commands::Markets(args) => {
+                assert!(args.provider.is_none());
+                assert_eq!(args.exchange, "hyperliquid");
+                assert!(args.refresh);
+                args.validate()
+                    .expect("standalone Hyperliquid markets should validate");
+            }
+            _ => panic!("expected markets command"),
+        }
+
+        let source = Cli::try_parse_from([
+            "mlab",
+            "source",
+            "orderbook",
+            "--exchange",
+            "hyperliquid",
+            "--symbol",
+            "BTC/USDT",
+            "--depth",
+            "20",
+        ])
+        .expect("Hyperliquid source command should parse");
+        match source.command {
+            Commands::Source {
+                command: SourceCommands::Orderbook(args),
+            } => {
+                args.validate()
+                    .expect("standalone Hyperliquid source should validate");
+                assert_eq!(
+                    args.provider_kind().expect("provider resolves"),
+                    CliProviderKind::Hyperliquid
+                );
+            }
+            _ => panic!("expected source orderbook command"),
+        }
+
+        let trade = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "long",
+            "BTC/USDT",
+            "--venue",
+            "hyperliquid",
+            "--margin",
+            "100",
+            "--leverage",
+            "5",
+            "--dry-run",
+        ])
+        .expect("Hyperliquid trade command should parse");
+        match trade.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => {
+                args.validate_shape()
+                    .expect("Hyperliquid trade shape should validate");
+                assert!(matches!(args.venue, ExecutionVenueArg::Hyperliquid));
+            }
+            _ => panic!("expected trade long command"),
         }
     }
 

@@ -19,6 +19,7 @@ use crate::credentials;
 use crate::domain::execution::{CancelPlan, ExecutionReceipt, ExecutionVenue, Position, TradePlan};
 use crate::providers::bulk::execution::BulkExecutionAdapter;
 use crate::providers::bulk::ws::BulkAccountStream;
+use crate::providers::hyperliquid::ws::HyperliquidAccountStream;
 use crate::scripting::execution::{
     ScriptCancelRequest, ScriptManagedRequest, ScriptOrderRef, ScriptRawOrderRequest,
     ScriptTradeRequest, local_order_id,
@@ -32,7 +33,7 @@ use crate::strategies::jobs::{
 };
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-const RUNTIME_VERSION: u8 = 25;
+const RUNTIME_VERSION: u8 = 26;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -361,14 +362,17 @@ struct AccountRuntimeEvent<'a> {
 
 enum AccountConnectionEvent {
     Connected {
+        venue: ExecutionVenue,
         account: String,
         reconnected: bool,
     },
     Data {
+        venue: ExecutionVenue,
         account: String,
         data: serde_json::Value,
     },
     Disconnected {
+        venue: ExecutionVenue,
         account: String,
         error: String,
     },
@@ -445,7 +449,12 @@ pub async fn serve() -> Result<()> {
     let (account_tx, mut account_rx) = mpsc::channel(1024);
     let mut account_supervisors = HashSet::new();
     if let Ok(account) = credentials::bulk_account() {
-        ensure_account_supervisor(&account, &account_tx, &mut account_supervisors);
+        ensure_account_supervisor(
+            ExecutionVenue::Bulk,
+            &account,
+            &account_tx,
+            &mut account_supervisors,
+        );
     }
     let mut should_stop = false;
     while !should_stop {
@@ -479,7 +488,7 @@ pub async fn serve() -> Result<()> {
                     record_runtime_error(
                         &paths,
                         &mut state,
-                        format!("BULK account stream event failed: {error:#}"),
+                        format!("execution account stream event failed: {error:#}"),
                     );
                 }
             }
@@ -947,7 +956,13 @@ pub async fn submit_bot_cancel(
 pub fn append_bot_output(job_id: &str, value: &impl Serialize) -> Result<()> {
     let paths = RuntimePaths::load()?;
     let path = bot_job_directory(&paths, job_id)?.join("output.jsonl");
-    append_json_line(&path, value)
+    let mut value = serde_json::to_value(value).context("failed to encode bot output")?;
+    if let Some(object) = value.as_object_mut() {
+        object
+            .entry("tsMs")
+            .or_insert(serde_json::Value::from(now_ms()?));
+    }
+    append_json_line(&path, &value)
 }
 
 pub fn bot_output_after(
@@ -1307,6 +1322,10 @@ fn create_script_job(
     if submission.venue == Some(ExecutionVenue::Bulk) {
         credentials::bulk_account()
             .context("BULK authentication is required when a script uses --venue bulk")?;
+    } else if submission.venue == Some(ExecutionVenue::Hyperliquid) {
+        credentials::hyperliquid_account().context(
+            "Hyperliquid authentication is required when a script uses --venue hyperliquid",
+        )?;
     }
 
     fs::create_dir_all(&paths.jobs)
@@ -1633,7 +1652,15 @@ fn create_strategy_job(
     submission: StrategyJobSubmission,
 ) -> Result<StrategyJob> {
     submission.validate()?;
-    credentials::bulk_account().context("BULK authentication is required for strategy jobs")?;
+    crate::providers::execution::ExecutionAdapter::configured_account(
+        submission.definition.venue(),
+    )
+    .with_context(|| {
+        format!(
+            "{} authentication is required for strategy jobs",
+            execution_exchange(submission.definition.venue())
+        )
+    })?;
 
     fs::create_dir_all(&paths.jobs)
         .with_context(|| format!("failed to create {}", paths.jobs.display()))?;
@@ -1839,13 +1866,32 @@ fn mark_strategy_worker_finished(
     Ok(job)
 }
 
-fn create_bot_job(
+async fn create_bot_job(
     paths: &RuntimePaths,
     state: &mut RuntimeState,
     submission: BotJobSubmission,
 ) -> Result<BotJob> {
     submission.validate()?;
-    credentials::bulk_account().context("BULK authentication is required for bot jobs")?;
+    crate::providers::execution::ExecutionAdapter::configured_account(
+        submission.definition.venue(),
+    )
+    .with_context(|| {
+        format!(
+            "{} authentication is required for bot jobs",
+            execution_exchange(submission.definition.venue())
+        )
+    })?;
+
+    if submission.definition.venue() == ExecutionVenue::Hyperliquid {
+        crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new()
+            .await?
+            .configure_leverage(
+                submission.definition.symbol(),
+                submission.definition.leverage(),
+            )
+            .await
+            .context("failed to configure Hyperliquid leverage before starting the bot")?;
+    }
 
     fs::create_dir_all(&paths.jobs)
         .with_context(|| format!("failed to create {}", paths.jobs.display()))?;
@@ -2213,9 +2259,6 @@ async fn execute_script_order(
         .definition
         .venue
         .context("script execution is disabled; deploy the script with --venue")?;
-    if venue != ExecutionVenue::Bulk {
-        bail!("unsupported script execution venue");
-    }
     let expected_id = local_order_id(job_id, &key);
     if order.id != expected_id || order.key != key {
         bail!("script order reference does not match its job and idempotency key");
@@ -2264,16 +2307,27 @@ async fn execute_script_order(
         crate::scripting::execution::ScriptTimeInForce::Ioc => crate::cli::TradeTimeInForce::Ioc,
         crate::scripting::execution::ScriptTimeInForce::Alo => crate::cli::TradeTimeInForce::Alo,
     };
-    let account = match credentials::bulk_account() {
+    let account = match crate::providers::execution::ExecutionAdapter::configured_account(venue) {
         Ok(account) => account,
         Err(error) => {
             fail_script_order(paths, state, job_id, &order.id, &error)?;
             return Err(error);
         }
     };
+    let venue_adapter = match crate::providers::execution::ExecutionAdapter::new(venue).await {
+        Ok(adapter) => adapter,
+        Err(error) => {
+            fail_script_order(paths, state, job_id, &order.id, &error)?;
+            return Err(error);
+        }
+    };
+    let venue_arg = match venue {
+        ExecutionVenue::Bulk => crate::cli::ExecutionVenueArg::Bulk,
+        ExecutionVenue::Hyperliquid => crate::cli::ExecutionVenueArg::Hyperliquid,
+    };
     let (args, direction) = match &request {
         ScriptManagedRequest::Trade(request) => {
-            let snapshot = match adapter.account_snapshot(&account).await {
+            let snapshot = match venue_adapter.account_snapshot(&account).await {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     fail_script_order(paths, state, job_id, &order.id, &error)?;
@@ -2334,7 +2388,7 @@ async fn execute_script_order(
                 crate::cli::TradeArgs {
                     symbol: job.definition.symbol.clone(),
                     config: None,
-                    venue: crate::cli::ExecutionVenueArg::Bulk,
+                    venue: venue_arg,
                     size,
                     margin,
                     order_kind,
@@ -2355,7 +2409,7 @@ async fn execute_script_order(
             crate::cli::TradeArgs {
                 symbol: job.definition.symbol.clone(),
                 config: None,
-                venue: crate::cli::ExecutionVenueArg::Bulk,
+                venue: venue_arg,
                 size: request.size,
                 margin: request.margin,
                 order_kind,
@@ -2379,7 +2433,7 @@ async fn execute_script_order(
             return Err(error);
         }
     };
-    ensure_account_supervisor(&plan.account, account_tx, account_supervisors);
+    ensure_account_supervisor(venue, &plan.account, account_tx, account_supervisors);
     let receipt = match execute_trade(paths, adapter, state, &plan, Some(order.id.clone())).await {
         Ok(receipt) => receipt,
         Err(error) => {
@@ -2521,11 +2575,11 @@ async fn execute_script_cancel(
         persist_state(paths, state)?;
         return Ok(managed);
     };
-    let market = crate::providers::bulk::markets::market(&current.symbol)?;
+    let market = crate::markets::exchange_market(execution_exchange(venue), &current.symbol)?;
     let plan = CancelPlan {
         created_at_ms: now_ms()?,
         venue,
-        account: credentials::bulk_account()?,
+        account: crate::providers::execution::ExecutionAdapter::configured_account(venue)?,
         internal_symbol: market.symbol.clone(),
         venue_symbol: market.venue_symbol.clone(),
         order_id: venue_order_id,
@@ -2679,7 +2733,10 @@ fn validate_strategy_trade(
             if sequence > child_orders {
                 bail!("TWAP child sequence {sequence} exceeds schedule length {child_orders}");
             }
-            let market = crate::providers::bulk::markets::market(&definition.symbol)?;
+            let market = crate::markets::exchange_market(
+                execution_exchange(definition.venue),
+                &definition.symbol,
+            )?;
             let rules = market.execution_rules()?;
             let schedule = crate::strategies::twap::TwapSchedule::build(
                 definition.total_size,
@@ -2733,7 +2790,7 @@ async fn execute_strategy_cancel(
         bail!("strategy job `{job_id}` is not running");
     }
     let order_prefix = format!("{job_id}:");
-    if plan.venue != ExecutionVenue::Bulk
+    if plan.venue != job.definition.venue()
         || plan.internal_symbol != job.definition.symbol()
         || !state.strategy_executions.iter().any(|(key, receipt)| {
             key.starts_with(&order_prefix)
@@ -2841,7 +2898,7 @@ async fn execute_bot_cancel(
         bail!("bot job `{job_id}` is not running");
     }
     let order_prefix = format!("{job_id}:");
-    if plan.venue != ExecutionVenue::Bulk
+    if plan.venue != job.definition.venue()
         || plan.internal_symbol != job.definition.symbol()
         || !state.bot_executions.iter().any(|(key, receipt)| {
             key.starts_with(&order_prefix)
@@ -2946,7 +3003,7 @@ async fn handle_connection(
             }
         }
         RuntimeRequest::ExecuteTrade { plan } => {
-            ensure_account_supervisor(&plan.account, account_tx, account_supervisors);
+            ensure_account_supervisor(plan.venue, &plan.account, account_tx, account_supervisors);
             match execute_trade(paths, adapter, state, &plan, None).await {
                 Ok(receipt) => RuntimeResponse {
                     ok: true,
@@ -2965,7 +3022,7 @@ async fn handle_connection(
             }
         }
         RuntimeRequest::CancelOrder { plan } => {
-            ensure_account_supervisor(&plan.account, account_tx, account_supervisors);
+            ensure_account_supervisor(plan.venue, &plan.account, account_tx, account_supervisors);
             match execute_cancel(paths, adapter, state, &plan).await {
                 Ok(receipt) => RuntimeResponse {
                     ok: true,
@@ -2984,10 +3041,11 @@ async fn handle_connection(
             }
         }
         RuntimeRequest::SubmitScriptJob { submission } => {
-            if submission.venue == Some(ExecutionVenue::Bulk)
-                && let Ok(account) = credentials::bulk_account()
+            if let Some(venue) = submission.venue
+                && let Ok(account) =
+                    crate::providers::execution::ExecutionAdapter::configured_account(venue)
             {
-                ensure_account_supervisor(&account, account_tx, account_supervisors);
+                ensure_account_supervisor(venue, &account, account_tx, account_supervisors);
             }
             match create_script_job(paths, state, submission) {
                 Ok(job) => RuntimeResponse {
@@ -3202,8 +3260,11 @@ async fn handle_connection(
             }
         }
         RuntimeRequest::SubmitStrategyJob { submission } => {
-            if let Ok(account) = credentials::bulk_account() {
-                ensure_account_supervisor(&account, account_tx, account_supervisors);
+            let venue = submission.definition.venue();
+            if let Ok(account) =
+                crate::providers::execution::ExecutionAdapter::configured_account(venue)
+            {
+                ensure_account_supervisor(venue, &account, account_tx, account_supervisors);
             }
             match create_strategy_job(paths, state, submission) {
                 Ok(job) => RuntimeResponse {
@@ -3290,7 +3351,7 @@ async fn handle_connection(
             sequence,
             plan,
         } => {
-            ensure_account_supervisor(&plan.account, account_tx, account_supervisors);
+            ensure_account_supervisor(plan.venue, &plan.account, account_tx, account_supervisors);
             match execute_strategy_trade(paths, adapter, state, &job_id, sequence, &plan).await {
                 Ok(receipt) => RuntimeResponse {
                     ok: true,
@@ -3317,10 +3378,13 @@ async fn handle_connection(
             Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
         },
         RuntimeRequest::SubmitBotJob { submission } => {
-            if let Ok(account) = credentials::bulk_account() {
-                ensure_account_supervisor(&account, account_tx, account_supervisors);
+            let venue = submission.definition.venue();
+            if let Ok(account) =
+                crate::providers::execution::ExecutionAdapter::configured_account(venue)
+            {
+                ensure_account_supervisor(venue, &account, account_tx, account_supervisors);
             }
-            match create_bot_job(paths, state, submission) {
+            match create_bot_job(paths, state, submission).await {
                 Ok(job) => RuntimeResponse {
                     ok: true,
                     message: "bot job submitted".to_string(),
@@ -3403,7 +3467,7 @@ async fn handle_connection(
             sequence,
             plan,
         } => {
-            ensure_account_supervisor(&plan.account, account_tx, account_supervisors);
+            ensure_account_supervisor(plan.venue, &plan.account, account_tx, account_supervisors);
             match execute_bot_trade(paths, adapter, state, &job_id, sequence, &plan).await {
                 Ok(receipt) => RuntimeResponse {
                     ok: true,
@@ -3447,9 +3511,19 @@ async fn execute_trade(
     plan: &TradePlan,
     script_order_id: Option<String>,
 ) -> Result<ExecutionReceipt> {
-    let receipt = adapter
-        .submit_trade(credentials::active_bulk_credential()?, plan)
-        .await?;
+    let receipt = match plan.venue {
+        ExecutionVenue::Bulk => {
+            adapter
+                .submit_trade(credentials::active_bulk_credential()?, plan)
+                .await?
+        }
+        ExecutionVenue::Hyperliquid => {
+            crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new()
+                .await?
+                .submit_trade(plan)
+                .await?
+        }
+    };
     if let Err(error) = append_json_line(
         &paths.events,
         &TradeSubmissionEvent {
@@ -3465,7 +3539,7 @@ async fn execute_trade(
         let order_id = receipt
             .order_id
             .as_deref()
-            .context("non-terminal BULK receipt omitted its order id")?;
+            .context("non-terminal execution receipt omitted its order id")?;
         let order = TrackedOrder {
             venue: plan.venue,
             account: plan.account.clone(),
@@ -3492,20 +3566,32 @@ async fn execute_cancel(
     state: &mut RuntimeState,
     plan: &CancelPlan,
 ) -> Result<ExecutionReceipt> {
-    if plan.venue != ExecutionVenue::Bulk {
-        bail!("BULK runtime received a cancel plan for another venue");
-    }
-    let market = crate::providers::bulk::markets::market(&plan.internal_symbol)?;
+    let market =
+        crate::markets::exchange_market(execution_exchange(plan.venue), &plan.internal_symbol)?;
     if market.venue_symbol != plan.venue_symbol {
         bail!("cancel plan symbol mapping does not match the installed market snapshot");
     }
-    let credential = credentials::active_bulk_credential()?;
-    if credential.account.to_base58() != plan.account {
-        bail!("cancel plan account no longer matches the configured BULK account");
+    let configured = crate::providers::execution::ExecutionAdapter::configured_account(plan.venue)?;
+    if !configured.eq_ignore_ascii_case(&plan.account) {
+        bail!("cancel plan account no longer matches the configured venue account");
     }
-    let receipt = adapter
-        .cancel_order(credential, &plan.venue_symbol, &plan.order_id)
-        .await?;
+    let receipt = match plan.venue {
+        ExecutionVenue::Bulk => {
+            adapter
+                .cancel_order(
+                    credentials::active_bulk_credential()?,
+                    &plan.venue_symbol,
+                    &plan.order_id,
+                )
+                .await?
+        }
+        ExecutionVenue::Hyperliquid => {
+            crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new()
+                .await?
+                .cancel_order(&plan.venue_symbol, &plan.order_id)
+                .await?
+        }
+    };
     if let Err(error) = append_json_line(
         &paths.events,
         &CancelSubmissionEvent {
@@ -3524,28 +3610,65 @@ async fn execute_cancel(
 }
 
 fn ensure_account_supervisor(
+    venue: ExecutionVenue,
     account: &str,
     sender: &mpsc::Sender<AccountConnectionEvent>,
     supervisors: &mut HashSet<String>,
 ) {
-    if !supervisors.insert(account.to_string()) {
+    let key = format!("{}:{account}", execution_exchange(venue));
+    if !supervisors.insert(key) {
         return;
     }
     let account = account.to_string();
     let sender = sender.clone();
     tokio::spawn(async move {
-        supervise_account_stream(account, sender).await;
+        supervise_account_stream(venue, account, sender).await;
     });
 }
 
-async fn supervise_account_stream(account: String, sender: mpsc::Sender<AccountConnectionEvent>) {
+fn execution_exchange(venue: ExecutionVenue) -> &'static str {
+    match venue {
+        ExecutionVenue::Bulk => "bulk",
+        ExecutionVenue::Hyperliquid => "hyperliquid",
+    }
+}
+
+enum VenueAccountStream {
+    Bulk(BulkAccountStream),
+    Hyperliquid(HyperliquidAccountStream),
+}
+
+impl VenueAccountStream {
+    async fn connect(venue: ExecutionVenue, account: &str) -> Result<Self> {
+        match venue {
+            ExecutionVenue::Bulk => Ok(Self::Bulk(BulkAccountStream::connect(account).await?)),
+            ExecutionVenue::Hyperliquid => Ok(Self::Hyperliquid(
+                HyperliquidAccountStream::connect(account).await?,
+            )),
+        }
+    }
+
+    async fn next_event(&mut self) -> Result<serde_json::Value> {
+        match self {
+            Self::Bulk(stream) => stream.next_event().await,
+            Self::Hyperliquid(stream) => stream.next_event().await,
+        }
+    }
+}
+
+async fn supervise_account_stream(
+    venue: ExecutionVenue,
+    account: String,
+    sender: mpsc::Sender<AccountConnectionEvent>,
+) {
     let mut connected_once = false;
     let mut reconnect_delay_secs = 1_u64;
     loop {
-        match BulkAccountStream::connect(&account).await {
+        match VenueAccountStream::connect(venue, &account).await {
             Ok(mut stream) => {
                 if sender
                     .send(AccountConnectionEvent::Connected {
+                        venue,
                         account: account.clone(),
                         reconnected: connected_once,
                     })
@@ -3561,6 +3684,7 @@ async fn supervise_account_stream(account: String, sender: mpsc::Sender<AccountC
                         Ok(data) => {
                             if sender
                                 .send(AccountConnectionEvent::Data {
+                                    venue,
                                     account: account.clone(),
                                     data,
                                 })
@@ -3573,6 +3697,7 @@ async fn supervise_account_stream(account: String, sender: mpsc::Sender<AccountC
                         Err(error) => {
                             if sender
                                 .send(AccountConnectionEvent::Disconnected {
+                                    venue,
                                     account: account.clone(),
                                     error: format!("{error:#}"),
                                 })
@@ -3589,6 +3714,7 @@ async fn supervise_account_stream(account: String, sender: mpsc::Sender<AccountC
             Err(error) => {
                 if sender
                     .send(AccountConnectionEvent::Disconnected {
+                        venue,
                         account: account.clone(),
                         error: format!("{error:#}"),
                     })
@@ -3612,27 +3738,39 @@ async fn handle_account_connection_event(
 ) -> Result<()> {
     match event {
         AccountConnectionEvent::Connected {
+            venue,
             account,
             reconnected,
         } => {
             state.account_stream_connected = true;
             state.last_error = None;
-            refresh_account_positions(adapter, state, &account, true).await?;
+            refresh_account_positions(venue, adapter, state, &account, true).await?;
             persist_state(paths, state)?;
             if reconnected {
-                recover_account_gap(paths, adapter, state, &account).await?;
+                recover_account_gap(venue, paths, adapter, state, &account).await?;
             }
         }
-        AccountConnectionEvent::Disconnected { account, error } => {
+        AccountConnectionEvent::Disconnected {
+            venue,
+            account,
+            error,
+        } => {
             state.account_stream_connected = false;
             state.account_disconnected_at_ms = Some(now_ms()?);
             record_runtime_error(
                 paths,
                 state,
-                format!("BULK account WebSocket disconnected for {account}: {error}"),
+                format!(
+                    "{} account WebSocket disconnected for {account}: {error}",
+                    execution_exchange(venue)
+                ),
             );
         }
-        AccountConnectionEvent::Data { account, data } => {
+        AccountConnectionEvent::Data {
+            venue,
+            account,
+            data,
+        } => {
             let received_at_ms = now_ms()?;
             state.account_stream_connected = true;
             state.last_account_event_ms = Some(received_at_ms);
@@ -3645,7 +3783,12 @@ async fn handle_account_connection_event(
                     data: &data,
                 },
             )?;
-            apply_account_event(paths, state, &account, &data, received_at_ms)?;
+            apply_account_event(venue, paths, state, &account, &data, received_at_ms)?;
+            if venue == ExecutionVenue::Hyperliquid
+                && data.get("channel").and_then(serde_json::Value::as_str) == Some("user")
+            {
+                refresh_account_positions(venue, adapter, state, &account, true).await?;
+            }
             persist_state(paths, state)?;
         }
     }
@@ -3653,6 +3796,7 @@ async fn handle_account_connection_event(
 }
 
 async fn refresh_account_positions(
+    venue: ExecutionVenue,
     adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
     account: &str,
@@ -3667,7 +3811,15 @@ async fn refresh_account_positions(
     {
         return Ok(());
     }
-    let snapshot = adapter.account_snapshot(account).await?;
+    let snapshot = match venue {
+        ExecutionVenue::Bulk => adapter.account_snapshot(account).await?,
+        ExecutionVenue::Hyperliquid => {
+            crate::providers::execution::ExecutionAdapter::new(venue)
+                .await?
+                .account_snapshot(account)
+                .await?
+        }
+    };
     state
         .account_positions
         .insert(account.to_string(), snapshot.positions);
@@ -3691,8 +3843,9 @@ async fn script_positions_in_daemon(
     if job.definition.venue.is_none() {
         return Ok(Vec::new());
     }
-    let account = credentials::bulk_account()?;
-    refresh_account_positions(adapter, state, &account, false).await?;
+    let venue = job.definition.venue.expect("checked execution venue");
+    let account = crate::providers::execution::ExecutionAdapter::configured_account(venue)?;
+    refresh_account_positions(venue, adapter, state, &account, false).await?;
     persist_state(paths, state)?;
     Ok(state
         .account_positions
@@ -3709,6 +3862,24 @@ async fn script_positions_in_daemon(
 }
 
 fn apply_account_event(
+    venue: ExecutionVenue,
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
+    account: &str,
+    data: &serde_json::Value,
+    received_at_ms: u64,
+) -> Result<()> {
+    match venue {
+        ExecutionVenue::Bulk => {
+            apply_bulk_account_event(paths, state, account, data, received_at_ms)
+        }
+        ExecutionVenue::Hyperliquid => {
+            apply_hyperliquid_account_event(paths, state, account, data, received_at_ms)
+        }
+    }
+}
+
+fn apply_bulk_account_event(
     paths: &RuntimePaths,
     state: &mut RuntimeState,
     account: &str,
@@ -3766,8 +3937,109 @@ fn apply_account_event(
         }
         _ => {}
     }
-    route_account_event_to_scripts(paths, state, data)?;
+    route_account_event_to_scripts(ExecutionVenue::Bulk, paths, state, data)?;
     Ok(())
+}
+
+fn apply_hyperliquid_account_event(
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
+    account: &str,
+    data: &serde_json::Value,
+    received_at_ms: u64,
+) -> Result<()> {
+    match data.get("channel").and_then(serde_json::Value::as_str) {
+        Some("orderUpdates") => {
+            let updates = data
+                .get("data")
+                .and_then(serde_json::Value::as_array)
+                .context("Hyperliquid orderUpdates omitted its update list")?;
+            for update in updates {
+                let order = update
+                    .get("order")
+                    .context("Hyperliquid order update omitted order")?;
+                let order_id = value_identifier(
+                    order
+                        .get("oid")
+                        .context("Hyperliquid order update omitted oid")?,
+                )?;
+                let raw_status = update
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .context("Hyperliquid order update omitted status")?;
+                let status = normalize_hyperliquid_order_status(raw_status);
+                let event_ms = update
+                    .get("statusTimestamp")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(received_at_ms);
+                apply_tracked_order_status(paths, state, account, &order_id, status, event_ms)?;
+                apply_script_order_status(
+                    paths,
+                    state,
+                    &order_id,
+                    status,
+                    event_ms,
+                    update.clone(),
+                )?;
+            }
+        }
+        Some("user") => {
+            let event = data
+                .get("data")
+                .context("Hyperliquid user event omitted data")?;
+            if let Some(fills) = event.get("fills").and_then(serde_json::Value::as_array) {
+                for fill in fills {
+                    let mut normalized = serde_json::json!({
+                        "type": "fill",
+                        "venue": "hyperliquid",
+                        "symbol": fill.get("coin").cloned().unwrap_or(serde_json::Value::Null),
+                        "price": fill.get("px").cloned().unwrap_or(serde_json::Value::Null),
+                        "size": fill.get("sz").cloned().unwrap_or(serde_json::Value::Null),
+                        "side": fill.get("side").cloned().unwrap_or(serde_json::Value::Null),
+                        "fee": fill.get("fee").cloned().unwrap_or(serde_json::Value::Null),
+                        "timestamp": fill.get("time").cloned().unwrap_or(serde_json::Value::Null),
+                        "raw": fill,
+                    });
+                    if let Some(oid) = fill.get("oid") {
+                        normalized.as_object_mut().expect("object").insert(
+                            "orderId".to_string(),
+                            serde_json::Value::String(value_identifier(oid)?),
+                        );
+                    }
+                    route_account_event_to_scripts(
+                        ExecutionVenue::Hyperliquid,
+                        paths,
+                        state,
+                        &normalized,
+                    )?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn value_identifier(value: &serde_json::Value) -> Result<String> {
+    match value {
+        serde_json::Value::String(value) => Ok(value.clone()),
+        serde_json::Value::Number(value) => Ok(value.to_string()),
+        _ => bail!("execution order id is neither a string nor an integer"),
+    }
+}
+
+fn normalize_hyperliquid_order_status(status: &str) -> &str {
+    if status.eq_ignore_ascii_case("open") {
+        "resting"
+    } else if status.eq_ignore_ascii_case("filled") {
+        "filled"
+    } else if status.eq_ignore_ascii_case("canceled") || status.eq_ignore_ascii_case("cancelled") {
+        "cancelled"
+    } else if status.eq_ignore_ascii_case("rejected") || status.ends_with("Canceled") {
+        "rejected"
+    } else {
+        status
+    }
 }
 
 fn apply_script_order_status(
@@ -3824,6 +4096,7 @@ fn apply_script_order_status(
 }
 
 fn route_account_event_to_scripts(
+    venue: ExecutionVenue,
     paths: &RuntimePaths,
     state: &mut RuntimeState,
     data: &serde_json::Value,
@@ -3841,7 +4114,7 @@ fn route_account_event_to_scripts(
         .and_then(serde_json::Value::as_str);
     let venue_symbol = data.get("symbol").and_then(serde_json::Value::as_str);
     let internal_symbol = venue_symbol
-        .and_then(|symbol| crate::providers::bulk::markets::market(symbol).ok())
+        .and_then(|symbol| crate::markets::exchange_market(execution_exchange(venue), symbol).ok())
         .map(|market| market.symbol.clone());
     let event_type = match kind {
         "fill" => "order.fill",
@@ -3882,7 +4155,7 @@ fn route_account_event_to_scripts(
         .values()
         .filter(|job| {
             job.status.is_active()
-                && job.definition.venue == Some(ExecutionVenue::Bulk)
+                && job.definition.venue == Some(venue)
                 && internal_symbol
                     .as_deref()
                     .is_none_or(|symbol| job.definition.symbol == symbol)
@@ -3931,6 +4204,7 @@ fn apply_tracked_order_status(
 }
 
 async fn recover_account_gap(
+    venue: ExecutionVenue,
     paths: &RuntimePaths,
     adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
@@ -3943,32 +4217,65 @@ async fn recover_account_gap(
 
     // These are one-shot gap-recovery calls after a proven disconnect. They are
     // never scheduled on a timer while the account WebSocket is healthy.
-    let history = adapter.order_history(account).await?;
-    for record in history
-        .into_iter()
-        .filter(|record| record.ts_ms >= gap_started_ms)
-    {
-        apply_tracked_order_status(
-            paths,
-            state,
-            account,
-            &record.order_id,
-            &record.status,
-            record.ts_ms,
-        )?;
-        apply_script_order_status(
-            paths,
-            state,
-            &record.order_id,
-            &record.status,
-            record.ts_ms,
-            serde_json::to_value(&record)?,
-        )?;
+    match venue {
+        ExecutionVenue::Bulk => {
+            for record in adapter
+                .order_history(account)
+                .await?
+                .into_iter()
+                .filter(|record| record.ts_ms >= gap_started_ms)
+            {
+                apply_tracked_order_status(
+                    paths,
+                    state,
+                    account,
+                    &record.order_id,
+                    &record.status,
+                    record.ts_ms,
+                )?;
+                apply_script_order_status(
+                    paths,
+                    state,
+                    &record.order_id,
+                    &record.status,
+                    record.ts_ms,
+                    serde_json::to_value(&record)?,
+                )?;
+            }
+        }
+        ExecutionVenue::Hyperliquid => {
+            let execution = crate::providers::execution::ExecutionAdapter::new(venue).await?;
+            for order in execution.open_orders(account).await? {
+                apply_tracked_order_status(
+                    paths,
+                    state,
+                    account,
+                    &order.order_id,
+                    "resting",
+                    order.ts_ms,
+                )?;
+                apply_script_order_status(
+                    paths,
+                    state,
+                    &order.order_id,
+                    "resting",
+                    order.ts_ms,
+                    serde_json::to_value(&order)?,
+                )?;
+            }
+        }
     }
 
-    for fill in adapter
-        .fills(account)
-        .await?
+    let fills = match venue {
+        ExecutionVenue::Bulk => adapter.fills(account).await?,
+        ExecutionVenue::Hyperliquid => {
+            crate::providers::execution::ExecutionAdapter::new(venue)
+                .await?
+                .fills(account)
+                .await?
+        }
+    };
+    for fill in fills
         .into_iter()
         .filter(|fill| fill.ts_ms >= gap_started_ms)
     {
@@ -3999,7 +4306,7 @@ async fn recover_account_gap(
                 serde_json::Value::String(fill.venue_symbol.clone()),
             );
         }
-        route_account_event_to_scripts(paths, state, &routed)?;
+        route_account_event_to_scripts(venue, paths, state, &routed)?;
     }
     state.last_recovery_ms = Some(now_ms()?);
     state.account_disconnected_at_ms = None;
@@ -4219,6 +4526,20 @@ mod tests {
     }
 
     #[test]
+    fn hyperliquid_order_ids_and_statuses_normalize_for_runtime_tracking() {
+        assert_eq!(
+            value_identifier(&serde_json::json!(123)).expect("oid"),
+            "123"
+        );
+        assert_eq!(normalize_hyperliquid_order_status("open"), "resting");
+        assert_eq!(normalize_hyperliquid_order_status("filled"), "filled");
+        assert_eq!(
+            normalize_hyperliquid_order_status("scheduledCancelCanceled"),
+            "rejected"
+        );
+    }
+
+    #[test]
     fn reads_status_from_runtime_before_account_stream_fields_existed() {
         let status: RuntimeStatus = serde_json::from_value(serde_json::json!({
             "running": true,
@@ -4239,8 +4560,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_protocol_v25_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 25);
+    fn runtime_protocol_v26_decodes_oiwap_submissions() {
+        assert_eq!(RUNTIME_VERSION, 26);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",
@@ -4276,7 +4597,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_protocol_v25_decodes_mid_price_bot_submissions() {
+    fn runtime_protocol_v26_decodes_mid_price_bot_submissions() {
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_bot_job",
             "submission": {
@@ -4312,7 +4633,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_protocol_v25_decodes_volume_mid_bot_submissions() {
+    fn runtime_protocol_v26_decodes_volume_mid_bot_submissions() {
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_bot_job",
             "submission": {

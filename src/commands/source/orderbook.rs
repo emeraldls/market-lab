@@ -9,6 +9,8 @@ use crate::domain::enums::ProviderKind;
 use crate::domain::types::{OrderBookLevel, OrderBookSnapshot};
 use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::bulk::ws::BulkOrderBookStream;
+use crate::providers::hyperliquid::market_data::HyperliquidProvider;
+use crate::providers::hyperliquid::ws::HyperliquidOrderBookStream;
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::ws::MmtDepthStream;
 
@@ -26,6 +28,7 @@ pub async fn handle(args: SourceOrderbookArgs) -> Result<()> {
     match args.provider_kind()?.into() {
         ProviderKind::Mmt => handle_mmt(args).await,
         ProviderKind::Bulk => handle_bulk(args).await,
+        ProviderKind::Hyperliquid => handle_hyperliquid(args).await,
         ProviderKind::MarketLab => unreachable!("source routing cannot resolve to Market Lab"),
     }
 }
@@ -57,6 +60,23 @@ async fn handle_bulk(args: SourceOrderbookArgs) -> Result<()> {
     let env = build_orderbook_envelope(&snap, &args, "bulk", false)?;
     render_json_or_terminal(
         &env,
+        &args.output,
+        format_terminal_summary,
+        "source orderbook",
+    )
+}
+
+async fn handle_hyperliquid(args: SourceOrderbookArgs) -> Result<()> {
+    if args.stream {
+        if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("stream mode currently supports only --output terminal|json|jsonl");
+        }
+        return stream_hyperliquid_orderbook(args).await;
+    }
+    let snapshot = HyperliquidProvider::live_orderbook(&args.symbol, args.depth, None).await?;
+    let envelope = build_orderbook_envelope(&snapshot, &args, "hyperliquid", false)?;
+    render_json_or_terminal(
+        &envelope,
         &args.output,
         format_terminal_summary,
         "source orderbook",
@@ -129,6 +149,37 @@ async fn stream_bulk_orderbook(args: SourceOrderbookArgs) -> Result<()> {
                         if buf.len() >= args.buffer_size as usize { buf.pop_front(); }
                         buf.push_back(line);
                         render_terminal("market-lab source BULK orderbook stream", &buf)?;
+                    }
+                    OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn stream_hyperliquid_orderbook(args: SourceOrderbookArgs) -> Result<()> {
+    let mut stream = HyperliquidOrderBookStream::connect(&args.symbol, args.depth).await?;
+    let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
+    let mut latest = None;
+    let mut buf = VecDeque::with_capacity(args.buffer_size as usize);
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\nstream stopped");
+                break;
+            }
+            snapshot = stream.next_snapshot() => latest = Some(snapshot?),
+            _ = ticker.tick() => {
+                let Some(snapshot) = latest.as_ref() else { continue; };
+                let envelope = build_orderbook_envelope(snapshot, &args, "hyperliquid", true)?;
+                match args.output {
+                    OutputFormat::Json | OutputFormat::Jsonl => println!("{}", serde_json::to_string(&envelope)?),
+                    OutputFormat::Terminal => {
+                        let line = format_terminal_summary(&envelope);
+                        if buf.len() >= args.buffer_size as usize { buf.pop_front(); }
+                        buf.push_back(line);
+                        render_terminal("market-lab source Hyperliquid orderbook stream", &buf)?;
                     }
                     OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
                 }
