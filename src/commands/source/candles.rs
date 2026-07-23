@@ -6,6 +6,7 @@ use anyhow::{Result, bail};
 use crate::cli::{OutputFormat, SourceCandlesArgs};
 use crate::domain::enums::ProviderKind;
 use crate::domain::types::{OhlcvSeries, OhlcvtCandle};
+use crate::providers::binance::{BinanceMarket, BinanceProvider};
 use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::bulk::ws::BulkCandleStream;
 use crate::providers::hyperliquid::market_data::HyperliquidProvider;
@@ -21,6 +22,8 @@ pub async fn handle(args: SourceCandlesArgs) -> Result<()> {
         ProviderKind::Mmt => handle_mmt(args).await,
         ProviderKind::Bulk => handle_bulk(args).await,
         ProviderKind::Hyperliquid => handle_hyperliquid(args).await,
+        ProviderKind::Binance => handle_binance(args, BinanceMarket::Spot).await,
+        ProviderKind::BinanceFutures => handle_binance(args, BinanceMarket::Futures).await,
         ProviderKind::MarketLab => unreachable!("source routing cannot resolve to Market Lab"),
     }
 }
@@ -119,6 +122,27 @@ async fn handle_hyperliquid(args: SourceCandlesArgs) -> Result<()> {
     )
     .await?;
     render_direct_series(&series, &args, "hyperliquid", "Hyperliquid")
+}
+
+async fn handle_binance(args: SourceCandlesArgs, market: BinanceMarket) -> Result<()> {
+    if args.stream {
+        bail!("Binance live candle streaming is not implemented");
+    }
+    let series = BinanceProvider::candles_paginated(
+        market,
+        &args.symbol,
+        args.timeframe_name()?,
+        args.from
+            .ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?,
+        args.to
+            .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?,
+    )
+    .await?;
+    let label = match market {
+        BinanceMarket::Spot => "Binance Spot",
+        BinanceMarket::Futures => "Binance Futures",
+    };
+    render_direct_series(&series, &args, market.exchange(), label)
 }
 
 fn render_bulk_series(series: &OhlcvSeries, args: &SourceCandlesArgs) -> Result<()> {

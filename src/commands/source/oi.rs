@@ -22,6 +22,9 @@ pub async fn handle(args: SourceOiArgs) -> Result<()> {
         ProviderKind::Mmt => handle_mmt(args).await,
         ProviderKind::Bulk => handle_bulk(args).await,
         ProviderKind::Hyperliquid => handle_hyperliquid(args).await,
+        ProviderKind::Binance | ProviderKind::BinanceFutures => {
+            bail!("Binance open interest is not implemented")
+        }
         ProviderKind::MarketLab => unreachable!("source routing cannot resolve to Market Lab"),
     }
 }

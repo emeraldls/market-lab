@@ -1,15 +1,17 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::domain::enums::ProviderKind;
 use crate::domain::requests::{InspectRequest, ReplayRequest};
 use crate::domain::types::{OrderBookSnapshot, ProviderHealth, TopOfBook};
 
+pub mod binance;
 pub mod bulk;
 pub mod execution;
 pub mod hyperliquid;
 pub mod marketlab_cloud;
 pub mod mmt;
 
+use binance::{BinanceMarket, BinanceProvider};
 use bulk::market_data::BulkProvider;
 use hyperliquid::market_data::HyperliquidProvider;
 use marketlab_cloud::MarketLabProvider;
@@ -27,6 +29,8 @@ pub enum ProviderClient {
     Mmt,
     Bulk,
     Hyperliquid,
+    Binance,
+    BinanceFutures,
 }
 
 impl ProviderClient {
@@ -36,6 +40,8 @@ impl ProviderClient {
             ProviderKind::Mmt => Self::Mmt,
             ProviderKind::Bulk => Self::Bulk,
             ProviderKind::Hyperliquid => Self::Hyperliquid,
+            ProviderKind::Binance => Self::Binance,
+            ProviderKind::BinanceFutures => Self::BinanceFutures,
         }
     }
 }
@@ -47,6 +53,9 @@ impl MarketDataProvider for ProviderClient {
             Self::Mmt => MmtProvider::inspect(req).await,
             Self::Bulk => BulkProvider::inspect_historical().await,
             Self::Hyperliquid => HyperliquidProvider::inspect_historical().await,
+            Self::Binance | Self::BinanceFutures => {
+                bail!("Binance does not provide historical orderbook inspection")
+            }
         }
     }
 
@@ -56,6 +65,9 @@ impl MarketDataProvider for ProviderClient {
             Self::Mmt => MmtProvider::replay(req).await,
             Self::Bulk => BulkProvider::replay_historical().await,
             Self::Hyperliquid => HyperliquidProvider::replay_historical().await,
+            Self::Binance | Self::BinanceFutures => {
+                bail!("Binance historical orderbook replay is not implemented")
+            }
         }
     }
 
@@ -65,6 +77,8 @@ impl MarketDataProvider for ProviderClient {
             Self::Mmt => MmtProvider::health().await,
             Self::Bulk => BulkProvider::health().await,
             Self::Hyperliquid => HyperliquidProvider::health().await,
+            Self::Binance => BinanceProvider::health(BinanceMarket::Spot).await,
+            Self::BinanceFutures => BinanceProvider::health(BinanceMarket::Futures).await,
         }
     }
 }

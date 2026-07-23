@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use crate::cli::{OutputFormat, SourceVolumesArgs};
 use crate::domain::enums::ProviderKind;
 use crate::domain::types::{VolumeBarSeries, VolumeProfile};
+use crate::providers::binance::{BinanceMarket, BinanceProvider};
 use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::bulk::ws::BulkCandleStream;
 use crate::providers::hyperliquid::market_data::HyperliquidProvider;
@@ -22,6 +23,8 @@ pub async fn handle(args: SourceVolumesArgs) -> Result<()> {
         ProviderKind::Mmt => handle_mmt(args).await,
         ProviderKind::Bulk => handle_bulk(args).await,
         ProviderKind::Hyperliquid => handle_hyperliquid(args).await,
+        ProviderKind::Binance => handle_binance(args, BinanceMarket::Spot).await,
+        ProviderKind::BinanceFutures => handle_binance(args, BinanceMarket::Futures).await,
         ProviderKind::MarketLab => unreachable!("source routing cannot resolve to Market Lab"),
     }
 }
@@ -126,6 +129,27 @@ async fn handle_hyperliquid(args: SourceVolumesArgs) -> Result<()> {
     )
     .await?;
     render_direct_volume_bars(&series, args.output, "hyperliquid", "Hyperliquid")
+}
+
+async fn handle_binance(args: SourceVolumesArgs, market: BinanceMarket) -> Result<()> {
+    if args.stream {
+        bail!("Binance live volume streaming is not implemented");
+    }
+    let series = BinanceProvider::volume_bars(
+        market,
+        &args.symbol,
+        args.timeframe_name()?,
+        args.from
+            .ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?,
+        args.to
+            .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?,
+    )
+    .await?;
+    let label = match market {
+        BinanceMarket::Spot => "Binance Spot",
+        BinanceMarket::Futures => "Binance Futures",
+    };
+    render_direct_volume_bars(&series, args.output, market.exchange(), label)
 }
 
 fn render_bulk_volume_bars(series: &VolumeBarSeries, output: OutputFormat) -> Result<()> {

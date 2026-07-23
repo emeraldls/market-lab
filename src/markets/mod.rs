@@ -16,6 +16,8 @@ use crate::credentials::mmt_api_key;
 
 const SNAPSHOT_SCHEMA_VERSION: u8 = 1;
 const BULK_MARKETS_URL: &str = "https://exchange-api.bulk.trade/api/v1/exchangeInfo";
+const BINANCE_SPOT_MARKETS_URL: &str = "https://api.binance.com/api/v3/exchangeInfo";
+const BINANCE_FUTURES_MARKETS_URL: &str = "https://fapi.binance.com/fapi/v1/exchangeInfo";
 const HYPERLIQUID_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 const MMT_MARKETS_URL: &str = "https://eu-central-1.mmt.gg/api/v1/markets";
 const MARKET_HTTP_TIMEOUT_SECS: u64 = 15;
@@ -175,6 +177,33 @@ struct MmtMarket {
     normalised_quote: String,
     tick_size: f64,
     step_size: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceExchangeInfo {
+    symbols: Vec<BinanceMarket>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinanceMarket {
+    symbol: String,
+    status: String,
+    base_asset: String,
+    quote_asset: String,
+    #[serde(default)]
+    contract_type: Option<String>,
+    filters: Vec<BinanceFilter>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinanceFilter {
+    filter_type: String,
+    #[serde(default)]
+    tick_size: Option<String>,
+    #[serde(default)]
+    step_size: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -593,6 +622,8 @@ pub async fn refresh_route(provider: Option<&str>, exchange: &str) -> Result<Mar
         None if exchange.eq_ignore_ascii_case("hyperliquid") => {
             fetch_hyperliquid_snapshot().await?
         }
+        None if exchange.eq_ignore_ascii_case("binance") => fetch_binance_snapshot(false).await?,
+        None if exchange.eq_ignore_ascii_case("binancef") => fetch_binance_snapshot(true).await?,
         None => bail!("market refresh is not implemented for standalone exchange `{exchange}`"),
     };
     write_snapshot(&snapshot)?;
@@ -606,6 +637,14 @@ pub async fn refresh_bulk() -> Result<MarketSnapshot> {
 
 pub async fn refresh_hyperliquid() -> Result<MarketSnapshot> {
     refresh_route(None, "hyperliquid").await
+}
+
+pub async fn refresh_binance() -> Result<MarketSnapshot> {
+    refresh_route(None, "binance").await
+}
+
+pub async fn refresh_binance_futures() -> Result<MarketSnapshot> {
+    refresh_route(None, "binancef").await
 }
 
 pub async fn refresh_mmt() -> Result<MarketSnapshot> {
@@ -723,6 +762,116 @@ async fn fetch_bulk_snapshot() -> Result<MarketSnapshot> {
     };
     snapshot.validate()?;
     Ok(snapshot)
+}
+
+async fn fetch_binance_snapshot(futures: bool) -> Result<MarketSnapshot> {
+    let (provider, name, source_url, market_type) = if futures {
+        (
+            "binancef",
+            "Binance USD-M Futures",
+            BINANCE_FUTURES_MARKETS_URL,
+            MarketType::Futures,
+        )
+    } else {
+        (
+            "binance",
+            "Binance Spot",
+            BINANCE_SPOT_MARKETS_URL,
+            MarketType::Spot,
+        )
+    };
+    let response = Client::new()
+        .get(source_url)
+        .timeout(Duration::from_secs(MARKET_HTTP_TIMEOUT_SECS))
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch {name} markets"))?;
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .with_context(|| format!("failed to decode {name} markets response"))?;
+    if !status.is_success() {
+        bail!("{name} markets returned HTTP {status} body={body}");
+    }
+    let raw = serde_json::from_value::<BinanceExchangeInfo>(body)
+        .with_context(|| format!("invalid {name} markets response"))?;
+    let markets = raw
+        .symbols
+        .into_iter()
+        .filter(|market| {
+            market.status.eq_ignore_ascii_case("TRADING")
+                && (!futures
+                    || market
+                        .contract_type
+                        .as_deref()
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("PERPETUAL")))
+        })
+        .map(binance_market)
+        .collect::<Result<Vec<_>>>()?;
+    if markets.is_empty() {
+        bail!("{name} returned no active markets");
+    }
+    let snapshot = MarketSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        provider: provider.to_string(),
+        provider_type: ProviderType::Standalone,
+        source_url: source_url.to_string(),
+        fetched_at: fetched_at(),
+        exchanges: vec![ExchangeMarkets {
+            exchange: provider.to_string(),
+            name: name.to_string(),
+            market_type,
+            markets,
+        }],
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
+}
+
+fn binance_market(market: BinanceMarket) -> Result<Market> {
+    let price_increment = binance_filter_increment(&market.filters, "PRICE_FILTER", "tickSize")?;
+    let size_increment = binance_filter_increment(&market.filters, "LOT_SIZE", "stepSize")?;
+    let base_asset = market.base_asset.to_ascii_uppercase();
+    let quote_asset = market.quote_asset.to_ascii_uppercase();
+    Ok(Market {
+        symbol: format!("{base_asset}/{quote_asset}"),
+        provider_symbol: market.symbol.clone(),
+        venue_symbol: market.symbol,
+        venue_id: None,
+        aliases: Vec::new(),
+        base_asset: base_asset.clone(),
+        quote_asset: quote_asset.clone(),
+        venue_base_asset: base_asset,
+        venue_quote_asset: quote_asset,
+        status: market.status,
+        price_increment: Some(price_increment),
+        size_increment: Some(size_increment),
+        execution: None,
+    })
+}
+
+fn binance_filter_increment(
+    filters: &[BinanceFilter],
+    filter_type: &str,
+    field: &str,
+) -> Result<f64> {
+    let filter = filters
+        .iter()
+        .find(|filter| filter.filter_type == filter_type)
+        .with_context(|| format!("Binance market omitted {filter_type}"))?;
+    let value = match field {
+        "tickSize" => filter.tick_size.as_deref(),
+        "stepSize" => filter.step_size.as_deref(),
+        _ => None,
+    }
+    .with_context(|| format!("Binance {filter_type} omitted {field}"))?
+    .parse::<f64>()
+    .with_context(|| format!("Binance {filter_type} returned an invalid {field}"))?;
+    if !value.is_finite() || value <= 0.0 {
+        bail!("Binance {filter_type} returned a non-positive {field}");
+    }
+    Ok(value)
 }
 
 async fn fetch_hyperliquid_snapshot() -> Result<MarketSnapshot> {
@@ -1125,6 +1274,22 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
             time_in_forces: vec!["GTC".to_string(), "IOC".to_string(), "ALO".to_string()],
         }),
     };
+    let binance_spot_market = Market {
+        symbol: "BTC/USDT".to_string(),
+        provider_symbol: "BTCUSDT".to_string(),
+        venue_symbol: "BTCUSDT".to_string(),
+        venue_id: None,
+        aliases: Vec::new(),
+        base_asset: "BTC".to_string(),
+        quote_asset: "USDT".to_string(),
+        venue_base_asset: "BTC".to_string(),
+        venue_quote_asset: "USDT".to_string(),
+        status: "TRADING".to_string(),
+        price_increment: Some(0.01),
+        size_increment: Some(0.00001),
+        execution: None,
+    };
+    let binance_futures_market = binance_spot_market.clone();
     vec![
         MarketSnapshot {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -1150,6 +1315,32 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
                 name: "Hyperliquid".to_string(),
                 market_type: MarketType::Futures,
                 markets: vec![hyperliquid_market],
+            }],
+        },
+        MarketSnapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            provider: "binance".to_string(),
+            provider_type: ProviderType::Standalone,
+            source_url: BINANCE_SPOT_MARKETS_URL.to_string(),
+            fetched_at: "2026-07-19T00:00:00Z".to_string(),
+            exchanges: vec![ExchangeMarkets {
+                exchange: "binance".to_string(),
+                name: "Binance Spot".to_string(),
+                market_type: MarketType::Spot,
+                markets: vec![binance_spot_market],
+            }],
+        },
+        MarketSnapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            provider: "binancef".to_string(),
+            provider_type: ProviderType::Standalone,
+            source_url: BINANCE_FUTURES_MARKETS_URL.to_string(),
+            fetched_at: "2026-07-19T00:00:00Z".to_string(),
+            exchanges: vec![ExchangeMarkets {
+                exchange: "binancef".to_string(),
+                name: "Binance USD-M Futures".to_string(),
+                market_type: MarketType::Futures,
+                markets: vec![binance_futures_market],
             }],
         },
         MarketSnapshot {
@@ -1189,7 +1380,7 @@ mod tests {
     #[test]
     fn snapshots_build_provider_and_direct_indexes() {
         let registry = MarketRegistry::new(test_snapshots()).expect("snapshots index");
-        assert_eq!(registry.snapshots.len(), 3);
+        assert_eq!(registry.snapshots.len(), 5);
 
         let bulk = exchange_market("bulk", "btc/usdt").expect("BULK market resolves");
         assert_eq!(bulk.symbol, "BTC/USDT");
@@ -1202,6 +1393,40 @@ mod tests {
         let mmt = provider_market("mmt", "binancef", "btc/usdt").expect("MMT market resolves");
         assert_eq!(mmt.provider_symbol, "btc/usd");
         assert!(mmt.execution.is_none());
+
+        let spot = exchange_market("binance", "btc/usdt").expect("Binance spot market resolves");
+        assert_eq!(spot.provider_symbol, "BTCUSDT");
+        assert!(!is_futures_exchange("binance").expect("Binance spot type resolves"));
+
+        let futures =
+            exchange_market("binancef", "btc/usdt").expect("Binance futures market resolves");
+        assert_eq!(futures.provider_symbol, "BTCUSDT");
+        assert!(is_futures_exchange("binancef").expect("Binance futures type resolves"));
+    }
+
+    #[test]
+    fn binance_filter_increments_are_strictly_decoded() {
+        let filters = vec![
+            BinanceFilter {
+                filter_type: "PRICE_FILTER".to_string(),
+                tick_size: Some("0.10".to_string()),
+                step_size: None,
+            },
+            BinanceFilter {
+                filter_type: "LOT_SIZE".to_string(),
+                tick_size: None,
+                step_size: Some("0.001".to_string()),
+            },
+        ];
+        assert_eq!(
+            binance_filter_increment(&filters, "PRICE_FILTER", "tickSize").expect("tick size"),
+            0.1
+        );
+        assert_eq!(
+            binance_filter_increment(&filters, "LOT_SIZE", "stepSize").expect("step size"),
+            0.001
+        );
+        assert!(binance_filter_increment(&filters, "MARKET_LOT_SIZE", "stepSize").is_err());
     }
 
     #[test]

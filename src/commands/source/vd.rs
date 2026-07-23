@@ -33,6 +33,9 @@ pub async fn handle(args: SourceVdArgs) -> Result<()> {
         ProviderKind::Mmt => handle_mmt(args).await,
         ProviderKind::Bulk => stream_bulk_vd(args).await,
         ProviderKind::Hyperliquid => stream_hyperliquid_vd(args).await,
+        ProviderKind::Binance | ProviderKind::BinanceFutures => {
+            bail!("Binance live volume delta is not implemented")
+        }
         ProviderKind::MarketLab => unreachable!("source routing cannot resolve to Market Lab"),
     }
 }

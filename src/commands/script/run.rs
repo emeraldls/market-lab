@@ -775,7 +775,10 @@ impl DirectTradesStream {
                 )
                 .await?,
             )),
-            ProviderKind::Mmt | ProviderKind::MarketLab => {
+            ProviderKind::Mmt
+            | ProviderKind::MarketLab
+            | ProviderKind::Binance
+            | ProviderKind::BinanceFutures => {
                 bail!("provider does not use the direct trade stream")
             }
         }
@@ -813,7 +816,10 @@ impl DirectOrderBookStream {
                 )
                 .await?,
             )),
-            ProviderKind::Mmt | ProviderKind::MarketLab => {
+            ProviderKind::Mmt
+            | ProviderKind::MarketLab
+            | ProviderKind::Binance
+            | ProviderKind::BinanceFutures => {
                 bail!("provider does not use the direct orderbook stream")
             }
         }
@@ -843,7 +849,10 @@ impl DirectTickerStream {
                 )
                 .await?,
             )),
-            ProviderKind::Mmt | ProviderKind::MarketLab => {
+            ProviderKind::Mmt
+            | ProviderKind::MarketLab
+            | ProviderKind::Binance
+            | ProviderKind::BinanceFutures => {
                 bail!("provider does not use the direct ticker stream")
             }
         }
@@ -881,7 +890,10 @@ impl DirectCandleStream {
                 )
                 .await?,
             )),
-            ProviderKind::Mmt | ProviderKind::MarketLab => {
+            ProviderKind::Mmt
+            | ProviderKind::MarketLab
+            | ProviderKind::Binance
+            | ProviderKind::BinanceFutures => {
                 bail!("provider does not use the direct candle stream")
             }
         }
@@ -899,6 +911,8 @@ fn direct_provider_name(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Bulk => "bulk",
         ProviderKind::Hyperliquid => "hyperliquid",
+        ProviderKind::Binance => "binance",
+        ProviderKind::BinanceFutures => "binancef",
         ProviderKind::Mmt => "mmt",
         ProviderKind::MarketLab => "marketlab",
     }
@@ -910,7 +924,10 @@ fn direct_timeframe(provider: ProviderKind, seconds: u32) -> Result<&'static str
         ProviderKind::Hyperliquid => {
             crate::providers::hyperliquid::market_data::timeframe_from_seconds(seconds)
         }
-        ProviderKind::Mmt | ProviderKind::MarketLab => {
+        ProviderKind::Mmt
+        | ProviderKind::MarketLab
+        | ProviderKind::Binance
+        | ProviderKind::BinanceFutures => {
             bail!("provider does not use a direct timeframe")
         }
     }

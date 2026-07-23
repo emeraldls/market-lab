@@ -185,6 +185,8 @@ pub fn source_provider_name(provider: ProviderKind) -> &'static str {
         ProviderKind::Mmt => "mmt",
         ProviderKind::Bulk => "bulk",
         ProviderKind::Hyperliquid => "hyperliquid",
+        ProviderKind::Binance => "binance",
+        ProviderKind::BinanceFutures => "binancef",
         ProviderKind::MarketLab => "marketlab",
     }
 }
@@ -330,6 +332,27 @@ fn validate_source_config(config: &SourceConfig, historical: bool) -> Result<()>
                 }
             }
         },
+        ProviderKind::Binance | ProviderKind::BinanceFutures => {
+            if !historical {
+                bail!(
+                    "{} live script sources are not implemented",
+                    source_provider_name(config.provider)
+                );
+            }
+            match &config.source {
+                ScriptSource::Candles | ScriptSource::Volumes => {
+                    let timeframe = config.require_timeframe(&config.source)?;
+                    direct_timeframe_from_seconds(config.provider, timeframe)?;
+                }
+                ScriptSource::Orderbook | ScriptSource::Vd | ScriptSource::Oi => {
+                    bail!(
+                        "{} does not provide historical {} for script backtests",
+                        source_provider_name(config.provider),
+                        config.source.as_str()
+                    );
+                }
+            }
+        }
         ProviderKind::MarketLab => bail!("marketlab is not a script source provider"),
     }
     Ok(())
@@ -403,6 +426,8 @@ fn parse_source_selector(raw: &str) -> Result<(String, ScriptSource, ProviderKin
         ProviderKind::Mmt => format!("{}@{exchange}@mmt", source.as_str()),
         ProviderKind::Bulk => format!("{}@bulk", source.as_str()),
         ProviderKind::Hyperliquid => format!("{}@hyperliquid", source.as_str()),
+        ProviderKind::Binance => format!("{}@binance", source.as_str()),
+        ProviderKind::BinanceFutures => format!("{}@binancef", source.as_str()),
         ProviderKind::MarketLab => unreachable!(),
     };
     Ok((selector, source, provider, exchange))
@@ -413,6 +438,8 @@ fn parse_source_provider(raw: &str) -> Result<ProviderKind> {
         "mmt" => Ok(ProviderKind::Mmt),
         "bulk" => Ok(ProviderKind::Bulk),
         "hyperliquid" => Ok(ProviderKind::Hyperliquid),
+        "binance" => Ok(ProviderKind::Binance),
+        "binancef" => Ok(ProviderKind::BinanceFutures),
         other => bail!("unsupported script source provider `{other}`"),
     }
 }
@@ -421,6 +448,8 @@ fn provider_name_for_exchange(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Bulk => "bulk",
         ProviderKind::Hyperliquid => "hyperliquid",
+        ProviderKind::Binance => "binance",
+        ProviderKind::BinanceFutures => "binancef",
         ProviderKind::Mmt => "mmt",
         ProviderKind::MarketLab => "marketlab",
     }
@@ -431,6 +460,9 @@ fn direct_timeframe_from_seconds(provider: ProviderKind, seconds: u32) -> Result
         ProviderKind::Bulk => bulk_timeframe_from_seconds(seconds),
         ProviderKind::Hyperliquid => {
             crate::providers::hyperliquid::market_data::timeframe_from_seconds(seconds)
+        }
+        ProviderKind::Binance | ProviderKind::BinanceFutures => {
+            crate::providers::binance::market_data::timeframe_from_seconds(seconds)
         }
         ProviderKind::Mmt | ProviderKind::MarketLab => unreachable!("direct provider required"),
     }
@@ -687,6 +719,26 @@ mod tests {
         .expect("historical Hyperliquid selectors should parse");
         validate_source_configs(&historical_manifest, &historical_configs)
             .expect("Hyperliquid candles and volume should support backtests");
+    }
+
+    #[test]
+    fn validates_historical_binance_spot_and_futures_bindings() {
+        let manifest = manifest(vec![ScriptSource::Candles, ScriptSource::Volumes]);
+        let configs = parse_source_configs(&[
+            "candles@binance:timeframe=60".to_string(),
+            "volumes@binancef:timeframe=300".to_string(),
+        ])
+        .expect("standalone Binance selectors should parse");
+
+        validate_source_configs(&manifest, &configs)
+            .expect("historical Binance configs should validate");
+        assert_eq!(configs["candles@binance"].provider, ProviderKind::Binance);
+        assert_eq!(
+            configs["volumes@binancef"].provider,
+            ProviderKind::BinanceFutures
+        );
+        validate_source_configs_for_run(&manifest, &configs)
+            .expect_err("live Binance streams are not implemented");
     }
 
     #[test]
