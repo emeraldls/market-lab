@@ -15,6 +15,7 @@ use crate::domain::execution::{
 use crate::markets::Market;
 use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::execution::ExecutionAdapter;
+use crate::providers::hyperliquid::HyperliquidNetwork;
 use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 
 pub async fn handle_trade(args: TradeArgs, direction: PositionDirection) -> Result<()> {
@@ -32,7 +33,10 @@ pub async fn handle_trade(args: TradeArgs, direction: PositionDirection) -> Resu
         if !matches!(args.output, OutputFormat::Terminal) {
             bail!("live execution with structured output requires --yes");
         }
-        print!("Submit this order to {}? [y/N]: ", venue_label(plan.venue));
+        print!(
+            "Submit this order to {}? [y/N]: ",
+            venue_network_label(plan.venue, plan.testnet)
+        );
         io::stdout()
             .flush()
             .context("failed to flush confirmation prompt")?;
@@ -48,7 +52,7 @@ pub async fn handle_trade(args: TradeArgs, direction: PositionDirection) -> Resu
 
     let receipt = crate::runtime::submit_trade(&plan).await?;
     let post_trade_position = if matches!(receipt.status.as_str(), "filled" | "partiallyFilled") {
-        match ExecutionAdapter::new(plan.venue).await {
+        match ExecutionAdapter::new(plan.venue, plan.testnet).await {
             Ok(adapter) => {
                 adapter
                     .account_snapshot(&plan.account)
@@ -74,7 +78,7 @@ pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
     let symbol = validate_optional_symbol(args.symbol.as_deref())?;
     let venue = ExecutionVenue::from(args.venue);
     let account = ExecutionAdapter::configured_account(venue)?;
-    let snapshot = ExecutionAdapter::new(venue)
+    let snapshot = ExecutionAdapter::new(venue, args.testnet)
         .await?
         .account_snapshot(&account)
         .await?;
@@ -95,7 +99,7 @@ pub async fn handle_orders(args: AccountQueryArgs) -> Result<()> {
     let symbol = validate_optional_symbol(args.symbol.as_deref())?;
     let venue = ExecutionVenue::from(args.venue);
     let account = ExecutionAdapter::configured_account(venue)?;
-    let orders = ExecutionAdapter::new(venue)
+    let orders = ExecutionAdapter::new(venue, args.testnet)
         .await?
         .open_orders(&account)
         .await?
@@ -114,7 +118,7 @@ pub async fn handle_fills(args: AccountQueryArgs) -> Result<()> {
     let symbol = validate_optional_symbol(args.symbol.as_deref())?;
     let venue = ExecutionVenue::from(args.venue);
     let account = ExecutionAdapter::configured_account(venue)?;
-    let fills = ExecutionAdapter::new(venue)
+    let fills = ExecutionAdapter::new(venue, args.testnet)
         .await?
         .fills(&account)
         .await?
@@ -160,6 +164,7 @@ pub async fn handle_cancel(args: CancelOrderArgs) -> Result<()> {
     let plan = CancelPlan {
         created_at_ms: now_ms()?,
         venue,
+        testnet: args.testnet,
         account,
         internal_symbol: market.symbol.clone(),
         venue_symbol: market.venue_symbol.clone(),
@@ -172,7 +177,10 @@ pub async fn handle_cancel(args: CancelOrderArgs) -> Result<()> {
     if matches!(args.output, OutputFormat::Terminal) {
         render_cancel_plan(&plan, false, args.output)?;
     }
-    let prompt = format!("Cancel this {} order?", venue_label(venue));
+    let prompt = format!(
+        "Cancel this {} order?",
+        venue_network_label(venue, args.testnet)
+    );
     if !args.yes && !confirm_live_action(args.output, &prompt)? {
         println!("cancelled; the order was not changed");
         return Ok(());
@@ -186,7 +194,7 @@ pub async fn handle_close(args: ClosePositionArgs) -> Result<()> {
     let requested_symbol = validate_optional_symbol(args.symbol.as_deref())?;
     let venue = ExecutionVenue::from(args.venue);
     let account = ExecutionAdapter::configured_account(venue)?;
-    let snapshot = ExecutionAdapter::new(venue)
+    let snapshot = ExecutionAdapter::new(venue, args.testnet)
         .await?
         .account_snapshot(&account)
         .await?;
@@ -209,6 +217,7 @@ pub async fn handle_close(args: ClosePositionArgs) -> Result<()> {
             symbol: position.internal_symbol,
             config: None,
             venue: args.venue,
+            testnet: args.testnet,
             size: Some(position.size),
             margin: None,
             order_kind: TradeOrderKind::Market,
@@ -298,9 +307,12 @@ pub(crate) async fn build_trade_plan(
         TradeOrderKind::Market => match venue {
             ExecutionVenue::Bulk => BulkProvider::ticker(&market.symbol).await?.mark_price,
             ExecutionVenue::Hyperliquid => {
-                HyperliquidProvider::ticker(&market.symbol)
-                    .await?
-                    .mark_price
+                HyperliquidProvider::ticker_on(
+                    &market.symbol,
+                    HyperliquidNetwork::from_testnet(args.testnet),
+                )
+                .await?
+                .mark_price
             }
         },
     };
@@ -352,6 +364,7 @@ pub(crate) async fn build_trade_plan(
     Ok(TradePlan {
         created_at_ms: now_ms()?,
         venue,
+        testnet: args.testnet,
         account,
         internal_symbol: market.symbol.clone(),
         venue_symbol: market.venue_symbol.clone(),
@@ -517,7 +530,15 @@ fn venue_key(venue: ExecutionVenue) -> &'static str {
 fn venue_label(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "BULK",
-        ExecutionVenue::Hyperliquid => "Hyperliquid testnet",
+        ExecutionVenue::Hyperliquid => "Hyperliquid",
+    }
+}
+
+fn venue_network_label(venue: ExecutionVenue, testnet: bool) -> &'static str {
+    match (venue, testnet) {
+        (ExecutionVenue::Hyperliquid, true) => "Hyperliquid testnet",
+        (ExecutionVenue::Hyperliquid, false) => "Hyperliquid mainnet",
+        (ExecutionVenue::Bulk, _) => "BULK",
     }
 }
 
@@ -569,6 +590,12 @@ fn render_trade_plan(plan: &TradePlan, dry_run: bool, output: OutputFormat) -> R
                 }
             );
             println!("  venue:             {}", venue_key(plan.venue));
+            if plan.venue == ExecutionVenue::Hyperliquid {
+                println!(
+                    "  network:           {}",
+                    if plan.testnet { "testnet" } else { "mainnet" }
+                );
+            }
             println!("  account:           {}", plan.account);
             println!(
                 "  symbol:            {} ({})",

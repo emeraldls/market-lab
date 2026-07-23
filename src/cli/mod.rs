@@ -103,6 +103,9 @@ pub struct TradeArgs {
     pub config: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
+    /// Use Hyperliquid testnet instead of the default mainnet.
+    #[arg(long, default_value_t = false)]
+    pub testnet: bool,
     /// Exact base-asset exposure; leverage does not multiply an explicit size.
     #[arg(long, conflicts_with = "margin", required_unless_present = "margin")]
     pub size: Option<f64>,
@@ -199,6 +202,7 @@ impl TradeArgs {
         if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("trade supports only --output terminal|json|jsonl");
         }
+        validate_execution_network(self.venue, self.testnet)?;
         Ok(())
     }
 }
@@ -207,6 +211,9 @@ impl TradeArgs {
 pub struct AccountQueryArgs {
     #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
+    /// Query Hyperliquid testnet instead of the default mainnet.
+    #[arg(long, default_value_t = false)]
+    pub testnet: bool,
     #[arg(long)]
     pub symbol: Option<String>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
@@ -219,6 +226,9 @@ pub struct CancelOrderArgs {
     pub order_id: String,
     #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
+    /// Cancel on Hyperliquid testnet instead of the default mainnet.
+    #[arg(long, default_value_t = false)]
+    pub testnet: bool,
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
     #[arg(long, default_value_t = false)]
@@ -241,6 +251,7 @@ impl CancelOrderArgs {
         if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("cancel supports only --output terminal|json|jsonl");
         }
+        validate_execution_network(self.venue, self.testnet)?;
         Ok(())
     }
 }
@@ -250,6 +261,9 @@ pub struct ClosePositionArgs {
     pub symbol: Option<String>,
     #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
+    /// Close on Hyperliquid testnet instead of the default mainnet.
+    #[arg(long, default_value_t = false)]
+    pub testnet: bool,
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
     #[arg(long, default_value_t = false)]
@@ -271,6 +285,7 @@ impl ClosePositionArgs {
         if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("close supports only --output terminal|json|jsonl");
         }
+        validate_execution_network(self.venue, self.testnet)?;
         Ok(())
     }
 }
@@ -285,14 +300,22 @@ impl AccountQueryArgs {
         if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("account queries support only --output terminal|json|jsonl");
         }
+        validate_execution_network(self.venue, self.testnet)?;
         Ok(())
     }
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ExecutionVenueArg {
     Bulk,
     Hyperliquid,
+}
+
+fn validate_execution_network(venue: ExecutionVenueArg, testnet: bool) -> Result<()> {
+    if testnet && venue != ExecutionVenueArg::Hyperliquid {
+        bail!("--testnet is only valid with --venue hyperliquid");
+    }
+    Ok(())
 }
 
 impl From<ExecutionVenueArg> for ExecutionVenue {
@@ -371,7 +394,7 @@ pub enum AuthCommands {
 pub struct AuthSetArgs {
     #[arg(value_enum)]
     pub provider: AuthProvider,
-    /// Reauthorize the existing remote credential without replacing it locally first.
+    /// Replace remote execution credentials after their replacements are confirmed.
     #[arg(long, default_value_t = false)]
     pub reauthorize: bool,
 }
@@ -479,6 +502,9 @@ pub struct ScriptRunArgs {
     /// Arms live execution for ctx.trade/ctx.cancel while data may come from any provider.
     #[arg(long, value_enum)]
     pub venue: Option<ExecutionVenueArg>,
+    /// Execute through Hyperliquid testnet instead of the default mainnet.
+    #[arg(long, default_value_t = false)]
+    pub testnet: bool,
     #[arg(long)]
     pub from: Option<u64>,
     #[arg(long)]
@@ -568,6 +594,9 @@ impl ScriptRunArgs {
         }
         if self.duration == Some(0) {
             bail!("--duration must be at least 1 second");
+        }
+        if self.testnet && self.venue != Some(ExecutionVenueArg::Hyperliquid) {
+            bail!("--testnet requires --venue hyperliquid");
         }
         Ok(())
     }
@@ -1548,6 +1577,9 @@ pub struct RunTwapArgs {
     pub symbol: String,
     #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
+    /// Execute through Hyperliquid testnet instead of the default mainnet.
+    #[arg(long, default_value_t = false)]
+    pub testnet: bool,
     #[arg(long, value_enum)]
     pub side: CliSide,
     /// Exact total base-asset exposure; leverage does not multiply an explicit size.
@@ -1580,6 +1612,9 @@ pub struct RunVwapArgs {
     pub symbol: String,
     #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
+    /// Execute through Hyperliquid testnet instead of the default mainnet.
+    #[arg(long, default_value_t = false)]
+    pub testnet: bool,
     #[arg(long, value_enum)]
     pub side: CliSide,
     /// Exact total base-asset exposure; leverage does not multiply an explicit size.
@@ -1612,6 +1647,9 @@ pub struct RunOiwapArgs {
     pub symbol: String,
     #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
+    /// Execute through Hyperliquid testnet instead of the default mainnet.
+    #[arg(long, default_value_t = false)]
+    pub testnet: bool,
     #[arg(long, value_enum)]
     pub side: CliSide,
     /// Exact total base-asset exposure; leverage does not multiply an explicit size.
@@ -1644,6 +1682,9 @@ pub struct RunMidPriceArgs {
     pub symbol: String,
     #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
+    /// Execute through Hyperliquid testnet instead of the default mainnet.
+    #[arg(long, default_value_t = false)]
+    pub testnet: bool,
     /// Hard one-sided inventory limit in base-asset units.
     #[arg(long, conflicts_with = "margin", required_unless_present = "margin")]
     pub size: Option<f64>,
@@ -1689,6 +1730,9 @@ pub struct RunGridArgs {
     pub symbol: String,
     #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
+    /// Execute through Hyperliquid testnet instead of the default mainnet.
+    #[arg(long, default_value_t = false)]
+    pub testnet: bool,
     /// Hard one-sided inventory limit in base-asset units.
     #[arg(long, conflicts_with = "margin", required_unless_present = "margin")]
     pub size: Option<f64>,
@@ -1871,6 +1915,7 @@ impl RunTwapArgs {
         if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("strategy run supports only --output terminal|json|jsonl");
         }
+        validate_execution_network(self.venue, self.testnet)?;
         Ok(())
     }
 }
@@ -1924,6 +1969,7 @@ impl RunVwapArgs {
             execution_venue,
             &self.symbol,
         )?;
+        validate_execution_network(self.venue, self.testnet)?;
         Ok(())
     }
 }
@@ -1972,6 +2018,7 @@ impl RunOiwapArgs {
             &self.oi_sources,
             &self.symbol,
         )?;
+        validate_execution_network(self.venue, self.testnet)?;
         Ok(())
     }
 }
@@ -2029,6 +2076,7 @@ impl RunMidPriceArgs {
         if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("bot run supports only --output terminal|json|jsonl");
         }
+        validate_execution_network(self.venue, self.testnet)?;
         Ok(())
     }
 }
@@ -2104,6 +2152,7 @@ impl RunGridArgs {
         if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("bot run supports only --output terminal|json|jsonl");
         }
+        validate_execution_network(self.venue, self.testnet)?;
         Ok(())
     }
 }

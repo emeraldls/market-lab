@@ -25,6 +25,8 @@ pub struct ScriptJobSubmission {
     #[serde(default)]
     pub venue: Option<ExecutionVenue>,
     #[serde(default)]
+    pub testnet: bool,
+    #[serde(default)]
     pub duration_seconds: Option<u64>,
     #[serde(default)]
     pub verbose: bool,
@@ -66,9 +68,15 @@ pub struct ScriptJobDefinition {
     pub sources: Vec<String>,
     pub params: Vec<String>,
     pub venue: Option<ExecutionVenue>,
+    #[serde(default = "legacy_hyperliquid_testnet")]
+    pub testnet: bool,
     #[serde(default)]
     pub duration_seconds: Option<u64>,
     pub verbose: bool,
+}
+
+const fn legacy_hyperliquid_testnet() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -161,6 +169,8 @@ pub struct ScriptManagedOrder {
     pub request: ScriptManagedRequest,
     pub symbol: String,
     pub venue: ExecutionVenue,
+    #[serde(default = "legacy_hyperliquid_testnet")]
+    pub testnet: bool,
     pub status: String,
     pub venue_order_id: Option<String>,
     pub created_at_ms: u64,

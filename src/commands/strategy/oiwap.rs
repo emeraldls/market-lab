@@ -27,8 +27,8 @@ use crate::strategies::vwap::{HistoricalVolume, VolumeCurve};
 use super::vwap::{
     MAX_PARTICIPATION_RATE, MAX_TAKER_SLIPPAGE_BPS, StrategyStopped, TrajectoryFeed,
     VwapFeasibility, WeightedCurves, WeightedJobDefinition, execution_venue_name,
-    fetch_execution_volume_history, render_submission, run_weighted_execution, strategy_direction,
-    worker_trade_args,
+    execution_venue_network_name, fetch_execution_volume_history, render_submission,
+    run_weighted_execution, strategy_direction, worker_trade_args,
 };
 
 const HISTORY_DAYS: u64 = 28;
@@ -165,7 +165,7 @@ pub async fn handle(args: RunOiwapArgs) -> Result<()> {
     }
     if matches!(args.output, OutputFormat::Terminal) {
         render_plan(&view, args.output)?;
-        if !args.yes && !confirm_live_execution(parent.venue)? {
+        if !args.yes && !confirm_live_execution(parent.venue, parent.testnet)? {
             println!("cancelled; no strategy job was submitted");
             return Ok(());
         }
@@ -174,6 +174,7 @@ pub async fn handle(args: RunOiwapArgs) -> Result<()> {
     let submission = StrategyJobSubmission {
         definition: StrategyJobDefinition::Oiwap(OiwapJobDefinition {
             venue: parent.venue,
+            testnet: parent.testnet,
             symbol: parent.internal_symbol,
             side: strategy_side(args.side),
             total_size: parent.size,
@@ -611,6 +612,7 @@ fn trade_args(args: &RunOiwapArgs, size: Option<f64>, margin: Option<f64>) -> Tr
         symbol: args.symbol.clone(),
         config: None,
         venue: args.venue,
+        testnet: args.testnet,
         size,
         margin,
         order_kind: TradeOrderKind::Market,
@@ -626,10 +628,10 @@ fn trade_args(args: &RunOiwapArgs, size: Option<f64>, margin: Option<f64>) -> Tr
     }
 }
 
-fn confirm_live_execution(venue: ExecutionVenue) -> Result<bool> {
+fn confirm_live_execution(venue: ExecutionVenue, testnet: bool) -> Result<bool> {
     print!(
         "Submit a live maker-first OIWAP job on {}? [y/N]: ",
-        execution_venue_name(venue)
+        execution_venue_network_name(venue, testnet)
     );
     io::stdout()
         .flush()

@@ -78,7 +78,7 @@ pub async fn handle(args: RunGridArgs) -> Result<()> {
     .await?;
     let market = execution_market(parent.venue, &parent.internal_symbol)?;
     let rules = market.execution_rules()?;
-    let book = live_orderbook(parent.venue, &parent.internal_symbol).await?;
+    let book = live_orderbook(parent.venue, &parent.internal_symbol, parent.testnet).await?;
     let best_bid = book
         .bids
         .first()
@@ -118,6 +118,7 @@ pub async fn handle(args: RunGridArgs) -> Result<()> {
 
     let definition = GridJobDefinition {
         venue: parent.venue,
+        testnet: parent.testnet,
         symbol: parent.internal_symbol.clone(),
         max_inventory_size: parent.size,
         requested_margin: parent.requested_margin,
@@ -142,7 +143,7 @@ pub async fn handle(args: RunGridArgs) -> Result<()> {
     }
     if matches!(args.output, OutputFormat::Terminal) {
         render_plan(&view, args.output)?;
-        if !args.yes && !confirm_live_execution(parent.venue)? {
+        if !args.yes && !confirm_live_execution(parent.venue, parent.testnet)? {
             println!("cancelled; no bot job was submitted");
             return Ok(());
         }
@@ -189,6 +190,7 @@ fn trade_args(args: &RunGridArgs, size: Option<f64>, margin: Option<f64>) -> Tra
         symbol: args.symbol.clone(),
         config: None,
         venue: args.venue,
+        testnet: args.testnet,
         size,
         margin,
         order_kind: TradeOrderKind::Market,
@@ -212,6 +214,7 @@ fn worker_trade_args(definition: &GridJobDefinition) -> TradeArgs {
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
             ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
         },
+        testnet: definition.testnet,
         size: Some(definition.max_inventory_size),
         margin: None,
         order_kind: TradeOrderKind::Market,
@@ -449,8 +452,9 @@ async fn run_worker(job_id: &str, definition: &GridJobDefinition) -> Result<()> 
     let parent = build_trade_plan(&worker_trade_args(definition), PositionDirection::Long).await?;
     let market = execution_market(definition.venue, &definition.symbol)?;
     let rules = market.execution_rules()?;
-    let adapter = ExecutionAdapter::new(definition.venue).await?;
-    let initial_book = live_orderbook(definition.venue, &definition.symbol).await?;
+    let adapter = ExecutionAdapter::new(definition.venue, definition.testnet).await?;
+    let initial_book =
+        live_orderbook(definition.venue, &definition.symbol, definition.testnet).await?;
     let initial_bid = initial_book
         .bids
         .first()
@@ -495,8 +499,13 @@ async fn run_worker(job_id: &str, definition: &GridJobDefinition) -> Result<()> 
         .collect::<HashMap<_, _>>();
     let started = Instant::now();
     let deadline = started + Duration::from_secs(definition.duration_seconds);
-    let mut book = spawn_book_feed(definition.venue, definition.symbol.clone());
-    let mut account_events = spawn_account_feed(definition.venue, parent.account.clone());
+    let mut book = spawn_book_feed(
+        definition.venue,
+        definition.testnet,
+        definition.symbol.clone(),
+    );
+    let mut account_events =
+        spawn_account_feed(definition.venue, definition.testnet, parent.account.clone());
     let mut account_connected = false;
     let allocated_margin = definition
         .requested_margin

@@ -28,6 +28,7 @@ use crate::domain::types::{OrderBookSnapshot, TopOfBook};
 use crate::providers::bulk::market_data::{BulkProvider, normalize_timestamp_ms};
 use crate::providers::bulk::ws::{BulkAccountStream, BulkOrderBookStream};
 use crate::providers::execution::ExecutionAdapter;
+use crate::providers::hyperliquid::HyperliquidNetwork;
 use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 use crate::providers::hyperliquid::ws::{HyperliquidAccountStream, HyperliquidOrderBookStream};
 
@@ -142,7 +143,7 @@ async fn handle(
     .await?;
     let market = execution_market(parent.venue, &parent.internal_symbol)?;
     let rules = market.execution_rules()?;
-    let top = live_orderbook(parent.venue, &parent.internal_symbol).await?;
+    let top = live_orderbook(parent.venue, &parent.internal_symbol, parent.testnet).await?;
     let best_bid = top
         .bids
         .first()
@@ -180,6 +181,7 @@ async fn handle(
     }
     let definition = MidPriceJobDefinition {
         venue: parent.venue,
+        testnet: parent.testnet,
         symbol: parent.internal_symbol.clone(),
         max_inventory_size: parent.size,
         requested_margin: parent.requested_margin,
@@ -212,7 +214,7 @@ async fn handle(
     }
     if matches!(args.output, OutputFormat::Terminal) {
         render_plan(&view, args.output)?;
-        if !args.yes && !confirm_live_execution(parent.venue)? {
+        if !args.yes && !confirm_live_execution(parent.venue, parent.testnet)? {
             println!("cancelled; no bot job was submitted");
             return Ok(());
         }
@@ -264,6 +266,7 @@ fn trade_args(args: &RunMidPriceArgs, size: Option<f64>, margin: Option<f64>) ->
         symbol: args.symbol.clone(),
         config: None,
         venue: args.venue,
+        testnet: args.testnet,
         size,
         margin,
         order_kind: TradeOrderKind::Market,
@@ -287,6 +290,7 @@ fn worker_trade_args(definition: &MidPriceJobDefinition) -> TradeArgs {
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
             ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
         },
+        testnet: definition.testnet,
         size: Some(definition.max_inventory_size),
         margin: None,
         order_kind: TradeOrderKind::Market,
@@ -426,10 +430,10 @@ pub(super) fn render_submission(job: &BotJob, output: OutputFormat) -> Result<()
     Ok(())
 }
 
-pub(super) fn confirm_live_execution(venue: ExecutionVenue) -> Result<bool> {
+pub(super) fn confirm_live_execution(venue: ExecutionVenue, testnet: bool) -> Result<bool> {
     print!(
         "Deploy this live maker-only bot on {}? [y/N]: ",
-        venue_label(venue)
+        execution_venue_label(venue, testnet)
     );
     io::stdout()
         .flush()
@@ -444,6 +448,14 @@ pub(super) fn confirm_live_execution(venue: ExecutionVenue) -> Result<bool> {
     ))
 }
 
+fn execution_venue_label(venue: ExecutionVenue, testnet: bool) -> &'static str {
+    match (venue, testnet) {
+        (ExecutionVenue::Bulk, _) => "BULK testnet",
+        (ExecutionVenue::Hyperliquid, true) => "Hyperliquid testnet",
+        (ExecutionVenue::Hyperliquid, false) => "Hyperliquid mainnet",
+    }
+}
+
 pub(super) fn venue_key(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "bulk",
@@ -454,7 +466,7 @@ pub(super) fn venue_key(venue: ExecutionVenue) -> &'static str {
 pub(super) fn venue_label(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "BULK",
-        ExecutionVenue::Hyperliquid => "Hyperliquid testnet",
+        ExecutionVenue::Hyperliquid => "Hyperliquid",
     }
 }
 
@@ -468,11 +480,18 @@ pub(super) fn execution_market(
 pub(super) async fn live_orderbook(
     venue: ExecutionVenue,
     symbol: &str,
+    testnet: bool,
 ) -> Result<OrderBookSnapshot> {
     match venue {
         ExecutionVenue::Bulk => BulkProvider::live_orderbook(symbol, BOOK_DEPTH, None).await,
         ExecutionVenue::Hyperliquid => {
-            HyperliquidProvider::live_orderbook(symbol, BOOK_DEPTH, None).await
+            HyperliquidProvider::live_orderbook_on(
+                symbol,
+                BOOK_DEPTH,
+                None,
+                HyperliquidNetwork::from_testnet(testnet),
+            )
+            .await
         }
     }
 }
@@ -792,13 +811,18 @@ enum BotOrderBookStream {
 }
 
 impl BotOrderBookStream {
-    async fn connect(venue: ExecutionVenue, symbol: &str) -> Result<Self> {
+    async fn connect(venue: ExecutionVenue, symbol: &str, testnet: bool) -> Result<Self> {
         match venue {
             ExecutionVenue::Bulk => Ok(Self::Bulk(
                 BulkOrderBookStream::connect(symbol, BOOK_DEPTH).await?,
             )),
             ExecutionVenue::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidOrderBookStream::connect(symbol, BOOK_DEPTH).await?,
+                HyperliquidOrderBookStream::connect_on(
+                    symbol,
+                    BOOK_DEPTH,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
             )),
         }
     }
@@ -813,6 +837,7 @@ impl BotOrderBookStream {
 
 pub(super) fn spawn_book_feed(
     venue: ExecutionVenue,
+    testnet: bool,
     symbol: String,
 ) -> watch::Receiver<BookFeedState> {
     let (sender, receiver) = watch::channel(BookFeedState::default());
@@ -820,7 +845,7 @@ pub(super) fn spawn_book_feed(
         let mut delay = 1_u64;
         let mut revision = 0_u64;
         loop {
-            match BotOrderBookStream::connect(venue, &symbol).await {
+            match BotOrderBookStream::connect(venue, &symbol, testnet).await {
                 Ok(mut stream) => {
                     delay = 1;
                     loop {
@@ -880,11 +905,15 @@ enum BotAccountStream {
 }
 
 impl BotAccountStream {
-    async fn connect(venue: ExecutionVenue, account: &str) -> Result<Self> {
+    async fn connect(venue: ExecutionVenue, account: &str, testnet: bool) -> Result<Self> {
         match venue {
             ExecutionVenue::Bulk => Ok(Self::Bulk(BulkAccountStream::connect(account).await?)),
             ExecutionVenue::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidAccountStream::connect(account).await?,
+                HyperliquidAccountStream::connect_on(
+                    account,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
             )),
         }
     }
@@ -901,11 +930,12 @@ impl BotAccountStream {
 
 pub(super) fn spawn_account_feed(
     venue: ExecutionVenue,
+    testnet: bool,
     account: String,
 ) -> mpsc::Receiver<AccountFeedEvent> {
     let (sender, receiver) = mpsc::channel(1024);
     tokio::spawn(async move {
-        let adapter = match ExecutionAdapter::new(venue).await {
+        let adapter = match ExecutionAdapter::new(venue, testnet).await {
             Ok(adapter) => adapter,
             Err(error) => {
                 let _ = sender
@@ -916,7 +946,7 @@ pub(super) fn spawn_account_feed(
         };
         let mut delay = 1_u64;
         loop {
-            match BotAccountStream::connect(venue, &account).await {
+            match BotAccountStream::connect(venue, &account, testnet).await {
                 Ok(mut stream) => {
                     let (open_orders, fills) =
                         tokio::join!(adapter.open_orders(&account), adapter.fills(&account),);
@@ -1110,9 +1140,10 @@ async fn run_worker(job_id: &str, mode: MidMode, definition: &MidPriceJobDefinit
     let parent = build_trade_plan(&worker_trade_args(definition), PositionDirection::Long).await?;
     let market = execution_market(definition.venue, &definition.symbol)?;
     let rules = market.execution_rules()?;
-    let adapter = ExecutionAdapter::new(definition.venue).await?;
+    let adapter = ExecutionAdapter::new(definition.venue, definition.testnet).await?;
 
-    let initial_book = live_orderbook(definition.venue, &definition.symbol).await?;
+    let initial_book =
+        live_orderbook(definition.venue, &definition.symbol, definition.testnet).await?;
     let initial_quotes = quote_prices(
         initial_book
             .bids
@@ -1164,8 +1195,13 @@ async fn run_worker(job_id: &str, mode: MidMode, definition: &MidPriceJobDefinit
 
     let started = Instant::now();
     let deadline = started + Duration::from_secs(definition.duration_seconds);
-    let mut book = spawn_book_feed(definition.venue, definition.symbol.clone());
-    let mut account_events = spawn_account_feed(definition.venue, parent.account.clone());
+    let mut book = spawn_book_feed(
+        definition.venue,
+        definition.testnet,
+        definition.symbol.clone(),
+    );
+    let mut account_events =
+        spawn_account_feed(definition.venue, definition.testnet, parent.account.clone());
     let mut account_connected = false;
     let mut buy = QuoteSlot::default();
     let mut sell = QuoteSlot::default();
@@ -1771,6 +1807,7 @@ pub(super) fn quote_plan(
     Ok(TradePlan {
         created_at_ms: now_ms()?,
         venue: parent.venue,
+        testnet: parent.testnet,
         account: parent.account.clone(),
         internal_symbol: parent.internal_symbol.clone(),
         venue_symbol: parent.venue_symbol.clone(),
@@ -1803,6 +1840,7 @@ pub(super) fn inventory_unwind_plan(
     Ok(TradePlan {
         created_at_ms: now_ms()?,
         venue: parent.venue,
+        testnet: parent.testnet,
         account: parent.account.clone(),
         internal_symbol: parent.internal_symbol.clone(),
         venue_symbol: parent.venue_symbol.clone(),
@@ -1831,6 +1869,7 @@ pub(super) fn cancel_plan(parent: &TradePlan, order_id: String) -> Result<Cancel
     Ok(CancelPlan {
         created_at_ms: now_ms()?,
         venue: parent.venue,
+        testnet: parent.testnet,
         account: parent.account.clone(),
         internal_symbol: parent.internal_symbol.clone(),
         venue_symbol: parent.venue_symbol.clone(),
@@ -2652,6 +2691,7 @@ mod tests {
     fn stop_loss_uses_allocated_margin_and_requires_complete_net_pnl() {
         let definition = MidPriceJobDefinition {
             venue: ExecutionVenue::Bulk,
+            testnet: false,
             symbol: "BTC/USDT".to_string(),
             max_inventory_size: 1.0,
             requested_margin: Some(200.0),
@@ -2702,6 +2742,7 @@ mod tests {
         let parent = TradePlan {
             created_at_ms: 1,
             venue: ExecutionVenue::Bulk,
+            testnet: false,
             account: "account".to_string(),
             internal_symbol: "BTC/USDT".to_string(),
             venue_symbol: "BTC-USD".to_string(),

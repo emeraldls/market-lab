@@ -6,6 +6,7 @@ use crate::domain::execution::{
     VenueCapabilities,
 };
 use crate::providers::bulk::execution::BulkExecutionAdapter;
+use crate::providers::hyperliquid::HyperliquidNetwork;
 use crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter;
 
 pub enum ExecutionAdapter {
@@ -14,12 +15,12 @@ pub enum ExecutionAdapter {
 }
 
 impl ExecutionAdapter {
-    pub async fn new(venue: ExecutionVenue) -> Result<Self> {
+    pub async fn new(venue: ExecutionVenue, testnet: bool) -> Result<Self> {
         match venue {
             ExecutionVenue::Bulk => Ok(Self::Bulk(BulkExecutionAdapter::new()?)),
-            ExecutionVenue::Hyperliquid => {
-                Ok(Self::Hyperliquid(HyperliquidExecutionAdapter::new().await?))
-            }
+            ExecutionVenue::Hyperliquid => Ok(Self::Hyperliquid(
+                HyperliquidExecutionAdapter::new(HyperliquidNetwork::from_testnet(testnet)).await?,
+            )),
         }
     }
 

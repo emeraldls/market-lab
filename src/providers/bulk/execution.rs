@@ -1347,6 +1347,7 @@ mod tests {
         let plan = TradePlan {
             created_at_ms: 1_784_158_000_000,
             venue: ExecutionVenue::Bulk,
+            testnet: false,
             account: account.to_base58(),
             internal_symbol: "BTC/USDT".to_string(),
             venue_symbol: "BTC-USD".to_string(),

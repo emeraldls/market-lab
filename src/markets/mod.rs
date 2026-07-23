@@ -18,7 +18,7 @@ const SNAPSHOT_SCHEMA_VERSION: u8 = 1;
 const BULK_MARKETS_URL: &str = "https://exchange-api.bulk.trade/api/v1/exchangeInfo";
 const BINANCE_SPOT_MARKETS_URL: &str = "https://api.binance.com/api/v3/exchangeInfo";
 const BINANCE_FUTURES_MARKETS_URL: &str = "https://fapi.binance.com/fapi/v1/exchangeInfo";
-const HYPERLIQUID_INFO_URL: &str = "https://api.hyperliquid-testnet.xyz/info";
+const HYPERLIQUID_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 const MMT_MARKETS_URL: &str = "https://eu-central-1.mmt.gg/api/v1/markets";
 const MARKET_HTTP_TIMEOUT_SECS: u64 = 15;
 
@@ -339,6 +339,13 @@ impl MarketSnapshot {
                 "unsupported market snapshot schema version {} for provider {}",
                 self.schema_version,
                 self.provider
+            );
+        }
+        if self.provider.eq_ignore_ascii_case("hyperliquid")
+            && self.source_url.contains("hyperliquid-testnet")
+        {
+            bail!(
+                "the installed Hyperliquid market snapshot is from testnet; run `mlab markets --exchange hyperliquid --refresh` to replace it with mainnet markets"
             );
         }
         if self.provider.trim().is_empty()
@@ -874,14 +881,14 @@ async fn fetch_hyperliquid_snapshot() -> Result<MarketSnapshot> {
         .json(&serde_json::json!({ "type": "metaAndAssetCtxs" }))
         .send()
         .await
-        .context("failed to fetch Hyperliquid testnet markets")?;
+        .context("failed to fetch Hyperliquid markets")?;
     let status = response.status();
     let body: Value = response
         .json()
         .await
-        .context("failed to decode Hyperliquid testnet markets response")?;
+        .context("failed to decode Hyperliquid markets response")?;
     if !status.is_success() {
-        bail!("Hyperliquid testnet markets returned HTTP {status} body={body}");
+        bail!("Hyperliquid markets returned HTTP {status} body={body}");
     }
 
     let entries = body
@@ -949,7 +956,7 @@ async fn fetch_hyperliquid_snapshot() -> Result<MarketSnapshot> {
         })
         .collect::<Result<Vec<_>>>()?;
     if markets.is_empty() {
-        bail!("Hyperliquid testnet returned no active native perpetual markets");
+        bail!("Hyperliquid returned no active native perpetual markets");
     }
 
     let snapshot = MarketSnapshot {
@@ -960,7 +967,7 @@ async fn fetch_hyperliquid_snapshot() -> Result<MarketSnapshot> {
         fetched_at: fetched_at(),
         exchanges: vec![ExchangeMarkets {
             exchange: "hyperliquid".to_string(),
-            name: "Hyperliquid Testnet".to_string(),
+            name: "Hyperliquid".to_string(),
             market_type: MarketType::Futures,
             markets,
         }],
@@ -1305,7 +1312,7 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
             fetched_at: "2026-07-19T00:00:00Z".to_string(),
             exchanges: vec![ExchangeMarkets {
                 exchange: "hyperliquid".to_string(),
-                name: "Hyperliquid Testnet".to_string(),
+                name: "Hyperliquid".to_string(),
                 market_type: MarketType::Futures,
                 markets: vec![hyperliquid_market],
             }],

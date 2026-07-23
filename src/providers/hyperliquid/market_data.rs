@@ -10,6 +10,7 @@ use crate::domain::types::{
 };
 
 use super::EXCHANGE;
+use super::HyperliquidNetwork;
 use super::client::HyperliquidClient;
 use super::markets;
 
@@ -18,7 +19,7 @@ pub struct HyperliquidProvider;
 impl HyperliquidProvider {
     pub fn capabilities() -> serde_json::Value {
         serde_json::json!({
-            "network": "testnet",
+            "network": "mainnet",
             "products": ["native_perpetuals"],
             "authentication": {
                 "market_data_requires_api_key": false,
@@ -41,7 +42,7 @@ impl HyperliquidProvider {
             provider: EXCHANGE.to_string(),
             status: "ok".to_string(),
             details: serde_json::json!({
-                "network": "testnet",
+                "network": "mainnet",
                 "public_market_data": true,
                 "requires_api_key": false,
                 "capabilities": Self::capabilities()
@@ -115,13 +116,22 @@ impl HyperliquidProvider {
     pub async fn live_orderbook(
         symbol: &str,
         depth: u16,
+        aggregation: Option<f64>,
+    ) -> Result<OrderBookSnapshot> {
+        Self::live_orderbook_on(symbol, depth, aggregation, HyperliquidNetwork::Mainnet).await
+    }
+
+    pub async fn live_orderbook_on(
+        symbol: &str,
+        depth: u16,
         _aggregation: Option<f64>,
+        network: HyperliquidNetwork,
     ) -> Result<OrderBookSnapshot> {
         if depth == 0 || depth > 20 {
             bail!("Hyperliquid orderbook depth must be between 1 and 20");
         }
         let market = require_market(symbol)?;
-        let raw: HyperliquidBook = HyperliquidClient::new()?
+        let raw: HyperliquidBook = HyperliquidClient::for_network(network)?
             .info(&serde_json::json!({
                 "type": "l2Book",
                 "coin": market.provider_symbol
@@ -131,8 +141,12 @@ impl HyperliquidProvider {
     }
 
     pub async fn ticker(symbol: &str) -> Result<MarketTicker> {
+        Self::ticker_on(symbol, HyperliquidNetwork::Mainnet).await
+    }
+
+    pub async fn ticker_on(symbol: &str, network: HyperliquidNetwork) -> Result<MarketTicker> {
         let market = require_market(symbol)?;
-        let (meta, contexts) = meta_and_contexts().await?;
+        let (meta, contexts) = meta_and_contexts(network).await?;
         let index = meta
             .universe
             .iter()
@@ -172,7 +186,7 @@ impl HyperliquidProvider {
             bail!("Hyperliquid statistics currently supports only period 1d");
         }
         let selected = symbol.map(require_market).transpose()?;
-        let (meta, contexts) = meta_and_contexts().await?;
+        let (meta, contexts) = meta_and_contexts(HyperliquidNetwork::Mainnet).await?;
         let timestamp_ms = now_ms()?;
         let mut markets_out = Vec::new();
         let mut funding = Vec::new();
@@ -310,8 +324,10 @@ fn parse(value: &str, name: &str) -> Result<f64> {
         .with_context(|| format!("invalid Hyperliquid {name} `{value}`"))
 }
 
-async fn meta_and_contexts() -> Result<(HyperliquidMeta, Vec<HyperliquidContext>)> {
-    let value: serde_json::Value = HyperliquidClient::new()?
+async fn meta_and_contexts(
+    network: HyperliquidNetwork,
+) -> Result<(HyperliquidMeta, Vec<HyperliquidContext>)> {
+    let value: serde_json::Value = HyperliquidClient::for_network(network)?
         .info(&serde_json::json!({ "type": "metaAndAssetCtxs" }))
         .await?;
     let entries = value

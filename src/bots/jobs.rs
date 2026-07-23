@@ -8,6 +8,8 @@ use crate::domain::execution::ExecutionVenue;
 #[serde(rename_all = "camelCase")]
 pub struct MidPriceJobDefinition {
     pub venue: ExecutionVenue,
+    #[serde(default = "legacy_hyperliquid_testnet")]
+    pub testnet: bool,
     pub symbol: String,
     /// Hard one-sided inventory limit in normalized base-asset units.
     #[serde(default)]
@@ -34,6 +36,8 @@ pub struct MidPriceJobDefinition {
 #[serde(rename_all = "camelCase")]
 pub struct GridJobDefinition {
     pub venue: ExecutionVenue,
+    #[serde(default = "legacy_hyperliquid_testnet")]
+    pub testnet: bool,
     pub symbol: String,
     /// Hard one-sided inventory limit in normalized base-asset units.
     pub max_inventory_size: f64,
@@ -189,6 +193,13 @@ impl BotJobDefinition {
         }
     }
 
+    pub fn testnet(&self) -> bool {
+        match self {
+            Self::Grid(definition) => definition.testnet,
+            Self::MidPrice(definition) | Self::VolumeMid(definition) => definition.testnet,
+        }
+    }
+
     pub fn leverage(&self) -> f64 {
         match self {
             Self::Grid(definition) => definition.leverage,
@@ -202,6 +213,10 @@ impl BotJobDefinition {
             Self::MidPrice(definition) | Self::VolumeMid(definition) => definition.validate(),
         }
     }
+}
+
+const fn legacy_hyperliquid_testnet() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

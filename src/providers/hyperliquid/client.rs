@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use super::HTTP_URL;
+use super::HyperliquidNetwork;
 
 const HTTP_TIMEOUT_SECS: u64 = 20;
 
@@ -18,7 +18,11 @@ pub struct HyperliquidClient {
 
 impl HyperliquidClient {
     pub fn new() -> Result<Self> {
-        Self::with_base_url(HTTP_URL)
+        Self::for_network(HyperliquidNetwork::Mainnet)
+    }
+
+    pub fn for_network(network: HyperliquidNetwork) -> Result<Self> {
+        Self::with_base_url(network.http_url())
     }
 
     pub fn with_base_url(base_url: impl Into<String>) -> Result<Self> {
@@ -44,17 +48,16 @@ impl HyperliquidClient {
             .json(body)
             .send()
             .await
-            .context("failed to call Hyperliquid testnet info API")?;
+            .context("failed to call Hyperliquid info API")?;
         let status = response.status();
         let body: Value = response
             .json()
             .await
-            .context("failed to decode Hyperliquid testnet info response")?;
+            .context("failed to decode Hyperliquid info response")?;
         if !status.is_success() {
-            bail!("Hyperliquid testnet info returned HTTP {status}: {body}");
+            bail!("Hyperliquid info returned HTTP {status}: {body}");
         }
-        serde_json::from_value(body)
-            .context("Hyperliquid testnet info returned an unexpected payload")
+        serde_json::from_value(body).context("Hyperliquid info returned an unexpected payload")
     }
 }
 
