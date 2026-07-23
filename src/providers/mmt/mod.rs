@@ -21,6 +21,7 @@ use utils::{normalize_symbol_for_mmt, normalize_to_ms, normalize_to_seconds, par
 
 const MMT_BASE_URL: &str = "https://eu-central-1.mmt.gg/api/v1";
 const MMT_HTTP_TIMEOUT_SECS: u64 = 8;
+const MMT_OI_HTTP_TIMEOUT_SECS: u64 = 60;
 
 pub struct MmtProvider;
 
@@ -61,7 +62,7 @@ impl MmtProvider {
         bucket: u8,
     ) -> Result<VdSeries> {
         let api_key = mmt_api_key()?;
-        let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
+        let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
         let exchange = exchange.trim().to_lowercase();
         let from_s = normalize_to_seconds(from);
         let to_s = normalize_to_seconds(to);
@@ -114,7 +115,7 @@ impl MmtProvider {
         to: u64,
     ) -> Result<CandleSeries> {
         let api_key = mmt_api_key()?;
-        let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
+        let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
         let exchange = exchange.trim().to_lowercase();
         let from_s = normalize_to_seconds(from);
         let to_s = normalize_to_seconds(to);
@@ -165,7 +166,7 @@ impl MmtProvider {
         to: u64,
     ) -> Result<OiSeries> {
         let api_key = mmt_api_key()?;
-        let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
+        let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
         let exchange = exchange.trim().to_lowercase();
         let from_s = normalize_to_seconds(from);
         let to_s = normalize_to_seconds(to);
@@ -173,7 +174,7 @@ impl MmtProvider {
         let url = format!("{MMT_BASE_URL}/oi");
         let resp = Client::new()
             .get(url)
-            .timeout(std::time::Duration::from_secs(MMT_HTTP_TIMEOUT_SECS))
+            .timeout(std::time::Duration::from_secs(MMT_OI_HTTP_TIMEOUT_SECS))
             .header("X-API-Key", api_key)
             .query(&[
                 ("exchange", exchange.as_str()),
@@ -215,48 +216,49 @@ impl MmtProvider {
         from: u64,
         to: u64,
     ) -> Result<VolumeProfileSeries> {
-        let api_key = mmt_api_key()?;
-        let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
-        let exchange = exchange.trim().to_lowercase();
-        let from_s = normalize_to_seconds(from);
-        let to_s = normalize_to_seconds(to);
+        let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
+        fetch_volumes(
+            exchange.trim().to_lowercase(),
+            normalized_symbol,
+            tf,
+            from,
+            to,
+        )
+        .await
+    }
 
-        let url = format!("{MMT_BASE_URL}/volumes");
-        let resp = Client::new()
-            .get(url)
-            .timeout(std::time::Duration::from_secs(MMT_HTTP_TIMEOUT_SECS))
-            .header("X-API-Key", api_key)
-            .query(&[
-                ("exchange", exchange.as_str()),
-                ("symbol", normalized_symbol.as_str()),
-                ("tf", tf),
-                ("from", &from_s.to_string()),
-                ("to", &to_s.to_string()),
-            ])
-            .send()
-            .await
-            .context("failed to call MMT /volumes")?;
-
-        let status = resp.status();
-        let body: Value = resp
-            .json()
-            .await
-            .context("failed to decode MMT /volumes response")?;
-        if !status.is_success() {
-            bail!("MMT /volumes returned HTTP {} body={}", status, body);
+    pub async fn aggregated_volumes(
+        exchanges: &[String],
+        symbol: &str,
+        tf: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<VolumeProfileSeries> {
+        if exchanges.is_empty() {
+            bail!("MMT aggregated volumes require at least one exchange");
         }
-
-        let parsed: VolumesResponse =
-            serde_json::from_value(body).context("invalid /volumes payload shape")?;
-        Ok(VolumeProfileSeries {
-            exchange: parsed.exchange,
-            symbol: parsed.symbol,
-            tf: parsed.tf,
-            from: normalize_to_ms(parsed.from),
-            to: normalize_to_ms(parsed.to),
-            points: parsed.points,
-            data: parsed.data,
-        })
+        let mut normalized_symbol = None;
+        let mut normalized_exchanges = Vec::with_capacity(exchanges.len());
+        for exchange in exchanges {
+            let candidate = normalize_symbol_for_mmt(exchange, symbol)?;
+            if normalized_symbol
+                .as_ref()
+                .is_some_and(|expected| expected != &candidate)
+            {
+                bail!("MMT volume sources do not share one provider symbol for `{symbol}`");
+            }
+            normalized_symbol.get_or_insert(candidate);
+            normalized_exchanges.push(exchange.trim().to_ascii_lowercase());
+        }
+        normalized_exchanges.sort();
+        fetch_volumes(
+            normalized_exchanges.join(":"),
+            normalized_symbol.expect("non-empty exchanges checked"),
+            tf,
+            from,
+            to,
+        )
+        .await
     }
 
     pub async fn replay(_req: &ReplayRequest) -> Result<Vec<TopOfBook>> {
@@ -291,6 +293,55 @@ impl MmtProvider {
             details: body,
         })
     }
+}
+
+async fn fetch_volumes(
+    exchange: String,
+    normalized_symbol: String,
+    tf: &str,
+    from: u64,
+    to: u64,
+) -> Result<VolumeProfileSeries> {
+    let api_key = mmt_api_key()?;
+    let from_s = normalize_to_seconds(from);
+    let to_s = normalize_to_seconds(to);
+
+    let url = format!("{MMT_BASE_URL}/volumes");
+    let resp = Client::new()
+        .get(url)
+        .timeout(std::time::Duration::from_secs(MMT_HTTP_TIMEOUT_SECS))
+        .header("X-API-Key", api_key)
+        .query(&[
+            ("exchange", exchange.as_str()),
+            ("symbol", normalized_symbol.as_str()),
+            ("tf", tf),
+            ("from", &from_s.to_string()),
+            ("to", &to_s.to_string()),
+        ])
+        .send()
+        .await
+        .context("failed to call MMT /volumes")?;
+
+    let status = resp.status();
+    let body: Value = resp
+        .json()
+        .await
+        .context("failed to decode MMT /volumes response")?;
+    if !status.is_success() {
+        bail!("MMT /volumes returned HTTP {} body={}", status, body);
+    }
+
+    let parsed: VolumesResponse =
+        serde_json::from_value(body).context("invalid /volumes payload shape")?;
+    Ok(VolumeProfileSeries {
+        exchange: parsed.exchange,
+        symbol: parsed.symbol,
+        tf: parsed.tf,
+        from: normalize_to_ms(parsed.from),
+        to: normalize_to_ms(parsed.to),
+        points: parsed.points,
+        data: parsed.data,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -359,7 +410,7 @@ async fn fetch_orderbook_snapshot(
     depth: u16,
 ) -> Result<OrderBookSnapshot> {
     let api_key = mmt_api_key()?;
-    let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
+    let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
     let exchange = exchange.trim().to_lowercase();
 
     let levels = levels_param(depth);
@@ -454,7 +505,7 @@ async fn fetch_flat_heatmap_hd_snapshot(
     depth: u16,
 ) -> Result<OrderBookSnapshot> {
     let api_key = mmt_api_key()?;
-    let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
+    let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
     let exchange = exchange.trim().to_lowercase();
 
     let tf = "1m";
@@ -514,7 +565,7 @@ async fn fetch_flat_heatmap_hd_series(
     depth: u16,
 ) -> Result<Vec<OrderBookSnapshot>> {
     let api_key = mmt_api_key()?;
-    let normalized_symbol = normalize_symbol_for_mmt(symbol)?;
+    let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
     let exchange = exchange.trim().to_lowercase();
     let from_s = normalize_to_seconds(from);
     let to_s = normalize_to_seconds(to);
@@ -616,7 +667,7 @@ mod tests {
 
     #[test]
     fn normalize_symbol_maps_usdt_to_usd() {
-        let got = normalize_symbol_for_mmt("BTC/USDT").expect("must normalize");
+        let got = normalize_symbol_for_mmt("binancef", "BTC/USDT").expect("must normalize");
         assert_eq!(got, "btc/usd");
     }
 

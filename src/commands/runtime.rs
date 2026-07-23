@@ -112,6 +112,14 @@ fn render_status(status: &RuntimeStatus, output: OutputFormat) -> Result<()> {
                     .filter(|job| job.status.is_active())
                     .count()
             );
+            println!(
+                "  active bot jobs: {}",
+                status
+                    .bot_jobs
+                    .iter()
+                    .filter(|job| job.status.is_active())
+                    .count()
+            );
             if let Some(error) = &status.last_error {
                 println!("  last error:       {error}");
             }

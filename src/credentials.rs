@@ -7,18 +7,67 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::cli::{AuthProvider, AuthProviderArgs, AuthSetArgs};
 use crate::providers::bulk;
+use crate::providers::hyperliquid::exchange::{approve_agent, response_error};
+use crate::providers::hyperliquid::signing::{HyperliquidWallet, canonical_address};
 
 const MMT_API_KEY_ENV: &str = "MMT_API_KEY";
 const KEYRING_SERVICE: &str = "market-lab";
 const MMT_KEYRING_ACCOUNT: &str = "mmt-api-key";
 const BULK_KEYRING_ACCOUNT: &str = "bulk-agent";
+const HYPERLIQUID_KEYRING_ACCOUNT: &str = "hyperliquid-testnet-agent";
 const BULK_CREDENTIAL_VERSION: u8 = 1;
+const HYPERLIQUID_CREDENTIAL_VERSION: u8 = 1;
 
 static MMT_API_KEY: OnceLock<String> = OnceLock::new();
 
 pub struct ActiveBulkCredential {
     pub account: Pubkey,
     pub agent: Keypair,
+}
+
+pub struct ActiveHyperliquidCredential {
+    pub account: String,
+    pub agent: HyperliquidWallet,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct HyperliquidCredential {
+    version: u8,
+    account: String,
+    agent_address: String,
+    agent_private_key: String,
+}
+
+impl HyperliquidCredential {
+    fn validate(&self) -> Result<()> {
+        if self.version != HYPERLIQUID_CREDENTIAL_VERSION {
+            bail!(
+                "unsupported stored Hyperliquid credential version {}",
+                self.version
+            );
+        }
+        let account = parse_hyperliquid_address(&self.account, "account")?;
+        if account != self.account.to_ascii_lowercase() {
+            bail!("stored Hyperliquid account is not canonical");
+        }
+        let agent = self.agent_wallet()?;
+        let derived = agent.address();
+        if derived != self.agent_address.to_ascii_lowercase() {
+            bail!("stored Hyperliquid agent public and private keys do not match");
+        }
+        Ok(())
+    }
+
+    fn agent_wallet(&self) -> Result<HyperliquidWallet> {
+        HyperliquidWallet::from_private_key(&self.agent_private_key)
+            .context("stored Hyperliquid agent private key is invalid")
+    }
+}
+
+impl Drop for HyperliquidCredential {
+    fn drop(&mut self) {
+        self.agent_private_key.zeroize();
+    }
 }
 
 pub fn mmt_api_key() -> Result<String> {
@@ -37,6 +86,17 @@ pub fn mmt_api_key() -> Result<String> {
 
     let _ = MMT_API_KEY.set(key.clone());
     Ok(key)
+}
+
+pub fn mmt_is_configured() -> Result<bool> {
+    if std::env::var(MMT_API_KEY_ENV).is_ok_and(|key| !key.trim().is_empty()) {
+        return Ok(true);
+    }
+    match mmt_entry()?.get_password() {
+        Ok(key) => Ok(!key.trim().is_empty()),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(error) => Err(error).context("failed to read MMT keychain status"),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -122,20 +182,38 @@ pub fn bulk_account() -> Result<String> {
     Ok(active_bulk_credential()?.account.to_base58())
 }
 
+pub fn active_hyperliquid_credential() -> Result<ActiveHyperliquidCredential> {
+    let credential = load_hyperliquid_credential()?
+        .context("Hyperliquid credentials are not configured; run `mlab auth set hyperliquid`")?;
+    Ok(ActiveHyperliquidCredential {
+        account: credential.account.clone(),
+        agent: credential.agent_wallet()?,
+    })
+}
+
+pub fn hyperliquid_account() -> Result<String> {
+    Ok(active_hyperliquid_credential()?.account)
+}
+
 pub async fn handle_set(args: AuthSetArgs) -> Result<()> {
     match args.provider {
         AuthProvider::Mmt => {
             if args.reauthorize {
-                bail!("`--reauthorize` is only supported for BULK");
+                bail!("`--reauthorize` is only supported for execution venues");
             }
             let key = rpassword::prompt_password("MMT API key: ")?;
             let key = validate_key(key, "MMT API key")?;
             mmt_entry()?
                 .set_password(&key)
                 .context("failed to store MMT API key in the OS keychain")?;
+            crate::markets::refresh_mmt()
+                .await
+                .context("MMT was configured, but its market snapshot could not be initialized")?;
+            crate::runtime::reload_markets_if_running().await?;
             println!("mmt: configured");
         }
         AuthProvider::Bulk => handle_set_bulk(args.reauthorize).await?,
+        AuthProvider::Hyperliquid => handle_set_hyperliquid(args.reauthorize).await?,
     }
     Ok(())
 }
@@ -143,6 +221,19 @@ pub async fn handle_set(args: AuthSetArgs) -> Result<()> {
 pub fn handle_status() -> Result<()> {
     print_mmt_status()?;
     print_bulk_status()?;
+    print_hyperliquid_status()?;
+    Ok(())
+}
+
+fn print_hyperliquid_status() -> Result<()> {
+    match load_hyperliquid_credential()? {
+        Some(credential) => {
+            println!("hyperliquid: configured for testnet in OS keychain");
+            println!("  account: {}", credential.account);
+            println!("  agent: {}", credential.agent_address);
+        }
+        None => println!("hyperliquid: not configured"),
+    }
     Ok(())
 }
 
@@ -185,6 +276,103 @@ pub async fn handle_remove(args: AuthProviderArgs) -> Result<()> {
             Err(err) => return Err(err).context("failed to remove MMT API key from OS keychain"),
         },
         AuthProvider::Bulk => handle_remove_bulk().await?,
+        AuthProvider::Hyperliquid => handle_remove_hyperliquid().await?,
+    }
+    Ok(())
+}
+
+async fn handle_set_hyperliquid(reauthorize: bool) -> Result<()> {
+    let existing = load_hyperliquid_credential()?;
+    if let Some(credential) = &existing
+        && !reauthorize
+    {
+        println!("hyperliquid: already configured for testnet");
+        println!("  account: {}", credential.account);
+        println!("  agent: {}", credential.agent_address);
+        println!("  use `mlab auth set hyperliquid --reauthorize` to replace the API wallet");
+        return Ok(());
+    }
+
+    println!(
+        "Hyperliquid testnet only. The main wallet private key is used once and never stored."
+    );
+    let master = {
+        let private_key = Zeroizing::new(rpassword::prompt_password(
+            "Hyperliquid testnet main wallet private key (hidden): ",
+        )?);
+        HyperliquidWallet::from_private_key(private_key.trim())
+            .context("invalid Hyperliquid main wallet private key")?
+    };
+    let account = master.address();
+    if let Some(existing) = &existing
+        && existing.account != account
+    {
+        bail!(
+            "this Hyperliquid credential belongs to {}, but the supplied key belongs to {account}",
+            existing.account
+        );
+    }
+
+    println!("hyperliquid: authorizing a new testnet API wallet for {account}");
+    let (agent, response) = approve_agent(&master)
+        .await
+        .context("Hyperliquid testnet API-wallet authorization failed")?;
+    ensure_hyperliquid_exchange_ok(&response, "API-wallet authorization")?;
+    let credential = HyperliquidCredential {
+        version: HYPERLIQUID_CREDENTIAL_VERSION,
+        account: account.clone(),
+        agent_address: agent.address(),
+        agent_private_key: agent.private_key_hex(),
+    };
+    save_hyperliquid_credential(&credential)?;
+    crate::markets::refresh_hyperliquid().await.context(
+        "Hyperliquid was configured, but its testnet market snapshot could not be initialized",
+    )?;
+    crate::runtime::reload_markets_if_running().await?;
+
+    println!("hyperliquid: configured for testnet");
+    println!("  account: {account}");
+    println!("  agent: {}", credential.agent_address);
+    Ok(())
+}
+
+async fn handle_remove_hyperliquid() -> Result<()> {
+    let Some(credential) = load_hyperliquid_credential()? else {
+        println!("hyperliquid: not configured");
+        return Ok(());
+    };
+    println!(
+        "The main wallet private key is used once to replace and revoke the stored testnet API wallet."
+    );
+    let master = {
+        let private_key = Zeroizing::new(rpassword::prompt_password(
+            "Hyperliquid testnet main wallet private key (hidden): ",
+        )?);
+        HyperliquidWallet::from_private_key(private_key.trim())
+            .context("invalid Hyperliquid main wallet private key")?
+    };
+    let account = master.address();
+    if account != credential.account {
+        bail!(
+            "the supplied key belongs to {account}, but the stored Hyperliquid agent belongs to {}",
+            credential.account
+        );
+    }
+    let (_replacement, response) = approve_agent(&master)
+        .await
+        .context("failed to revoke the stored Hyperliquid API wallet")?;
+    ensure_hyperliquid_exchange_ok(&response, "API-wallet replacement")?;
+    delete_hyperliquid_credential()?;
+    println!("hyperliquid: revoked and removed");
+    Ok(())
+}
+
+fn ensure_hyperliquid_exchange_ok(
+    response: &crate::providers::hyperliquid::exchange::ExchangeResponseStatus,
+    operation: &str,
+) -> Result<()> {
+    if let Some(error) = response_error(response) {
+        bail!("Hyperliquid rejected {operation}: {error}");
     }
     Ok(())
 }
@@ -351,6 +539,11 @@ fn bulk_entry() -> Result<keyring::Entry> {
         .context("failed to access the OS keychain")
 }
 
+fn hyperliquid_entry() -> Result<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, HYPERLIQUID_KEYRING_ACCOUNT)
+        .context("failed to access the OS keychain")
+}
+
 fn load_bulk_credential() -> Result<Option<BulkCredential>> {
     let encoded = match bulk_entry()?.get_password() {
         Ok(encoded) => Zeroizing::new(encoded),
@@ -372,6 +565,43 @@ fn save_bulk_credential(credential: &BulkCredential) -> Result<()> {
     bulk_entry()?
         .set_password(encoded.as_str())
         .context("failed to store BULK agent in the OS keychain")
+}
+
+fn load_hyperliquid_credential() -> Result<Option<HyperliquidCredential>> {
+    let encoded = match hyperliquid_entry()?.get_password() {
+        Ok(encoded) => Zeroizing::new(encoded),
+        Err(keyring::Error::NoEntry) => return Ok(None),
+        Err(error) => {
+            return Err(error).context("failed to read Hyperliquid agent from OS keychain");
+        }
+    };
+    let credential: HyperliquidCredential = serde_json::from_str(encoded.as_str())
+        .context("stored Hyperliquid agent credential is malformed")?;
+    credential.validate()?;
+    Ok(Some(credential))
+}
+
+fn save_hyperliquid_credential(credential: &HyperliquidCredential) -> Result<()> {
+    credential.validate()?;
+    let encoded = Zeroizing::new(
+        serde_json::to_string(credential)
+            .context("failed to encode Hyperliquid agent credential")?,
+    );
+    hyperliquid_entry()?
+        .set_password(encoded.as_str())
+        .context("failed to store Hyperliquid agent in the OS keychain")
+}
+
+fn delete_hyperliquid_credential() -> Result<()> {
+    match hyperliquid_entry()?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(error).context("failed to remove Hyperliquid agent from OS keychain"),
+    }
+}
+
+fn parse_hyperliquid_address(address: &str, name: &str) -> Result<String> {
+    canonical_address(address)
+        .with_context(|| format!("stored Hyperliquid {name} address is invalid"))
 }
 
 fn validate_key(key: String, name: &str) -> Result<String> {

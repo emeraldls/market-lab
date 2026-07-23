@@ -14,12 +14,15 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
+use crate::bots::jobs::{BotJob, BotJobDefinition, BotJobStatus, BotJobSubmission, BotPerformance};
 use crate::credentials;
 use crate::domain::execution::{CancelPlan, ExecutionReceipt, ExecutionVenue, Position, TradePlan};
 use crate::providers::bulk::execution::BulkExecutionAdapter;
 use crate::providers::bulk::ws::BulkAccountStream;
+use crate::providers::hyperliquid::ws::HyperliquidAccountStream;
 use crate::scripting::execution::{
-    ScriptCancelRequest, ScriptOrderRef, ScriptTradeRequest, local_order_id,
+    ScriptCancelRequest, ScriptManagedRequest, ScriptOrderRef, ScriptRawOrderRequest,
+    ScriptTradeRequest, local_order_id,
 };
 use crate::scripting::jobs::{
     ScriptExecutionEvent, ScriptJob, ScriptJobDefinition, ScriptJobStatus, ScriptJobSubmission,
@@ -29,7 +32,8 @@ use crate::strategies::jobs::{
     StrategyJob, StrategyJobDefinition, StrategyJobStatus, StrategyJobSubmission, StrategySide,
 };
 
-const RUNTIME_VERSION: u8 = 10;
+// Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
+const RUNTIME_VERSION: u8 = 29;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -66,6 +70,8 @@ pub struct RuntimeStatus {
     pub script_jobs: Vec<ScriptJob>,
     #[serde(default)]
     pub strategy_jobs: Vec<StrategyJob>,
+    #[serde(default)]
+    pub bot_jobs: Vec<BotJob>,
 }
 
 impl RuntimeStatus {
@@ -82,6 +88,7 @@ impl RuntimeStatus {
             tracked_orders: Vec::new(),
             script_jobs: Vec::new(),
             strategy_jobs: Vec::new(),
+            bot_jobs: Vec::new(),
         }
     }
 }
@@ -91,6 +98,7 @@ impl RuntimeStatus {
 enum RuntimeRequest {
     Ping,
     Status,
+    ReloadMarkets,
     Stop,
     TrackOrder {
         order: TrackedOrder,
@@ -132,9 +140,17 @@ enum RuntimeRequest {
         order: ScriptOrderRef,
         request: ScriptTradeRequest,
     },
+    ScriptExecuteOrder {
+        job_id: String,
+        order: ScriptOrderRef,
+        request: ScriptRawOrderRequest,
+    },
     ScriptCancel {
         job_id: String,
         request: ScriptCancelRequest,
+    },
+    ScriptCancelAllOrders {
+        job_id: String,
     },
     ScriptEvents {
         job_id: String,
@@ -176,6 +192,45 @@ enum RuntimeRequest {
         sequence: u64,
         plan: TradePlan,
     },
+    StrategyCancelOrder {
+        job_id: String,
+        sequence: u64,
+        plan: CancelPlan,
+    },
+    SubmitBotJob {
+        submission: BotJobSubmission,
+    },
+    ListBotJobs,
+    GetBotJob {
+        job_id: String,
+    },
+    StopBotJob {
+        job_id: String,
+    },
+    BotWorkerStarted {
+        job_id: String,
+        pid: u32,
+    },
+    BotWorkerHeartbeat {
+        job_id: String,
+        pid: u32,
+        performance: Option<BotPerformance>,
+    },
+    BotWorkerFinished {
+        job_id: String,
+        pid: u32,
+        error: Option<String>,
+    },
+    BotExecuteTrade {
+        job_id: String,
+        sequence: u64,
+        plan: TradePlan,
+    },
+    BotCancelOrder {
+        job_id: String,
+        sequence: u64,
+        plan: CancelPlan,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -199,6 +254,10 @@ struct RuntimeResponse {
     strategy_job: Option<StrategyJob>,
     #[serde(default)]
     strategy_jobs: Option<Vec<StrategyJob>>,
+    #[serde(default)]
+    bot_job: Option<BotJob>,
+    #[serde(default)]
+    bot_jobs: Option<Vec<BotJob>>,
 }
 
 impl RuntimeResponse {
@@ -215,6 +274,8 @@ impl RuntimeResponse {
             script_positions: None,
             strategy_job: None,
             strategy_jobs: None,
+            bot_job: None,
+            bot_jobs: None,
         }
     }
 
@@ -250,6 +311,14 @@ struct RuntimeState {
     strategy_jobs: BTreeMap<String, StrategyJob>,
     #[serde(default)]
     strategy_executions: BTreeMap<String, ExecutionReceipt>,
+    #[serde(default)]
+    strategy_cancellations: BTreeMap<String, ExecutionReceipt>,
+    #[serde(default)]
+    bot_jobs: BTreeMap<String, BotJob>,
+    #[serde(default)]
+    bot_executions: BTreeMap<String, ExecutionReceipt>,
+    #[serde(default)]
+    bot_cancellations: BTreeMap<String, ExecutionReceipt>,
     #[serde(default)]
     script_orders: BTreeMap<String, ScriptManagedOrder>,
     #[serde(default)]
@@ -293,14 +362,17 @@ struct AccountRuntimeEvent<'a> {
 
 enum AccountConnectionEvent {
     Connected {
+        venue: ExecutionVenue,
         account: String,
         reconnected: bool,
     },
     Data {
+        venue: ExecutionVenue,
         account: String,
         data: serde_json::Value,
     },
     Disconnected {
+        venue: ExecutionVenue,
         account: String,
         error: String,
     },
@@ -359,6 +431,10 @@ pub async fn serve() -> Result<()> {
         script_jobs: BTreeMap::new(),
         strategy_jobs: BTreeMap::new(),
         strategy_executions: BTreeMap::new(),
+        strategy_cancellations: BTreeMap::new(),
+        bot_jobs: BTreeMap::new(),
+        bot_executions: BTreeMap::new(),
+        bot_cancellations: BTreeMap::new(),
         script_orders: BTreeMap::new(),
         script_cancel_keys: BTreeMap::new(),
         account_positions: BTreeMap::new(),
@@ -373,7 +449,12 @@ pub async fn serve() -> Result<()> {
     let (account_tx, mut account_rx) = mpsc::channel(1024);
     let mut account_supervisors = HashSet::new();
     if let Ok(account) = credentials::bulk_account() {
-        ensure_account_supervisor(&account, &account_tx, &mut account_supervisors);
+        ensure_account_supervisor(
+            ExecutionVenue::Bulk,
+            &account,
+            &account_tx,
+            &mut account_supervisors,
+        );
     }
     let mut should_stop = false;
     while !should_stop {
@@ -407,7 +488,7 @@ pub async fn serve() -> Result<()> {
                     record_runtime_error(
                         &paths,
                         &mut state,
-                        format!("BULK account stream event failed: {error:#}"),
+                        format!("execution account stream event failed: {error:#}"),
                     );
                 }
             }
@@ -421,7 +502,7 @@ pub async fn serve() -> Result<()> {
         .map(|job| job.id.clone())
         .collect::<Vec<_>>();
     for job_id in active_jobs {
-        let _ = stop_script_job_in_daemon(&paths, &mut state, &job_id);
+        let _ = stop_script_job_in_daemon(&paths, &adapter, &mut state, &job_id).await;
     }
     let active_strategy_jobs = state
         .strategy_jobs
@@ -431,6 +512,15 @@ pub async fn serve() -> Result<()> {
         .collect::<Vec<_>>();
     for job_id in active_strategy_jobs {
         let _ = stop_strategy_job_in_daemon(&paths, &mut state, &job_id);
+    }
+    let active_bot_jobs = state
+        .bot_jobs
+        .values()
+        .filter(|job| job.status.is_active())
+        .map(|job| job.id.clone())
+        .collect::<Vec<_>>();
+    for job_id in active_bot_jobs {
+        let _ = stop_bot_job_in_daemon(&paths, &mut state, &job_id);
     }
     drop(listener);
     let _ = fs::remove_file(&paths.socket);
@@ -447,10 +537,12 @@ pub async fn ensure_running() -> Result<RuntimeStatus> {
         }
         let _ = stop().await;
         for _ in 0..20 {
-            if try_status().await?.is_none() {
-                break;
+            match try_status().await {
+                Ok(None) => break,
+                Ok(Some(_)) | Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
     let paths = RuntimePaths::load()?;
@@ -518,6 +610,22 @@ pub async fn stop() -> Result<bool> {
     };
     if !response.ok {
         bail!("mlabd refused to stop: {}", response.message);
+    }
+    Ok(true)
+}
+
+pub async fn reload_markets_if_running() -> Result<bool> {
+    let Some(status) = try_status().await? else {
+        return Ok(false);
+    };
+    if status.version != RUNTIME_VERSION {
+        return Ok(false);
+    }
+    let Some(response) = try_request(RuntimeRequest::ReloadMarkets).await? else {
+        return Ok(false);
+    };
+    if !response.ok {
+        bail!("mlabd failed to reload markets: {}", response.message);
     }
     Ok(true)
 }
@@ -698,6 +806,190 @@ pub async fn submit_strategy_trade(
         .context("mlabd omitted the strategy execution receipt")
 }
 
+pub async fn submit_strategy_cancel(
+    job_id: &str,
+    sequence: u64,
+    plan: &CancelPlan,
+) -> Result<ExecutionReceipt> {
+    let response = request(RuntimeRequest::StrategyCancelOrder {
+        job_id: job_id.to_string(),
+        sequence,
+        plan: plan.clone(),
+    })
+    .await?;
+    if !response.ok {
+        bail!("strategy cancellation failed: {}", response.message);
+    }
+    response
+        .receipt
+        .context("mlabd omitted the strategy cancellation receipt")
+}
+
+pub async fn submit_bot_job(submission: BotJobSubmission) -> Result<BotJob> {
+    ensure_running().await?;
+    let response = request(RuntimeRequest::SubmitBotJob { submission }).await?;
+    if !response.ok {
+        bail!("mlabd rejected bot job: {}", response.message);
+    }
+    response
+        .bot_job
+        .context("mlabd omitted the submitted bot job")
+}
+
+pub async fn list_bot_jobs() -> Result<Vec<BotJob>> {
+    ensure_running().await?;
+    let response = request(RuntimeRequest::ListBotJobs).await?;
+    if !response.ok {
+        bail!("mlabd could not list bot jobs: {}", response.message);
+    }
+    response.bot_jobs.context("mlabd omitted bot jobs")
+}
+
+pub async fn get_bot_job(job_id: &str) -> Result<BotJob> {
+    ensure_running().await?;
+    get_bot_job_from_running_daemon(job_id).await
+}
+
+pub(crate) async fn get_bot_job_from_running_daemon(job_id: &str) -> Result<BotJob> {
+    let response = request(RuntimeRequest::GetBotJob {
+        job_id: job_id.to_string(),
+    })
+    .await?;
+    if !response.ok {
+        bail!("mlabd could not get bot job: {}", response.message);
+    }
+    response.bot_job.context("mlabd omitted bot job")
+}
+
+pub async fn stop_bot_job(job_id: &str) -> Result<BotJob> {
+    ensure_running().await?;
+    let response = request(RuntimeRequest::StopBotJob {
+        job_id: job_id.to_string(),
+    })
+    .await?;
+    if !response.ok {
+        bail!("mlabd could not stop bot job: {}", response.message);
+    }
+    response.bot_job.context("mlabd omitted bot job")
+}
+
+pub async fn bot_worker_started(job_id: &str, pid: u32) -> Result<BotJob> {
+    let response = request(RuntimeRequest::BotWorkerStarted {
+        job_id: job_id.to_string(),
+        pid,
+    })
+    .await?;
+    if !response.ok {
+        bail!("mlabd rejected bot worker: {}", response.message);
+    }
+    response.bot_job.context("mlabd omitted bot job")
+}
+
+pub async fn bot_worker_heartbeat(
+    job_id: &str,
+    pid: u32,
+    performance: Option<&BotPerformance>,
+) -> Result<BotJob> {
+    let response = request(RuntimeRequest::BotWorkerHeartbeat {
+        job_id: job_id.to_string(),
+        pid,
+        performance: performance.cloned(),
+    })
+    .await?;
+    if !response.ok {
+        bail!("mlabd rejected bot worker heartbeat: {}", response.message);
+    }
+    response.bot_job.context("mlabd omitted bot job")
+}
+
+pub async fn bot_worker_finished(job_id: &str, pid: u32, error: Option<String>) -> Result<BotJob> {
+    let response = request(RuntimeRequest::BotWorkerFinished {
+        job_id: job_id.to_string(),
+        pid,
+        error,
+    })
+    .await?;
+    if !response.ok {
+        bail!("mlabd rejected bot worker finish: {}", response.message);
+    }
+    response.bot_job.context("mlabd omitted bot job")
+}
+
+pub async fn submit_bot_trade(
+    job_id: &str,
+    sequence: u64,
+    plan: &TradePlan,
+) -> Result<ExecutionReceipt> {
+    let response = request(RuntimeRequest::BotExecuteTrade {
+        job_id: job_id.to_string(),
+        sequence,
+        plan: plan.clone(),
+    })
+    .await?;
+    if !response.ok {
+        bail!("bot trade failed: {}", response.message);
+    }
+    response
+        .receipt
+        .context("mlabd omitted the bot execution receipt")
+}
+
+pub async fn submit_bot_cancel(
+    job_id: &str,
+    sequence: u64,
+    plan: &CancelPlan,
+) -> Result<ExecutionReceipt> {
+    let response = request(RuntimeRequest::BotCancelOrder {
+        job_id: job_id.to_string(),
+        sequence,
+        plan: plan.clone(),
+    })
+    .await?;
+    if !response.ok {
+        bail!("bot cancellation failed: {}", response.message);
+    }
+    response
+        .receipt
+        .context("mlabd omitted the bot cancellation receipt")
+}
+
+pub fn append_bot_output(job_id: &str, value: &impl Serialize) -> Result<()> {
+    let paths = RuntimePaths::load()?;
+    let path = bot_job_directory(&paths, job_id)?.join("output.jsonl");
+    let mut value = serde_json::to_value(value).context("failed to encode bot output")?;
+    if let Some(object) = value.as_object_mut() {
+        object
+            .entry("tsMs")
+            .or_insert(serde_json::Value::from(now_ms()?));
+    }
+    append_json_line(&path, &value)
+}
+
+pub fn bot_output_after(
+    job_id: &str,
+    after_line: usize,
+) -> Result<(usize, Vec<serde_json::Value>)> {
+    let paths = RuntimePaths::load()?;
+    let path = bot_job_directory(&paths, job_id)?.join("output.jsonl");
+    let source = match fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((0, Vec::new()));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let lines = source.lines().collect::<Vec<_>>();
+    let total = lines.len();
+    let values = lines
+        .into_iter()
+        .skip(after_line.min(total))
+        .map(|line| serde_json::from_str(line).context("bot output journal is malformed"))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((total, values))
+}
+
 pub async fn list_script_jobs() -> Result<Vec<ScriptJob>> {
     ensure_running().await?;
     let response = request(RuntimeRequest::ListScriptJobs).await?;
@@ -812,6 +1104,25 @@ pub async fn submit_script_trade(
         .context("mlabd omitted the managed script order")
 }
 
+pub async fn submit_script_order(
+    job_id: &str,
+    order: ScriptOrderRef,
+    request_value: ScriptRawOrderRequest,
+) -> Result<ScriptManagedOrder> {
+    let response = request(RuntimeRequest::ScriptExecuteOrder {
+        job_id: job_id.to_string(),
+        order,
+        request: request_value,
+    })
+    .await?;
+    if !response.ok {
+        bail!("script order failed: {}", response.message);
+    }
+    response
+        .script_order
+        .context("mlabd omitted the managed script order")
+}
+
 pub async fn submit_script_cancellation(
     job_id: &str,
     request_value: ScriptCancelRequest,
@@ -827,6 +1138,17 @@ pub async fn submit_script_cancellation(
     response
         .script_order
         .context("mlabd omitted the managed script order")
+}
+
+pub async fn cancel_all_script_orders(job_id: &str) -> Result<()> {
+    let response = request(RuntimeRequest::ScriptCancelAllOrders {
+        job_id: job_id.to_string(),
+    })
+    .await?;
+    if !response.ok {
+        bail!("script managed-order cleanup failed: {}", response.message);
+    }
+    Ok(())
 }
 
 pub async fn script_execution_events(
@@ -883,6 +1205,15 @@ pub fn append_script_output(job_id: &str, value: &impl Serialize) -> Result<()> 
     let paths = RuntimePaths::load()?;
     let path = script_job_directory(&paths, job_id)?.join("output.jsonl");
     append_json_line(&path, value)
+}
+
+fn script_failure_record(ts_ms: u64, error: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "script.run.failed",
+        "version": "1",
+        "ts_ms": ts_ms,
+        "error": error,
+    })
 }
 
 pub fn append_strategy_output(job_id: &str, value: &impl Serialize) -> Result<()> {
@@ -991,6 +1322,10 @@ fn create_script_job(
     if submission.venue == Some(ExecutionVenue::Bulk) {
         credentials::bulk_account()
             .context("BULK authentication is required when a script uses --venue bulk")?;
+    } else if submission.venue == Some(ExecutionVenue::Hyperliquid) {
+        credentials::hyperliquid_account().context(
+            "Hyperliquid authentication is required when a script uses --venue hyperliquid",
+        )?;
     }
 
     fs::create_dir_all(&paths.jobs)
@@ -1105,17 +1440,59 @@ fn spawn_script_worker(paths: &RuntimePaths, state: &mut RuntimeState, job_id: &
     Ok(())
 }
 
-fn stop_script_job_in_daemon(
+async fn cancel_script_job_orders(
     paths: &RuntimePaths,
+    adapter: &BulkExecutionAdapter,
+    state: &mut RuntimeState,
+    job_id: &str,
+) -> Result<()> {
+    if !state.script_jobs.contains_key(job_id) {
+        bail!("script job `{job_id}` was not found");
+    }
+    let order_ids = state
+        .script_orders
+        .values()
+        .filter(|order| {
+            order.job_id == job_id
+                && order.status != "rejected"
+                && !is_terminal_order_status(&order.status)
+        })
+        .map(|order| order.order.id.clone())
+        .collect::<Vec<_>>();
+    let mut failures = Vec::new();
+    for order_id in order_ids {
+        let request = ScriptCancelRequest {
+            key: format!("system-cleanup-{order_id}"),
+            order: order_id.clone(),
+        };
+        if let Err(error) = execute_script_cancel(paths, adapter, state, job_id, request).await {
+            failures.push(format!("{order_id}: {error:#}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "failed to cancel {} managed order(s): {}",
+            failures.len(),
+            failures.join("; ")
+        )
+    }
+}
+
+async fn stop_script_job_in_daemon(
+    paths: &RuntimePaths,
+    adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
     job_id: &str,
 ) -> Result<ScriptJob> {
-    let job = state
+    let current = state
         .script_jobs
-        .get_mut(job_id)
+        .get(job_id)
+        .cloned()
         .with_context(|| format!("script job `{job_id}` was not found"))?;
-    if job.status.is_active()
-        && let Some(pid) = job.pid
+    if current.status.is_active()
+        && let Some(pid) = current.pid
     {
         let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
         if result == -1 {
@@ -1125,16 +1502,33 @@ fn stop_script_job_in_daemon(
             }
         }
     }
+    let cleanup_error = if current.status.is_active() {
+        cancel_script_job_orders(paths, adapter, state, job_id)
+            .await
+            .err()
+    } else {
+        None
+    };
+    let job = state
+        .script_jobs
+        .get_mut(job_id)
+        .context("script job disappeared while stopping")?;
     job.status = ScriptJobStatus::Stopped;
     job.pid = None;
     job.stopped_at_ms = Some(now_ms()?);
+    job.last_error = cleanup_error.as_ref().map(|error| format!("{error:#}"));
     let job = job.clone();
     persist_state(paths, state)?;
-    Ok(job)
+    if let Some(error) = cleanup_error {
+        Err(error).context("script worker stopped, but its managed orders were not fully cancelled")
+    } else {
+        Ok(job)
+    }
 }
 
-fn restart_script_job_in_daemon(
+async fn restart_script_job_in_daemon(
     paths: &RuntimePaths,
+    adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
     job_id: &str,
 ) -> Result<ScriptJob> {
@@ -1143,7 +1537,7 @@ fn restart_script_job_in_daemon(
         .get(job_id)
         .is_some_and(|job| job.status.is_active())
     {
-        stop_script_job_in_daemon(paths, state, job_id)?;
+        stop_script_job_in_daemon(paths, adapter, state, job_id).await?;
     }
     spawn_script_worker(paths, state, job_id)?;
     persist_state(paths, state)?;
@@ -1197,22 +1591,35 @@ fn mark_script_worker_heartbeat(
     Ok(job)
 }
 
-fn mark_script_worker_finished(
+async fn mark_script_worker_finished(
     paths: &RuntimePaths,
+    adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
     job_id: &str,
     pid: u32,
     error: Option<String>,
 ) -> Result<ScriptJob> {
+    let current = state
+        .script_jobs
+        .get(job_id)
+        .cloned()
+        .with_context(|| format!("script job `{job_id}` was not found"))?;
+    if current.pid.is_some() && current.pid != Some(pid) {
+        bail!("stale script worker attempted to finish job `{job_id}`");
+    }
+    let cleanup_error = if current.status.is_active() {
+        cancel_script_job_orders(paths, adapter, state, job_id)
+            .await
+            .err()
+    } else {
+        None
+    };
     let job = state
         .script_jobs
         .get_mut(job_id)
-        .with_context(|| format!("script job `{job_id}` was not found"))?;
-    if job.pid.is_some() && job.pid != Some(pid) {
-        bail!("stale script worker attempted to finish job `{job_id}`");
-    }
+        .context("script job disappeared while finishing its worker")?;
     if job.status != ScriptJobStatus::Stopped {
-        job.status = if error.is_some() {
+        job.status = if error.is_some() || cleanup_error.is_some() {
             ScriptJobStatus::Failed
         } else {
             ScriptJobStatus::Completed
@@ -1220,7 +1627,20 @@ fn mark_script_worker_finished(
     }
     job.pid = None;
     job.stopped_at_ms = Some(now_ms()?);
-    job.last_error = error;
+    job.last_error = match (error, cleanup_error) {
+        (Some(worker), Some(cleanup)) => Some(format!(
+            "{worker}; managed-order cleanup also failed: {cleanup:#}"
+        )),
+        (Some(worker), None) => Some(worker),
+        (None, Some(cleanup)) => Some(format!("managed-order cleanup failed: {cleanup:#}")),
+        (None, None) => None,
+    };
+    if let Some(error) = &job.last_error {
+        let _ = append_json_line(
+            &paths.jobs.join(job_id).join("output.jsonl"),
+            &script_failure_record(now_ms()?, error),
+        );
+    }
     let job = job.clone();
     persist_state(paths, state)?;
     Ok(job)
@@ -1232,7 +1652,15 @@ fn create_strategy_job(
     submission: StrategyJobSubmission,
 ) -> Result<StrategyJob> {
     submission.validate()?;
-    credentials::bulk_account().context("BULK authentication is required for strategy jobs")?;
+    crate::providers::execution::ExecutionAdapter::configured_account(
+        submission.definition.venue(),
+    )
+    .with_context(|| {
+        format!(
+            "{} authentication is required for strategy jobs",
+            execution_exchange(submission.definition.venue())
+        )
+    })?;
 
     fs::create_dir_all(&paths.jobs)
         .with_context(|| format!("failed to create {}", paths.jobs.display()))?;
@@ -1356,9 +1784,9 @@ fn stop_strategy_job_in_daemon(
             }
         }
     }
-    job.status = StrategyJobStatus::Stopped;
-    job.pid = None;
-    job.stopped_at_ms = Some(now_ms()?);
+    if job.status.is_active() {
+        job.status = StrategyJobStatus::Stopping;
+    }
     let job = job.clone();
     persist_state(paths, state)?;
     Ok(job)
@@ -1421,11 +1849,247 @@ fn mark_strategy_worker_finished(
     if job.pid.is_some() && job.pid != Some(pid) {
         bail!("stale strategy worker attempted to finish job `{job_id}`");
     }
-    if job.status != StrategyJobStatus::Stopped {
+    if job.status == StrategyJobStatus::Stopping {
+        job.status = StrategyJobStatus::Stopped;
+    } else if job.status != StrategyJobStatus::Stopped {
         job.status = if error.is_some() {
             StrategyJobStatus::Failed
         } else {
             StrategyJobStatus::Completed
+        };
+    }
+    job.pid = None;
+    job.stopped_at_ms = Some(now_ms()?);
+    job.last_error = error;
+    let job = job.clone();
+    persist_state(paths, state)?;
+    Ok(job)
+}
+
+async fn create_bot_job(
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
+    submission: BotJobSubmission,
+) -> Result<BotJob> {
+    submission.validate()?;
+    crate::providers::execution::ExecutionAdapter::configured_account(
+        submission.definition.venue(),
+    )
+    .with_context(|| {
+        format!(
+            "{} authentication is required for bot jobs",
+            execution_exchange(submission.definition.venue())
+        )
+    })?;
+
+    if submission.definition.venue() == ExecutionVenue::Hyperliquid {
+        crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new()
+            .await?
+            .configure_leverage(
+                submission.definition.symbol(),
+                submission.definition.leverage(),
+            )
+            .await
+            .context("failed to configure Hyperliquid leverage before starting the bot")?;
+    }
+
+    fs::create_dir_all(&paths.jobs)
+        .with_context(|| format!("failed to create {}", paths.jobs.display()))?;
+    fs::set_permissions(&paths.jobs, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to secure {}", paths.jobs.display()))?;
+    let job_id = new_bot_job_id(state)?;
+    let job_directory = paths.jobs.join(&job_id);
+    fs::create_dir(&job_directory)
+        .with_context(|| format!("failed to create {}", job_directory.display()))?;
+    fs::set_permissions(&job_directory, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to secure {}", job_directory.display()))?;
+
+    let created_at_ms = now_ms()?;
+    let job = BotJob {
+        id: job_id.clone(),
+        definition: submission.definition,
+        status: BotJobStatus::Starting,
+        pid: None,
+        created_at_ms,
+        started_at_ms: None,
+        stopped_at_ms: None,
+        last_heartbeat_ms: None,
+        last_error: None,
+        performance: None,
+    };
+    state.bot_jobs.insert(job_id.clone(), job);
+    persist_state(paths, state)?;
+    if let Err(error) = spawn_bot_worker(paths, state, &job_id) {
+        if let Some(job) = state.bot_jobs.get_mut(&job_id) {
+            job.status = BotJobStatus::Failed;
+            job.stopped_at_ms = Some(now_ms().unwrap_or(created_at_ms));
+            job.last_error = Some(format!("{error:#}"));
+        }
+        persist_state(paths, state)?;
+        return Err(error);
+    }
+    persist_state(paths, state)?;
+    state
+        .bot_jobs
+        .get(&job_id)
+        .cloned()
+        .context("bot job disappeared after creation")
+}
+
+fn new_bot_job_id(state: &RuntimeState) -> Result<String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?;
+    let base = format!("bot_{:013x}_{:05x}", now.as_millis(), now.subsec_nanos());
+    if !state.bot_jobs.contains_key(&base)
+        && !state.strategy_jobs.contains_key(&base)
+        && !state.script_jobs.contains_key(&base)
+    {
+        return Ok(base);
+    }
+    for suffix in 1..=9999_u16 {
+        let candidate = format!("{base}_{suffix}");
+        if !state.bot_jobs.contains_key(&candidate)
+            && !state.strategy_jobs.contains_key(&candidate)
+            && !state.script_jobs.contains_key(&candidate)
+        {
+            return Ok(candidate);
+        }
+    }
+    bail!("could not allocate a unique bot job id")
+}
+
+fn spawn_bot_worker(paths: &RuntimePaths, state: &mut RuntimeState, job_id: &str) -> Result<()> {
+    if !state.bot_jobs.contains_key(job_id) {
+        bail!("bot job was not found");
+    }
+    let worker_log = paths.jobs.join(job_id).join("worker.log");
+    let stdout = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&worker_log)
+        .with_context(|| format!("failed to open {}", worker_log.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .context("failed to clone bot worker log handle")?;
+    let executable = std::env::current_exe().context("failed to locate mlabd")?;
+    let child = Command::new(executable)
+        .arg("bot-worker")
+        .arg(job_id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .with_context(|| format!("failed to start bot worker for {job_id}"))?;
+    let job = state
+        .bot_jobs
+        .get_mut(job_id)
+        .context("bot job disappeared while starting")?;
+    job.status = BotJobStatus::Starting;
+    job.pid = Some(child.id());
+    job.stopped_at_ms = None;
+    job.last_error = None;
+    Ok(())
+}
+
+fn stop_bot_job_in_daemon(
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
+    job_id: &str,
+) -> Result<BotJob> {
+    let job = state
+        .bot_jobs
+        .get_mut(job_id)
+        .with_context(|| format!("bot job `{job_id}` was not found"))?;
+    if job.status.is_active()
+        && let Some(pid) = job.pid
+    {
+        let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        if result == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error).context("failed to stop bot worker");
+            }
+        }
+        job.status = BotJobStatus::Stopping;
+    }
+    let job = job.clone();
+    persist_state(paths, state)?;
+    Ok(job)
+}
+
+fn mark_bot_worker_started(
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
+    job_id: &str,
+    pid: u32,
+) -> Result<BotJob> {
+    let now = now_ms()?;
+    let job = state
+        .bot_jobs
+        .get_mut(job_id)
+        .with_context(|| format!("bot job `{job_id}` was not found"))?;
+    if job.status == BotJobStatus::Stopped {
+        bail!("bot job `{job_id}` was stopped before its worker became ready");
+    }
+    job.status = BotJobStatus::Running;
+    job.pid = Some(pid);
+    job.started_at_ms = Some(now);
+    job.last_heartbeat_ms = Some(now);
+    job.last_error = None;
+    let job = job.clone();
+    persist_state(paths, state)?;
+    Ok(job)
+}
+
+fn mark_bot_worker_heartbeat(
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
+    job_id: &str,
+    pid: u32,
+    performance: Option<BotPerformance>,
+) -> Result<BotJob> {
+    let job = state
+        .bot_jobs
+        .get_mut(job_id)
+        .with_context(|| format!("bot job `{job_id}` was not found"))?;
+    if job.pid != Some(pid) || !job.status.is_active() {
+        bail!("bot worker is no longer active for job `{job_id}`");
+    }
+    job.last_heartbeat_ms = Some(now_ms()?);
+    if performance.is_some() {
+        job.performance = performance;
+    }
+    let job = job.clone();
+    persist_state(paths, state)?;
+    Ok(job)
+}
+
+fn mark_bot_worker_finished(
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
+    job_id: &str,
+    pid: u32,
+    error: Option<String>,
+) -> Result<BotJob> {
+    let job = state
+        .bot_jobs
+        .get_mut(job_id)
+        .with_context(|| format!("bot job `{job_id}` was not found"))?;
+    if job.pid.is_some() && job.pid != Some(pid) {
+        bail!("stale bot worker attempted to finish job `{job_id}`");
+    }
+    if job.status == BotJobStatus::Stopping {
+        job.status = if error.is_some() {
+            BotJobStatus::Failed
+        } else {
+            BotJobStatus::Stopped
+        };
+    } else if job.status != BotJobStatus::Stopped {
+        job.status = if error.is_some() {
+            BotJobStatus::Failed
+        } else {
+            BotJobStatus::Completed
         };
     }
     job.pid = None;
@@ -1454,6 +2118,17 @@ fn strategy_job_directory(paths: &RuntimePaths, job_id: &str) -> Result<PathBuf>
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     {
         bail!("invalid strategy job id");
+    }
+    Ok(paths.jobs.join(job_id))
+}
+
+fn bot_job_directory(paths: &RuntimePaths, job_id: &str) -> Result<PathBuf> {
+    if job_id.is_empty()
+        || !job_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        bail!("invalid bot job id");
     }
     Ok(paths.jobs.join(job_id))
 }
@@ -1542,26 +2217,36 @@ fn acknowledge_script_events_in_daemon(
     Ok(job)
 }
 
-struct ScriptTradeOperation<'a> {
+struct ScriptOrderOperation<'a> {
     job_id: &'a str,
     order: ScriptOrderRef,
-    request: ScriptTradeRequest,
+    request: ScriptManagedRequest,
 }
 
-async fn execute_script_trade(
+async fn execute_script_order(
     paths: &RuntimePaths,
     adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
     account_tx: &mpsc::Sender<AccountConnectionEvent>,
     account_supervisors: &mut HashSet<String>,
-    operation: ScriptTradeOperation<'_>,
+    operation: ScriptOrderOperation<'_>,
 ) -> Result<ScriptManagedOrder> {
-    let ScriptTradeOperation {
+    let ScriptOrderOperation {
         job_id,
         order,
         request,
     } = operation;
-    request.validate()?;
+    let operation_name = match &request {
+        ScriptManagedRequest::Trade(request) => {
+            request.validate()?;
+            "ctx.trade"
+        }
+        ScriptManagedRequest::Order(request) => {
+            request.validate()?;
+            "ctx.order"
+        }
+    };
+    let key = request.key().to_string();
     let job = state
         .script_jobs
         .get(job_id)
@@ -1574,21 +2259,15 @@ async fn execute_script_trade(
         .definition
         .venue
         .context("script execution is disabled; deploy the script with --venue")?;
-    if venue != ExecutionVenue::Bulk {
-        bail!("unsupported script execution venue");
-    }
-    let expected_id = local_order_id(job_id, &request.key);
-    if order.id != expected_id || order.key != request.key {
+    let expected_id = local_order_id(job_id, &key);
+    if order.id != expected_id || order.key != key {
         bail!("script order reference does not match its job and idempotency key");
     }
     if let Some(existing) = state.script_orders.get(&order.id) {
         if existing.job_id == job_id && existing.request == request {
             return Ok(existing.clone());
         }
-        bail!(
-            "ctx.trade key `{}` was already used with different order parameters",
-            request.key
-        );
+        bail!("{operation_name} key `{key}` was already used with different order parameters");
     }
 
     let created_at_ms = now_ms()?;
@@ -1618,109 +2297,143 @@ async fn execute_script_trade(
     )?;
     persist_state(paths, state)?;
 
-    let order_kind = match request.order.kind {
+    let order_spec = request.order().clone();
+    let order_kind = match order_spec.kind {
         crate::scripting::execution::ScriptOrderKind::Market => crate::cli::TradeOrderKind::Market,
         crate::scripting::execution::ScriptOrderKind::Limit => crate::cli::TradeOrderKind::Limit,
     };
-    let tif = match request.order.tif {
+    let tif = match order_spec.tif {
         crate::scripting::execution::ScriptTimeInForce::Gtc => crate::cli::TradeTimeInForce::Gtc,
         crate::scripting::execution::ScriptTimeInForce::Ioc => crate::cli::TradeTimeInForce::Ioc,
         crate::scripting::execution::ScriptTimeInForce::Alo => crate::cli::TradeTimeInForce::Alo,
     };
-    let account = match credentials::bulk_account() {
+    let account = match crate::providers::execution::ExecutionAdapter::configured_account(venue) {
         Ok(account) => account,
         Err(error) => {
             fail_script_order(paths, state, job_id, &order.id, &error)?;
             return Err(error);
         }
     };
-    let snapshot = match adapter.account_snapshot(&account).await {
-        Ok(snapshot) => snapshot,
+    let venue_adapter = match crate::providers::execution::ExecutionAdapter::new(venue).await {
+        Ok(adapter) => adapter,
         Err(error) => {
             fail_script_order(paths, state, job_id, &order.id, &error)?;
             return Err(error);
         }
     };
-    let symbol_position = snapshot.positions.iter().find(|position| {
-        position
-            .internal_symbol
-            .eq_ignore_ascii_case(&job.definition.symbol)
-            && position.size > f64::EPSILON
-    });
-    let target_direction = request.position.position_direction();
-    let (size, margin, leverage) = if request.position.is_open() {
-        if let Some(position) = symbol_position
-            && position.direction != target_direction
-        {
-            let required_close = match position.direction {
-                crate::domain::execution::PositionDirection::Long => "close-long",
-                crate::domain::execution::PositionDirection::Short => "close-short",
+    let venue_arg = match venue {
+        ExecutionVenue::Bulk => crate::cli::ExecutionVenueArg::Bulk,
+        ExecutionVenue::Hyperliquid => crate::cli::ExecutionVenueArg::Hyperliquid,
+    };
+    let (args, direction) = match &request {
+        ScriptManagedRequest::Trade(request) => {
+            let snapshot = match venue_adapter.account_snapshot(&account).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    fail_script_order(paths, state, job_id, &order.id, &error)?;
+                    return Err(error);
+                }
             };
-            let error = anyhow::anyhow!(
-                "ctx.trade {} cannot reverse an open {:?} position; submit {required_close} first",
-                request.position.as_str(),
-                position.direction
-            );
-            fail_script_order(paths, state, job_id, &order.id, &error)?;
-            return Err(error);
+            let symbol_position = snapshot.positions.iter().find(|position| {
+                position
+                    .internal_symbol
+                    .eq_ignore_ascii_case(&job.definition.symbol)
+                    && position.size > f64::EPSILON
+            });
+            let target_direction = request.position.position_direction();
+            let (size, margin, leverage) = if request.position.is_open() {
+                if let Some(position) = symbol_position
+                    && position.direction != target_direction
+                {
+                    let required_close = match position.direction {
+                        crate::domain::execution::PositionDirection::Long => "close-long",
+                        crate::domain::execution::PositionDirection::Short => "close-short",
+                    };
+                    let error = anyhow::anyhow!(
+                        "ctx.trade {} cannot reverse an open {:?} position; submit {required_close} first",
+                        request.position.as_str(),
+                        position.direction
+                    );
+                    fail_script_order(paths, state, job_id, &order.id, &error)?;
+                    return Err(error);
+                }
+                (request.size, request.margin, request.leverage_or_default())
+            } else {
+                let Some(position) =
+                    symbol_position.filter(|position| position.direction == target_direction)
+                else {
+                    let error = anyhow::anyhow!(
+                        "ctx.trade {} requires an open {:?} position for {}",
+                        request.position.as_str(),
+                        target_direction,
+                        job.definition.symbol
+                    );
+                    fail_script_order(paths, state, job_id, &order.id, &error)?;
+                    return Err(error);
+                };
+                let close_size = request.size.unwrap_or(position.size);
+                if close_size > position.size + f64::EPSILON {
+                    let error = anyhow::anyhow!(
+                        "ctx.trade {} size {} exceeds the open position size {}",
+                        request.position.as_str(),
+                        close_size,
+                        position.size
+                    );
+                    fail_script_order(paths, state, job_id, &order.id, &error)?;
+                    return Err(error);
+                }
+                (Some(close_size), None, position.leverage.max(1.0))
+            };
+            (
+                crate::cli::TradeArgs {
+                    symbol: job.definition.symbol.clone(),
+                    config: None,
+                    venue: venue_arg,
+                    size,
+                    margin,
+                    order_kind,
+                    price: order_spec.price,
+                    tif,
+                    leverage,
+                    reduce_only: request.position.reduce_only(),
+                    sl: request.sl,
+                    tp: request.tp,
+                    dry_run: false,
+                    yes: true,
+                    output: crate::cli::OutputFormat::Json,
+                },
+                request.position.order_direction(),
+            )
         }
-        (request.size, request.margin, request.leverage_or_default())
-    } else {
-        let Some(position) =
-            symbol_position.filter(|position| position.direction == target_direction)
-        else {
-            let error = anyhow::anyhow!(
-                "ctx.trade {} requires an open {:?} position for {}",
-                request.position.as_str(),
-                target_direction,
-                job.definition.symbol
-            );
-            fail_script_order(paths, state, job_id, &order.id, &error)?;
-            return Err(error);
-        };
-        let close_size = request.size.unwrap_or(position.size);
-        if close_size > position.size + f64::EPSILON {
-            let error = anyhow::anyhow!(
-                "ctx.trade {} size {} exceeds the open position size {}",
-                request.position.as_str(),
-                close_size,
-                position.size
-            );
-            fail_script_order(paths, state, job_id, &order.id, &error)?;
-            return Err(error);
-        }
-        (Some(close_size), None, position.leverage.max(1.0))
+        ScriptManagedRequest::Order(request) => (
+            crate::cli::TradeArgs {
+                symbol: job.definition.symbol.clone(),
+                config: None,
+                venue: venue_arg,
+                size: request.size,
+                margin: request.margin,
+                order_kind,
+                price: order_spec.price,
+                tif,
+                leverage: request.leverage_or_default(),
+                reduce_only: request.reduce_only,
+                sl: None,
+                tp: None,
+                dry_run: false,
+                yes: true,
+                output: crate::cli::OutputFormat::Json,
+            },
+            request.side.order_direction(),
+        ),
     };
-    let args = crate::cli::TradeArgs {
-        symbol: job.definition.symbol.clone(),
-        config: None,
-        venue: crate::cli::ExecutionVenueArg::Bulk,
-        size,
-        margin,
-        order_kind,
-        price: request.order.price,
-        tif,
-        leverage,
-        reduce_only: request.position.reduce_only(),
-        sl: request.sl,
-        tp: request.tp,
-        dry_run: false,
-        yes: true,
-        output: crate::cli::OutputFormat::Json,
-    };
-    let plan = match crate::commands::execution::build_trade_plan(
-        &args,
-        request.position.order_direction(),
-    )
-    .await
-    {
+    let plan = match crate::commands::execution::build_trade_plan(&args, direction).await {
         Ok(plan) => plan,
         Err(error) => {
             fail_script_order(paths, state, job_id, &order.id, &error)?;
             return Err(error);
         }
     };
-    ensure_account_supervisor(&plan.account, account_tx, account_supervisors);
+    ensure_account_supervisor(venue, &plan.account, account_tx, account_supervisors);
     let receipt = match execute_trade(paths, adapter, state, &plan, Some(order.id.clone())).await {
         Ok(receipt) => receipt,
         Err(error) => {
@@ -1744,6 +2457,8 @@ async fn execute_script_trade(
         job_id,
         if receipt.terminal {
             "order.terminal"
+        } else if receipt.status == "submitted" {
+            "order.submitted"
         } else {
             "order.accepted"
         },
@@ -1860,13 +2575,13 @@ async fn execute_script_cancel(
         persist_state(paths, state)?;
         return Ok(managed);
     };
-    let market = crate::providers::bulk::catalog::market(&current.symbol)?;
+    let market = crate::markets::exchange_market(execution_exchange(venue), &current.symbol)?;
     let plan = CancelPlan {
         created_at_ms: now_ms()?,
         venue,
-        account: credentials::bulk_account()?,
-        internal_symbol: market.internal_symbol.clone(),
-        venue_symbol: market.symbol.clone(),
+        account: crate::providers::execution::ExecutionAdapter::configured_account(venue)?,
+        internal_symbol: market.symbol.clone(),
+        venue_symbol: market.venue_symbol.clone(),
         order_id: venue_order_id,
     };
     let receipt = match execute_cancel(paths, adapter, state, &plan).await {
@@ -1895,7 +2610,11 @@ async fn execute_script_cancel(
             .script_orders
             .get_mut(&order_id)
             .context("script order disappeared after cancellation")?;
-        managed.status = receipt.status.clone();
+        if receipt.terminal {
+            managed.status = receipt.status.clone();
+        } else {
+            managed.cancel_requested = true;
+        }
         managed.updated_at_ms = receipt.submitted_at_ms;
         managed.clone()
     };
@@ -1903,9 +2622,13 @@ async fn execute_script_cancel(
         paths,
         state,
         job_id,
-        "order.cancelled",
+        if receipt.terminal {
+            "order.cancelled"
+        } else {
+            "order.cancel_requested"
+        },
         Some(&managed),
-        true,
+        receipt.terminal,
         serde_json::to_value(&receipt)?,
     )?;
     persist_state(paths, state)?;
@@ -1931,37 +2654,7 @@ async fn execute_strategy_trade(
     if !job.status.is_active() {
         bail!("strategy job `{job_id}` is not running");
     }
-    let StrategyJobDefinition::Twap(definition) = &job.definition;
-    let expected_direction = match definition.side {
-        StrategySide::Buy => crate::domain::execution::PositionDirection::Long,
-        StrategySide::Sell => crate::domain::execution::PositionDirection::Short,
-    };
-    let child_orders = definition
-        .duration_seconds
-        .div_ceil(definition.interval_seconds);
-    if sequence > child_orders {
-        bail!("TWAP child sequence {sequence} exceeds schedule length {child_orders}");
-    }
-    let market = crate::providers::bulk::catalog::market(&definition.symbol)?;
-    let schedule = crate::strategies::twap::TwapSchedule::build(
-        definition.total_size,
-        market.lot_size,
-        plan.reference_price,
-        market.min_notional,
-        definition.duration_seconds,
-        definition.interval_seconds,
-    )?;
-    let expected_size = schedule.children[(sequence - 1) as usize].size;
-    if plan.venue != definition.exchange
-        || plan.internal_symbol != definition.symbol
-        || plan.direction != expected_direction
-        || plan.order_kind != crate::domain::execution::OrderKind::Market
-        || plan.reduce_only != definition.reduce_only
-        || (plan.leverage - definition.leverage).abs() > f64::EPSILON
-        || (plan.size - expected_size).abs() > 1e-12_f64.max(expected_size.abs() * 1e-12)
-    {
-        bail!("strategy child order does not match its persisted TWAP definition");
-    }
+    validate_strategy_trade(&job.definition, sequence, plan)?;
 
     let execution_key = format!("{job_id}:{sequence}");
     if let Some(receipt) = state.strategy_executions.get(&execution_key) {
@@ -1970,7 +2663,7 @@ async fn execute_strategy_trade(
     if sequence > 1 {
         let previous_key = format!("{job_id}:{}", sequence - 1);
         if !state.strategy_executions.contains_key(&previous_key) {
-            bail!("TWAP child order {sequence} was submitted out of sequence");
+            bail!("strategy child order {sequence} was submitted out of sequence");
         }
     }
 
@@ -1978,6 +2671,259 @@ async fn execute_strategy_trade(
     state
         .strategy_executions
         .insert(execution_key, receipt.clone());
+    persist_state(paths, state)?;
+    Ok(receipt)
+}
+
+fn validate_strategy_trade(
+    definition: &StrategyJobDefinition,
+    sequence: u64,
+    plan: &TradePlan,
+) -> Result<()> {
+    let (venue, symbol, side, total_size, leverage, reduce_only) = match definition {
+        StrategyJobDefinition::Twap(definition) => (
+            definition.venue,
+            definition.symbol.as_str(),
+            definition.side,
+            definition.total_size,
+            definition.leverage,
+            definition.reduce_only,
+        ),
+        StrategyJobDefinition::Vwap(definition) => (
+            definition.venue,
+            definition.symbol.as_str(),
+            definition.side,
+            definition.total_size,
+            definition.leverage,
+            definition.reduce_only,
+        ),
+        StrategyJobDefinition::Oiwap(definition) => (
+            definition.venue,
+            definition.symbol.as_str(),
+            definition.side,
+            definition.total_size,
+            definition.leverage,
+            definition.reduce_only,
+        ),
+    };
+    let expected_direction = match side {
+        StrategySide::Buy => crate::domain::execution::PositionDirection::Long,
+        StrategySide::Sell => crate::domain::execution::PositionDirection::Short,
+    };
+    if plan.venue != venue
+        || plan.internal_symbol != symbol
+        || plan.direction != expected_direction
+        || plan.reduce_only != reduce_only
+        || (plan.leverage - leverage).abs() > f64::EPSILON
+        || plan.stop_loss_price.is_some()
+        || plan.take_profit_price.is_some()
+        || plan.size > total_size + 1e-12_f64.max(total_size.abs() * 1e-12)
+    {
+        bail!(
+            "strategy child order does not match its persisted {} definition",
+            definition.name()
+        );
+    }
+
+    match definition {
+        StrategyJobDefinition::Twap(definition) => {
+            let child_orders = definition
+                .duration_seconds
+                .div_ceil(definition.interval_seconds);
+            if sequence > child_orders {
+                bail!("TWAP child sequence {sequence} exceeds schedule length {child_orders}");
+            }
+            let market = crate::markets::exchange_market(
+                execution_exchange(definition.venue),
+                &definition.symbol,
+            )?;
+            let rules = market.execution_rules()?;
+            let schedule = crate::strategies::twap::TwapSchedule::build(
+                definition.total_size,
+                rules.lot_size,
+                plan.reference_price,
+                rules.min_notional,
+                definition.duration_seconds,
+                definition.interval_seconds,
+            )?;
+            let expected_size = schedule.children[(sequence - 1) as usize].size;
+            if plan.order_kind != crate::domain::execution::OrderKind::Market
+                || (plan.size - expected_size).abs() > 1e-12_f64.max(expected_size.abs() * 1e-12)
+            {
+                bail!("strategy child order does not match its persisted TWAP definition");
+            }
+        }
+        StrategyJobDefinition::Vwap(_) | StrategyJobDefinition::Oiwap(_) => match plan.order_kind {
+            crate::domain::execution::OrderKind::Market => {
+                if plan.price.is_some() || plan.time_in_force.is_some() {
+                    bail!("weighted strategy market child contains limit-order fields");
+                }
+            }
+            crate::domain::execution::OrderKind::Limit => {
+                if plan.price.is_none()
+                    || plan.time_in_force != Some(crate::domain::execution::TimeInForce::Alo)
+                {
+                    bail!("weighted strategy maker children must be post-only ALO limit orders");
+                }
+            }
+        },
+    }
+    Ok(())
+}
+
+async fn execute_strategy_cancel(
+    paths: &RuntimePaths,
+    adapter: &BulkExecutionAdapter,
+    state: &mut RuntimeState,
+    job_id: &str,
+    sequence: u64,
+    plan: &CancelPlan,
+) -> Result<ExecutionReceipt> {
+    if sequence == 0 {
+        bail!("strategy cancellation sequence must start at 1");
+    }
+    let job = state
+        .strategy_jobs
+        .get(job_id)
+        .with_context(|| format!("strategy job `{job_id}` was not found"))?;
+    if !job.status.is_active() {
+        bail!("strategy job `{job_id}` is not running");
+    }
+    let order_prefix = format!("{job_id}:");
+    if plan.venue != job.definition.venue()
+        || plan.internal_symbol != job.definition.symbol()
+        || !state.strategy_executions.iter().any(|(key, receipt)| {
+            key.starts_with(&order_prefix)
+                && receipt.order_id.as_deref() == Some(plan.order_id.as_str())
+        })
+    {
+        bail!("strategy cannot cancel an order it does not own");
+    }
+    let cancellation_key = format!("{job_id}:{sequence}");
+    if let Some(receipt) = state.strategy_cancellations.get(&cancellation_key) {
+        return Ok(receipt.clone());
+    }
+    let receipt = execute_cancel(paths, adapter, state, plan).await?;
+    state
+        .strategy_cancellations
+        .insert(cancellation_key, receipt.clone());
+    persist_state(paths, state)?;
+    Ok(receipt)
+}
+
+async fn execute_bot_trade(
+    paths: &RuntimePaths,
+    adapter: &BulkExecutionAdapter,
+    state: &mut RuntimeState,
+    job_id: &str,
+    sequence: u64,
+    plan: &TradePlan,
+) -> Result<ExecutionReceipt> {
+    if sequence == 0 {
+        bail!("bot order sequence must start at 1");
+    }
+    let job = state
+        .bot_jobs
+        .get(job_id)
+        .cloned()
+        .with_context(|| format!("bot job `{job_id}` was not found"))?;
+    if !job.status.is_active() {
+        bail!("bot job `{job_id}` is not running");
+    }
+    validate_bot_trade(&job.definition, plan)?;
+
+    let execution_key = format!("{job_id}:{sequence}");
+    if let Some(receipt) = state.bot_executions.get(&execution_key) {
+        return Ok(receipt.clone());
+    }
+    let receipt = execute_trade(paths, adapter, state, plan, None).await?;
+    state.bot_executions.insert(execution_key, receipt.clone());
+    persist_state(paths, state)?;
+    Ok(receipt)
+}
+
+fn validate_bot_trade(definition: &BotJobDefinition, plan: &TradePlan) -> Result<()> {
+    let (venue, symbol, leverage, max_inventory_size, name) = match definition {
+        BotJobDefinition::Grid(definition) => (
+            definition.venue,
+            definition.symbol.as_str(),
+            definition.leverage,
+            definition.max_inventory_size,
+            "grid",
+        ),
+        BotJobDefinition::MidPrice(definition) | BotJobDefinition::VolumeMid(definition) => (
+            definition.venue,
+            definition.symbol.as_str(),
+            definition.leverage,
+            definition.max_inventory_size,
+            "mid-price",
+        ),
+    };
+    if plan.venue != venue
+        || plan.internal_symbol != symbol
+        || (plan.leverage - leverage).abs() > f64::EPSILON
+        || plan.stop_loss_price.is_some()
+        || plan.take_profit_price.is_some()
+        || plan.size > max_inventory_size + 1e-12_f64.max(max_inventory_size.abs() * 1e-12)
+        || crate::domain::execution::OrderSide::from(plan.direction) != plan.side
+    {
+        bail!("bot order does not match its persisted {name} definition");
+    }
+
+    match plan.order_kind {
+        crate::domain::execution::OrderKind::Limit => {
+            if plan.reduce_only
+                || plan.price.is_none()
+                || plan.time_in_force != Some(crate::domain::execution::TimeInForce::Alo)
+            {
+                bail!("bot quotes must be non-reduce-only post-only ALO limit orders");
+            }
+        }
+        crate::domain::execution::OrderKind::Market => {
+            if plan.reduce_only || plan.price.is_some() || plan.time_in_force.is_some() {
+                bail!("bot inventory exits must be non-reduce-only market orders");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn execute_bot_cancel(
+    paths: &RuntimePaths,
+    adapter: &BulkExecutionAdapter,
+    state: &mut RuntimeState,
+    job_id: &str,
+    sequence: u64,
+    plan: &CancelPlan,
+) -> Result<ExecutionReceipt> {
+    if sequence == 0 {
+        bail!("bot cancellation sequence must start at 1");
+    }
+    let job = state
+        .bot_jobs
+        .get(job_id)
+        .with_context(|| format!("bot job `{job_id}` was not found"))?;
+    if !job.status.is_active() {
+        bail!("bot job `{job_id}` is not running");
+    }
+    let order_prefix = format!("{job_id}:");
+    if plan.venue != job.definition.venue()
+        || plan.internal_symbol != job.definition.symbol()
+        || !state.bot_executions.iter().any(|(key, receipt)| {
+            key.starts_with(&order_prefix)
+                && receipt.order_id.as_deref() == Some(plan.order_id.as_str())
+        })
+    {
+        bail!("bot cannot cancel an order it does not own");
+    }
+    let cancellation_key = format!("{job_id}:{sequence}");
+    if let Some(receipt) = state.bot_cancellations.get(&cancellation_key) {
+        return Ok(receipt.clone());
+    }
+    let receipt = execute_cancel(paths, adapter, state, plan).await?;
+    state
+        .bot_cancellations
+        .insert(cancellation_key, receipt.clone());
     persist_state(paths, state)?;
     Ok(receipt)
 }
@@ -1999,7 +2945,23 @@ async fn handle_connection(
     if line.len() > MAX_RUNTIME_REQUEST_BYTES {
         bail!("mlabd request exceeds the runtime request limit");
     }
-    let request: RuntimeRequest = serde_json::from_str(&line).context("invalid mlabd request")?;
+    let request: RuntimeRequest = match serde_json::from_str(&line) {
+        Ok(request) => request,
+        Err(error) => {
+            let message = format!("invalid mlabd request: {error}");
+            record_runtime_error(paths, state, message.clone());
+            let response = RuntimeResponse::error(message, state);
+            let mut encoded =
+                serde_json::to_vec(&response).context("failed to encode mlabd error response")?;
+            encoded.push(b'\n');
+            writer
+                .write_all(&encoded)
+                .await
+                .context("failed to write mlabd error response")?;
+            writer.shutdown().await.ok();
+            return Ok(false);
+        }
+    };
     let should_stop = matches!(request, RuntimeRequest::Stop);
     let response = match request {
         RuntimeRequest::Ping => RuntimeResponse {
@@ -2015,6 +2977,20 @@ async fn handle_connection(
             status: Some(runtime_status(state)),
             receipt: None,
             ..RuntimeResponse::empty()
+        },
+        RuntimeRequest::ReloadMarkets => match crate::markets::reload() {
+            Ok(()) => RuntimeResponse {
+                ok: true,
+                message: "market snapshots reloaded".to_string(),
+                status: Some(runtime_status(state)),
+                ..RuntimeResponse::empty()
+            },
+            Err(error) => RuntimeResponse {
+                ok: false,
+                message: format!("{error:#}"),
+                status: Some(runtime_status(state)),
+                ..RuntimeResponse::empty()
+            },
         },
         RuntimeRequest::Stop => RuntimeResponse {
             ok: true,
@@ -2036,7 +3012,7 @@ async fn handle_connection(
             }
         }
         RuntimeRequest::ExecuteTrade { plan } => {
-            ensure_account_supervisor(&plan.account, account_tx, account_supervisors);
+            ensure_account_supervisor(plan.venue, &plan.account, account_tx, account_supervisors);
             match execute_trade(paths, adapter, state, &plan, None).await {
                 Ok(receipt) => RuntimeResponse {
                     ok: true,
@@ -2055,7 +3031,7 @@ async fn handle_connection(
             }
         }
         RuntimeRequest::CancelOrder { plan } => {
-            ensure_account_supervisor(&plan.account, account_tx, account_supervisors);
+            ensure_account_supervisor(plan.venue, &plan.account, account_tx, account_supervisors);
             match execute_cancel(paths, adapter, state, &plan).await {
                 Ok(receipt) => RuntimeResponse {
                     ok: true,
@@ -2074,10 +3050,11 @@ async fn handle_connection(
             }
         }
         RuntimeRequest::SubmitScriptJob { submission } => {
-            if submission.venue == Some(ExecutionVenue::Bulk)
-                && let Ok(account) = credentials::bulk_account()
+            if let Some(venue) = submission.venue
+                && let Ok(account) =
+                    crate::providers::execution::ExecutionAdapter::configured_account(venue)
             {
-                ensure_account_supervisor(&account, account_tx, account_supervisors);
+                ensure_account_supervisor(venue, &account, account_tx, account_supervisors);
             }
             match create_script_job(paths, state, submission) {
                 Ok(job) => RuntimeResponse {
@@ -2108,7 +3085,7 @@ async fn handle_connection(
             None => RuntimeResponse::error(format!("script job `{job_id}` was not found"), state),
         },
         RuntimeRequest::StopScriptJob { job_id } => {
-            match stop_script_job_in_daemon(paths, state, &job_id) {
+            match stop_script_job_in_daemon(paths, adapter, state, &job_id).await {
                 Ok(job) => RuntimeResponse {
                     ok: true,
                     message: "script job stopped".to_string(),
@@ -2120,7 +3097,7 @@ async fn handle_connection(
             }
         }
         RuntimeRequest::RestartScriptJob { job_id } => {
-            match restart_script_job_in_daemon(paths, state, &job_id) {
+            match restart_script_job_in_daemon(paths, adapter, state, &job_id).await {
                 Ok(job) => RuntimeResponse {
                     ok: true,
                     message: "script job restarted".to_string(),
@@ -2156,7 +3133,7 @@ async fn handle_connection(
             }
         }
         RuntimeRequest::ScriptWorkerFinished { job_id, pid, error } => {
-            match mark_script_worker_finished(paths, state, &job_id, pid, error) {
+            match mark_script_worker_finished(paths, adapter, state, &job_id, pid, error).await {
                 Ok(job) => RuntimeResponse {
                     ok: true,
                     message: "script worker finished".to_string(),
@@ -2171,16 +3148,43 @@ async fn handle_connection(
             job_id,
             order,
             request,
-        } => match execute_script_trade(
+        } => match execute_script_order(
             paths,
             adapter,
             state,
             account_tx,
             account_supervisors,
-            ScriptTradeOperation {
+            ScriptOrderOperation {
                 job_id: &job_id,
                 order,
-                request,
+                request: ScriptManagedRequest::Trade(request),
+            },
+        )
+        .await
+        {
+            Ok(script_order) => RuntimeResponse {
+                ok: true,
+                message: "script order processed".to_string(),
+                status: Some(runtime_status(state)),
+                script_order: Some(script_order),
+                ..RuntimeResponse::empty()
+            },
+            Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+        },
+        RuntimeRequest::ScriptExecuteOrder {
+            job_id,
+            order,
+            request,
+        } => match execute_script_order(
+            paths,
+            adapter,
+            state,
+            account_tx,
+            account_supervisors,
+            ScriptOrderOperation {
+                job_id: &job_id,
+                order,
+                request: ScriptManagedRequest::Order(request),
             },
         )
         .await
@@ -2204,6 +3208,25 @@ async fn handle_connection(
                     ..RuntimeResponse::empty()
                 },
                 Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
+        RuntimeRequest::ScriptCancelAllOrders { job_id } => {
+            let active = state
+                .script_jobs
+                .get(&job_id)
+                .is_some_and(|job| job.status.is_active());
+            if !active {
+                RuntimeResponse::error(format!("active script job `{job_id}` was not found"), state)
+            } else {
+                match cancel_script_job_orders(paths, adapter, state, &job_id).await {
+                    Ok(()) => RuntimeResponse {
+                        ok: true,
+                        message: "script managed orders cancelled".to_string(),
+                        status: Some(runtime_status(state)),
+                        ..RuntimeResponse::empty()
+                    },
+                    Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+                }
             }
         }
         RuntimeRequest::ScriptEvents {
@@ -2246,8 +3269,11 @@ async fn handle_connection(
             }
         }
         RuntimeRequest::SubmitStrategyJob { submission } => {
-            if let Ok(account) = credentials::bulk_account() {
-                ensure_account_supervisor(&account, account_tx, account_supervisors);
+            let venue = submission.definition.venue();
+            if let Ok(account) =
+                crate::providers::execution::ExecutionAdapter::configured_account(venue)
+            {
+                ensure_account_supervisor(venue, &account, account_tx, account_supervisors);
             }
             match create_strategy_job(paths, state, submission) {
                 Ok(job) => RuntimeResponse {
@@ -2334,7 +3360,7 @@ async fn handle_connection(
             sequence,
             plan,
         } => {
-            ensure_account_supervisor(&plan.account, account_tx, account_supervisors);
+            ensure_account_supervisor(plan.venue, &plan.account, account_tx, account_supervisors);
             match execute_strategy_trade(paths, adapter, state, &job_id, sequence, &plan).await {
                 Ok(receipt) => RuntimeResponse {
                     ok: true,
@@ -2346,6 +3372,136 @@ async fn handle_connection(
                 Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
             }
         }
+        RuntimeRequest::StrategyCancelOrder {
+            job_id,
+            sequence,
+            plan,
+        } => match execute_strategy_cancel(paths, adapter, state, &job_id, sequence, &plan).await {
+            Ok(receipt) => RuntimeResponse {
+                ok: true,
+                message: "strategy order cancelled".to_string(),
+                status: Some(runtime_status(state)),
+                receipt: Some(receipt),
+                ..RuntimeResponse::empty()
+            },
+            Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+        },
+        RuntimeRequest::SubmitBotJob { submission } => {
+            let venue = submission.definition.venue();
+            if let Ok(account) =
+                crate::providers::execution::ExecutionAdapter::configured_account(venue)
+            {
+                ensure_account_supervisor(venue, &account, account_tx, account_supervisors);
+            }
+            match create_bot_job(paths, state, submission).await {
+                Ok(job) => RuntimeResponse {
+                    ok: true,
+                    message: "bot job submitted".to_string(),
+                    status: Some(runtime_status(state)),
+                    bot_job: Some(job),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
+        RuntimeRequest::ListBotJobs => RuntimeResponse {
+            ok: true,
+            message: "bot jobs".to_string(),
+            status: Some(runtime_status(state)),
+            bot_jobs: Some(state.bot_jobs.values().cloned().collect()),
+            ..RuntimeResponse::empty()
+        },
+        RuntimeRequest::GetBotJob { job_id } => match state.bot_jobs.get(&job_id).cloned() {
+            Some(job) => RuntimeResponse {
+                ok: true,
+                message: "bot job".to_string(),
+                status: Some(runtime_status(state)),
+                bot_job: Some(job),
+                ..RuntimeResponse::empty()
+            },
+            None => RuntimeResponse::error(format!("bot job `{job_id}` was not found"), state),
+        },
+        RuntimeRequest::StopBotJob { job_id } => {
+            match stop_bot_job_in_daemon(paths, state, &job_id) {
+                Ok(job) => RuntimeResponse {
+                    ok: true,
+                    message: "bot job stopping".to_string(),
+                    status: Some(runtime_status(state)),
+                    bot_job: Some(job),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
+        RuntimeRequest::BotWorkerStarted { job_id, pid } => {
+            match mark_bot_worker_started(paths, state, &job_id, pid) {
+                Ok(job) => RuntimeResponse {
+                    ok: true,
+                    message: "bot worker running".to_string(),
+                    status: Some(runtime_status(state)),
+                    bot_job: Some(job),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
+        RuntimeRequest::BotWorkerHeartbeat {
+            job_id,
+            pid,
+            performance,
+        } => match mark_bot_worker_heartbeat(paths, state, &job_id, pid, performance) {
+            Ok(job) => RuntimeResponse {
+                ok: true,
+                message: "bot worker heartbeat".to_string(),
+                status: Some(runtime_status(state)),
+                bot_job: Some(job),
+                ..RuntimeResponse::empty()
+            },
+            Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+        },
+        RuntimeRequest::BotWorkerFinished { job_id, pid, error } => {
+            match mark_bot_worker_finished(paths, state, &job_id, pid, error) {
+                Ok(job) => RuntimeResponse {
+                    ok: true,
+                    message: "bot worker finished".to_string(),
+                    status: Some(runtime_status(state)),
+                    bot_job: Some(job),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
+        RuntimeRequest::BotExecuteTrade {
+            job_id,
+            sequence,
+            plan,
+        } => {
+            ensure_account_supervisor(plan.venue, &plan.account, account_tx, account_supervisors);
+            match execute_bot_trade(paths, adapter, state, &job_id, sequence, &plan).await {
+                Ok(receipt) => RuntimeResponse {
+                    ok: true,
+                    message: "bot order processed".to_string(),
+                    status: Some(runtime_status(state)),
+                    receipt: Some(receipt),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
+        RuntimeRequest::BotCancelOrder {
+            job_id,
+            sequence,
+            plan,
+        } => match execute_bot_cancel(paths, adapter, state, &job_id, sequence, &plan).await {
+            Ok(receipt) => RuntimeResponse {
+                ok: true,
+                message: "bot order cancellation processed".to_string(),
+                status: Some(runtime_status(state)),
+                receipt: Some(receipt),
+                ..RuntimeResponse::empty()
+            },
+            Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+        },
     };
     let mut encoded = serde_json::to_vec(&response).context("failed to encode mlabd response")?;
     encoded.push(b'\n');
@@ -2364,9 +3520,19 @@ async fn execute_trade(
     plan: &TradePlan,
     script_order_id: Option<String>,
 ) -> Result<ExecutionReceipt> {
-    let receipt = adapter
-        .submit_trade(credentials::active_bulk_credential()?, plan)
-        .await?;
+    let receipt = match plan.venue {
+        ExecutionVenue::Bulk => {
+            adapter
+                .submit_trade(credentials::active_bulk_credential()?, plan)
+                .await?
+        }
+        ExecutionVenue::Hyperliquid => {
+            crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new()
+                .await?
+                .submit_trade(plan)
+                .await?
+        }
+    };
     if let Err(error) = append_json_line(
         &paths.events,
         &TradeSubmissionEvent {
@@ -2382,7 +3548,7 @@ async fn execute_trade(
         let order_id = receipt
             .order_id
             .as_deref()
-            .context("non-terminal BULK receipt omitted its order id")?;
+            .context("non-terminal execution receipt omitted its order id")?;
         let order = TrackedOrder {
             venue: plan.venue,
             account: plan.account.clone(),
@@ -2409,20 +3575,32 @@ async fn execute_cancel(
     state: &mut RuntimeState,
     plan: &CancelPlan,
 ) -> Result<ExecutionReceipt> {
-    if plan.venue != ExecutionVenue::Bulk {
-        bail!("BULK runtime received a cancel plan for another venue");
+    let market =
+        crate::markets::exchange_market(execution_exchange(plan.venue), &plan.internal_symbol)?;
+    if market.venue_symbol != plan.venue_symbol {
+        bail!("cancel plan symbol mapping does not match the installed market snapshot");
     }
-    let market = crate::providers::bulk::catalog::market(&plan.internal_symbol)?;
-    if market.symbol != plan.venue_symbol {
-        bail!("cancel plan symbol mapping does not match the embedded BULK catalog");
+    let configured = crate::providers::execution::ExecutionAdapter::configured_account(plan.venue)?;
+    if !configured.eq_ignore_ascii_case(&plan.account) {
+        bail!("cancel plan account no longer matches the configured venue account");
     }
-    let credential = credentials::active_bulk_credential()?;
-    if credential.account.to_base58() != plan.account {
-        bail!("cancel plan account no longer matches the configured BULK account");
-    }
-    let receipt = adapter
-        .cancel_order(credential, &plan.venue_symbol, &plan.order_id)
-        .await?;
+    let receipt = match plan.venue {
+        ExecutionVenue::Bulk => {
+            adapter
+                .cancel_order(
+                    credentials::active_bulk_credential()?,
+                    &plan.venue_symbol,
+                    &plan.order_id,
+                )
+                .await?
+        }
+        ExecutionVenue::Hyperliquid => {
+            crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new()
+                .await?
+                .cancel_order(&plan.venue_symbol, &plan.order_id)
+                .await?
+        }
+    };
     if let Err(error) = append_json_line(
         &paths.events,
         &CancelSubmissionEvent {
@@ -2434,35 +3612,72 @@ async fn execute_cancel(
     ) {
         eprintln!("execution journal warning: {error:#}");
     }
-    if state.tracked_orders.remove(&plan.order_id).is_some() {
+    if receipt.terminal && state.tracked_orders.remove(&plan.order_id).is_some() {
         persist_state(paths, state)?;
     }
     Ok(receipt)
 }
 
 fn ensure_account_supervisor(
+    venue: ExecutionVenue,
     account: &str,
     sender: &mpsc::Sender<AccountConnectionEvent>,
     supervisors: &mut HashSet<String>,
 ) {
-    if !supervisors.insert(account.to_string()) {
+    let key = format!("{}:{account}", execution_exchange(venue));
+    if !supervisors.insert(key) {
         return;
     }
     let account = account.to_string();
     let sender = sender.clone();
     tokio::spawn(async move {
-        supervise_account_stream(account, sender).await;
+        supervise_account_stream(venue, account, sender).await;
     });
 }
 
-async fn supervise_account_stream(account: String, sender: mpsc::Sender<AccountConnectionEvent>) {
+fn execution_exchange(venue: ExecutionVenue) -> &'static str {
+    match venue {
+        ExecutionVenue::Bulk => "bulk",
+        ExecutionVenue::Hyperliquid => "hyperliquid",
+    }
+}
+
+enum VenueAccountStream {
+    Bulk(BulkAccountStream),
+    Hyperliquid(HyperliquidAccountStream),
+}
+
+impl VenueAccountStream {
+    async fn connect(venue: ExecutionVenue, account: &str) -> Result<Self> {
+        match venue {
+            ExecutionVenue::Bulk => Ok(Self::Bulk(BulkAccountStream::connect(account).await?)),
+            ExecutionVenue::Hyperliquid => Ok(Self::Hyperliquid(
+                HyperliquidAccountStream::connect(account).await?,
+            )),
+        }
+    }
+
+    async fn next_event(&mut self) -> Result<serde_json::Value> {
+        match self {
+            Self::Bulk(stream) => stream.next_event().await,
+            Self::Hyperliquid(stream) => stream.next_event().await,
+        }
+    }
+}
+
+async fn supervise_account_stream(
+    venue: ExecutionVenue,
+    account: String,
+    sender: mpsc::Sender<AccountConnectionEvent>,
+) {
     let mut connected_once = false;
     let mut reconnect_delay_secs = 1_u64;
     loop {
-        match BulkAccountStream::connect(&account).await {
+        match VenueAccountStream::connect(venue, &account).await {
             Ok(mut stream) => {
                 if sender
                     .send(AccountConnectionEvent::Connected {
+                        venue,
                         account: account.clone(),
                         reconnected: connected_once,
                     })
@@ -2478,6 +3693,7 @@ async fn supervise_account_stream(account: String, sender: mpsc::Sender<AccountC
                         Ok(data) => {
                             if sender
                                 .send(AccountConnectionEvent::Data {
+                                    venue,
                                     account: account.clone(),
                                     data,
                                 })
@@ -2490,6 +3706,7 @@ async fn supervise_account_stream(account: String, sender: mpsc::Sender<AccountC
                         Err(error) => {
                             if sender
                                 .send(AccountConnectionEvent::Disconnected {
+                                    venue,
                                     account: account.clone(),
                                     error: format!("{error:#}"),
                                 })
@@ -2506,6 +3723,7 @@ async fn supervise_account_stream(account: String, sender: mpsc::Sender<AccountC
             Err(error) => {
                 if sender
                     .send(AccountConnectionEvent::Disconnected {
+                        venue,
                         account: account.clone(),
                         error: format!("{error:#}"),
                     })
@@ -2529,27 +3747,39 @@ async fn handle_account_connection_event(
 ) -> Result<()> {
     match event {
         AccountConnectionEvent::Connected {
+            venue,
             account,
             reconnected,
         } => {
             state.account_stream_connected = true;
             state.last_error = None;
-            refresh_account_positions(adapter, state, &account, true).await?;
+            refresh_account_positions(venue, adapter, state, &account, true).await?;
             persist_state(paths, state)?;
             if reconnected {
-                recover_account_gap(paths, adapter, state, &account).await?;
+                recover_account_gap(venue, paths, adapter, state, &account).await?;
             }
         }
-        AccountConnectionEvent::Disconnected { account, error } => {
+        AccountConnectionEvent::Disconnected {
+            venue,
+            account,
+            error,
+        } => {
             state.account_stream_connected = false;
             state.account_disconnected_at_ms = Some(now_ms()?);
             record_runtime_error(
                 paths,
                 state,
-                format!("BULK account WebSocket disconnected for {account}: {error}"),
+                format!(
+                    "{} account WebSocket disconnected for {account}: {error}",
+                    execution_exchange(venue)
+                ),
             );
         }
-        AccountConnectionEvent::Data { account, data } => {
+        AccountConnectionEvent::Data {
+            venue,
+            account,
+            data,
+        } => {
             let received_at_ms = now_ms()?;
             state.account_stream_connected = true;
             state.last_account_event_ms = Some(received_at_ms);
@@ -2562,8 +3792,12 @@ async fn handle_account_connection_event(
                     data: &data,
                 },
             )?;
-            apply_account_event(paths, state, &account, &data, received_at_ms)?;
-            refresh_account_positions(adapter, state, &account, false).await?;
+            apply_account_event(venue, paths, state, &account, &data, received_at_ms)?;
+            if venue == ExecutionVenue::Hyperliquid
+                && data.get("channel").and_then(serde_json::Value::as_str) == Some("user")
+            {
+                refresh_account_positions(venue, adapter, state, &account, true).await?;
+            }
             persist_state(paths, state)?;
         }
     }
@@ -2571,6 +3805,7 @@ async fn handle_account_connection_event(
 }
 
 async fn refresh_account_positions(
+    venue: ExecutionVenue,
     adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
     account: &str,
@@ -2585,7 +3820,15 @@ async fn refresh_account_positions(
     {
         return Ok(());
     }
-    let snapshot = adapter.account_snapshot(account).await?;
+    let snapshot = match venue {
+        ExecutionVenue::Bulk => adapter.account_snapshot(account).await?,
+        ExecutionVenue::Hyperliquid => {
+            crate::providers::execution::ExecutionAdapter::new(venue)
+                .await?
+                .account_snapshot(account)
+                .await?
+        }
+    };
     state
         .account_positions
         .insert(account.to_string(), snapshot.positions);
@@ -2609,11 +3852,10 @@ async fn script_positions_in_daemon(
     if job.definition.venue.is_none() {
         return Ok(Vec::new());
     }
-    let account = credentials::bulk_account()?;
-    if !state.account_positions.contains_key(&account) {
-        refresh_account_positions(adapter, state, &account, true).await?;
-        persist_state(paths, state)?;
-    }
+    let venue = job.definition.venue.expect("checked execution venue");
+    let account = crate::providers::execution::ExecutionAdapter::configured_account(venue)?;
+    refresh_account_positions(venue, adapter, state, &account, false).await?;
+    persist_state(paths, state)?;
     Ok(state
         .account_positions
         .get(&account)
@@ -2629,6 +3871,24 @@ async fn script_positions_in_daemon(
 }
 
 fn apply_account_event(
+    venue: ExecutionVenue,
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
+    account: &str,
+    data: &serde_json::Value,
+    received_at_ms: u64,
+) -> Result<()> {
+    match venue {
+        ExecutionVenue::Bulk => {
+            apply_bulk_account_event(paths, state, account, data, received_at_ms)
+        }
+        ExecutionVenue::Hyperliquid => {
+            apply_hyperliquid_account_event(paths, state, account, data, received_at_ms)
+        }
+    }
+}
+
+fn apply_bulk_account_event(
     paths: &RuntimePaths,
     state: &mut RuntimeState,
     account: &str,
@@ -2686,8 +3946,109 @@ fn apply_account_event(
         }
         _ => {}
     }
-    route_account_event_to_scripts(paths, state, data)?;
+    route_account_event_to_scripts(ExecutionVenue::Bulk, paths, state, data)?;
     Ok(())
+}
+
+fn apply_hyperliquid_account_event(
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
+    account: &str,
+    data: &serde_json::Value,
+    received_at_ms: u64,
+) -> Result<()> {
+    match data.get("channel").and_then(serde_json::Value::as_str) {
+        Some("orderUpdates") => {
+            let updates = data
+                .get("data")
+                .and_then(serde_json::Value::as_array)
+                .context("Hyperliquid orderUpdates omitted its update list")?;
+            for update in updates {
+                let order = update
+                    .get("order")
+                    .context("Hyperliquid order update omitted order")?;
+                let order_id = value_identifier(
+                    order
+                        .get("oid")
+                        .context("Hyperliquid order update omitted oid")?,
+                )?;
+                let raw_status = update
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .context("Hyperliquid order update omitted status")?;
+                let status = normalize_hyperliquid_order_status(raw_status);
+                let event_ms = update
+                    .get("statusTimestamp")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(received_at_ms);
+                apply_tracked_order_status(paths, state, account, &order_id, status, event_ms)?;
+                apply_script_order_status(
+                    paths,
+                    state,
+                    &order_id,
+                    status,
+                    event_ms,
+                    update.clone(),
+                )?;
+            }
+        }
+        Some("user") => {
+            let event = data
+                .get("data")
+                .context("Hyperliquid user event omitted data")?;
+            if let Some(fills) = event.get("fills").and_then(serde_json::Value::as_array) {
+                for fill in fills {
+                    let mut normalized = serde_json::json!({
+                        "type": "fill",
+                        "venue": "hyperliquid",
+                        "symbol": fill.get("coin").cloned().unwrap_or(serde_json::Value::Null),
+                        "price": fill.get("px").cloned().unwrap_or(serde_json::Value::Null),
+                        "size": fill.get("sz").cloned().unwrap_or(serde_json::Value::Null),
+                        "side": fill.get("side").cloned().unwrap_or(serde_json::Value::Null),
+                        "fee": fill.get("fee").cloned().unwrap_or(serde_json::Value::Null),
+                        "timestamp": fill.get("time").cloned().unwrap_or(serde_json::Value::Null),
+                        "raw": fill,
+                    });
+                    if let Some(oid) = fill.get("oid") {
+                        normalized.as_object_mut().expect("object").insert(
+                            "orderId".to_string(),
+                            serde_json::Value::String(value_identifier(oid)?),
+                        );
+                    }
+                    route_account_event_to_scripts(
+                        ExecutionVenue::Hyperliquid,
+                        paths,
+                        state,
+                        &normalized,
+                    )?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn value_identifier(value: &serde_json::Value) -> Result<String> {
+    match value {
+        serde_json::Value::String(value) => Ok(value.clone()),
+        serde_json::Value::Number(value) => Ok(value.to_string()),
+        _ => bail!("execution order id is neither a string nor an integer"),
+    }
+}
+
+fn normalize_hyperliquid_order_status(status: &str) -> &str {
+    if status.eq_ignore_ascii_case("open") {
+        "resting"
+    } else if status.eq_ignore_ascii_case("filled") {
+        "filled"
+    } else if status.eq_ignore_ascii_case("canceled") || status.eq_ignore_ascii_case("cancelled") {
+        "cancelled"
+    } else if status.eq_ignore_ascii_case("rejected") || status.ends_with("Canceled") {
+        "rejected"
+    } else {
+        status
+    }
 }
 
 fn apply_script_order_status(
@@ -2710,18 +4071,22 @@ fn apply_script_order_status(
                 .script_orders
                 .get_mut(&local_id)
                 .context("script order disappeared while applying account event")?;
-            let changed = managed.status != status;
-            managed.status = status.to_string();
-            managed.updated_at_ms = event_ms;
+            let changed = should_apply_script_order_status(&managed.status, status);
+            if changed {
+                managed.status = status.to_string();
+                managed.updated_at_ms = event_ms;
+            }
             (managed.job_id.clone(), managed.clone(), changed)
         };
         if changed {
-            let event_type = if status == "filled" || status == "partiallyFilled" {
+            let event_type = if status == "filled" {
                 "order.filled"
             } else if status.starts_with("cancelled") || status == "siblingCancelled" {
                 "order.cancelled"
             } else if status.starts_with("rejected") || status == "triggerFailed" {
                 "order.rejected"
+            } else if matches!(status, "placed" | "resting") {
+                "order.accepted"
             } else {
                 "order.updated"
             };
@@ -2740,6 +4105,7 @@ fn apply_script_order_status(
 }
 
 fn route_account_event_to_scripts(
+    venue: ExecutionVenue,
     paths: &RuntimePaths,
     state: &mut RuntimeState,
     data: &serde_json::Value,
@@ -2757,8 +4123,8 @@ fn route_account_event_to_scripts(
         .and_then(serde_json::Value::as_str);
     let venue_symbol = data.get("symbol").and_then(serde_json::Value::as_str);
     let internal_symbol = venue_symbol
-        .and_then(|symbol| crate::providers::bulk::catalog::market(symbol).ok())
-        .map(|market| market.internal_symbol.as_str());
+        .and_then(|symbol| crate::markets::exchange_market(execution_exchange(venue), symbol).ok())
+        .map(|market| market.symbol.clone());
     let event_type = match kind {
         "fill" => "order.fill",
         "positionUpdate" if data.get("size").and_then(serde_json::Value::as_f64) == Some(0.0) => {
@@ -2798,8 +4164,10 @@ fn route_account_event_to_scripts(
         .values()
         .filter(|job| {
             job.status.is_active()
-                && job.definition.venue == Some(ExecutionVenue::Bulk)
-                && internal_symbol.is_none_or(|symbol| job.definition.symbol == symbol)
+                && job.definition.venue == Some(venue)
+                && internal_symbol
+                    .as_deref()
+                    .is_none_or(|symbol| job.definition.symbol == symbol)
         })
         .map(|job| job.id.clone())
         .collect::<HashSet<_>>();
@@ -2845,6 +4213,7 @@ fn apply_tracked_order_status(
 }
 
 async fn recover_account_gap(
+    venue: ExecutionVenue,
     paths: &RuntimePaths,
     adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
@@ -2857,32 +4226,65 @@ async fn recover_account_gap(
 
     // These are one-shot gap-recovery calls after a proven disconnect. They are
     // never scheduled on a timer while the account WebSocket is healthy.
-    let history = adapter.order_history(account).await?;
-    for record in history
-        .into_iter()
-        .filter(|record| record.ts_ms >= gap_started_ms)
-    {
-        apply_tracked_order_status(
-            paths,
-            state,
-            account,
-            &record.order_id,
-            &record.status,
-            record.ts_ms,
-        )?;
-        apply_script_order_status(
-            paths,
-            state,
-            &record.order_id,
-            &record.status,
-            record.ts_ms,
-            serde_json::to_value(&record)?,
-        )?;
+    match venue {
+        ExecutionVenue::Bulk => {
+            for record in adapter
+                .order_history(account)
+                .await?
+                .into_iter()
+                .filter(|record| record.ts_ms >= gap_started_ms)
+            {
+                apply_tracked_order_status(
+                    paths,
+                    state,
+                    account,
+                    &record.order_id,
+                    &record.status,
+                    record.ts_ms,
+                )?;
+                apply_script_order_status(
+                    paths,
+                    state,
+                    &record.order_id,
+                    &record.status,
+                    record.ts_ms,
+                    serde_json::to_value(&record)?,
+                )?;
+            }
+        }
+        ExecutionVenue::Hyperliquid => {
+            let execution = crate::providers::execution::ExecutionAdapter::new(venue).await?;
+            for order in execution.open_orders(account).await? {
+                apply_tracked_order_status(
+                    paths,
+                    state,
+                    account,
+                    &order.order_id,
+                    "resting",
+                    order.ts_ms,
+                )?;
+                apply_script_order_status(
+                    paths,
+                    state,
+                    &order.order_id,
+                    "resting",
+                    order.ts_ms,
+                    serde_json::to_value(&order)?,
+                )?;
+            }
+        }
     }
 
-    for fill in adapter
-        .fills(account)
-        .await?
+    let fills = match venue {
+        ExecutionVenue::Bulk => adapter.fills(account).await?,
+        ExecutionVenue::Hyperliquid => {
+            crate::providers::execution::ExecutionAdapter::new(venue)
+                .await?
+                .fills(account)
+                .await?
+        }
+    };
+    for fill in fills
         .into_iter()
         .filter(|fill| fill.ts_ms >= gap_started_ms)
     {
@@ -2913,7 +4315,7 @@ async fn recover_account_gap(
                 serde_json::Value::String(fill.venue_symbol.clone()),
             );
         }
-        route_account_event_to_scripts(paths, state, &routed)?;
+        route_account_event_to_scripts(venue, paths, state, &routed)?;
     }
     state.last_recovery_ms = Some(now_ms()?);
     state.account_disconnected_at_ms = None;
@@ -2924,7 +4326,8 @@ fn is_terminal_order_status(status: &str) -> bool {
     matches!(
         status,
         "filled"
-            | "partiallyFilled"
+            | "rejected"
+            | "error"
             | "cancelled"
             | "cancelledRiskLimit"
             | "cancelledSelfCrossing"
@@ -2937,6 +4340,10 @@ fn is_terminal_order_status(status: &str) -> bool {
             | "siblingCancelled"
             | "triggerFailed"
     )
+}
+
+fn should_apply_script_order_status(current: &str, incoming: &str) -> bool {
+    current != incoming && !is_terminal_order_status(current)
 }
 
 async fn try_status() -> Result<Option<RuntimeStatus>> {
@@ -2979,10 +4386,13 @@ async fn try_request(request: RuntimeRequest) -> Result<Option<RuntimeResponse>>
         .context("failed to write mlabd request")?;
     writer.shutdown().await.ok();
     let mut line = String::new();
-    BufReader::new(reader)
+    let bytes_read = BufReader::new(reader)
         .read_line(&mut line)
         .await
         .context("failed to read mlabd response")?;
+    if bytes_read == 0 {
+        bail!("mlabd closed the local connection without a response");
+    }
     let response = serde_json::from_str(&line).context("invalid mlabd response")?;
     Ok(Some(response))
 }
@@ -3000,6 +4410,7 @@ fn runtime_status(state: &RuntimeState) -> RuntimeStatus {
         tracked_orders: state.tracked_orders.values().cloned().collect(),
         script_jobs: state.script_jobs.values().cloned().collect(),
         strategy_jobs: state.strategy_jobs.values().cloned().collect(),
+        bot_jobs: state.bot_jobs.values().cloned().collect(),
     }
 }
 
@@ -3100,6 +4511,41 @@ mod tests {
         assert!(status.tracked_orders.is_empty());
         assert!(status.script_jobs.is_empty());
         assert!(status.strategy_jobs.is_empty());
+        assert!(status.bot_jobs.is_empty());
+    }
+
+    #[test]
+    fn partial_fills_keep_managed_orders_active() {
+        assert!(!is_terminal_order_status("partiallyFilled"));
+        assert!(is_terminal_order_status("filled"));
+        assert!(is_terminal_order_status("cancelled"));
+    }
+
+    #[test]
+    fn terminal_script_order_status_cannot_regress() {
+        assert!(should_apply_script_order_status("submitted", "resting"));
+        assert!(should_apply_script_order_status("resting", "filled"));
+        assert!(!should_apply_script_order_status("filled", "resting"));
+        assert!(!should_apply_script_order_status("cancelled", "resting"));
+        assert!(!should_apply_script_order_status(
+            "rejectedCrossing",
+            "resting"
+        ));
+        assert!(!should_apply_script_order_status("rejected", "resting"));
+    }
+
+    #[test]
+    fn hyperliquid_order_ids_and_statuses_normalize_for_runtime_tracking() {
+        assert_eq!(
+            value_identifier(&serde_json::json!(123)).expect("oid"),
+            "123"
+        );
+        assert_eq!(normalize_hyperliquid_order_status("open"), "resting");
+        assert_eq!(normalize_hyperliquid_order_status("filled"), "filled");
+        assert_eq!(
+            normalize_hyperliquid_order_status("scheduledCancelCanceled"),
+            "rejected"
+        );
     }
 
     #[test]
@@ -3119,5 +4565,194 @@ mod tests {
         assert!(status.last_recovery_ms.is_none());
         assert!(status.script_jobs.is_empty());
         assert!(status.strategy_jobs.is_empty());
+        assert!(status.bot_jobs.is_empty());
+    }
+
+    #[test]
+    fn runtime_protocol_v29_decodes_oiwap_submissions() {
+        assert_eq!(RUNTIME_VERSION, 29);
+
+        let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
+            "type": "submit_strategy_job",
+            "submission": {
+                "definition": {
+                    "name": "oiwap",
+                    "config": {
+                        "venue": "bulk",
+                        "symbol": "ZEC/USDT",
+                        "side": "buy",
+                        "totalSize": 1.0,
+                        "requestedMargin": 50.0,
+                        "targetMargin": 50.0,
+                        "targetExposure": 500.0,
+                        "durationSeconds": 3_900,
+                        "oiSources": [{"exchange": "hyperliquid", "provider": "mmt"}],
+                        "leverage": 10.0,
+                        "reduceOnly": false
+                    }
+                }
+            }
+        }))
+        .expect("runtime protocol should decode OIWAP submissions");
+
+        assert!(matches!(
+            request,
+            RuntimeRequest::SubmitStrategyJob {
+                submission: StrategyJobSubmission {
+                    definition: StrategyJobDefinition::Oiwap(_)
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn runtime_protocol_v29_decodes_mid_price_bot_submissions() {
+        let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
+            "type": "submit_bot_job",
+            "submission": {
+                "definition": {
+                    "name": "mid_price",
+                    "config": {
+                        "venue": "bulk",
+                        "symbol": "BTC/USDT",
+                        "maxInventorySize": 0.02,
+                        "requestedMargin": 100.0,
+                        "maxInventoryMargin": 100.0,
+                        "maxInventoryExposure": 1_000.0,
+                        "durationSeconds": 300,
+                        "spreadBps": 2.0,
+                        "refreshSeconds": 5.0,
+                        "refreshToleranceBps": 0.5,
+                        "directionalBiasPercent": 25.0,
+                        "leverage": 10.0
+                    }
+                }
+            }
+        }))
+        .expect("runtime protocol should decode mid-price bot submissions");
+
+        assert!(matches!(
+            request,
+            RuntimeRequest::SubmitBotJob {
+                submission: BotJobSubmission {
+                    definition: BotJobDefinition::MidPrice(_)
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn runtime_protocol_v29_decodes_volume_mid_bot_submissions() {
+        let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
+            "type": "submit_bot_job",
+            "submission": {
+                "definition": {
+                    "name": "volume_mid",
+                    "config": {
+                        "venue": "bulk",
+                        "symbol": "BTC/USDT",
+                        "maxInventorySize": 0.02,
+                        "requestedMargin": 100.0,
+                        "maxInventoryMargin": 100.0,
+                        "maxInventoryExposure": 1_000.0,
+                        "durationSeconds": 300,
+                        "spreadBps": 6.0,
+                        "refreshSeconds": 2.0,
+                        "refreshToleranceBps": 1.0,
+                        "directionalBiasPercent": 0.0,
+                        "leverage": 10.0,
+                        "stopLossPct": 5.0
+                    }
+                }
+            }
+        }))
+        .expect("runtime protocol should decode volume-mid bot submissions");
+
+        assert!(matches!(
+            request,
+            RuntimeRequest::SubmitBotJob {
+                submission: BotJobSubmission {
+                    definition: BotJobDefinition::VolumeMid(_)
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn runtime_protocol_v29_decodes_grid_bot_submissions() {
+        let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
+            "type": "submit_bot_job",
+            "submission": {
+                "definition": {
+                    "name": "grid",
+                    "config": {
+                        "venue": "hyperliquid",
+                        "symbol": "BTC/USDT",
+                        "maxInventorySize": 0.02,
+                        "requestedMargin": 100.0,
+                        "maxInventoryMargin": 100.0,
+                        "maxInventoryExposure": 1_000.0,
+                        "durationSeconds": 300,
+                        "levelsPerSide": 3,
+                        "stepBps": 2.0,
+                        "resetThresholdPct": 0.5,
+                        "leverage": 10.0,
+                        "stopLossPct": 5.0
+                    }
+                }
+            }
+        }))
+        .expect("runtime protocol should decode grid bot submissions");
+
+        assert!(matches!(
+            request,
+            RuntimeRequest::SubmitBotJob {
+                submission: BotJobSubmission {
+                    definition: BotJobDefinition::Grid(_)
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn runtime_protocol_v17_decodes_raw_script_orders() {
+        let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
+            "type": "script_execute_order",
+            "job_id": "script_1",
+            "order": { "id": "ord_1", "key": "ask-1" },
+            "request": {
+                "key": "ask-1",
+                "side": "short",
+                "size": 1,
+                "leverage": 5,
+                "order": { "type": "limit", "price": 101, "tif": "alo" }
+            }
+        }))
+        .expect("raw script order request decodes");
+
+        assert!(matches!(request, RuntimeRequest::ScriptExecuteOrder { .. }));
+    }
+
+    #[test]
+    fn runtime_protocol_v17_decodes_script_order_cleanup() {
+        let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
+            "type": "script_cancel_all_orders",
+            "job_id": "script_1"
+        }))
+        .expect("script cleanup request decodes");
+
+        assert!(matches!(
+            request,
+            RuntimeRequest::ScriptCancelAllOrders { job_id } if job_id == "script_1"
+        ));
+    }
+
+    #[test]
+    fn script_failure_records_explain_terminal_worker_errors() {
+        let record = script_failure_record(1_780_000_000_000, "connection reset by peer");
+
+        assert_eq!(record["type"], "script.run.failed");
+        assert_eq!(record["error"], "connection reset by peer");
+        assert_eq!(record["ts_ms"], 1_780_000_000_000_u64);
     }
 }

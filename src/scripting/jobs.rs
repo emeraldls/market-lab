@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::execution::ExecutionVenue;
 
-use super::execution::{ScriptOrderRef, ScriptTradeRequest};
+use super::execution::{ScriptManagedRequest, ScriptOrderRef};
 
 pub const MAX_SCRIPT_SOURCE_BYTES: usize = 1024 * 1024;
 
@@ -158,7 +158,7 @@ mod tests {
 pub struct ScriptManagedOrder {
     pub job_id: String,
     pub order: ScriptOrderRef,
-    pub request: ScriptTradeRequest,
+    pub request: ScriptManagedRequest,
     pub symbol: String,
     pub venue: ExecutionVenue,
     pub status: String,

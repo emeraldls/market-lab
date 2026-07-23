@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8,6 +9,7 @@ use bulk_keychain::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 use crate::credentials::ActiveBulkCredential;
 use crate::domain::execution::{
@@ -16,9 +18,10 @@ use crate::domain::execution::{
     VenueCapabilities,
 };
 
-use super::catalog;
 use super::client::BulkClient;
 use super::market_data::normalize_timestamp_ms;
+use super::markets;
+use super::ws::{BulkTradingClient, is_trading_acknowledgement};
 
 static LAST_NONCE: AtomicU64 = AtomicU64::new(0);
 const ORDER_RECONCILIATION_ATTEMPTS: usize = 4;
@@ -26,6 +29,8 @@ const ORDER_RECONCILIATION_DELAY: Duration = Duration::from_millis(500);
 
 pub struct BulkExecutionAdapter {
     client: BulkClient,
+    trading: BulkTradingClient,
+    leverage_settings: Mutex<HashMap<(String, String), f64>>,
 }
 
 impl BulkExecutionAdapter {
@@ -50,6 +55,8 @@ impl BulkExecutionAdapter {
     pub fn new() -> Result<Self> {
         Ok(Self {
             client: BulkClient::new()?,
+            trading: BulkTradingClient::new(),
+            leverage_settings: Mutex::new(HashMap::new()),
         })
     }
 
@@ -172,14 +179,7 @@ impl BulkExecutionAdapter {
         let mut signer = Signer::new(credential.agent);
 
         if !plan.reduce_only {
-            let leverage_action = Action::UpdateUserSettings(
-                bulk_keychain::UserSettings::set_leverage(plan.venue_symbol.clone(), plan.leverage),
-            );
-            let leverage_tx = signer
-                .sign_action(&leverage_action, next_nonce()?, &account)
-                .context("failed to sign BULK leverage update")?;
-            let leverage_response: Value = self.client.post("order", &leverage_tx).await?;
-            validate_transaction_response(&leverage_response, "leverage update")?;
+            self.ensure_leverage(&mut signer, &account, plan).await?;
         }
 
         let signed = sign_trade_order(&mut signer, &account, plan, next_nonce()?)?;
@@ -187,12 +187,16 @@ impl BulkExecutionAdapter {
             .order_id
             .clone()
             .context("signed BULK order omitted its deterministic order id")?;
-        match self.client.post("order", &signed).await {
-            Ok(response) => receipt_from_response(
+        match self.trading.post(&signed).await {
+            Ok(response) if is_trading_acknowledgement(&response) => acknowledged_receipt(
                 &plan.account,
-                Some(optimistic_order_id),
+                optimistic_order_id,
+                "submitted",
                 response,
             ),
+            Ok(response) => {
+                receipt_from_response(&plan.account, Some(optimistic_order_id), response)
+            }
             Err(submission_error) => self
                 .reconcile_order_submission(
                     &plan.account,
@@ -206,6 +210,36 @@ impl BulkExecutionAdapter {
                     )
                 }),
         }
+    }
+
+    async fn ensure_leverage(
+        &self,
+        signer: &mut Signer,
+        account: &Pubkey,
+        plan: &TradePlan,
+    ) -> Result<()> {
+        let key = (plan.account.clone(), plan.venue_symbol.clone());
+        let mut settings = self.leverage_settings.lock().await;
+        if settings
+            .get(&key)
+            .is_some_and(|leverage| (*leverage - plan.leverage).abs() <= f64::EPSILON)
+        {
+            return Ok(());
+        }
+
+        let action = Action::UpdateUserSettings(bulk_keychain::UserSettings::set_leverage(
+            plan.venue_symbol.clone(),
+            plan.leverage,
+        ));
+        let transaction = signer
+            .sign_action(&action, next_nonce()?, account)
+            .context("failed to sign BULK leverage update")?;
+        let response = self.trading.post(&transaction).await?;
+        if !is_trading_acknowledgement(&response) {
+            validate_transaction_response(&response, "leverage update")?;
+        }
+        settings.insert(key, plan.leverage);
+        Ok(())
     }
 
     pub async fn cancel_order(
@@ -223,8 +257,17 @@ impl BulkExecutionAdapter {
         let signed = signer
             .sign_action(&action, next_nonce()?, &account)
             .context("failed to sign BULK order cancellation")?;
-        let response: Value = self.client.post("order", &signed).await?;
-        receipt_from_response(&account.to_base58(), Some(order_id.to_string()), response)
+        let response = self.trading.post(&signed).await?;
+        if is_trading_acknowledgement(&response) {
+            acknowledged_receipt(
+                &account.to_base58(),
+                order_id.to_string(),
+                "cancelSubmitted",
+                response,
+            )
+        } else {
+            receipt_from_response(&account.to_base58(), Some(order_id.to_string()), response)
+        }
     }
 
     async fn reconcile_order_submission(
@@ -438,47 +481,48 @@ fn validate_trade_plan(plan: &TradePlan) -> Result<()> {
     if plan.venue != ExecutionVenue::Bulk {
         bail!("BULK adapter received a plan for another execution venue");
     }
-    let market = catalog::market(&plan.internal_symbol)?;
-    if !market.is_trading() {
-        bail!("BULK market `{}` is not trading", market.symbol);
+    let market = markets::market(&plan.internal_symbol)?;
+    let rules = market.execution_rules()?;
+    if !market.is_available() {
+        bail!("BULK market `{}` is not trading", market.venue_symbol);
     }
-    if plan.venue_symbol != market.symbol {
-        bail!("trade plan symbol mapping does not match the embedded BULK catalog");
+    if plan.venue_symbol != market.venue_symbol {
+        bail!("trade plan symbol mapping does not match the installed market snapshot");
     }
-    if !plan.size.is_finite() || plan.size <= 0.0 || !is_step_aligned(plan.size, market.lot_size) {
+    if !plan.size.is_finite() || plan.size <= 0.0 || !is_step_aligned(plan.size, rules.lot_size) {
         bail!(
             "trade plan size is not aligned to BULK lot size {} for {}",
-            market.lot_size,
-            market.internal_symbol
+            rules.lot_size,
+            market.symbol
         );
     }
     if !plan.leverage.is_finite()
         || plan.leverage < 1.0
-        || plan.leverage > f64::from(market.max_leverage)
+        || plan.leverage > f64::from(rules.max_leverage)
     {
         bail!(
             "trade plan leverage must be between 1 and {} for {}",
-            market.max_leverage,
-            market.internal_symbol
+            rules.max_leverage,
+            market.symbol
         );
     }
     if !plan.reference_price.is_finite() || plan.reference_price <= 0.0 {
         bail!("trade plan has an invalid reference price");
     }
-    if plan.size * plan.reference_price < market.min_notional {
+    if plan.size * plan.reference_price < rules.min_notional {
         bail!(
             "trade plan notional is below BULK minimum {} for {}",
-            market.min_notional,
-            market.internal_symbol
+            rules.min_notional,
+            market.symbol
         );
     }
-    validate_protection(plan, market.tick_size)?;
+    validate_protection(plan, rules.tick_size)?;
     match plan.order_kind {
         OrderKind::Market => {
             if !market.supports_order_type("MARKET") {
                 bail!(
                     "BULK market `{}` does not support market orders",
-                    market.symbol
+                    market.venue_symbol
                 );
             }
             if plan.price.is_some() || plan.time_in_force.is_some() {
@@ -489,17 +533,17 @@ fn validate_trade_plan(plan: &TradePlan) -> Result<()> {
             if !market.supports_order_type("LIMIT") {
                 bail!(
                     "BULK market `{}` does not support limit orders",
-                    market.symbol
+                    market.venue_symbol
                 );
             }
             let price = plan
                 .price
                 .context("limit trade plan is missing its price")?;
-            if !price.is_finite() || price <= 0.0 || !is_step_aligned(price, market.tick_size) {
+            if !price.is_finite() || price <= 0.0 || !is_step_aligned(price, rules.tick_size) {
                 bail!(
                     "trade plan price is not aligned to BULK tick size {} for {}",
-                    market.tick_size,
-                    market.internal_symbol
+                    rules.tick_size,
+                    market.symbol
                 );
             }
             let tif = plan
@@ -510,12 +554,15 @@ fn validate_trade_plan(plan: &TradePlan) -> Result<()> {
                 crate::domain::execution::TimeInForce::Ioc => "IOC",
                 crate::domain::execution::TimeInForce::Alo => "ALO",
             };
-            if !market
+            if !rules
                 .time_in_forces
                 .iter()
                 .any(|candidate| candidate.eq_ignore_ascii_case(tif))
             {
-                bail!("BULK market `{}` does not support TIF {tif}", market.symbol);
+                bail!(
+                    "BULK market `{}` does not support TIF {tif}",
+                    market.venue_symbol
+                );
             }
         }
     }
@@ -656,11 +703,33 @@ fn receipt_from_response(
     })
 }
 
+fn acknowledged_receipt(
+    account: &str,
+    order_id: String,
+    status: &str,
+    response: Value,
+) -> Result<ExecutionReceipt> {
+    Ok(ExecutionReceipt {
+        venue: ExecutionVenue::Bulk,
+        account: account.to_string(),
+        order_id: Some(order_id),
+        status: status.to_string(),
+        terminal: false,
+        submitted_at_ms: now_ms()?,
+        raw_status: response,
+    })
+}
+
 fn status_error(status: &Value) -> Option<String> {
     let object = status.as_object()?;
     let (name, details) = object.iter().next()?;
-    (name == "error" || name.starts_with("rejected") || name.ends_with("Failed"))
-        .then(|| response_message(details))
+    if name == "error" {
+        Some(response_message(details))
+    } else if name.starts_with("rejected") || name.ends_with("Failed") {
+        Some(format!("{name}: {}", response_message(details)))
+    } else {
+        None
+    }
 }
 
 fn response_message(value: &Value) -> String {
@@ -775,13 +844,13 @@ impl TryFrom<BulkPosition> for Position {
     type Error = anyhow::Error;
 
     fn try_from(value: BulkPosition) -> Result<Self> {
-        let (internal_symbol, venue_symbol, catalog_supported) =
+        let (internal_symbol, venue_symbol, registry_supported) =
             normalize_account_symbol(&value.symbol)?;
         Ok(Self {
             venue: ExecutionVenue::Bulk,
             internal_symbol,
             venue_symbol,
-            catalog_supported,
+            registry_supported,
             direction: if value.size >= 0.0 {
                 PositionDirection::Long
             } else {
@@ -841,7 +910,7 @@ impl TryFrom<BulkOpenOrder> for OpenOrder {
     type Error = anyhow::Error;
 
     fn try_from(value: BulkOpenOrder) -> Result<Self> {
-        let (internal_symbol, venue_symbol, catalog_supported) =
+        let (internal_symbol, venue_symbol, registry_supported) =
             normalize_account_symbol(&value.symbol)?;
         let signed_size = if value.size != 0.0 {
             value.size
@@ -853,7 +922,7 @@ impl TryFrom<BulkOpenOrder> for OpenOrder {
             venue: ExecutionVenue::Bulk,
             internal_symbol,
             venue_symbol,
-            catalog_supported,
+            registry_supported,
             order_id: value.order_id,
             side: if is_buy {
                 OrderSide::Buy
@@ -890,15 +959,17 @@ struct BulkFill {
     symbol: String,
     amount: f64,
     price: f64,
-    #[serde(default, alias = "reasonCode")]
+    #[serde(default)]
     reason: Option<BulkFillReason>,
+    #[serde(default)]
+    reason_code: Option<BulkFillReason>,
     slot: u64,
     timestamp: u64,
 }
 
 impl BulkFill {
     fn into_fill(self, account: &str) -> Result<Fill> {
-        let (internal_symbol, venue_symbol, catalog_supported) =
+        let (internal_symbol, venue_symbol, registry_supported) =
             normalize_account_symbol(&self.symbol)?;
         let is_maker = self.maker == account;
         let is_taker = self.taker == account;
@@ -909,7 +980,7 @@ impl BulkFill {
             venue: ExecutionVenue::Bulk,
             internal_symbol,
             venue_symbol,
-            catalog_supported,
+            registry_supported,
             side: if self.is_buy {
                 OrderSide::Buy
             } else {
@@ -919,6 +990,7 @@ impl BulkFill {
             price: self.price,
             reason: self
                 .reason
+                .or(self.reason_code)
                 .map(BulkFillReason::into_display)
                 .unwrap_or_else(|| "unknown".to_string()),
             order_id: Some(if is_maker {
@@ -927,6 +999,7 @@ impl BulkFill {
                 self.order_id_taker
             }),
             maker: is_maker,
+            fee: None,
             slot: self.slot,
             ts_ms: normalize_timestamp_ms(self.timestamp),
         })
@@ -986,7 +1059,7 @@ impl TryFrom<BulkOrderHistory> for OrderRecord {
     type Error = anyhow::Error;
 
     fn try_from(value: BulkOrderHistory) -> Result<Self> {
-        let (internal_symbol, venue_symbol, catalog_supported) =
+        let (internal_symbol, venue_symbol, registry_supported) =
             normalize_account_symbol(&value.symbol)?;
         let side = match value.side.to_ascii_lowercase().as_str() {
             "buy" => OrderSide::Buy,
@@ -997,7 +1070,7 @@ impl TryFrom<BulkOrderHistory> for OrderRecord {
             venue: ExecutionVenue::Bulk,
             internal_symbol,
             venue_symbol,
-            catalog_supported,
+            registry_supported,
             order_id: value.order_id,
             side,
             order_kind: value.order_type,
@@ -1019,20 +1092,20 @@ impl TryFrom<BulkLeverageSetting> for LeverageSetting {
     type Error = anyhow::Error;
 
     fn try_from(value: BulkLeverageSetting) -> Result<Self> {
-        let (internal_symbol, venue_symbol, catalog_supported) =
+        let (internal_symbol, venue_symbol, registry_supported) =
             normalize_account_symbol(&value.symbol)?;
         Ok(Self {
             internal_symbol,
             venue_symbol,
-            catalog_supported,
+            registry_supported,
             leverage: value.leverage,
         })
     }
 }
 
 fn normalize_account_symbol(symbol: &str) -> Result<(String, String, bool)> {
-    if let Ok(market) = catalog::market(symbol) {
-        return Ok((market.internal_symbol.clone(), market.symbol.clone(), true));
+    if let Ok(market) = markets::market(symbol) {
+        return Ok((market.symbol.clone(), market.venue_symbol.clone(), true));
     }
     let venue_symbol = symbol.trim().to_ascii_uppercase().replace('/', "-");
     let mut parts = venue_symbol.split('-');
@@ -1051,6 +1124,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejected_status_keeps_its_name_when_bulk_only_returns_an_order_id() {
+        let error = status_error(&serde_json::json!({
+            "rejectedCrossing": { "oid": "order-id" }
+        }))
+        .expect("rejection");
+
+        assert_eq!(error, r#"rejectedCrossing: {"oid":"order-id"}"#);
+    }
+
+    #[test]
     fn reconciled_terminal_order_preserves_the_deterministic_id() {
         let receipt = reconciled_history_receipt(
             "account",
@@ -1058,7 +1141,7 @@ mod tests {
                 venue: ExecutionVenue::Bulk,
                 internal_symbol: "BTC/USDT".to_string(),
                 venue_symbol: "BTC-USD".to_string(),
-                catalog_supported: true,
+                registry_supported: true,
                 order_id: "deterministic-id".to_string(),
                 side: OrderSide::Buy,
                 order_kind: "market".to_string(),
@@ -1089,13 +1172,14 @@ mod tests {
             venue: ExecutionVenue::Bulk,
             internal_symbol: "BTC/USDT".to_string(),
             venue_symbol: "BTC-USD".to_string(),
-            catalog_supported: true,
+            registry_supported: true,
             side: OrderSide::Buy,
             amount: 0.01,
             price: 64_000.0,
             reason: "normal".to_string(),
             order_id: Some("deterministic-id".to_string()),
             maker: false,
+            fee: None,
             slot: 42,
             ts_ms: 1_000,
         };
@@ -1122,7 +1206,7 @@ mod tests {
                 venue: ExecutionVenue::Bulk,
                 internal_symbol: "BTC/USDT".to_string(),
                 venue_symbol: "BTC-USD".to_string(),
-                catalog_supported: true,
+                registry_supported: true,
                 order_id: "deterministic-id".to_string(),
                 side: OrderSide::Buy,
                 order_kind: "market".to_string(),
@@ -1163,7 +1247,7 @@ mod tests {
         let normalized = OpenOrder::try_from(order).expect("order converts");
         assert_eq!(normalized.internal_symbol, "BTC/USDT");
         assert_eq!(normalized.ts_ms, 1_699_564_800_000);
-        assert!(normalized.catalog_supported);
+        assert!(normalized.registry_supported);
     }
 
     #[test]
@@ -1220,7 +1304,32 @@ mod tests {
     }
 
     #[test]
-    fn preserves_account_markets_outside_embedded_execution_catalog() {
+    fn decodes_fill_with_reason_and_reason_code() {
+        let fill: BulkFill = serde_json::from_str(
+            r#"{
+                "maker": "account",
+                "taker": "counterparty",
+                "orderIdMaker": "oid",
+                "orderIdTaker": "other-oid",
+                "isBuy": true,
+                "symbol": "BTC-USD",
+                "amount": 0.001,
+                "price": 65000.0,
+                "reason": "liquidation",
+                "reasonCode": 0,
+                "slot": 123,
+                "timestamp": 1699564800000000000
+            }"#,
+        )
+        .expect("fill with both reason fields decodes");
+
+        let normalized = fill.into_fill("account").expect("fill normalizes");
+        assert_eq!(normalized.reason, "liquidation");
+        assert_eq!(normalized.order_id.as_deref(), Some("oid"));
+    }
+
+    #[test]
+    fn preserves_account_markets_outside_installed_market_snapshot() {
         let (internal, venue, supported) =
             normalize_account_symbol("GOLD-USD").expect("symbol normalizes");
         assert_eq!(internal, "GOLD/USDT");
@@ -1322,6 +1431,26 @@ mod tests {
             error
                 .to_string()
                 .contains("mlab auth set bulk --reauthorize")
+        );
+    }
+
+    #[test]
+    fn acknowledgement_creates_a_non_terminal_optimistic_receipt() {
+        let response = serde_json::json!({
+            "type": "post",
+            "id": 7,
+            "data": { "type": "ack", "ok": true }
+        });
+        let receipt =
+            acknowledged_receipt("account", "order-id".to_string(), "submitted", response)
+                .expect("acknowledgement creates a receipt");
+
+        assert_eq!(receipt.order_id.as_deref(), Some("order-id"));
+        assert_eq!(receipt.status, "submitted");
+        assert!(!receipt.terminal);
+        assert_eq!(
+            receipt.raw_status.pointer("/data/ok"),
+            Some(&Value::Bool(true))
         );
     }
 }

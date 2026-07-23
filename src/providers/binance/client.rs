@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-const BINANCE_API_URL: &str = "https://api.binance.com/api/v3";
+const BINANCE_SPOT_API_URL: &str = "https://api.binance.com/api/v3";
 const BINANCE_FUTURES_API_URL: &str = "https://fapi.binance.com/fapi/v1";
 const BINANCE_HTTP_TIMEOUT_SECS: u64 = 15;
 
@@ -17,11 +17,11 @@ pub struct BinanceClient {
 }
 
 impl BinanceClient {
-    pub fn new() -> Result<Self> {
-        Self::with_base_url(BINANCE_API_URL)
+    pub fn spot() -> Result<Self> {
+        Self::with_base_url(BINANCE_SPOT_API_URL)
     }
 
-    pub fn new_futures() -> Result<Self> {
+    pub fn futures() -> Result<Self> {
         Self::with_base_url(BINANCE_FUTURES_API_URL)
     }
 
@@ -48,7 +48,10 @@ impl BinanceClient {
             .http
             .request(Method::GET, &url)
             .query(query)
-            .header("User-Agent", "mlab/0.0.4")
+            .header(
+                "User-Agent",
+                concat!("market-lab/", env!("CARGO_PKG_VERSION")),
+            )
             .send()
             .await
             .with_context(|| format!("failed to call Binance {path}"))?;

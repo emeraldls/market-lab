@@ -1476,6 +1476,13 @@ export function onData(ctx, input, history) {
     sl: 63000,
     tp: 67000
   });
+  ctx.order({
+    key: "maker-ask-1",
+    side: "short",
+    size: 0.01,
+    leverage: 5,
+    order: { type: "limit", price: 66000, tif: "alo" }
+  });
 }
 
 export function onExecution(ctx, event) {
@@ -1505,7 +1512,7 @@ export function onExecution(ctx, event) {
             }))
             .expect("run onData");
         assert!(execution.output.metrics.as_object().unwrap().is_empty());
-        assert_eq!(execution.commands.len(), 1);
+        assert_eq!(execution.commands.len(), 2);
         let order_id = match &execution.commands[0] {
             crate::scripting::execution::ScriptExecutionCommand::Trade { order, request } => {
                 assert_eq!(request.sl, Some(63_000.0));
@@ -1514,6 +1521,19 @@ export function onExecution(ctx, event) {
             }
             _ => panic!("expected trade command"),
         };
+        match &execution.commands[1] {
+            crate::scripting::execution::ScriptExecutionCommand::Order { request, .. } => {
+                assert_eq!(
+                    request.side,
+                    crate::scripting::execution::ScriptOrderSide::Sell
+                );
+                assert_eq!(
+                    request.order.tif,
+                    crate::scripting::execution::ScriptTimeInForce::Alo
+                );
+            }
+            _ => panic!("expected raw order command"),
+        }
 
         let execution = session
             .run_execution_event(json!({

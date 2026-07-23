@@ -26,9 +26,7 @@ where
     J: FnMut(&T, crate::cli::OutputFormat) -> Result<String>,
     T: Serialize,
 {
-    let state_cap = (cfg.depth as usize).saturating_mul(10).clamp(100, 10_000);
-    let mut stream =
-        MmtDepthStream::connect(&cfg.exchange, &cfg.symbol, cfg.depth, state_cap).await?;
+    let mut stream = MmtDepthStream::connect(&cfg.exchange, &cfg.symbol, cfg.depth).await?;
     let mut buf: VecDeque<String> = VecDeque::with_capacity(cfg.buffer_size as usize);
 
     loop {

@@ -21,11 +21,20 @@ async fn main() -> Result<()> {
             if args.next().is_some() {
                 anyhow::bail!("strategy-worker accepts exactly one job id");
             }
-            market_lab::commands::strategy::twap::handle_worker(&job_id).await
+            market_lab::commands::strategy::handle_worker(&job_id).await
+        }
+        Some("bot-worker") => {
+            let job_id = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("bot-worker requires a job id"))?;
+            if args.next().is_some() {
+                anyhow::bail!("bot-worker accepts exactly one job id");
+            }
+            market_lab::commands::bot::handle_worker(&job_id).await
         }
         Some(command) => {
             anyhow::bail!(
-                "unknown mlabd command `{command}` (expected `serve|script-worker|strategy-worker`)"
+                "unknown mlabd command `{command}` (expected `serve|script-worker|strategy-worker|bot-worker`)"
             )
         }
     }

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionVenue {
     Bulk,
+    Hyperliquid,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -113,7 +114,7 @@ pub struct Position {
     pub venue: ExecutionVenue,
     pub internal_symbol: String,
     pub venue_symbol: String,
-    pub catalog_supported: bool,
+    pub registry_supported: bool,
     pub direction: PositionDirection,
     pub size: f64,
     pub entry_price: f64,
@@ -133,7 +134,7 @@ pub struct OpenOrder {
     pub venue: ExecutionVenue,
     pub internal_symbol: String,
     pub venue_symbol: String,
-    pub catalog_supported: bool,
+    pub registry_supported: bool,
     pub order_id: String,
     pub side: OrderSide,
     pub price: f64,
@@ -153,13 +154,16 @@ pub struct Fill {
     pub venue: ExecutionVenue,
     pub internal_symbol: String,
     pub venue_symbol: String,
-    pub catalog_supported: bool,
+    pub registry_supported: bool,
     pub side: OrderSide,
     pub amount: f64,
     pub price: f64,
     pub reason: String,
     pub order_id: Option<String>,
     pub maker: bool,
+    /// Signed venue fee: negative is a cost and positive is a rebate.
+    #[serde(default)]
+    pub fee: Option<f64>,
     pub slot: u64,
     pub ts_ms: u64,
 }
@@ -169,7 +173,7 @@ pub struct OrderRecord {
     pub venue: ExecutionVenue,
     pub internal_symbol: String,
     pub venue_symbol: String,
-    pub catalog_supported: bool,
+    pub registry_supported: bool,
     pub order_id: String,
     pub side: OrderSide,
     pub order_kind: String,
@@ -189,7 +193,7 @@ pub struct OrderRecord {
 pub struct LeverageSetting {
     pub internal_symbol: String,
     pub venue_symbol: String,
-    pub catalog_supported: bool,
+    pub registry_supported: bool,
     pub leverage: f64,
 }
 

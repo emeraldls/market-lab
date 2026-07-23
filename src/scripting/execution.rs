@@ -81,6 +81,31 @@ pub enum ScriptPositionOperation {
     CloseShort,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptOrderSide {
+    #[serde(alias = "long")]
+    Buy,
+    #[serde(alias = "short")]
+    Sell,
+}
+
+impl ScriptOrderSide {
+    pub fn order_direction(self) -> PositionDirection {
+        match self {
+            Self::Buy => PositionDirection::Long,
+            Self::Sell => PositionDirection::Short,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Buy => "buy",
+            Self::Sell => "sell",
+        }
+    }
+}
+
 impl ScriptPositionOperation {
     pub fn position_direction(self) -> PositionDirection {
         match self {
@@ -213,6 +238,106 @@ impl ScriptTradeRequest {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScriptRawOrderRequest {
+    pub key: String,
+    pub side: ScriptOrderSide,
+    #[serde(default)]
+    pub size: Option<f64>,
+    #[serde(default)]
+    pub margin: Option<f64>,
+    #[serde(default)]
+    pub leverage: Option<f64>,
+    #[serde(default)]
+    pub reduce_only: bool,
+    #[serde(default)]
+    pub order: ScriptOrderRequest,
+}
+
+impl ScriptRawOrderRequest {
+    pub fn leverage_or_default(&self) -> f64 {
+        self.leverage.unwrap_or(1.0)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_key(&self.key)?;
+        match (self.size, self.margin) {
+            (Some(_), Some(_)) => bail!("ctx.order requires only one of size or margin"),
+            (None, None) => bail!("ctx.order requires size or margin"),
+            _ => {}
+        }
+        if let Some(size) = self.size
+            && (!size.is_finite() || size <= 0.0)
+        {
+            bail!("ctx.order size must be > 0");
+        }
+        if let Some(margin) = self.margin
+            && (!margin.is_finite() || margin <= 0.0)
+        {
+            bail!("ctx.order margin must be > 0");
+        }
+        if let Some(leverage) = self.leverage {
+            if !leverage.is_finite() || leverage < 1.0 {
+                bail!("ctx.order leverage must be at least 1");
+            }
+            if self
+                .margin
+                .is_some_and(|margin| !(margin * leverage).is_finite())
+            {
+                bail!("ctx.order margin multiplied by leverage is too large");
+            }
+        }
+        match self.order.kind {
+            ScriptOrderKind::Market if self.order.price.is_some() => {
+                bail!("ctx.order order.price is only valid for a limit order")
+            }
+            ScriptOrderKind::Market if self.order.tif != ScriptTimeInForce::Gtc => {
+                bail!("ctx.order order.tif is only valid for a limit order")
+            }
+            ScriptOrderKind::Limit => {
+                let price = self
+                    .order
+                    .price
+                    .context("ctx.order limit orders require order.price")?;
+                validate_price("ctx.order order.price", price)?;
+            }
+            ScriptOrderKind::Market => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum ScriptManagedRequest {
+    Trade(ScriptTradeRequest),
+    Order(ScriptRawOrderRequest),
+}
+
+impl ScriptManagedRequest {
+    pub fn key(&self) -> &str {
+        match self {
+            Self::Trade(request) => &request.key,
+            Self::Order(request) => &request.key,
+        }
+    }
+
+    pub fn order(&self) -> &ScriptOrderRequest {
+        match self {
+            Self::Trade(request) => &request.order,
+            Self::Order(request) => &request.order,
+        }
+    }
+
+    pub fn order_direction(&self) -> PositionDirection {
+        match self {
+            Self::Trade(request) => request.position.order_direction(),
+            Self::Order(request) => request.side.order_direction(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ScriptCancelRequest {
     pub key: String,
     pub order: String,
@@ -241,6 +366,10 @@ pub enum ScriptExecutionCommand {
     Trade {
         order: ScriptOrderRef,
         request: ScriptTradeRequest,
+    },
+    Order {
+        order: ScriptOrderRef,
+        request: ScriptRawOrderRequest,
     },
     Cancel {
         request: ScriptCancelRequest,
@@ -284,12 +413,16 @@ pub fn attach_execution_helpers<'js>(
         .eval(EXECUTION_HELPERS_JS)
         .context("failed to create ctx execution helpers")?;
     let trade: Function = helpers.get("trade").context("failed to create ctx.trade")?;
+    let order: Function = helpers.get("order").context("failed to create ctx.order")?;
     let cancel: Function = helpers
         .get("cancel")
         .context("failed to create ctx.cancel")?;
     script_ctx
         .set("trade", trade)
         .context("failed to assign ctx.trade")?;
+    script_ctx
+        .set("order", order)
+        .context("failed to assign ctx.order")?;
     script_ctx
         .set("cancel", cancel)
         .context("failed to assign ctx.cancel")?;
@@ -320,6 +453,23 @@ fn native_execution_call(
                     .lock()
                     .map_err(|_| anyhow::anyhow!("script execution queue lock poisoned"))?
                     .push(ScriptExecutionCommand::Trade {
+                        order: order.clone(),
+                        request,
+                    });
+                Ok(serde_json::to_value(order)?)
+            }
+            "order" => {
+                let request: ScriptRawOrderRequest = serde_json::from_str(payload)
+                    .context("ctx.order request must be valid JSON")?;
+                request.validate()?;
+                let order = ScriptOrderRef {
+                    id: local_order_id(job_id, &request.key),
+                    key: request.key.clone(),
+                };
+                commands
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("script execution queue lock poisoned"))?
+                    .push(ScriptExecutionCommand::Order {
                         order: order.clone(),
                         request,
                     });
@@ -389,6 +539,7 @@ const EXECUTION_HELPERS_JS: &str = r#"
   }
   return Object.freeze({
     trade(request) { return call("trade", request); },
+    order(request) { return call("order", request); },
     cancel(request) { return call("cancel", request); }
   });
 })()
@@ -450,6 +601,51 @@ mod tests {
         .expect("decode close request");
 
         assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn raw_order_accepts_direction_aliases_and_serializes_canonical_sides() {
+        let buy: ScriptRawOrderRequest = serde_json::from_value(json!({
+            "key": "bid-1",
+            "side": "long",
+            "size": 1,
+            "order": { "type": "limit", "price": 99, "tif": "alo" }
+        }))
+        .expect("long alias decodes");
+        let sell: ScriptRawOrderRequest = serde_json::from_value(json!({
+            "key": "ask-1",
+            "side": "short",
+            "margin": 100,
+            "leverage": 2,
+            "order": { "type": "limit", "price": 101, "tif": "alo" }
+        }))
+        .expect("short alias decodes");
+
+        buy.validate().expect("buy order validates");
+        sell.validate().expect("sell order validates");
+        assert_eq!(buy.side, ScriptOrderSide::Buy);
+        assert_eq!(sell.side, ScriptOrderSide::Sell);
+        assert_eq!(serde_json::to_value(buy).unwrap()["side"], "buy");
+        assert_eq!(serde_json::to_value(sell).unwrap()["side"], "sell");
+    }
+
+    #[test]
+    fn managed_request_distinguishes_position_intent_from_raw_side() {
+        let trade: ScriptManagedRequest = serde_json::from_value(json!({
+            "key": "entry",
+            "position": "open-long",
+            "size": 1
+        }))
+        .expect("trade request decodes");
+        let order: ScriptManagedRequest = serde_json::from_value(json!({
+            "key": "ask",
+            "side": "sell",
+            "size": 1
+        }))
+        .expect("raw order decodes");
+
+        assert!(matches!(trade, ScriptManagedRequest::Trade(_)));
+        assert!(matches!(order, ScriptManagedRequest::Order(_)));
     }
 
     #[test]

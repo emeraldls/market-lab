@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 
 use crate::cli::{ExecutionVenueArg, OutputFormat, ScriptRunArgs, mmt_timeframe_from_seconds};
 use crate::commands::script::{
@@ -19,9 +20,14 @@ use crate::domain::types::{
     OiCandle, OpenInterestSnapshot, OrderBookSnapshot, TradeTick, VdCandle, VolumeDeltaTick,
     VolumeProfile,
 };
-use crate::providers::bulk::catalog;
+use crate::providers::bulk::markets as bulk_markets;
 use crate::providers::bulk::ws::{
     BulkCandleStream, BulkOrderBookStream, BulkTickerStream, BulkTradesStream,
+};
+use crate::providers::hyperliquid::markets as hyperliquid_markets;
+use crate::providers::hyperliquid::ws::{
+    HyperliquidAssetContextStream, HyperliquidCandleStream, HyperliquidOrderBookStream,
+    HyperliquidTradesStream,
 };
 use crate::providers::mmt::utils::{normalize_symbol_for_mmt, normalize_to_ms, parse_levels};
 use crate::providers::mmt::ws_client::MmtWsClient;
@@ -37,6 +43,9 @@ use crate::scripting::manifest::ScriptSource;
 use crate::scripting::market_data::{
     ScriptCandle, ScriptOpenInterest, ScriptVolume, ScriptVolumeDelta, TradeCandleAggregator,
 };
+
+const SCRIPT_STREAM_RECONNECT_MAX_SECS: u64 = 30;
+const SCRIPT_STREAM_EVENT_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone, Serialize)]
 struct ScriptRunResult<I>
@@ -95,6 +104,12 @@ struct LiveUpdate {
     provider: ProviderKind,
     exchange: String,
     record: LiveRecord,
+}
+
+enum ScriptStreamEvent {
+    Update(LiveUpdate),
+    Disconnected { error: String, retry_seconds: u64 },
+    Reconnected,
 }
 
 struct ScriptRunMarket {
@@ -189,6 +204,7 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
     let script = Script::load(&job.definition.snapshot_path)?;
     let venue = job.definition.venue.map(|venue| match venue {
         crate::domain::execution::ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
+        crate::domain::execution::ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
     });
     let args = ScriptRunArgs {
         script: job.definition.snapshot_path.display().to_string(),
@@ -293,7 +309,9 @@ async fn stream_sources(
     report.set_phase("connecting_streams");
     write_running_report_best_effort(report);
 
-    let mut streams = ScriptLiveStreams::connect(&source_configs, &market.symbol).await?;
+    let streams = ScriptLiveStreams::connect(&source_configs, &market.symbol).await?;
+    let mut stream_events =
+        spawn_script_stream_supervisor(streams, source_configs.clone(), market.symbol.clone());
 
     let session = script.start_session_with_execution(
         &resolved_params,
@@ -331,9 +349,41 @@ async fn stream_sources(
         }
 
         let update = tokio::select! {
-            update = streams.next_update() => {
-                let Some(update) = update? else { continue; };
-                update
+            event = stream_events.recv() => {
+                match event.context("script market-data supervisor stopped unexpectedly")? {
+                    ScriptStreamEvent::Update(update) => update,
+                    ScriptStreamEvent::Disconnected { error, retry_seconds } => {
+                        let cleanup_error = if args.venue.is_some() {
+                            crate::runtime::cancel_all_script_orders(job_id)
+                                .await
+                                .err()
+                                .map(|error| format!("{error:#}"))
+                        } else {
+                            None
+                        };
+                        report.set_phase("reconnecting_streams");
+                        write_running_report_best_effort(report);
+                        crate::runtime::append_script_output(job_id, &json!({
+                            "type": "script.source.disconnected",
+                            "version": "1",
+                            "ts_ms": now_ms(),
+                            "error": error,
+                            "retrySeconds": retry_seconds,
+                            "orderCleanupError": cleanup_error,
+                        }))?;
+                        continue;
+                    }
+                    ScriptStreamEvent::Reconnected => {
+                        report.set_phase("streaming_sources");
+                        write_running_report_best_effort(report);
+                        crate::runtime::append_script_output(job_id, &json!({
+                            "type": "script.source.reconnected",
+                            "version": "1",
+                            "ts_ms": now_ms(),
+                        }))?;
+                        continue;
+                    }
+                }
             }
             _ = tokio::signal::ctrl_c() => {
                 report.set_phase("cancelled");
@@ -424,6 +474,11 @@ async fn dispatch_execution_commands(
                     .await
                     .map(|_| ())
             }
+            ScriptExecutionCommand::Order { order, request } => {
+                crate::runtime::submit_script_order(job_id, order, request)
+                    .await
+                    .map(|_| ())
+            }
             ScriptExecutionCommand::Cancel { request } => {
                 crate::runtime::submit_script_cancellation(job_id, request)
                     .await
@@ -483,7 +538,8 @@ fn now_ms() -> u64 {
 
 struct ScriptLiveStreams {
     mmt: Option<MmtScriptStreams>,
-    bulk: Option<Box<BulkScriptStreams>>,
+    bulk: Option<Box<DirectScriptStreams>>,
+    hyperliquid: Option<Box<DirectScriptStreams>>,
 }
 
 struct MmtScriptStreams {
@@ -497,10 +553,14 @@ impl ScriptLiveStreams {
     async fn connect(source_configs: &SourceConfigs, symbol: &str) -> Result<Self> {
         let mmt_configs = configs_for_provider(source_configs, ProviderKind::Mmt);
         let bulk_configs = configs_for_provider(source_configs, ProviderKind::Bulk);
+        let hyperliquid_configs = configs_for_provider(source_configs, ProviderKind::Hyperliquid);
         let mmt = if mmt_configs.is_empty() {
             None
         } else {
-            let ws = MmtWsClient::shared().await?;
+            for config in mmt_configs.values() {
+                normalize_symbol_for_mmt(&config.exchange, symbol)?;
+            }
+            let ws = MmtWsClient::connect().await?;
             subscribe_mmt_sources(&ws, &mmt_configs, symbol).await?;
             let orderbook_states = orderbook_states(&mmt_configs);
             let candle_aggregators = trade_candle_aggregators(&mmt_configs, now_ms())?;
@@ -514,26 +574,140 @@ impl ScriptLiveStreams {
         let bulk = if bulk_configs.is_empty() {
             None
         } else {
-            let symbol = catalog::market(symbol)?.internal_symbol.clone();
+            let symbol = bulk_markets::market(symbol)?.symbol.clone();
             Some(Box::new(
-                BulkScriptStreams::connect(&bulk_configs, &symbol).await?,
+                DirectScriptStreams::connect(ProviderKind::Bulk, &bulk_configs, &symbol).await?,
             ))
         };
-        if mmt.is_none() && bulk.is_none() {
+        let hyperliquid = if hyperliquid_configs.is_empty() {
+            None
+        } else {
+            let symbol = hyperliquid_markets::market(symbol)?.symbol.clone();
+            Some(Box::new(
+                DirectScriptStreams::connect(
+                    ProviderKind::Hyperliquid,
+                    &hyperliquid_configs,
+                    &symbol,
+                )
+                .await?,
+            ))
+        };
+        if mmt.is_none() && bulk.is_none() && hyperliquid.is_none() {
             bail!("script has no supported live source providers");
         }
-        Ok(Self { mmt, bulk })
+        Ok(Self {
+            mmt,
+            bulk,
+            hyperliquid,
+        })
     }
 
     async fn next_update(&mut self) -> Result<Option<LiveUpdate>> {
         let has_mmt = self.mmt.is_some();
         let has_bulk = self.bulk.is_some();
+        let has_hyperliquid = self.hyperliquid.is_some();
         tokio::select! {
             update = async { self.mmt.as_mut().expect("guarded MMT streams").next_update().await }, if has_mmt => update,
             update = async { self.bulk.as_mut().expect("guarded BULK streams").next_update().await }, if has_bulk => update.map(Some),
+            update = async { self.hyperliquid.as_mut().expect("guarded Hyperliquid streams").next_update().await }, if has_hyperliquid => update.map(Some),
             else => bail!("script has no active live source streams"),
         }
     }
+
+    fn carry_runtime_state_from(&mut self, previous: &Self) {
+        if let (Some(current), Some(previous)) = (self.bulk.as_mut(), previous.bulk.as_ref()) {
+            current.cumulative_delta = previous.cumulative_delta;
+        }
+        if let (Some(current), Some(previous)) =
+            (self.hyperliquid.as_mut(), previous.hyperliquid.as_ref())
+        {
+            current.cumulative_delta = previous.cumulative_delta;
+        }
+    }
+}
+
+fn spawn_script_stream_supervisor(
+    streams: ScriptLiveStreams,
+    source_configs: SourceConfigs,
+    symbol: String,
+) -> mpsc::Receiver<ScriptStreamEvent> {
+    let (sender, receiver) = mpsc::channel(SCRIPT_STREAM_EVENT_CAPACITY);
+    tokio::spawn(supervise_script_streams(
+        streams,
+        source_configs,
+        symbol,
+        sender,
+    ));
+    receiver
+}
+
+async fn supervise_script_streams(
+    mut streams: ScriptLiveStreams,
+    source_configs: SourceConfigs,
+    symbol: String,
+    sender: mpsc::Sender<ScriptStreamEvent>,
+) {
+    let mut retry_seconds = 1_u64;
+    loop {
+        match streams.next_update().await {
+            Ok(Some(update)) => {
+                retry_seconds = 1;
+                if sender
+                    .send(ScriptStreamEvent::Update(update))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if sender
+                    .send(ScriptStreamEvent::Disconnected {
+                        error: format!("{error:#}"),
+                        retry_seconds,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                loop {
+                    tokio::time::sleep(Duration::from_secs(retry_seconds)).await;
+                    match ScriptLiveStreams::connect(&source_configs, &symbol).await {
+                        Ok(mut reconnected) => {
+                            reconnected.carry_runtime_state_from(&streams);
+                            streams = reconnected;
+                            retry_seconds = 1;
+                            if sender.send(ScriptStreamEvent::Reconnected).await.is_err() {
+                                return;
+                            }
+                            break;
+                        }
+                        Err(error) => {
+                            retry_seconds = next_stream_reconnect_delay(retry_seconds);
+                            if sender
+                                .send(ScriptStreamEvent::Disconnected {
+                                    error: format!("{error:#}"),
+                                    retry_seconds,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn next_stream_reconnect_delay(current: u64) -> u64 {
+    current
+        .saturating_mul(2)
+        .min(SCRIPT_STREAM_RECONNECT_MAX_SECS)
 }
 
 impl MmtScriptStreams {
@@ -573,19 +747,170 @@ fn trade_candle_aggregators(
         .collect()
 }
 
-struct BulkScriptStreams {
+enum DirectTradesStream {
+    Bulk(BulkTradesStream),
+    Hyperliquid(HyperliquidTradesStream),
+}
+
+impl DirectTradesStream {
+    async fn connect(provider: ProviderKind, symbol: &str) -> Result<Self> {
+        match provider {
+            ProviderKind::Bulk => Ok(Self::Bulk(BulkTradesStream::connect(symbol).await?)),
+            ProviderKind::Hyperliquid => Ok(Self::Hyperliquid(
+                HyperliquidTradesStream::connect(symbol).await?,
+            )),
+            ProviderKind::Mmt
+            | ProviderKind::MarketLab
+            | ProviderKind::Binance
+            | ProviderKind::BinanceFutures => {
+                bail!("provider does not use the direct trade stream")
+            }
+        }
+    }
+
+    async fn next_trades(&mut self) -> Result<Vec<TradeTick>> {
+        match self {
+            Self::Bulk(stream) => stream.next_trades().await,
+            Self::Hyperliquid(stream) => stream.next_trades().await,
+        }
+    }
+}
+
+enum DirectOrderBookStream {
+    Bulk(BulkOrderBookStream),
+    Hyperliquid(HyperliquidOrderBookStream),
+}
+
+impl DirectOrderBookStream {
+    async fn connect(provider: ProviderKind, symbol: &str, depth: u16) -> Result<Self> {
+        match provider {
+            ProviderKind::Bulk => Ok(Self::Bulk(
+                BulkOrderBookStream::connect(symbol, depth).await?,
+            )),
+            ProviderKind::Hyperliquid => Ok(Self::Hyperliquid(
+                HyperliquidOrderBookStream::connect(symbol, depth).await?,
+            )),
+            ProviderKind::Mmt
+            | ProviderKind::MarketLab
+            | ProviderKind::Binance
+            | ProviderKind::BinanceFutures => {
+                bail!("provider does not use the direct orderbook stream")
+            }
+        }
+    }
+
+    async fn next_snapshot(&mut self) -> Result<OrderBookSnapshot> {
+        match self {
+            Self::Bulk(stream) => stream.next_snapshot().await,
+            Self::Hyperliquid(stream) => stream.next_snapshot().await,
+        }
+    }
+}
+
+enum DirectTickerStream {
+    Bulk(BulkTickerStream),
+    Hyperliquid(HyperliquidAssetContextStream),
+}
+
+impl DirectTickerStream {
+    async fn connect(provider: ProviderKind, symbol: &str) -> Result<Self> {
+        match provider {
+            ProviderKind::Bulk => Ok(Self::Bulk(BulkTickerStream::connect(symbol).await?)),
+            ProviderKind::Hyperliquid => Ok(Self::Hyperliquid(
+                HyperliquidAssetContextStream::connect(symbol).await?,
+            )),
+            ProviderKind::Mmt
+            | ProviderKind::MarketLab
+            | ProviderKind::Binance
+            | ProviderKind::BinanceFutures => {
+                bail!("provider does not use the direct ticker stream")
+            }
+        }
+    }
+
+    async fn next_ticker(&mut self) -> Result<crate::domain::types::MarketTicker> {
+        match self {
+            Self::Bulk(stream) => stream.next_ticker().await,
+            Self::Hyperliquid(stream) => stream.next_ticker().await,
+        }
+    }
+}
+
+enum DirectCandleStream {
+    Bulk(BulkCandleStream),
+    Hyperliquid(HyperliquidCandleStream),
+}
+
+impl DirectCandleStream {
+    async fn connect(provider: ProviderKind, symbol: &str, interval: &str) -> Result<Self> {
+        match provider {
+            ProviderKind::Bulk => Ok(Self::Bulk(
+                BulkCandleStream::connect(symbol, interval).await?,
+            )),
+            ProviderKind::Hyperliquid => Ok(Self::Hyperliquid(
+                HyperliquidCandleStream::connect(symbol, interval).await?,
+            )),
+            ProviderKind::Mmt
+            | ProviderKind::MarketLab
+            | ProviderKind::Binance
+            | ProviderKind::BinanceFutures => {
+                bail!("provider does not use the direct candle stream")
+            }
+        }
+    }
+
+    async fn next_candle(&mut self) -> Result<crate::domain::types::OhlcvCandle> {
+        match self {
+            Self::Bulk(stream) => stream.next_candle().await,
+            Self::Hyperliquid(stream) => stream.next_candle().await,
+        }
+    }
+}
+
+fn direct_provider_name(provider: ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::Bulk => "bulk",
+        ProviderKind::Hyperliquid => "hyperliquid",
+        ProviderKind::Binance => "binance",
+        ProviderKind::BinanceFutures => "binancef",
+        ProviderKind::Mmt => "mmt",
+        ProviderKind::MarketLab => "marketlab",
+    }
+}
+
+fn direct_timeframe(provider: ProviderKind, seconds: u32) -> Result<&'static str> {
+    match provider {
+        ProviderKind::Bulk => crate::providers::bulk::market_data::timeframe_from_seconds(seconds),
+        ProviderKind::Hyperliquid => {
+            crate::providers::hyperliquid::market_data::timeframe_from_seconds(seconds)
+        }
+        ProviderKind::Mmt
+        | ProviderKind::MarketLab
+        | ProviderKind::Binance
+        | ProviderKind::BinanceFutures => {
+            bail!("provider does not use a direct timeframe")
+        }
+    }
+}
+
+struct DirectScriptStreams {
+    provider: ProviderKind,
     source_configs: SourceConfigs,
-    trades: Option<BulkTradesStream>,
+    trades: Option<DirectTradesStream>,
     candle_aggregator: Option<TradeCandleAggregator>,
-    orderbook: Option<BulkOrderBookStream>,
-    oi: Option<BulkTickerStream>,
-    volumes: Option<BulkCandleStream>,
+    orderbook: Option<DirectOrderBookStream>,
+    oi: Option<DirectTickerStream>,
+    volumes: Option<DirectCandleStream>,
     cumulative_delta: f64,
     pending: VecDeque<LiveUpdate>,
 }
 
-impl BulkScriptStreams {
-    async fn connect(source_configs: &SourceConfigs, symbol: &str) -> Result<Self> {
+impl DirectScriptStreams {
+    async fn connect(
+        provider: ProviderKind,
+        source_configs: &SourceConfigs,
+        symbol: &str,
+    ) -> Result<Self> {
         let candle_timeframe = if source_configs
             .values()
             .any(|config| config.source == ScriptSource::Candles)
@@ -602,7 +927,7 @@ impl BulkScriptStreams {
                 .values()
                 .any(|config| config.source == ScriptSource::Vd)
         {
-            Some(BulkTradesStream::connect(symbol).await?)
+            Some(DirectTradesStream::connect(provider, symbol).await?)
         } else {
             None
         };
@@ -613,8 +938,7 @@ impl BulkScriptStreams {
             .any(|config| config.source == ScriptSource::Orderbook)
         {
             let depth = source_config(source_configs, &ScriptSource::Orderbook)?.depth_or_default();
-            let state_cap = (depth as usize).saturating_mul(10).clamp(100, 10_000);
-            Some(BulkOrderBookStream::connect(symbol, depth, state_cap).await?)
+            Some(DirectOrderBookStream::connect(provider, symbol, depth).await?)
         } else {
             None
         };
@@ -622,7 +946,7 @@ impl BulkScriptStreams {
             .values()
             .any(|config| config.source == ScriptSource::Oi)
         {
-            Some(BulkTickerStream::connect(symbol).await?)
+            Some(DirectTickerStream::connect(provider, symbol).await?)
         } else {
             None
         };
@@ -632,12 +956,13 @@ impl BulkScriptStreams {
         {
             let seconds = source_config(source_configs, &ScriptSource::Volumes)?
                 .require_timeframe(&ScriptSource::Volumes)?;
-            let interval = crate::providers::bulk::market_data::timeframe_from_seconds(seconds)?;
-            Some(BulkCandleStream::connect(symbol, interval).await?)
+            let interval = direct_timeframe(provider, seconds)?;
+            Some(DirectCandleStream::connect(provider, symbol, interval).await?)
         } else {
             None
         };
         Ok(Self {
+            provider,
             source_configs: source_configs.clone(),
             trades,
             candle_aggregator,
@@ -697,7 +1022,7 @@ impl BulkScriptStreams {
                         );
                     }
                     if let Some(config) = vd_config.as_ref()
-                        && let Some(update) = bulk_vd_update(&batch, cumulative_delta)
+                        && let Some(update) = direct_vd_update(self.provider, &batch, cumulative_delta)
                     {
                         pending.push_back(LiveUpdate::new(config, LiveRecord::Vd(update)));
                     }
@@ -719,13 +1044,14 @@ impl BulkScriptStreams {
                 candle = async { volumes.as_mut().expect("guarded volume stream").next_candle().await }, if has_volumes => {
                     return Ok(LiveUpdate::new(volumes_config.as_ref().expect("configured volumes source"), LiveRecord::Volumes(ScriptVolume::from_bulk_candle(candle?))));
                 }
-                else => bail!("BULK script has no live source streams"),
+                else => bail!("{} script has no live source streams", direct_provider_name(self.provider)),
             }
         }
     }
 }
 
-fn bulk_vd_update(
+fn direct_vd_update(
+    provider: ProviderKind,
     trades: &[crate::domain::types::TradeTick],
     cumulative_delta: &mut f64,
 ) -> Option<ScriptVolumeDelta> {
@@ -744,7 +1070,7 @@ fn bulk_vd_update(
         .sum::<f64>();
     *cumulative_delta += delta;
     Some(ScriptVolumeDelta::from_bulk(VolumeDeltaTick {
-        exchange: "bulk".to_string(),
+        exchange: direct_provider_name(provider).to_string(),
         symbol: trades[0].symbol.clone(),
         timestamp_ms: trades
             .iter()
@@ -761,18 +1087,18 @@ async fn subscribe_mmt_sources(
     source_configs: &SourceConfigs,
     symbol: &str,
 ) -> Result<()> {
-    let symbol = normalize_symbol_for_mmt(symbol)?;
     let mut configs = source_configs.values().collect::<Vec<_>>();
     configs.sort_by_key(|config| config.position);
     for config in configs {
         let exchange = config.exchange.as_str();
+        let provider_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
         match &config.source {
             ScriptSource::Candles => {
                 ws.subscribe(json!({
                     "type": "subscribe",
                     "channel": "trades",
                     "exchange": exchange,
-                    "symbol": symbol.as_str(),
+                    "symbol": provider_symbol.as_str(),
                 }))
                 .await
                 .with_context(|| format!("failed to subscribe {}", config.selector))?;
@@ -782,7 +1108,7 @@ async fn subscribe_mmt_sources(
                     "type": "subscribe",
                     "channel": "depth",
                     "exchange": exchange,
-                    "symbol": symbol.as_str(),
+                    "symbol": provider_symbol.as_str(),
                 }))
                 .await
                 .with_context(|| format!("failed to subscribe {}", config.selector))?;
@@ -796,7 +1122,7 @@ async fn subscribe_mmt_sources(
                     "type": "subscribe",
                     "channel": "vd",
                     "exchange": exchange,
-                    "symbol": symbol.as_str(),
+                    "symbol": provider_symbol.as_str(),
                     "tf": tf,
                     "bucket": bucket,
                 }))
@@ -811,7 +1137,7 @@ async fn subscribe_mmt_sources(
                     "type": "subscribe",
                     "channel": "oi",
                     "exchange": exchange,
-                    "symbol": symbol.as_str(),
+                    "symbol": provider_symbol.as_str(),
                     "tf": tf,
                 }))
                 .await
@@ -825,7 +1151,7 @@ async fn subscribe_mmt_sources(
                     "type": "subscribe",
                     "channel": "volumes",
                     "exchange": exchange,
-                    "symbol": symbol.as_str(),
+                    "symbol": provider_symbol.as_str(),
                     "tf": tf,
                 }))
                 .await
@@ -840,15 +1166,7 @@ fn orderbook_states(source_configs: &SourceConfigs) -> BTreeMap<String, OrderBoo
     source_configs
         .values()
         .filter(|config| config.source == ScriptSource::Orderbook)
-        .map(|config| {
-            let state_cap = (config.depth_or_default() as usize)
-                .saturating_mul(10)
-                .clamp(100, 10_000);
-            (
-                config.selector.clone(),
-                OrderBookState::with_max_levels_per_side(state_cap),
-            )
-        })
+        .map(|config| (config.selector.clone(), OrderBookState::default()))
         .collect()
 }
 
@@ -1354,5 +1672,13 @@ mod tests {
         );
         assert!(payload.get("sources").is_none());
         assert!(payload.get("candles").is_none());
+    }
+
+    #[test]
+    fn script_stream_reconnect_delay_is_bounded() {
+        assert_eq!(next_stream_reconnect_delay(1), 2);
+        assert_eq!(next_stream_reconnect_delay(16), 30);
+        assert_eq!(next_stream_reconnect_delay(30), 30);
+        assert_eq!(next_stream_reconnect_delay(u64::MAX), 30);
     }
 }

@@ -5,6 +5,7 @@ pub enum ProviderKind {
     MarketLab,
     Mmt,
     Bulk,
+    Hyperliquid,
     Binance,
     BinanceFutures,
 }

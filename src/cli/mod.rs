@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+use crate::bots::grid::MAX_GRID_LEVELS_PER_SIDE;
 use crate::domain::enums::{BookMode, ProviderKind, Side};
 use crate::domain::execution::{ExecutionVenue, OrderKind, TimeInForce};
 use crate::domain::requests::{
@@ -51,6 +52,10 @@ pub enum Commands {
     Strategy {
         #[command(subcommand)]
         command: StrategyCommands,
+    },
+    Bot {
+        #[command(subcommand)]
+        command: BotCommands,
     },
     Health(HealthArgs),
     Status(StatusArgs),
@@ -287,12 +292,14 @@ impl AccountQueryArgs {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum ExecutionVenueArg {
     Bulk,
+    Hyperliquid,
 }
 
 impl From<ExecutionVenueArg> for ExecutionVenue {
     fn from(value: ExecutionVenueArg) -> Self {
         match value {
             ExecutionVenueArg::Bulk => ExecutionVenue::Bulk,
+            ExecutionVenueArg::Hyperliquid => ExecutionVenue::Hyperliquid,
         }
     }
 }
@@ -331,17 +338,25 @@ impl From<TradeTimeInForce> for TimeInForce {
 
 #[derive(Clone, Debug, Args)]
 pub struct MarketsArgs {
+    #[arg(long, value_enum)]
+    pub provider: Option<CliDataProvider>,
     #[arg(long)]
     pub exchange: String,
     #[arg(long)]
     pub symbol: Option<String>,
+    /// Replace the installed snapshot with current provider markets.
+    #[arg(long, default_value_t = false)]
+    pub refresh: bool,
     #[arg(long, default_value_t = false)]
     pub json: bool,
 }
 
 impl MarketsArgs {
     pub fn validate(&self) -> Result<()> {
-        validate_bulk_exchange(&self.exchange, "markets")
+        if self.exchange.trim().is_empty() {
+            bail!("--exchange cannot be empty");
+        }
+        Ok(())
     }
 }
 
@@ -371,6 +386,7 @@ pub struct AuthProviderArgs {
 pub enum AuthProvider {
     Mmt,
     Bulk,
+    Hyperliquid,
 }
 
 #[derive(Subcommand, Debug)]
@@ -430,6 +446,27 @@ pub enum StrategyCommands {
 #[derive(Subcommand, Debug)]
 pub enum StrategyRunCommands {
     Twap(RunTwapArgs),
+    Vwap(RunVwapArgs),
+    Oiwap(RunOiwapArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BotCommands {
+    Run {
+        #[command(subcommand)]
+        command: BotRunCommands,
+    },
+    Jobs(BotJobsArgs),
+    Status(BotJobArgs),
+    Logs(BotLogsArgs),
+    Stop(BotJobArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BotRunCommands {
+    Grid(RunGridArgs),
+    MidPrice(RunMidPriceArgs),
+    VolumeMid(RunVolumeMidArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -638,12 +675,21 @@ pub struct SourceVdArgs {
 impl SourceVdArgs {
     pub fn validate(&self) -> Result<()> {
         let provider = validate_source_identity(self.provider, &self.exchange, &self.symbol)?;
-        if provider == CliProviderKind::Bulk {
+        if matches!(
+            provider,
+            CliProviderKind::Binance | CliProviderKind::BinanceFutures
+        ) {
+            bail!("Binance live volume delta is not implemented");
+        }
+        if matches!(
+            provider,
+            CliProviderKind::Bulk | CliProviderKind::Hyperliquid
+        ) {
             if !self.stream {
-                bail!("BULK volume delta is derived from live trades and requires --stream");
+                bail!("standalone volume delta is derived from live trades and requires --stream");
             }
             if self.timeframe.is_some() || self.from.is_some() || self.to.is_some() {
-                bail!("BULK live volume delta does not use --timeframe/--from/--to");
+                bail!("standalone live volume delta does not use --timeframe/--from/--to");
             }
         } else {
             mmt_timeframe_from_seconds(
@@ -805,6 +851,18 @@ pub struct SourceOiArgs {
 impl SourceOiArgs {
     pub fn validate(&self) -> Result<()> {
         let provider = validate_source_identity(self.provider, &self.exchange, &self.symbol)?;
+        if matches!(
+            provider,
+            CliProviderKind::Binance | CliProviderKind::BinanceFutures
+        ) {
+            bail!("Binance open interest is not implemented");
+        }
+        if !crate::markets::is_futures_exchange(&self.exchange)? {
+            bail!(
+                "open interest requires a futures exchange; `{}` is spot",
+                self.exchange
+            );
+        }
         if provider == CliProviderKind::Bulk {
             if self.timeframe.is_some() || self.from.is_some() || self.to.is_some() {
                 bail!("BULK open interest is current/live only; omit --timeframe/--from/--to");
@@ -919,6 +977,14 @@ impl TimeframeSourceValidation<'_> {
             bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
         provider_timeframe_from_seconds(self.provider, self.timeframe)?;
+        if self.stream
+            && matches!(
+                self.provider,
+                CliProviderKind::Binance | CliProviderKind::BinanceFutures
+            )
+        {
+            bail!("Binance live candle and volume streaming is not implemented");
+        }
         if self.stream {
             if self.from.is_some() || self.to.is_some() {
                 bail!("--from/--to are not allowed with --stream");
@@ -1063,7 +1129,7 @@ pub struct SourceStatsArgs {
 
 impl SourceStatsArgs {
     pub fn validate(&self) -> Result<()> {
-        validate_bulk_exchange(&self.exchange, "source stats")?;
+        resolve_source_provider(None, &self.exchange)?;
         if let Some(symbol) = &self.symbol
             && !is_valid_symbol(symbol)
         {
@@ -1076,12 +1142,16 @@ impl SourceStatsArgs {
             bail!("--period must be one of 1d,7d,30d,90d,1y,all");
         }
         if self.stream && self.symbol.is_none() {
-            bail!("--symbol is required when streaming BULK statistics");
+            bail!("--symbol is required when streaming statistics");
         }
         if self.stream && matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("stream mode currently supports only --output terminal|json|jsonl");
         }
         validate_stream_controls(self.buffer_size, self.interval_ms)
+    }
+
+    pub fn provider_kind(&self) -> Result<CliProviderKind> {
+        resolve_source_provider(None, &self.exchange)
     }
 }
 
@@ -1103,7 +1173,7 @@ pub struct SourceFundingArgs {
 
 impl SourceFundingArgs {
     pub fn validate(&self) -> Result<()> {
-        validate_bulk_exchange(&self.exchange, "source funding")?;
+        resolve_source_provider(None, &self.exchange)?;
         if !is_valid_symbol(&self.symbol) {
             bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
@@ -1111,6 +1181,10 @@ impl SourceFundingArgs {
             bail!("stream mode currently supports only --output terminal|json|jsonl");
         }
         validate_stream_controls(self.buffer_size, self.interval_ms)
+    }
+
+    pub fn provider_kind(&self) -> Result<CliProviderKind> {
+        resolve_source_provider(None, &self.exchange)
     }
 }
 
@@ -1473,7 +1547,7 @@ pub struct DepthArgs {
 pub struct RunTwapArgs {
     pub symbol: String,
     #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
-    pub exchange: ExecutionVenueArg,
+    pub venue: ExecutionVenueArg,
     #[arg(long, value_enum)]
     pub side: CliSide,
     /// Exact total base-asset exposure; leverage does not multiply an explicit size.
@@ -1493,6 +1567,151 @@ pub struct RunTwapArgs {
     pub leverage: f64,
     #[arg(long, default_value_t = false)]
     pub reduce_only: bool,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct RunVwapArgs {
+    pub symbol: String,
+    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    pub venue: ExecutionVenueArg,
+    #[arg(long, value_enum)]
+    pub side: CliSide,
+    /// Exact total base-asset exposure; leverage does not multiply an explicit size.
+    #[arg(long, conflicts_with = "margin", required_unless_present = "margin")]
+    pub size: Option<f64>,
+    /// Total quote collateral; exposure is margin multiplied by leverage.
+    #[arg(long, conflicts_with = "size", required_unless_present = "size")]
+    pub margin: Option<f64>,
+    /// Total execution window in seconds. VWAP requires at least one minute.
+    #[arg(long)]
+    pub duration: u64,
+    /// Comma-separated volume venues, for example binancef@mmt,okxf@mmt,bulk.
+    #[arg(long, value_delimiter = ',')]
+    pub volume_sources: Vec<String>,
+    /// Exposure multiplier for margin sizing and the leverage setting sent to BULK.
+    #[arg(long, default_value_t = 1.0)]
+    pub leverage: f64,
+    #[arg(long, default_value_t = false)]
+    pub reduce_only: bool,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct RunOiwapArgs {
+    pub symbol: String,
+    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    pub venue: ExecutionVenueArg,
+    #[arg(long, value_enum)]
+    pub side: CliSide,
+    /// Exact total base-asset exposure; leverage does not multiply an explicit size.
+    #[arg(long, conflicts_with = "margin", required_unless_present = "margin")]
+    pub size: Option<f64>,
+    /// Total quote collateral; exposure is margin multiplied by leverage.
+    #[arg(long, conflicts_with = "size", required_unless_present = "size")]
+    pub margin: Option<f64>,
+    /// Total execution window in seconds. OIWAP requires at least one minute.
+    #[arg(long)]
+    pub duration: u64,
+    /// Comma-separated normalized MMT OI venues, for example binancef@mmt,bybitf@mmt.
+    #[arg(long, value_delimiter = ',')]
+    pub oi_sources: Vec<String>,
+    /// Exposure multiplier for margin sizing and the leverage setting sent to the venue.
+    #[arg(long, default_value_t = 1.0)]
+    pub leverage: f64,
+    #[arg(long, default_value_t = false)]
+    pub reduce_only: bool,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct RunMidPriceArgs {
+    pub symbol: String,
+    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    pub venue: ExecutionVenueArg,
+    /// Hard one-sided inventory limit in base-asset units.
+    #[arg(long, conflicts_with = "margin", required_unless_present = "margin")]
+    pub size: Option<f64>,
+    /// Collateral allocated to the one-sided inventory limit.
+    #[arg(long, conflicts_with = "size", required_unless_present = "size")]
+    pub margin: Option<f64>,
+    /// Maximum bot runtime in seconds.
+    #[arg(long)]
+    pub duration: u64,
+    /// Total distance between bid and ask around the current midpoint.
+    #[arg(long, default_value_t = 2.0)]
+    pub spread_bps: f64,
+    /// Percentage size bias: -100 favors asks, +100 favors bids, 0 is neutral.
+    #[arg(long = "directional-bias", alias = "bias", default_value_t = 0.0)]
+    pub directional_bias: f64,
+    #[arg(long, default_value_t = 1.0)]
+    pub leverage: f64,
+    /// Stop after net bot PnL loses this percentage of allocated margin. Zero disables it.
+    #[arg(long)]
+    pub stop_loss_pct: Option<f64>,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct RunVolumeMidArgs {
+    #[command(flatten)]
+    pub common: RunMidPriceArgs,
+    /// Minimum lifetime of each working quote, in seconds.
+    #[arg(long)]
+    pub refresh_time: f64,
+    /// Price drift allowed before a quote moving away from the market is replaced.
+    #[arg(long)]
+    pub refresh_tolerance_bps: f64,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct RunGridArgs {
+    pub symbol: String,
+    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    pub venue: ExecutionVenueArg,
+    /// Hard one-sided inventory limit in base-asset units.
+    #[arg(long, conflicts_with = "margin", required_unless_present = "margin")]
+    pub size: Option<f64>,
+    /// Collateral allocated to the bot. Margin multiplied by leverage is the total working exposure.
+    #[arg(long, conflicts_with = "size", required_unless_present = "size")]
+    pub margin: Option<f64>,
+    /// Maximum bot runtime in seconds.
+    #[arg(long)]
+    pub duration: u64,
+    /// Number of simultaneously maintained price levels on each side.
+    #[arg(long, default_value_t = 3)]
+    pub levels: u16,
+    /// Distance behind the live best bid/ask for level one and between every following level.
+    #[arg(long, default_value_t = 2.0)]
+    pub step_bps: f64,
+    /// Adverse movement from the bot's average entry that activates passive inventory rescue (0-1%).
+    #[arg(long)]
+    pub reset_threshold_pct: Option<f64>,
+    #[arg(long, default_value_t = 1.0)]
+    pub leverage: f64,
+    /// Stop after net bot PnL loses this percentage of allocated margin. Zero disables it.
+    #[arg(long)]
+    pub stop_loss_pct: Option<f64>,
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
     #[arg(long, default_value_t = false)]
@@ -1535,6 +1754,60 @@ pub struct StrategyLogsArgs {
     pub follow: bool,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct BotJobsArgs {
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct BotJobArgs {
+    pub job: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl BotJobArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.job.trim().is_empty() {
+            bail!("bot job id is required");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("bot job commands support only --output terminal|json|jsonl");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct BotLogsArgs {
+    pub job: String,
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
+    #[arg(long, default_value_t = false)]
+    pub follow: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl BotLogsArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.job.trim().is_empty() {
+            bail!("bot job id is required");
+        }
+        if self.limit == 0 {
+            bail!("--limit must be >= 1");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("bot logs supports only --output terminal|json|jsonl");
+        }
+        if self.follow && matches!(self.output, OutputFormat::Json) {
+            bail!("--follow supports terminal or jsonl output");
+        }
+        Ok(())
+    }
 }
 
 impl StrategyLogsArgs {
@@ -1597,6 +1870,239 @@ impl RunTwapArgs {
         }
         if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("strategy run supports only --output terminal|json|jsonl");
+        }
+        Ok(())
+    }
+}
+
+impl RunVwapArgs {
+    pub fn validate(&self) -> Result<()> {
+        if !is_valid_symbol(&self.symbol) {
+            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        if self
+            .size
+            .is_some_and(|size| !size.is_finite() || size <= 0.0)
+        {
+            bail!("--size must be > 0");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| !margin.is_finite() || margin <= 0.0)
+        {
+            bail!("--margin must be > 0");
+        }
+        match (self.size, self.margin) {
+            (Some(_), Some(_)) => bail!("set only one of --size or --margin"),
+            (None, None) => bail!("one of --size or --margin is required"),
+            _ => {}
+        }
+        if self.duration < 60 {
+            bail!("--duration must be at least 60 seconds for VWAP");
+        }
+        if !self.leverage.is_finite() || self.leverage < 1.0 {
+            bail!("--leverage must be at least 1");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| !(margin * self.leverage).is_finite())
+        {
+            bail!("--margin multiplied by --leverage is too large");
+        }
+        if self.dry_run && self.yes {
+            bail!("--yes is not used with --dry-run");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("strategy run supports only --output terminal|json|jsonl");
+        }
+        let execution_venue = match self.venue {
+            ExecutionVenueArg::Bulk => "bulk",
+            ExecutionVenueArg::Hyperliquid => "hyperliquid",
+        };
+        crate::strategies::vwap::VolumeSourceSelector::parse(
+            &self.volume_sources,
+            execution_venue,
+            &self.symbol,
+        )?;
+        Ok(())
+    }
+}
+
+impl RunOiwapArgs {
+    pub fn validate(&self) -> Result<()> {
+        if !is_valid_symbol(&self.symbol) {
+            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        if self
+            .size
+            .is_some_and(|size| !size.is_finite() || size <= 0.0)
+        {
+            bail!("--size must be > 0");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| !margin.is_finite() || margin <= 0.0)
+        {
+            bail!("--margin must be > 0");
+        }
+        match (self.size, self.margin) {
+            (Some(_), Some(_)) => bail!("set only one of --size or --margin"),
+            (None, None) => bail!("one of --size or --margin is required"),
+            _ => {}
+        }
+        if self.duration < 60 {
+            bail!("--duration must be at least 60 seconds for OIWAP");
+        }
+        if !self.leverage.is_finite() || self.leverage < 1.0 {
+            bail!("--leverage must be at least 1");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| !(margin * self.leverage).is_finite())
+        {
+            bail!("--margin multiplied by --leverage is too large");
+        }
+        if self.dry_run && self.yes {
+            bail!("--yes is not used with --dry-run");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("strategy run supports only --output terminal|json|jsonl");
+        }
+        crate::strategies::oiwap::OpenInterestSourceSelector::parse(
+            &self.oi_sources,
+            &self.symbol,
+        )?;
+        Ok(())
+    }
+}
+
+impl RunMidPriceArgs {
+    pub fn validate(&self) -> Result<()> {
+        if !is_valid_symbol(&self.symbol) {
+            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        if self
+            .size
+            .is_some_and(|size| !size.is_finite() || size <= 0.0)
+        {
+            bail!("--size must be > 0");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| !margin.is_finite() || margin <= 0.0)
+        {
+            bail!("--margin must be > 0");
+        }
+        match (self.size, self.margin) {
+            (Some(_), Some(_)) => bail!("set only one of --size or --margin"),
+            (None, None) => bail!("one of --size or --margin is required"),
+            _ => {}
+        }
+        if self.duration == 0 {
+            bail!("--duration must be >= 1 second");
+        }
+        if !self.spread_bps.is_finite() || self.spread_bps < 0.0 {
+            bail!("--spread-bps must be zero or greater");
+        }
+        if !self.directional_bias.is_finite() || !(-100.0..=100.0).contains(&self.directional_bias)
+        {
+            bail!("--directional-bias must be between -100 and 100 percent");
+        }
+        if !self.leverage.is_finite() || self.leverage < 1.0 {
+            bail!("--leverage must be at least 1");
+        }
+        if self
+            .stop_loss_pct
+            .is_some_and(|percent| !percent.is_finite() || !(0.0..=100.0).contains(&percent))
+        {
+            bail!("--stop-loss-pct must be between 0 and 100 percent");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| !(margin * self.leverage).is_finite())
+        {
+            bail!("--margin multiplied by --leverage is too large");
+        }
+        if self.dry_run && self.yes {
+            bail!("--yes is not used with --dry-run");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("bot run supports only --output terminal|json|jsonl");
+        }
+        Ok(())
+    }
+}
+
+impl RunVolumeMidArgs {
+    pub fn validate(&self) -> Result<()> {
+        self.common.validate()?;
+        if !self.refresh_time.is_finite() || self.refresh_time <= 0.0 {
+            bail!("--refresh-time must be greater than zero seconds");
+        }
+        if !self.refresh_tolerance_bps.is_finite() || self.refresh_tolerance_bps < 0.0 {
+            bail!("--refresh-tolerance-bps must be zero or greater");
+        }
+        Ok(())
+    }
+}
+
+impl RunGridArgs {
+    pub fn validate(&self) -> Result<()> {
+        if !is_valid_symbol(&self.symbol) {
+            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        if self
+            .size
+            .is_some_and(|size| !size.is_finite() || size <= 0.0)
+        {
+            bail!("--size must be > 0");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| !margin.is_finite() || margin <= 0.0)
+        {
+            bail!("--margin must be > 0");
+        }
+        match (self.size, self.margin) {
+            (Some(_), Some(_)) => bail!("set only one of --size or --margin"),
+            (None, None) => bail!("one of --size or --margin is required"),
+            _ => {}
+        }
+        if self.duration == 0 {
+            bail!("--duration must be >= 1 second");
+        }
+        if !(1..=MAX_GRID_LEVELS_PER_SIDE).contains(&self.levels) {
+            bail!("--levels must be between 1 and {MAX_GRID_LEVELS_PER_SIDE}");
+        }
+        if !self.step_bps.is_finite() || self.step_bps <= 0.0 {
+            bail!("--step-bps must be greater than zero");
+        }
+        if self
+            .reset_threshold_pct
+            .is_some_and(|percent| !percent.is_finite() || !(0.0..=1.0).contains(&percent))
+        {
+            bail!("--reset-threshold-pct must be between 0 and 1 percent");
+        }
+        if !self.leverage.is_finite() || self.leverage < 1.0 {
+            bail!("--leverage must be at least 1");
+        }
+        if self
+            .stop_loss_pct
+            .is_some_and(|percent| !percent.is_finite() || !(0.0..=100.0).contains(&percent))
+        {
+            bail!("--stop-loss-pct must be between 0 and 100 percent");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| !(margin * self.leverage).is_finite())
+        {
+            bail!("--margin multiplied by --leverage is too large");
+        }
+        if self.dry_run && self.yes {
+            bail!("--yes is not used with --dry-run");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("bot run supports only --output terminal|json|jsonl");
         }
         Ok(())
     }
@@ -1697,33 +2203,26 @@ fn resolve_source_provider(
     if exchange.trim().is_empty() {
         bail!("--exchange cannot be empty");
     }
-    if let Some(p) = provider {
-        match p {
-            CliDataProvider::Binance => {
-                if !exchange.eq_ignore_ascii_case("binance") {
-                    bail!("--exchange must be `binance` with --provider binance");
-                }
-                return Ok(CliProviderKind::Binance);
-            }
-            CliDataProvider::BinanceFutures => {
-                if !exchange.eq_ignore_ascii_case("binance_futures")
-                    && !exchange.eq_ignore_ascii_case("binancefutures")
-                    && !exchange.eq_ignore_ascii_case("binance-futures")
-                {
-                    bail!("--exchange must be `binance_futures` with --provider binance-futures");
-                }
-                return Ok(CliProviderKind::BinanceFutures);
-            }
-            CliDataProvider::Mmt => {
-                if exchange.eq_ignore_ascii_case("bulk") {
-                    bail!("omit --provider for the standalone `bulk` exchange");
-                }
-                return Ok(CliProviderKind::Mmt);
-            }
+    if provider.is_some() {
+        if matches!(
+            exchange.to_ascii_lowercase().as_str(),
+            "bulk" | "hyperliquid"
+        ) {
+            bail!("omit --provider for the standalone `{exchange}` exchange");
         }
+        return Ok(CliProviderKind::Mmt);
     }
     if exchange.eq_ignore_ascii_case("bulk") {
         return Ok(CliProviderKind::Bulk);
+    }
+    if exchange.eq_ignore_ascii_case("hyperliquid") {
+        return Ok(CliProviderKind::Hyperliquid);
+    }
+    if exchange.eq_ignore_ascii_case("binance") {
+        return Ok(CliProviderKind::Binance);
+    }
+    if exchange.eq_ignore_ascii_case("binancef") {
+        return Ok(CliProviderKind::BinanceFutures);
     }
     bail!(
         "standalone exchange `{exchange}` is not supported yet; use --provider mmt when `{exchange}` is routed through MMT"
@@ -1742,23 +2241,28 @@ fn resolve_system_provider(
     exchange: Option<&str>,
 ) -> Result<ProviderKind> {
     match (provider, exchange) {
-        (Some(CliDataProvider::Binance), _) => Ok(ProviderKind::Binance),
-        (Some(CliDataProvider::BinanceFutures), _) => Ok(ProviderKind::BinanceFutures),
-        (Some(CliDataProvider::Mmt), Some(exchange)) if exchange.eq_ignore_ascii_case("bulk") => {
-            bail!("omit --provider for the standalone `bulk` exchange")
+        (Some(_), Some(exchange))
+            if matches!(
+                exchange.to_ascii_lowercase().as_str(),
+                "bulk" | "hyperliquid"
+            ) =>
+        {
+            bail!("omit --provider for the standalone `{exchange}` exchange")
         }
-        (Some(CliDataProvider::Mmt), _) => Ok(ProviderKind::Mmt),
+        (Some(_), _) => Ok(ProviderKind::Mmt),
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("bulk") => Ok(ProviderKind::Bulk),
+        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquid") => {
+            Ok(ProviderKind::Hyperliquid)
+        }
+        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("binance") => {
+            Ok(ProviderKind::Binance)
+        }
+        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("binancef") => {
+            Ok(ProviderKind::BinanceFutures)
+        }
         (None, Some(exchange)) => bail!("unsupported standalone exchange `{exchange}`"),
         (None, None) => Ok(ProviderKind::MarketLab),
     }
-}
-
-fn validate_bulk_exchange(exchange: &str, command: &str) -> Result<()> {
-    if !exchange.eq_ignore_ascii_case("bulk") {
-        bail!("{command} currently supports only --exchange bulk");
-    }
-    Ok(())
 }
 
 fn provider_timeframe_from_seconds(
@@ -1769,18 +2273,11 @@ fn provider_timeframe_from_seconds(
         CliProviderKind::Bulk => {
             crate::providers::bulk::market_data::timeframe_from_seconds(seconds)
         }
+        CliProviderKind::Hyperliquid => {
+            crate::providers::hyperliquid::market_data::timeframe_from_seconds(seconds)
+        }
         CliProviderKind::Binance | CliProviderKind::BinanceFutures => {
-            // Binance spot and futures use same interval format (1h, 15m, etc)
-            match seconds {
-                60 => Ok("1m"),
-                300 => Ok("5m"),
-                900 => Ok("15m"),
-                1800 => Ok("30m"),
-                3600 => Ok("1h"),
-                14400 => Ok("4h"),
-                86400 => Ok("1d"),
-                _ => bail!("unsupported timeframe for binance: {seconds} seconds"),
-            }
+            crate::providers::binance::market_data::timeframe_from_seconds(seconds)
         }
         CliProviderKind::Mmt | CliProviderKind::MarketLab => mmt_timeframe_from_seconds(seconds),
     }
@@ -1822,9 +2319,6 @@ pub(crate) fn mmt_timeframe_from_seconds(seconds: u32) -> Result<&'static str> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum CliDataProvider {
     Mmt,
-    Binance,
-    #[value(name = "binance-futures")]
-    BinanceFutures,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1832,6 +2326,7 @@ pub enum CliProviderKind {
     MarketLab,
     Mmt,
     Bulk,
+    Hyperliquid,
     Binance,
     BinanceFutures,
 }
@@ -1840,8 +2335,6 @@ impl From<CliDataProvider> for CliProviderKind {
     fn from(value: CliDataProvider) -> Self {
         match value {
             CliDataProvider::Mmt => Self::Mmt,
-            CliDataProvider::Binance => Self::Binance,
-            CliDataProvider::BinanceFutures => Self::BinanceFutures,
         }
     }
 }
@@ -1852,6 +2345,7 @@ impl From<CliProviderKind> for ProviderKind {
             CliProviderKind::MarketLab => ProviderKind::MarketLab,
             CliProviderKind::Mmt => ProviderKind::Mmt,
             CliProviderKind::Bulk => ProviderKind::Bulk,
+            CliProviderKind::Hyperliquid => ProviderKind::Hyperliquid,
             CliProviderKind::Binance => ProviderKind::Binance,
             CliProviderKind::BinanceFutures => ProviderKind::BinanceFutures,
         }
@@ -1917,10 +2411,127 @@ mod tests {
 
         match cli.command {
             Commands::Markets(args) => {
+                assert!(args.provider.is_none());
                 assert_eq!(args.exchange, "bulk");
                 assert_eq!(args.symbol.as_deref(), Some("BTC/USDT"));
+                assert!(!args.refresh);
                 assert!(args.json);
                 args.validate().expect("BULK markets should validate");
+            }
+            _ => panic!("expected markets command"),
+        }
+    }
+
+    #[test]
+    fn parse_hyperliquid_standalone_commands() {
+        let markets =
+            Cli::try_parse_from(["mlab", "markets", "--exchange", "hyperliquid", "--refresh"])
+                .expect("Hyperliquid markets command should parse");
+        match markets.command {
+            Commands::Markets(args) => {
+                assert!(args.provider.is_none());
+                assert_eq!(args.exchange, "hyperliquid");
+                assert!(args.refresh);
+                args.validate()
+                    .expect("standalone Hyperliquid markets should validate");
+            }
+            _ => panic!("expected markets command"),
+        }
+
+        let source = Cli::try_parse_from([
+            "mlab",
+            "source",
+            "orderbook",
+            "--exchange",
+            "hyperliquid",
+            "--symbol",
+            "BTC/USDT",
+            "--depth",
+            "20",
+        ])
+        .expect("Hyperliquid source command should parse");
+        match source.command {
+            Commands::Source {
+                command: SourceCommands::Orderbook(args),
+            } => {
+                args.validate()
+                    .expect("standalone Hyperliquid source should validate");
+                assert_eq!(
+                    args.provider_kind().expect("provider resolves"),
+                    CliProviderKind::Hyperliquid
+                );
+            }
+            _ => panic!("expected source orderbook command"),
+        }
+
+        let trade = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "long",
+            "BTC/USDT",
+            "--venue",
+            "hyperliquid",
+            "--margin",
+            "100",
+            "--leverage",
+            "5",
+            "--dry-run",
+        ])
+        .expect("Hyperliquid trade command should parse");
+        match trade.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => {
+                args.validate_shape()
+                    .expect("Hyperliquid trade shape should validate");
+                assert!(matches!(args.venue, ExecutionVenueArg::Hyperliquid));
+            }
+            _ => panic!("expected trade long command"),
+        }
+    }
+
+    #[test]
+    fn parse_markets_refresh_command() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "markets",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "binancef",
+            "--refresh",
+        ])
+        .expect("markets refresh command should parse");
+
+        match cli.command {
+            Commands::Markets(args) => {
+                assert_eq!(args.provider, Some(CliDataProvider::Mmt));
+                assert_eq!(args.exchange, "binancef");
+                assert!(args.refresh);
+            }
+            _ => panic!("expected markets command"),
+        }
+    }
+
+    #[test]
+    fn parse_mmt_markets_command() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "markets",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "binancef",
+            "--symbol",
+            "BTC/USDT",
+        ])
+        .expect("MMT markets command should parse");
+
+        match cli.command {
+            Commands::Markets(args) => {
+                assert_eq!(args.provider, Some(CliDataProvider::Mmt));
+                assert_eq!(args.exchange, "binancef");
+                args.validate().expect("MMT snapshot should validate");
             }
             _ => panic!("expected markets command"),
         }
@@ -2295,6 +2906,36 @@ mod tests {
     }
 
     #[test]
+    fn reject_source_oi_for_spot_exchange() {
+        let cli = Cli::try_parse_from([
+            "market-lab",
+            "source",
+            "oi",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "binance",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+            "--stream",
+        ])
+        .expect("source OI shape parses");
+
+        let Commands::Source {
+            command: SourceCommands::Oi(args),
+        } = cli.command
+        else {
+            panic!("expected source OI command");
+        };
+        let error = args
+            .validate()
+            .expect_err("spot exchange must reject open interest");
+        assert!(error.to_string().contains("requires a futures exchange"));
+    }
+
+    #[test]
     fn parse_source_volumes_command() {
         let cli = Cli::try_parse_from([
             "market-lab",
@@ -2641,27 +3282,55 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_standalone_exchange_explains_mmt_routing() {
-        let cli = Cli::try_parse_from([
+    fn binance_standalone_and_mmt_routes_are_distinct() {
+        let standalone = Cli::try_parse_from([
             "mlab",
             "source",
-            "orderbook",
+            "candles",
             "--exchange",
             "binancef",
             "--symbol",
             "BTC/USDT",
+            "--timeframe",
+            "60",
         ])
-        .expect("syntax should parse before exchange validation");
-        match cli.command {
+        .expect("standalone Binance futures command should parse");
+        match standalone.command {
             Commands::Source {
-                command: SourceCommands::Orderbook(args),
+                command: SourceCommands::Candles(args),
             } => {
-                let error = args
-                    .validate()
-                    .expect_err("binancef is not a standalone exchange yet");
-                assert!(error.to_string().contains("--provider mmt"));
+                assert_eq!(
+                    args.provider_kind().expect("standalone route resolves"),
+                    CliProviderKind::BinanceFutures
+                );
             }
-            _ => panic!("expected standalone orderbook command"),
+            _ => panic!("expected standalone candles command"),
+        }
+
+        let mmt = Cli::try_parse_from([
+            "mlab",
+            "source",
+            "candles",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "binancef",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+        ])
+        .expect("MMT Binance futures command should parse");
+        match mmt.command {
+            Commands::Source {
+                command: SourceCommands::Candles(args),
+            } => {
+                assert_eq!(
+                    args.provider_kind().expect("MMT route resolves"),
+                    CliProviderKind::Mmt
+                );
+            }
+            _ => panic!("expected MMT candles command"),
         }
     }
 
@@ -2702,7 +3371,7 @@ mod tests {
             "run",
             "twap",
             "BTC/USDT",
-            "--exchange",
+            "--venue",
             "bulk",
             "--side",
             "buy",
@@ -2731,6 +3400,290 @@ mod tests {
             }
             _ => panic!("expected strategy run twap command"),
         }
+    }
+
+    #[test]
+    fn parse_mid_price_bot_command_without_a_side() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "bot",
+            "run",
+            "mid-price",
+            "BTC/USDT",
+            "--venue",
+            "bulk",
+            "--margin",
+            "100",
+            "--duration",
+            "300",
+            "--spread-bps",
+            "2",
+            "--leverage",
+            "10",
+            "--stop-loss-pct",
+            "5",
+            "--dry-run",
+        ])
+        .expect("mid-price bot should parse");
+
+        match cli.command {
+            Commands::Bot {
+                command:
+                    BotCommands::Run {
+                        command: BotRunCommands::MidPrice(args),
+                    },
+            } => {
+                args.validate()
+                    .expect("mid-price arguments should validate");
+                assert_eq!(args.margin, Some(100.0));
+                assert_eq!(args.duration, 300);
+                assert_eq!(args.spread_bps, 2.0);
+                assert_eq!(args.directional_bias, 0.0);
+                assert_eq!(args.leverage, 10.0);
+                assert_eq!(args.stop_loss_pct, Some(5.0));
+                assert!(args.dry_run);
+            }
+            _ => panic!("expected bot run mid-price command"),
+        }
+    }
+
+    #[test]
+    fn parse_volume_mid_bot_with_fill_priority_refresh_controls() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "bot",
+            "run",
+            "volume-mid",
+            "BTC/USDT",
+            "--margin",
+            "100",
+            "--duration",
+            "300",
+            "--refresh-time",
+            "5",
+            "--refresh-tolerance-bps",
+            "0.5",
+            "--dry-run",
+        ])
+        .expect("volume-mid bot should parse");
+
+        match cli.command {
+            Commands::Bot {
+                command:
+                    BotCommands::Run {
+                        command: BotRunCommands::VolumeMid(args),
+                    },
+            } => {
+                args.validate()
+                    .expect("volume-mid arguments should validate");
+                assert_eq!(args.common.margin, Some(100.0));
+                assert_eq!(args.refresh_time, 5.0);
+                assert_eq!(args.refresh_tolerance_bps, 0.5);
+            }
+            _ => panic!("expected bot run volume-mid command"),
+        }
+    }
+
+    #[test]
+    fn parse_multi_level_grid_bot() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "bot",
+            "run",
+            "grid",
+            "BTC/USDT",
+            "--venue",
+            "hyperliquid",
+            "--margin",
+            "100",
+            "--duration",
+            "300",
+            "--levels",
+            "4",
+            "--step-bps",
+            "2",
+            "--reset-threshold-pct",
+            "0.5",
+            "--leverage",
+            "10",
+            "--stop-loss-pct",
+            "5",
+            "--dry-run",
+        ])
+        .expect("grid bot should parse");
+
+        match cli.command {
+            Commands::Bot {
+                command:
+                    BotCommands::Run {
+                        command: BotRunCommands::Grid(args),
+                    },
+            } => {
+                args.validate().expect("grid arguments should validate");
+                assert_eq!(args.margin, Some(100.0));
+                assert_eq!(args.levels, 4);
+                assert_eq!(args.step_bps, 2.0);
+                assert_eq!(args.reset_threshold_pct, Some(0.5));
+                assert_eq!(args.stop_loss_pct, Some(5.0));
+            }
+            _ => panic!("expected bot run grid command"),
+        }
+    }
+
+    #[test]
+    fn parse_strategy_vwap_command_without_interval() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "strategy",
+            "run",
+            "vwap",
+            "BTC/USDT",
+            "--venue",
+            "bulk",
+            "--side",
+            "buy",
+            "--margin",
+            "1000",
+            "--duration",
+            "3600",
+            "--volume-sources",
+            "binancef@mmt,hyperliquid@mmt,bulk",
+            "--dry-run",
+        ])
+        .expect("VWAP should parse");
+
+        match cli.command {
+            Commands::Strategy {
+                command:
+                    StrategyCommands::Run {
+                        command: StrategyRunCommands::Vwap(args),
+                    },
+            } => {
+                args.validate().expect("VWAP arguments should validate");
+                assert_eq!(args.duration, 3600);
+                assert_eq!(
+                    args.volume_sources,
+                    ["binancef@mmt", "hyperliquid@mmt", "bulk"]
+                );
+                assert!(args.dry_run);
+            }
+            _ => panic!("expected strategy run vwap command"),
+        }
+    }
+
+    #[test]
+    fn strategy_vwap_does_not_accept_an_interval() {
+        let error = Cli::try_parse_from([
+            "mlab",
+            "strategy",
+            "run",
+            "vwap",
+            "BTC/USDT",
+            "--side",
+            "buy",
+            "--margin",
+            "1000",
+            "--duration",
+            "300",
+            "--interval",
+            "30",
+        ])
+        .expect_err("VWAP must not expose a child interval");
+        assert!(error.to_string().contains("--interval"));
+    }
+
+    #[test]
+    fn parse_strategy_oiwap_command_without_interval() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "strategy",
+            "run",
+            "oiwap",
+            "BTC/USDT",
+            "--venue",
+            "bulk",
+            "--side",
+            "buy",
+            "--margin",
+            "1000",
+            "--duration",
+            "3600",
+            "--oi-sources",
+            "binancef@mmt,hyperliquid@mmt",
+            "--dry-run",
+        ])
+        .expect("OIWAP should parse");
+
+        match cli.command {
+            Commands::Strategy {
+                command:
+                    StrategyCommands::Run {
+                        command: StrategyRunCommands::Oiwap(args),
+                    },
+            } => {
+                args.validate().expect("OIWAP arguments should validate");
+                assert_eq!(args.duration, 3600);
+                assert_eq!(args.oi_sources, ["binancef@mmt", "hyperliquid@mmt"]);
+                assert!(args.dry_run);
+            }
+            _ => panic!("expected strategy run oiwap command"),
+        }
+    }
+
+    #[test]
+    fn strategy_oiwap_requires_explicit_oi_sources() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "strategy",
+            "run",
+            "oiwap",
+            "BTC/USDT",
+            "--side",
+            "buy",
+            "--margin",
+            "1000",
+            "--duration",
+            "300",
+        ])
+        .expect("CLI shape parses before semantic validation");
+        let Commands::Strategy {
+            command:
+                StrategyCommands::Run {
+                    command: StrategyRunCommands::Oiwap(args),
+                },
+        } = cli.command
+        else {
+            panic!("expected strategy run oiwap command");
+        };
+        assert!(
+            args.validate()
+                .expect_err("OI sources must be explicit")
+                .to_string()
+                .contains("requires --oi-sources")
+        );
+    }
+
+    #[test]
+    fn strategy_oiwap_does_not_accept_an_interval() {
+        let error = Cli::try_parse_from([
+            "mlab",
+            "strategy",
+            "run",
+            "oiwap",
+            "BTC/USDT",
+            "--side",
+            "buy",
+            "--margin",
+            "1000",
+            "--duration",
+            "300",
+            "--oi-sources",
+            "binancef@mmt",
+            "--interval",
+            "30",
+        ])
+        .expect_err("OIWAP must not expose a child interval");
+        assert!(error.to_string().contains("--interval"));
     }
 
     #[test]

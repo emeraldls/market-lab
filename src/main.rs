@@ -3,8 +3,9 @@ use clap::Parser;
 use mimalloc::MiMalloc;
 
 use market_lab::cli::{
-    AuthCommands, Cli, Commands, DaemonCommands, ScriptCommands, ScriptRunHistoryCommands,
-    SourceCommands, StrategyCommands, StrategyRunCommands, StudyCommands, TradeCommands,
+    AuthCommands, BotCommands, BotRunCommands, Cli, Commands, DaemonCommands, ScriptCommands,
+    ScriptRunHistoryCommands, SourceCommands, StrategyCommands, StrategyRunCommands, StudyCommands,
+    TradeCommands,
 };
 use market_lab::commands;
 use market_lab::config;
@@ -20,7 +21,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse_from(args);
 
     match cli.command {
-        Commands::Markets(args) => commands::markets::handle(args)?,
+        Commands::Markets(args) => commands::markets::handle(args).await?,
         Commands::Trade { command } => match command {
             TradeCommands::Long(args) => {
                 commands::execution::handle_trade(args, PositionDirection::Long).await?
@@ -75,11 +76,28 @@ async fn main() -> Result<()> {
         Commands::Strategy { command: strategy } => match strategy {
             StrategyCommands::Run { command } => match command {
                 StrategyRunCommands::Twap(args) => commands::strategy::twap::handle(args).await?,
+                StrategyRunCommands::Vwap(args) => commands::strategy::vwap::handle(args).await?,
+                StrategyRunCommands::Oiwap(args) => commands::strategy::oiwap::handle(args).await?,
             },
             StrategyCommands::Jobs(args) => commands::strategy::jobs::handle_list(args).await?,
             StrategyCommands::Status(args) => commands::strategy::jobs::handle_status(args).await?,
             StrategyCommands::Logs(args) => commands::strategy::jobs::handle_logs(args).await?,
             StrategyCommands::Stop(args) => commands::strategy::jobs::handle_stop(args).await?,
+        },
+        Commands::Bot { command: bot } => match bot {
+            BotCommands::Run { command } => match command {
+                BotRunCommands::Grid(args) => commands::bot::grid::handle(args).await?,
+                BotRunCommands::MidPrice(args) => {
+                    commands::bot::mid_price::handle_mid_price(args).await?
+                }
+                BotRunCommands::VolumeMid(args) => {
+                    commands::bot::mid_price::handle_volume_mid(args).await?
+                }
+            },
+            BotCommands::Jobs(args) => commands::bot::jobs::handle_list(args).await?,
+            BotCommands::Status(args) => commands::bot::jobs::handle_status(args).await?,
+            BotCommands::Logs(args) => commands::bot::jobs::handle_logs(args).await?,
+            BotCommands::Stop(args) => commands::bot::jobs::handle_stop(args).await?,
         },
         Commands::Health(args) => commands::system::health::handle(args).await?,
         Commands::Status(args) => commands::system::status::handle(args).await?,

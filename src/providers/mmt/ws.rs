@@ -12,19 +12,15 @@ pub struct MmtDepthStream {
 }
 
 impl MmtDepthStream {
-    pub async fn connect(
-        exchange: &str,
-        symbol: &str,
-        depth: u16,
-        state_cap: usize,
-    ) -> Result<Self> {
+    pub async fn connect(exchange: &str, symbol: &str, depth: u16) -> Result<Self> {
+        let provider_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
         let client = MmtWsClient::shared().await?;
 
         let subscribe = serde_json::json!({
             "type": "subscribe",
             "channel": "depth",
             "exchange": exchange.to_lowercase(),
-            "symbol": normalize_symbol_for_mmt(symbol)?,
+            "symbol": provider_symbol,
         });
 
         client
@@ -34,7 +30,7 @@ impl MmtDepthStream {
 
         Ok(Self {
             client,
-            state: OrderBookState::with_max_levels_per_side(state_cap),
+            state: OrderBookState::default(),
             depth,
         })
     }

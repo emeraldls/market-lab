@@ -4,13 +4,16 @@ use crate::domain::enums::ProviderKind;
 use crate::domain::requests::{InspectRequest, ReplayRequest};
 use crate::domain::types::{OrderBookSnapshot, ProviderHealth, TopOfBook};
 
-pub mod bulk;
 pub mod binance;
+pub mod bulk;
+pub mod execution;
+pub mod hyperliquid;
 pub mod marketlab_cloud;
 pub mod mmt;
 
+use binance::{BinanceMarket, BinanceProvider};
 use bulk::market_data::BulkProvider;
-use binance::market_data::BinanceProvider;
+use hyperliquid::market_data::HyperliquidProvider;
 use marketlab_cloud::MarketLabProvider;
 use mmt::MmtProvider;
 
@@ -25,6 +28,7 @@ pub enum ProviderClient {
     MarketLab,
     Mmt,
     Bulk,
+    Hyperliquid,
     Binance,
     BinanceFutures,
 }
@@ -35,6 +39,7 @@ impl ProviderClient {
             ProviderKind::MarketLab => Self::MarketLab,
             ProviderKind::Mmt => Self::Mmt,
             ProviderKind::Bulk => Self::Bulk,
+            ProviderKind::Hyperliquid => Self::Hyperliquid,
             ProviderKind::Binance => Self::Binance,
             ProviderKind::BinanceFutures => Self::BinanceFutures,
         }
@@ -47,7 +52,10 @@ impl MarketDataProvider for ProviderClient {
             Self::MarketLab => MarketLabProvider::inspect(req).await,
             Self::Mmt => MmtProvider::inspect(req).await,
             Self::Bulk => BulkProvider::inspect_historical().await,
-            Self::Binance | Self::BinanceFutures => bail!("Binance inspect not supported"),
+            Self::Hyperliquid => HyperliquidProvider::inspect_historical().await,
+            Self::Binance | Self::BinanceFutures => {
+                bail!("Binance does not provide historical orderbook inspection")
+            }
         }
     }
 
@@ -56,7 +64,10 @@ impl MarketDataProvider for ProviderClient {
             Self::MarketLab => MarketLabProvider::replay(req).await,
             Self::Mmt => MmtProvider::replay(req).await,
             Self::Bulk => BulkProvider::replay_historical().await,
-            Self::Binance | Self::BinanceFutures => bail!("Binance replay not supported"),
+            Self::Hyperliquid => HyperliquidProvider::replay_historical().await,
+            Self::Binance | Self::BinanceFutures => {
+                bail!("Binance historical orderbook replay is not implemented")
+            }
         }
     }
 
@@ -65,8 +76,9 @@ impl MarketDataProvider for ProviderClient {
             Self::MarketLab => MarketLabProvider::health().await,
             Self::Mmt => MmtProvider::health().await,
             Self::Bulk => BulkProvider::health().await,
-            Self::Binance => BinanceProvider::health().await,
-            Self::BinanceFutures => BinanceProvider::health_futures().await,
+            Self::Hyperliquid => HyperliquidProvider::health().await,
+            Self::Binance => BinanceProvider::health(BinanceMarket::Spot).await,
+            Self::BinanceFutures => BinanceProvider::health(BinanceMarket::Futures).await,
         }
     }
 }

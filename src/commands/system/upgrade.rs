@@ -65,7 +65,8 @@ pub async fn handle(args: UpgradeArgs) -> Result<()> {
         return render(&status, OutputFormat::Terminal);
     }
 
-    self_update(&asset_url).await?;
+    let installed_cli = self_update(&asset_url).await?;
+    refresh_market_snapshots(&installed_cli).await?;
 
     let status = UpgradeStatus {
         app: APP_NAME.to_string(),
@@ -137,7 +138,7 @@ fn is_latest(current: &str, latest: &str) -> Result<bool> {
     Ok(Version::parse(current)? >= Version::parse(latest)?)
 }
 
-async fn self_update(url: &str) -> Result<()> {
+async fn self_update(url: &str) -> Result<PathBuf> {
     let client = reqwest::Client::builder()
         .user_agent(format!("{APP_NAME}/{}", env!("CARGO_PKG_VERSION")))
         .build()?;
@@ -177,6 +178,40 @@ async fn self_update(url: &str) -> Result<()> {
         )
     })?;
 
+    Ok(current_exe)
+}
+
+async fn refresh_market_snapshots(cli: &Path) -> Result<()> {
+    refresh_market_snapshot(cli, &["--exchange", "bulk", "--refresh", "--json"]).await?;
+    refresh_market_snapshot(cli, &["--exchange", "hyperliquid", "--refresh", "--json"]).await?;
+    if crate::credentials::mmt_is_configured()? {
+        refresh_market_snapshot(
+            cli,
+            &[
+                "--provider",
+                "mmt",
+                "--exchange",
+                "binancef",
+                "--refresh",
+                "--json",
+            ],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn refresh_market_snapshot(cli: &Path, args: &[&str]) -> Result<()> {
+    let output = tokio::process::Command::new(cli)
+        .arg("markets")
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("failed to run {} markets --refresh", cli.display()))?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        bail!("market snapshot refresh failed: {}", error.trim());
+    }
     Ok(())
 }
 

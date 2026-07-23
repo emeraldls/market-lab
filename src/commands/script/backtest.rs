@@ -1,35 +1,27 @@
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crate::cli::{OutputFormat, ScriptBacktestArgs, mmt_timeframe_from_seconds};
-
-/// Standard timeframe mapping (1m, 5m, 15m, 30m, 1h, 4h, 1d) shared by BULK and Binance.
-/// Matches the mapping in `cli::provider_timeframe_from_seconds` for these providers.
-fn standard_timeframe_from_seconds(seconds: u32) -> Result<String> {
-    crate::providers::bulk::market_data::timeframe_from_seconds(seconds)
-        .map(|s| s.to_string())
-        .map_err(|e| anyhow::anyhow!("unsupported timeframe: {} seconds — {e}", seconds))
-}
 use crate::commands::script::{
     ScriptDescriptor, ScriptInputs, report_builder, write_report_best_effort,
     write_running_report_best_effort,
 };
 use crate::commands::study::common::is_empty_object;
 use crate::domain::enums::ProviderKind;
-use crate::domain::types::{CandleSeries, OhlcvtCandle, OhlcvSeries, OiCandle, OrderBookSnapshot, VdCandle, VolumeProfile};
-use crate::providers::mmt::MmtProvider;
+use crate::domain::types::OrderBookSnapshot;
+use crate::providers::binance::{BinanceMarket, BinanceProvider};
 use crate::providers::bulk::market_data::BulkProvider;
-use crate::providers::binance::market_data::BinanceProvider;
-
+use crate::providers::hyperliquid::market_data::HyperliquidProvider;
+use crate::providers::mmt::MmtProvider;
 use crate::scripting::engine::Script;
 use crate::scripting::execution::{
-    ScriptCancelRequest, ScriptExecutionCommand, ScriptExecutionContext, ScriptOrderKind,
-    ScriptOrderRef, ScriptTradeRequest,
+    ScriptCancelRequest, ScriptExecutionCommand, ScriptExecutionContext, ScriptManagedRequest,
+    ScriptOrderKind, ScriptOrderRef, ScriptRawOrderRequest, ScriptTradeRequest,
 };
 use crate::scripting::inputs::{
     SourceConfig, SourceConfigs, parse_param_values, parse_source_configs, resolve_params,
@@ -202,10 +194,16 @@ enum SimulatedOrderStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SimulatedFillOutcome {
+    Filled(f64),
+    Cancelled,
+}
+
 #[derive(Debug, Clone)]
 struct SimulatedScriptOrder {
     order: ScriptOrderRef,
-    request: ScriptTradeRequest,
+    request: ScriptManagedRequest,
     submitted_idx: usize,
     status: SimulatedOrderStatus,
 }
@@ -215,6 +213,8 @@ struct ScriptSimulationState {
     open_trades: Vec<OpenTrade>,
     closed_trades: Vec<ScriptBacktestTrade>,
     next_position_id: usize,
+    execution_events: VecDeque<Value>,
+    next_execution_event_seq: u64,
 }
 
 impl Default for ScriptSimulationState {
@@ -224,6 +224,8 @@ impl Default for ScriptSimulationState {
             open_trades: Vec::new(),
             closed_trades: Vec::new(),
             next_position_id: 1,
+            execution_events: VecDeque::new(),
+            next_execution_event_seq: 0,
         }
     }
 }
@@ -419,6 +421,15 @@ async fn backtest_events(
                 &mut simulation.closed_trades,
             )?;
             fill_pending_script_orders(config, &data, event.record_idx, idx, &mut simulation)?;
+            orders += dispatch_simulated_execution_events(
+                &session,
+                idx,
+                event.ts_ms,
+                latest_reference_price,
+                &mut simulation,
+                report,
+                &mut latest_output,
+            )?;
             peak_margin = peak_margin.max(open_position_margin(&simulation.open_trades));
         }
         let payload = build_event_payload(EventPayloadContext {
@@ -465,6 +476,16 @@ async fn backtest_events(
                 meta: output.meta,
             });
         }
+        orders += dispatch_simulated_execution_events(
+            &session,
+            idx,
+            event.ts_ms,
+            latest_reference_price,
+            &mut simulation,
+            report,
+            &mut latest_output,
+        )?;
+        peak_margin = peak_margin.max(open_position_margin(&simulation.open_trades));
 
         if (idx + 1) % 500 == 0 || idx + 1 == events.len() {
             eprintln!("processed {}/{} source events", idx + 1, events.len());
@@ -554,22 +575,32 @@ async fn fetch_sources(
         .any(|config| config.provider == ProviderKind::Bulk)
     {
         data.series.extend(
-            fetch_bulk_sources(args, source_configs, report)
+            fetch_direct_sources(args, source_configs, report, ProviderKind::Bulk)
                 .await?
                 .series,
         );
     }
     if source_configs
         .values()
-        .any(|config| {
-            config.provider == ProviderKind::Binance || config.provider == ProviderKind::BinanceFutures
-        })
+        .any(|config| config.provider == ProviderKind::Hyperliquid)
     {
         data.series.extend(
-            fetch_binance_sources(args, source_configs, report)
+            fetch_direct_sources(args, source_configs, report, ProviderKind::Hyperliquid)
                 .await?
                 .series,
         );
+    }
+    for provider in [ProviderKind::Binance, ProviderKind::BinanceFutures] {
+        if source_configs
+            .values()
+            .any(|config| config.provider == provider)
+        {
+            data.series.extend(
+                fetch_direct_sources(args, source_configs, report, provider)
+                    .await?
+                    .series,
+            );
+        }
     }
     Ok(data)
 }
@@ -599,15 +630,12 @@ async fn fetch_mmt_sources(
                     "fetching candles exchange={} symbol={} tf={} from={} to={}",
                     exchange, args.symbol, timeframe, args.from, args.to
                 );
-                let series = {
-                    let future =
-                        MmtProvider::candles(exchange, &args.symbol, tf, args.from, args.to);
-                    tokio::select! {
-                        result = future => result?,
-                        _ = &mut cancel => {
-                            report.set_phase("cancelled");
-                            return Err(ScriptCancelled.into());
-                        }
+                let future = MmtProvider::candles(exchange, &args.symbol, tf, args.from, args.to);
+                let series = tokio::select! {
+                    result = future => result?,
+                    _ = &mut cancel => {
+                        report.set_phase("cancelled");
+                        return Err(ScriptCancelled.into());
                     }
                 };
                 eprintln!(
@@ -800,28 +828,48 @@ async fn fetch_mmt_sources(
     Ok(data)
 }
 
-async fn fetch_bulk_sources(
+async fn fetch_direct_sources(
     args: &ScriptBacktestArgs,
     source_configs: &SourceConfigs,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
+    provider: ProviderKind,
 ) -> Result<BacktestData> {
     let mut data = BacktestData::default();
     let mut cancel = Box::pin(tokio::signal::ctrl_c());
 
     let mut configs = source_configs.values().collect::<Vec<_>>();
-    configs.retain(|config| config.provider == ProviderKind::Bulk);
+    configs.retain(|config| config.provider == provider);
     configs.sort_by_key(|config| config.position);
     for config in configs {
         let source = &config.source;
         let timeframe = config.require_timeframe(source)?;
-        let interval = crate::providers::bulk::market_data::timeframe_from_seconds(timeframe)?;
+        let provider_name = match provider {
+            ProviderKind::Bulk => "BULK",
+            ProviderKind::Hyperliquid => "Hyperliquid",
+            ProviderKind::Binance => "Binance Spot",
+            ProviderKind::BinanceFutures => "Binance Futures",
+            _ => bail!("historical direct source provider is invalid"),
+        };
+        let interval = match provider {
+            ProviderKind::Bulk => {
+                crate::providers::bulk::market_data::timeframe_from_seconds(timeframe)?
+            }
+            ProviderKind::Hyperliquid => {
+                crate::providers::hyperliquid::market_data::timeframe_from_seconds(timeframe)?
+            }
+            ProviderKind::Binance | ProviderKind::BinanceFutures => {
+                crate::providers::binance::market_data::timeframe_from_seconds(timeframe)?
+            }
+            _ => unreachable!(),
+        };
         let phase = match source {
             ScriptSource::Candles => "fetching_candles",
             ScriptSource::Volumes => "fetching_volumes",
             ScriptSource::Orderbook | ScriptSource::Vd | ScriptSource::Oi => {
                 bail!(
-                    "BULK does not provide historical {} for script backtests",
-                    source.as_str()
+                    "{} does not provide historical {} for script backtests",
+                    provider_name,
+                    source.as_str(),
                 );
             }
         };
@@ -829,14 +877,45 @@ async fn fetch_bulk_sources(
         write_running_report_best_effort(report);
         let started = Instant::now();
         eprintln!(
-            "fetching BULK {} symbol={} tf={} from={} to={}",
+            "fetching {} {} symbol={} tf={} from={} to={}",
+            provider_name,
             source.as_str(),
             args.symbol,
             timeframe,
             args.from,
             args.to
         );
-        let future = BulkProvider::candles(&args.symbol, interval, args.from, args.to);
+        let future = async {
+            match provider {
+                ProviderKind::Bulk => {
+                    BulkProvider::candles(&args.symbol, interval, args.from, args.to).await
+                }
+                ProviderKind::Hyperliquid => {
+                    HyperliquidProvider::candles(&args.symbol, interval, args.from, args.to).await
+                }
+                ProviderKind::Binance => {
+                    BinanceProvider::candles_paginated(
+                        BinanceMarket::Spot,
+                        &args.symbol,
+                        interval,
+                        args.from,
+                        args.to,
+                    )
+                    .await
+                }
+                ProviderKind::BinanceFutures => {
+                    BinanceProvider::candles_paginated(
+                        BinanceMarket::Futures,
+                        &args.symbol,
+                        interval,
+                        args.from,
+                        args.to,
+                    )
+                    .await
+                }
+                _ => unreachable!(),
+            }
+        };
         let series = tokio::select! {
             result = future => result?,
             _ = &mut cancel => {
@@ -873,108 +952,8 @@ async fn fetch_bulk_sources(
             ScriptSource::Orderbook | ScriptSource::Vd | ScriptSource::Oi => unreachable!(),
         }
         eprintln!(
-            "fetched {points} BULK {} records in {}ms",
-            source.as_str(),
-            started.elapsed().as_millis()
-        );
-        report.set_progress(
-            format!("{}_fetched", source.as_str()),
-            points as u64,
-            points as u64,
-        );
-        write_running_report_best_effort(report);
-    }
-
-    Ok(data)
-}
-
-async fn fetch_binance_sources(
-    args: &ScriptBacktestArgs,
-    source_configs: &SourceConfigs,
-    report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
-) -> Result<BacktestData> {
-    let mut data = BacktestData::default();
-    let mut cancel = Box::pin(tokio::signal::ctrl_c());
-
-    let mut configs = source_configs.values().collect::<Vec<_>>();
-    configs.retain(|config| {
-        config.provider == ProviderKind::Binance || config.provider == ProviderKind::BinanceFutures
-    });
-    configs.sort_by_key(|config| config.position);
-
-    for config in configs {
-        let source = &config.source;
-        let timeframe = config.require_timeframe(source)?;
-        let interval = standard_timeframe_from_seconds(timeframe)?;
-        let is_futures = config.provider == ProviderKind::BinanceFutures;
-
-        let phase = match source {
-            ScriptSource::Candles => "fetching_candles",
-            ScriptSource::Volumes => "fetching_volumes",
-            ScriptSource::Orderbook | ScriptSource::Vd | ScriptSource::Oi => {
-                bail!(
-                    "Binance does not provide historical {} for script backtests",
-                    source.as_str()
-                );
-            }
-        };
-
-        report.set_phase(phase);
-        write_running_report_best_effort(report);
-        let started = Instant::now();
-        eprintln!(
-            "fetching Binance{} {} symbol={} tf={} from={} to={}",
-            if is_futures { " Futures" } else { "" },
-            source.as_str(),
-            args.symbol,
-            timeframe,
-            args.from,
-            args.to
-        );
-
-        let series = {
-            let future: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<OhlcvSeries>> + Send>> =
-                if is_futures {
-                    Box::pin(BinanceProvider::candles_paginated_futures(
-                        &args.symbol, &interval, args.from, args.to,
-                    ))
-                } else {
-                    Box::pin(BinanceProvider::candles_paginated(
-                        &args.symbol, &interval, args.from, args.to,
-                    ))
-                };
-            tokio::select! {
-                result = future => result?,
-                _ = &mut cancel => {
-                    report.set_phase("cancelled");
-                    return Err(ScriptCancelled.into());
-                }
-            }
-        };
-
-        let points = series.data.len();
-        match source {
-            ScriptSource::Candles => {
-                data.series.insert(
-                    config.selector.clone(),
-                    BacktestSeries::Candles(
-                        series.data.into_iter().map(ScriptCandle::from_bulk).collect(),
-                    ),
-                );
-            }
-            ScriptSource::Volumes => {
-                data.series.insert(
-                    config.selector.clone(),
-                    BacktestSeries::Volumes(
-                        series.data.into_iter().map(ScriptVolume::from_bulk_candle).collect(),
-                    ),
-                );
-            }
-            _ => unreachable!(),
-        }
-        eprintln!(
-            "fetched {points} Binance{} {} records in {}ms",
-            if is_futures { " Futures" } else { "" },
+            "fetched {points} {} {} records in {}ms",
+            provider_name,
             source.as_str(),
             started.elapsed().as_millis()
         );
@@ -1260,52 +1239,159 @@ fn apply_script_execution_commands(
         match command {
             ScriptExecutionCommand::Trade { order, request } => {
                 request.validate()?;
-                if let Some(existing) = simulation.orders.get(&order.id) {
-                    if existing.request != request {
-                        bail!(
-                            "ctx.trade key `{}` was reused with different order parameters",
-                            request.key
-                        );
-                    }
-                    continue;
-                }
                 validate_position_transition(&request, &simulation.open_trades)?;
                 let reference_price = request.order.price.or(current_price).context(
                     "ctx.trade requires a price-bearing source before submitting this order",
                 )?;
                 validate_script_protection(&request, reference_price)?;
-                let order_id = order.id.clone();
-                simulation.orders.insert(
-                    order_id.clone(),
-                    SimulatedScriptOrder {
-                        order,
-                        request: request.clone(),
-                        submitted_idx: idx,
-                        status: SimulatedOrderStatus::Pending,
-                    },
-                );
-                submitted += 1;
-                if request.order.kind == ScriptOrderKind::Market {
-                    let fill_price = current_price.context(
-                        "ctx.trade market order requires a price-bearing source event first",
-                    )?;
-                    fill_script_order(&order_id, idx, ts_ms, fill_price, simulation)?;
-                }
+                submitted += usize::from(submit_simulated_script_order(
+                    order,
+                    ScriptManagedRequest::Trade(request),
+                    "ctx.trade",
+                    idx,
+                    ts_ms,
+                    current_price,
+                    simulation,
+                )?);
+            }
+            ScriptExecutionCommand::Order { order, request } => {
+                request.validate()?;
+                submitted += usize::from(submit_simulated_script_order(
+                    order,
+                    ScriptManagedRequest::Order(request),
+                    "ctx.order",
+                    idx,
+                    ts_ms,
+                    current_price,
+                    simulation,
+                )?);
             }
             ScriptExecutionCommand::Cancel { request } => {
-                cancel_script_order(request, &mut simulation.orders)?;
+                cancel_script_order(request, ts_ms, simulation)?;
             }
         }
     }
     Ok(submitted)
 }
 
+fn dispatch_simulated_execution_events(
+    session: &crate::scripting::engine::ScriptSession,
+    idx: usize,
+    ts_ms: u64,
+    current_price: Option<f64>,
+    simulation: &mut ScriptSimulationState,
+    report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
+    latest_output: &mut Option<ScriptBacktestLatestOutput>,
+) -> Result<usize> {
+    let mut submitted = 0;
+    let mut dispatched = 0_usize;
+    while let Some(event) = simulation.execution_events.pop_front() {
+        dispatched += 1;
+        if dispatched > 10_000 {
+            bail!("simulated onExecution hooks produced too many recursive events");
+        }
+        let execution = match session.run_execution_event(event) {
+            Ok(execution) => execution,
+            Err(error) => {
+                report.record_hook_failure();
+                return Err(error);
+            }
+        };
+        let Some(execution) = execution else {
+            continue;
+        };
+        report.record_hook(&execution.stats);
+        submitted += apply_script_execution_commands(
+            execution.commands,
+            idx,
+            ts_ms,
+            current_price,
+            simulation,
+        )?;
+        if !execution.output.is_empty() {
+            *latest_output = Some(ScriptBacktestLatestOutput {
+                metrics: execution.output.metrics,
+                meta: execution.output.meta,
+            });
+        }
+    }
+    Ok(submitted)
+}
+
+fn submit_simulated_script_order(
+    order: ScriptOrderRef,
+    request: ScriptManagedRequest,
+    operation: &str,
+    idx: usize,
+    ts_ms: u64,
+    current_price: Option<f64>,
+    simulation: &mut ScriptSimulationState,
+) -> Result<bool> {
+    if let Some(existing) = simulation.orders.get(&order.id) {
+        if existing.request != request {
+            bail!(
+                "{operation} key `{}` was reused with different order parameters",
+                request.key()
+            );
+        }
+        return Ok(false);
+    }
+    request.order().price.or(current_price).with_context(|| {
+        format!("{operation} requires a price-bearing source before submitting this order")
+    })?;
+    let order_id = order.id.clone();
+    let is_market = request.order().kind == ScriptOrderKind::Market;
+    simulation.orders.insert(
+        order_id.clone(),
+        SimulatedScriptOrder {
+            order,
+            request,
+            submitted_idx: idx,
+            status: SimulatedOrderStatus::Pending,
+        },
+    );
+    let submitted = simulation
+        .orders
+        .get(&order_id)
+        .cloned()
+        .context("simulated order disappeared after submission")?;
+    queue_simulated_order_event(
+        simulation,
+        &submitted,
+        ts_ms,
+        "order.pending",
+        "pending",
+        false,
+        serde_json::to_value(&submitted.request)?,
+    );
+    if !is_market {
+        queue_simulated_order_event(
+            simulation,
+            &submitted,
+            ts_ms,
+            "order.accepted",
+            "resting",
+            false,
+            Value::Null,
+        );
+    }
+    if is_market {
+        let fill_price = current_price.with_context(|| {
+            format!("{operation} market order requires a price-bearing source event first")
+        })?;
+        fill_script_order(&order_id, idx, ts_ms, fill_price, simulation)?;
+    }
+    Ok(true)
+}
+
 fn cancel_script_order(
     request: ScriptCancelRequest,
-    script_orders: &mut HashMap<String, SimulatedScriptOrder>,
+    ts_ms: u64,
+    simulation: &mut ScriptSimulationState,
 ) -> Result<()> {
     request.validate()?;
-    let Some(order_id) = script_orders
+    let Some(order_id) = simulation
+        .orders
         .values()
         .find(|order| order.order.id == request.order || order.order.key == request.order)
         .map(|order| order.order.id.clone())
@@ -1315,13 +1401,48 @@ fn cancel_script_order(
             request.order
         );
     };
-    let order = script_orders
+    let order = simulation
+        .orders
         .get_mut(&order_id)
         .context("simulated order disappeared during cancellation")?;
     if order.status == SimulatedOrderStatus::Pending {
         order.status = SimulatedOrderStatus::Cancelled;
+        let order = order.clone();
+        queue_simulated_order_event(
+            simulation,
+            &order,
+            ts_ms,
+            "order.cancelled",
+            "cancelled",
+            true,
+            Value::Null,
+        );
     }
     Ok(())
+}
+
+fn queue_simulated_order_event(
+    simulation: &mut ScriptSimulationState,
+    order: &SimulatedScriptOrder,
+    ts_ms: u64,
+    event_type: &str,
+    status: &str,
+    terminal: bool,
+    data: Value,
+) {
+    simulation.next_execution_event_seq = simulation.next_execution_event_seq.saturating_add(1);
+    simulation.execution_events.push_back(json!({
+        "seq": simulation.next_execution_event_seq,
+        "jobId": "backtest",
+        "tsMs": ts_ms,
+        "type": event_type,
+        "orderId": order.order.id,
+        "key": order.order.key,
+        "venue": "bulk",
+        "status": status,
+        "terminal": terminal,
+        "data": data,
+    }));
 }
 
 fn fill_pending_script_orders(
@@ -1340,18 +1461,21 @@ fn fill_pending_script_orders(
     for order in simulation.orders.values().filter(|order| {
         order.status == SimulatedOrderStatus::Pending
             && order.submitted_idx < event_idx
-            && order.request.order.kind == ScriptOrderKind::Limit
+            && order.request.order().kind == ScriptOrderKind::Limit
     }) {
         let price = order
             .request
-            .order
+            .order()
             .price
             .context("simulated limit order omitted its price")?;
         if limit_order_touched(config, data, record_idx, &order.request, price)? {
-            fillable.push((order.order.id.clone(), price));
+            fillable.push((order.submitted_idx, order.order.id.clone(), price));
         }
     }
-    for (order_id, price) in fillable {
+    // OHLC cannot reveal the path between two touched limits. Keep the result reproducible by
+    // applying older orders first, then stable local order id within the same submission event.
+    fillable.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
+    for (_, order_id, price) in fillable {
         fill_script_order(&order_id, event_idx, ts_ms, price, simulation)?;
     }
     Ok(())
@@ -1361,12 +1485,12 @@ fn limit_order_touched(
     config: &SourceConfig,
     data: &BacktestData,
     record_idx: usize,
-    request: &ScriptTradeRequest,
+    request: &ScriptManagedRequest,
     limit: f64,
 ) -> Result<bool> {
     if config.source == ScriptSource::Candles {
         let candle = backtest_candle(config, data, record_idx)?;
-        return Ok(match request.position.order_direction() {
+        return Ok(match request.order_direction() {
             crate::domain::execution::PositionDirection::Long => candle.l <= limit,
             crate::domain::execution::PositionDirection::Short => candle.h >= limit,
         });
@@ -1377,7 +1501,7 @@ fn limit_order_touched(
         .with_context(|| format!("{} data not loaded", config.selector))?;
     let price = backtest_series_reference_price(series, record_idx)?
         .context("limit order evaluation requires a price-bearing source event")?;
-    Ok(match request.position.order_direction() {
+    Ok(match request.order_direction() {
         crate::domain::execution::PositionDirection::Long => price <= limit,
         crate::domain::execution::PositionDirection::Short => price >= limit,
     })
@@ -1398,17 +1522,86 @@ fn fill_script_order(
     if order.status != SimulatedOrderStatus::Pending {
         return Ok(());
     }
-    validate_position_transition(&order.request, &simulation.open_trades)?;
-    if order.request.position.is_open() {
-        let side = trade_side(order.request.position.position_direction());
-        let leverage = order.request.leverage_or_default();
-        let notional = order
-            .request
+    let outcome =
+        match &order.request {
+            ScriptManagedRequest::Trade(request) => SimulatedFillOutcome::Filled(
+                fill_simulated_trade(request, &order.order, idx, ts_ms, price, simulation)?,
+            ),
+            ScriptManagedRequest::Order(request) => {
+                fill_simulated_raw_order(request, &order.order, idx, ts_ms, price, simulation)?
+            }
+        };
+    let status = match outcome {
+        SimulatedFillOutcome::Filled(_) => SimulatedOrderStatus::Filled,
+        SimulatedFillOutcome::Cancelled => SimulatedOrderStatus::Cancelled,
+    };
+    let managed = {
+        let managed = simulation
+            .orders
+            .get_mut(order_id)
+            .context("simulated order disappeared after fill")?;
+        managed.status = status;
+        managed.clone()
+    };
+    match outcome {
+        SimulatedFillOutcome::Filled(size) => {
+            let data = json!({
+                "price": price,
+                "size": size,
+                "side": match managed.request.order_direction() {
+                    crate::domain::execution::PositionDirection::Long => "buy",
+                    crate::domain::execution::PositionDirection::Short => "sell",
+                }
+            });
+            queue_simulated_order_event(
+                simulation,
+                &managed,
+                ts_ms,
+                "order.fill",
+                "filled",
+                false,
+                data.clone(),
+            );
+            queue_simulated_order_event(
+                simulation,
+                &managed,
+                ts_ms,
+                "order.filled",
+                "filled",
+                true,
+                data,
+            );
+        }
+        SimulatedFillOutcome::Cancelled => queue_simulated_order_event(
+            simulation,
+            &managed,
+            ts_ms,
+            "order.cancelled",
+            "cancelledReduceOnly",
+            true,
+            json!({ "reason": "reduce-only order would not reduce the net position" }),
+        ),
+    }
+    Ok(())
+}
+
+fn fill_simulated_trade(
+    request: &ScriptTradeRequest,
+    order: &ScriptOrderRef,
+    idx: usize,
+    ts_ms: u64,
+    price: f64,
+    simulation: &mut ScriptSimulationState,
+) -> Result<f64> {
+    validate_position_transition(request, &simulation.open_trades)?;
+    if request.position.is_open() {
+        let side = trade_side(request.position.position_direction());
+        let leverage = request.leverage_or_default();
+        let notional = request
             .margin
             .map(|margin| margin * leverage)
-            .or_else(|| order.request.size.map(|size| size * price));
-        let margin = order
-            .request
+            .or_else(|| request.size.map(|size| size * price));
+        let margin = request
             .margin
             .or_else(|| notional.map(|notional| margin_for_notional(notional, leverage)));
         let opened = open_trade_from_entry(
@@ -1418,29 +1611,30 @@ fn fill_script_order(
                 idx,
                 ts_ms,
                 price,
-                reason: format!("ctx.trade {}", order.request.key),
+                reason: format!("ctx.trade {}", request.key),
                 notional,
                 margin,
                 leverage,
-                order_id: Some(order.order.id.clone()),
-                stop_loss_price: order.request.sl,
-                take_profit_price: order.request.tp,
+                order_id: Some(order.id.clone()),
+                stop_loss_price: request.sl,
+                take_profit_price: request.tp,
             },
         );
+        let filled_qty = opened.qty;
         if let Some(existing) = simulation.open_trades.first_mut() {
             add_to_open_position(existing, opened);
         } else {
             simulation.open_trades.push(opened);
         }
+        Ok(filled_qty)
     } else {
-        let side = trade_side(order.request.position.position_direction());
+        let side = trade_side(request.position.position_direction());
         let open_index = simulation
             .open_trades
             .iter()
             .position(|open| open.side == side)
             .context("matching simulated position disappeared before the close filled")?;
-        let close_qty = order
-            .request
+        let close_qty = request
             .size
             .unwrap_or(simulation.open_trades[open_index].qty);
         close_position_quantity(
@@ -1452,16 +1646,81 @@ fn fill_script_order(
                 idx,
                 ts_ms,
                 price,
-                reason: format!("ctx.trade {}", order.request.key),
+                reason: format!("ctx.trade {}", request.key),
             },
         )?;
+        Ok(close_qty)
     }
-    simulation
-        .orders
-        .get_mut(order_id)
-        .context("simulated order disappeared after fill")?
-        .status = SimulatedOrderStatus::Filled;
-    Ok(())
+}
+
+fn fill_simulated_raw_order(
+    request: &ScriptRawOrderRequest,
+    order: &ScriptOrderRef,
+    idx: usize,
+    ts_ms: u64,
+    price: f64,
+    simulation: &mut ScriptSimulationState,
+) -> Result<SimulatedFillOutcome> {
+    let side = trade_side(request.side.order_direction());
+    let leverage = request.leverage_or_default();
+    let notional = request
+        .margin
+        .map(|margin| margin * leverage)
+        .or_else(|| request.size.map(|size| size * price))
+        .context("ctx.order simulation could not determine order notional")?;
+    let quantity = notional / price;
+    let existing = simulation.open_trades.first().map(|open| open.side);
+
+    if (existing.is_none() || existing == Some(side)) && request.reduce_only {
+        return Ok(SimulatedFillOutcome::Cancelled);
+    }
+
+    let event = TradeEvent {
+        idx,
+        ts_ms,
+        price,
+        reason: format!("ctx.order {}", request.key),
+    };
+    let mut remaining = quantity;
+    if existing.is_some_and(|existing_side| existing_side != side) {
+        let closing = remaining.min(simulation.open_trades[0].qty);
+        close_position_quantity(
+            0,
+            closing,
+            &mut simulation.open_trades,
+            &mut simulation.closed_trades,
+            &event,
+        )?;
+        remaining -= closing;
+        if request.reduce_only {
+            return Ok(SimulatedFillOutcome::Filled(closing));
+        }
+    }
+
+    if remaining > f64::EPSILON {
+        let opened = open_trade_from_entry(
+            &mut simulation.next_position_id,
+            TradeEntry {
+                side,
+                idx,
+                ts_ms,
+                price,
+                reason: event.reason,
+                notional: Some(remaining * price),
+                margin: Some(margin_for_notional(remaining * price, leverage)),
+                leverage,
+                order_id: Some(order.id.clone()),
+                stop_loss_price: None,
+                take_profit_price: None,
+            },
+        );
+        if let Some(existing) = simulation.open_trades.first_mut() {
+            add_to_open_position(existing, opened);
+        } else {
+            simulation.open_trades.push(opened);
+        }
+    }
+    Ok(SimulatedFillOutcome::Filled(quantity))
 }
 
 fn validate_position_transition(
@@ -2183,6 +2442,16 @@ mod tests {
         ScriptExecutionCommand::Trade { order, request }
     }
 
+    fn script_order(value: Value) -> ScriptExecutionCommand {
+        let request: ScriptRawOrderRequest =
+            serde_json::from_value(value).expect("valid raw script order request");
+        let order = ScriptOrderRef {
+            id: crate::scripting::execution::local_order_id("backtest", &request.key),
+            key: request.key.clone(),
+        };
+        ScriptExecutionCommand::Order { order, request }
+    }
+
     #[test]
     fn event_payload_matches_live_source_metadata() {
         let configs = parse_source_configs(&[
@@ -2540,5 +2809,164 @@ export function onData(ctx, input, history) {
         .expect_err("opposite open must fail");
 
         assert!(error.to_string().contains("submit close-long first"));
+    }
+
+    #[test]
+    fn raw_order_reduces_and_flips_the_net_position() {
+        let mut simulation = ScriptSimulationState::default();
+
+        apply_script_execution_commands(
+            vec![script_order(json!({
+                "key": "raw-buy",
+                "side": "long",
+                "size": 10
+            }))],
+            0,
+            1_000,
+            Some(100.0),
+            &mut simulation,
+        )
+        .expect("raw buy fills");
+        assert_eq!(simulation.open_trades.len(), 1);
+        assert_eq!(simulation.open_trades[0].side, TradeSide::Long);
+        assert_eq!(simulation.open_trades[0].qty, 10.0);
+
+        apply_script_execution_commands(
+            vec![script_order(json!({
+                "key": "raw-sell",
+                "side": "short",
+                "size": 14
+            }))],
+            1,
+            2_000,
+            Some(110.0),
+            &mut simulation,
+        )
+        .expect("raw sell closes and flips");
+
+        assert_eq!(simulation.closed_trades.len(), 1);
+        assert_eq!(simulation.closed_trades[0].qty, 10.0);
+        assert_eq!(simulation.closed_trades[0].net_pnl, 100.0);
+        assert_eq!(simulation.open_trades.len(), 1);
+        assert_eq!(simulation.open_trades[0].side, TradeSide::Short);
+        assert_eq!(simulation.open_trades[0].qty, 4.0);
+        assert_eq!(simulation.open_trades[0].entry_price, 110.0);
+    }
+
+    #[test]
+    fn raw_reduce_only_order_closes_without_flipping() {
+        let mut simulation = ScriptSimulationState::default();
+        apply_script_execution_commands(
+            vec![script_order(json!({
+                "key": "raw-buy",
+                "side": "buy",
+                "size": 10
+            }))],
+            0,
+            1_000,
+            Some(100.0),
+            &mut simulation,
+        )
+        .expect("raw buy fills");
+
+        apply_script_execution_commands(
+            vec![script_order(json!({
+                "key": "reduce-sell",
+                "side": "sell",
+                "size": 14,
+                "reduceOnly": true
+            }))],
+            1,
+            2_000,
+            Some(110.0),
+            &mut simulation,
+        )
+        .expect("reduce-only sell fills only the open long");
+
+        assert!(simulation.open_trades.is_empty());
+        assert_eq!(simulation.closed_trades.len(), 1);
+        assert_eq!(simulation.closed_trades[0].qty, 10.0);
+    }
+
+    #[test]
+    fn backtest_delivers_simulated_fills_to_on_execution() {
+        let path = std::env::temp_dir().join(format!(
+            "marketlab-backtest-execution-{}-{}.js",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(
+            &path,
+            r#"
+export const script = {
+  name: "backtest-execution",
+  version: "1",
+  sources: ["candles"],
+  params: {}
+};
+
+export function onData() {}
+
+export function onExecution(ctx, event) {
+  if (event.type === "order.filled" && event.key === "raw-buy") {
+    ctx.order({ key: "raw-sell", side: "sell", size: 1 });
+  }
+  return { metrics: { last_event: event.type } };
+}
+"#,
+        )
+        .expect("write test script");
+        let script = Script::load(&path).expect("load test script");
+        let session = script
+            .start_session_with_execution(
+                &json!({}),
+                ScriptExecutionContext {
+                    job_id: "backtest".to_string(),
+                    enabled: true,
+                },
+            )
+            .expect("start test session");
+        let mut simulation = ScriptSimulationState::default();
+        apply_script_execution_commands(
+            vec![script_order(json!({
+                "key": "raw-buy",
+                "side": "buy",
+                "size": 1
+            }))],
+            0,
+            1_000,
+            Some(100.0),
+            &mut simulation,
+        )
+        .expect("initial raw order fills");
+        let mut report = crate::scripting::telemetry::ScriptRuntimeReportBuilder::start(
+            "test",
+            crate::scripting::telemetry::ScriptReportScript {
+                name: "backtest-execution".to_string(),
+                path: path.display().to_string(),
+                source: "test".to_string(),
+            },
+            None,
+            None,
+            Some("BTC/USDT".to_string()),
+        );
+        let mut latest_output = None;
+
+        let submitted = dispatch_simulated_execution_events(
+            &session,
+            0,
+            1_000,
+            Some(100.0),
+            &mut simulation,
+            &mut report,
+            &mut latest_output,
+        )
+        .expect("dispatch simulated events");
+
+        assert_eq!(submitted, 1);
+        assert!(simulation.open_trades.is_empty());
+        assert_eq!(simulation.closed_trades.len(), 1);
+        assert_eq!(latest_output.unwrap().metrics["last_event"], "order.filled");
+        let _ = std::fs::remove_file(path);
     }
 }

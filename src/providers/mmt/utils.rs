@@ -3,17 +3,10 @@ use serde_json::Value;
 
 use crate::domain::types::OrderBookLevel;
 
-pub fn normalize_symbol_for_mmt(symbol: &str) -> Result<String> {
-    let normalized = symbol.trim().to_lowercase();
-    let mut parts = normalized.split('/');
-    let base = parts.next().unwrap_or_default();
-    let quote = parts.next().unwrap_or_default();
-    if base.is_empty() || quote.is_empty() || parts.next().is_some() {
-        bail!("invalid symbol format: expected BASE/QUOTE, got {symbol}");
-    }
-
-    let quote = if quote == "usdt" { "usd" } else { quote };
-    Ok(format!("{base}/{quote}"))
+pub fn normalize_symbol_for_mmt(exchange: &str, symbol: &str) -> Result<String> {
+    Ok(crate::markets::provider_market("mmt", exchange, symbol)?
+        .provider_symbol
+        .clone())
 }
 
 pub fn normalize_to_ms(ts: u64) -> u64 {

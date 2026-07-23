@@ -60,17 +60,18 @@ fn render_jobs(jobs: &[StrategyJob], output: OutputFormat) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<36} {:<11} {:>8} {:<14} {:<14}",
-                "JOB", "STATUS", "PID", "STRATEGY", "SYMBOL"
+                "{:<36} {:<11} {:>8} {:<14} {:<13} {:<14}",
+                "JOB", "STATUS", "PID", "STRATEGY", "EXCHANGE", "SYMBOL"
             );
             for job in jobs {
                 println!(
-                    "{:<36} {:<11} {:>8} {:<14} {:<14}",
+                    "{:<36} {:<11} {:>8} {:<14} {:<13} {:<14}",
                     job.id,
                     status_name(job.status),
                     job.pid
                         .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
                     job.definition.name(),
+                    venue_name(job.definition.venue()),
                     job.definition.symbol(),
                 );
             }
@@ -96,7 +97,7 @@ fn render_job(job: &StrategyJob, output: OutputFormat) -> Result<()> {
             println!("  symbol:           {}", job.definition.symbol());
             match &job.definition {
                 StrategyJobDefinition::Twap(definition) => {
-                    println!("  exchange:         bulk");
+                    println!("  venue:            {}", venue_name(definition.venue));
                     println!("  side:             {:?}", definition.side);
                     println!("  total size:       {}", definition.total_size);
                     if let Some(margin) = definition.requested_margin {
@@ -106,6 +107,50 @@ fn render_job(job: &StrategyJob, output: OutputFormat) -> Result<()> {
                     println!("  target exposure:  {}", definition.target_exposure);
                     println!("  duration:         {}s", definition.duration_seconds);
                     println!("  interval:         {}s", definition.interval_seconds);
+                    println!("  leverage:         {}x", definition.leverage);
+                    println!("  reduce only:      {}", definition.reduce_only);
+                }
+                StrategyJobDefinition::Vwap(definition) => {
+                    println!("  venue:            {}", venue_name(definition.venue));
+                    println!("  side:             {:?}", definition.side);
+                    println!("  total size:       {}", definition.total_size);
+                    if let Some(margin) = definition.requested_margin {
+                        println!("  requested margin: {margin}");
+                    }
+                    println!("  target margin:    {}", definition.target_margin);
+                    println!("  target exposure:  {}", definition.target_exposure);
+                    println!("  duration:         {}s", definition.duration_seconds);
+                    println!(
+                        "  volume sources:   {}",
+                        definition
+                            .volume_sources
+                            .iter()
+                            .map(crate::strategies::vwap::VolumeSource::selector)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                    println!("  leverage:         {}x", definition.leverage);
+                    println!("  reduce only:      {}", definition.reduce_only);
+                }
+                StrategyJobDefinition::Oiwap(definition) => {
+                    println!("  venue:            {}", venue_name(definition.venue));
+                    println!("  side:             {:?}", definition.side);
+                    println!("  total size:       {}", definition.total_size);
+                    if let Some(margin) = definition.requested_margin {
+                        println!("  requested margin: {margin}");
+                    }
+                    println!("  target margin:    {}", definition.target_margin);
+                    println!("  target exposure:  {}", definition.target_exposure);
+                    println!("  duration:         {}s", definition.duration_seconds);
+                    println!(
+                        "  OI sources:       {}",
+                        definition
+                            .oi_sources
+                            .iter()
+                            .map(crate::strategies::oiwap::OpenInterestSource::selector)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
                     println!("  leverage:         {}x", definition.leverage);
                     println!("  reduce only:      {}", definition.reduce_only);
                 }
@@ -128,6 +173,13 @@ fn render_job(job: &StrategyJob, output: OutputFormat) -> Result<()> {
         OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
     }
     Ok(())
+}
+
+fn venue_name(venue: crate::domain::execution::ExecutionVenue) -> &'static str {
+    match venue {
+        crate::domain::execution::ExecutionVenue::Bulk => "bulk",
+        crate::domain::execution::ExecutionVenue::Hyperliquid => "hyperliquid",
+    }
 }
 
 fn render_log_values(values: &[serde_json::Value], output: OutputFormat) -> Result<()> {

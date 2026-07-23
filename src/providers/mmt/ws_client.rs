@@ -21,6 +21,17 @@ pub struct MmtWsClient {
 static SHARED_WS: OnceLock<Arc<Mutex<WsStream>>> = OnceLock::new();
 
 impl MmtWsClient {
+    pub async fn connect() -> Result<Self> {
+        let api_key = mmt_api_key()?;
+        let ws_url = format!("{MMT_WS_URL}?api_key={}", api_key);
+        let (ws_stream, _) = connect_async(ws_url)
+            .await
+            .context("failed to connect websocket")?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(ws_stream)),
+        })
+    }
+
     pub async fn shared() -> Result<Self> {
         if let Some(inner) = SHARED_WS.get() {
             return Ok(Self {
@@ -28,12 +39,8 @@ impl MmtWsClient {
             });
         }
 
-        let api_key = mmt_api_key()?;
-        let ws_url = format!("{MMT_WS_URL}?api_key={}", api_key);
-        let (ws_stream, _) = connect_async(ws_url)
-            .await
-            .context("failed to connect websocket")?;
-        let arc = Arc::new(Mutex::new(ws_stream));
+        let client = Self::connect().await?;
+        let arc = Arc::clone(&client.inner);
         let _ = SHARED_WS.set(Arc::clone(&arc));
 
         let inner = SHARED_WS
@@ -53,19 +60,30 @@ impl MmtWsClient {
 
     pub async fn next_json(&self) -> Result<Option<serde_json::Value>> {
         let mut ws = self.inner.lock().await;
-        let Some(msg) = ws.next().await else {
-            return Ok(None);
-        };
-        let msg = msg.context("websocket read error")?;
-        let text = match msg {
-            Message::Text(t) => t,
-            Message::Binary(_)
-            | Message::Ping(_)
-            | Message::Pong(_)
-            | Message::Close(_)
-            | Message::Frame(_) => return Ok(Some(serde_json::Value::Null)),
-        };
-        let v: serde_json::Value = serde_json::from_str(&text).context("invalid websocket JSON")?;
-        Ok(Some(v))
+        loop {
+            let Some(msg) = ws.next().await else {
+                return Ok(None);
+            };
+            let msg = msg.context("websocket read error")?;
+            match msg {
+                Message::Text(text) => {
+                    return serde_json::from_str(&text)
+                        .context("invalid websocket JSON")
+                        .map(Some);
+                }
+                Message::Binary(bytes) => {
+                    return serde_json::from_slice(&bytes)
+                        .context("invalid websocket binary JSON")
+                        .map(Some);
+                }
+                Message::Ping(payload) => {
+                    ws.send(Message::Pong(payload))
+                        .await
+                        .context("failed to answer websocket ping")?;
+                }
+                Message::Close(_) => return Ok(None),
+                Message::Pong(_) | Message::Frame(_) => {}
+            }
+        }
     }
 }
