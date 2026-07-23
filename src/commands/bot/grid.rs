@@ -553,16 +553,19 @@ async fn run_worker(job_id: &str, definition: &GridJobDefinition) -> Result<()> 
                             let accepts_pending = slots
                                 .values()
                                 .any(|slot| slot.busy && slot.live.is_none());
+                            let mut account_state = AccountEventState {
+                                order_roles: &order_roles,
+                                pending_fills: &mut pending_fills,
+                                terminal_statuses: &mut terminal_statuses,
+                                slots: &mut slots,
+                                ledger: &mut ledger,
+                            };
                             apply_account_event(
                                 job_id,
                                 current_mark(&book, parent.reference_price),
                                 value,
                                 accepts_pending,
-                                &order_roles,
-                                &mut pending_fills,
-                                &mut terminal_statuses,
-                                &mut slots,
-                                &mut ledger,
+                                &mut account_state,
                             )?;
                         }
                     }
@@ -1165,16 +1168,20 @@ fn apply_action_completion(
     Ok(())
 }
 
+struct AccountEventState<'a> {
+    order_roles: &'a HashMap<String, OrderRole>,
+    pending_fills: &'a mut HashMap<String, Vec<ObservedFill>>,
+    terminal_statuses: &'a mut HashMap<String, String>,
+    slots: &'a mut HashMap<GridKey, QuoteSlot>,
+    ledger: &'a mut FillLedger,
+}
+
 fn apply_account_event(
     job_id: &str,
     mark_price: f64,
     value: Value,
     accepts_pending: bool,
-    order_roles: &HashMap<String, OrderRole>,
-    pending_fills: &mut HashMap<String, Vec<ObservedFill>>,
-    terminal_statuses: &mut HashMap<String, String>,
-    slots: &mut HashMap<GridKey, QuoteSlot>,
-    ledger: &mut FillLedger,
+    state: &mut AccountEventState<'_>,
 ) -> Result<()> {
     match value.get("type").and_then(Value::as_str) {
         Some("fill") => {
@@ -1193,10 +1200,19 @@ fn apply_account_event(
                 price: value.get("price").and_then(Value::as_f64).unwrap_or(0.0),
                 fee: value.get("fee").and_then(Value::as_f64),
             };
-            if let Some(role) = order_roles.get(order_id) {
-                record_fill(job_id, mark_price, ledger, order_id, role, &fill, slots)?;
+            if let Some(role) = state.order_roles.get(order_id) {
+                record_fill(
+                    job_id,
+                    mark_price,
+                    state.ledger,
+                    order_id,
+                    role,
+                    &fill,
+                    state.slots,
+                )?;
             } else if accepts_pending {
-                pending_fills
+                state
+                    .pending_fills
                     .entry(order_id.to_string())
                     .or_default()
                     .push(fill);
@@ -1210,12 +1226,13 @@ fn apply_account_event(
                 return Ok(());
             };
             if is_terminal_order_status(status) {
-                if let Some(OrderRole::Quote(key)) = order_roles.get(order_id) {
-                    let size = slots
+                if let Some(OrderRole::Quote(key)) = state.order_roles.get(order_id) {
+                    let size = state
+                        .slots
                         .get(key)
                         .and_then(|slot| slot.live.as_ref())
                         .map_or(0.0, |quote| quote.remaining_size);
-                    if let Some(slot) = slots.get_mut(key)
+                    if let Some(slot) = state.slots.get_mut(key)
                         && slot
                             .live
                             .as_ref()
@@ -1246,7 +1263,9 @@ fn apply_account_event(
                             .abs(),
                     )?;
                 } else if accepts_pending {
-                    terminal_statuses.insert(order_id.to_string(), status.to_string());
+                    state
+                        .terminal_statuses
+                        .insert(order_id.to_string(), status.to_string());
                 }
             }
         }
