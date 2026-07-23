@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use futures_util::future::join_all;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
@@ -1097,6 +1098,7 @@ fn normalize_hyperliquid_order_status(status: &str) -> &str {
 #[derive(Clone, Debug)]
 pub(super) struct ObservedFill {
     pub(super) timestamp: u64,
+    pub(super) recovered: bool,
     pub(super) buy: bool,
     pub(super) size: f64,
     pub(super) price: f64,
@@ -1195,7 +1197,13 @@ async fn run_worker(job_id: &str, mode: MidMode, definition: &MidPriceJobDefinit
                     }
                     let state = book.borrow().clone();
                     if let Some(error) = state.error {
-                        append_market_data(job_id, mode.name(), "disconnected", Some(&error))?;
+                        append_market_data(
+                            job_id,
+                            mode.name(),
+                            "orderbook",
+                            "disconnected",
+                            Some(&error),
+                        )?;
                     }
                     Some(ReconcilePolicy::PASSIVE)
                 }
@@ -1203,11 +1211,23 @@ async fn run_worker(job_id: &str, mode: MidMode, definition: &MidPriceJobDefinit
                     match event.context("mid-price account-event task stopped")? {
                         AccountFeedEvent::Connected => {
                             account_connected = true;
-                            append_market_data(job_id, mode.name(), "connected", None)?;
+                            append_market_data(
+                                job_id,
+                                mode.name(),
+                                "account",
+                                "connected",
+                                None,
+                            )?;
                         }
                         AccountFeedEvent::Disconnected(error) => {
                             account_connected = false;
-                            append_market_data(job_id, mode.name(), "disconnected", Some(&error))?;
+                            append_market_data(
+                                job_id,
+                                mode.name(),
+                                "account",
+                                "disconnected",
+                                Some(&error),
+                            )?;
                         }
                         AccountFeedEvent::Recovery { open_orders, fills } => {
                             reconcile_recovery(
@@ -1843,6 +1863,7 @@ fn apply_account_event(
                 .unwrap_or_default();
             let fill = ObservedFill {
                 timestamp: normalize_timestamp_ms(timestamp),
+                recovered: false,
                 buy: value.get("isBuy").and_then(Value::as_bool).unwrap_or(false),
                 size: value.get("size").and_then(Value::as_f64).unwrap_or(0.0),
                 price: value.get("price").and_then(Value::as_f64).unwrap_or(0.0),
@@ -1954,6 +1975,7 @@ fn reconcile_recovery(
         }
         let observed = ObservedFill {
             timestamp: fill.ts_ms,
+            recovered: true,
             buy: fill.side == OrderSide::Buy,
             size: fill.amount,
             price: fill.price,
@@ -2037,6 +2059,8 @@ pub(super) fn append_fill(
             "bot": bot,
             "jobId": job_id,
             "orderId": order_id,
+            "venueTsMs": fill.timestamp,
+            "recovered": fill.recovered,
             "side": if fill.buy { "BUY" } else { "SELL" },
             "size": fill.size,
             "price": fill.price,
@@ -2147,6 +2171,7 @@ fn append_quote(
 pub(super) fn append_market_data(
     job_id: &str,
     bot: &str,
+    feed: &str,
     status: &str,
     error: Option<&str>,
 ) -> Result<()> {
@@ -2156,6 +2181,7 @@ pub(super) fn append_market_data(
             "type": "bot.market_data",
             "bot": bot,
             "jobId": job_id,
+            "feed": feed,
             "status": status,
             "error": error,
         }),
@@ -2202,9 +2228,21 @@ async fn cleanup(
         if remaining.is_empty() {
             break;
         }
-        for order in remaining {
-            let plan = cancel_plan(parent, order.order_id.clone())?;
-            match adapter.cancel_order(&plan).await {
+        let cancellation_plans = remaining
+            .into_iter()
+            .map(|order| {
+                let plan = cancel_plan(parent, order.order_id.clone())?;
+                Ok((order, plan))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let cancellation_results = join_all(
+            cancellation_plans
+                .iter()
+                .map(|(_, plan)| adapter.cancel_order(plan)),
+        )
+        .await;
+        for ((order, _), result) in cancellation_plans.into_iter().zip(cancellation_results) {
+            match result {
                 Ok(receipt) => append_quote(
                     job_id,
                     bot,
@@ -2352,6 +2390,7 @@ mod tests {
         let mut ledger = FillLedger::default();
         let buy = ObservedFill {
             timestamp: 10,
+            recovered: false,
             buy: true,
             size: 2.0,
             price: 100.0,
@@ -2359,6 +2398,7 @@ mod tests {
         };
         let sell = ObservedFill {
             timestamp: 11,
+            recovered: false,
             buy: false,
             size: 1.0,
             price: 101.0,
@@ -2380,6 +2420,7 @@ mod tests {
             "buy",
             &ObservedFill {
                 timestamp: 1,
+                recovered: false,
                 buy: true,
                 size: 2.0,
                 price: 100.0,
@@ -2390,6 +2431,7 @@ mod tests {
             "sell",
             &ObservedFill {
                 timestamp: 2,
+                recovered: false,
                 buy: false,
                 size: 3.0,
                 price: 110.0,
@@ -2419,6 +2461,7 @@ mod tests {
             "recovered",
             &ObservedFill {
                 timestamp: 1,
+                recovered: true,
                 buy: true,
                 size: 1.0,
                 price: 100.0,
@@ -2629,6 +2672,7 @@ mod tests {
             "buy",
             &ObservedFill {
                 timestamp: 1,
+                recovered: false,
                 buy: true,
                 size: 1.0,
                 price: 100.0,
@@ -2642,6 +2686,7 @@ mod tests {
             "buy",
             &ObservedFill {
                 timestamp: 1,
+                recovered: true,
                 buy: true,
                 size: 1.0,
                 price: 100.0,

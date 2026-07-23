@@ -21,10 +21,12 @@ type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 const TRADING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 const TRADING_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const SUBSCRIPTION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_INFLIGHT_POSTS: usize = 100;
 
 struct HyperliquidWsClient {
     stream: WsStream,
+    heartbeat: tokio::time::Interval,
 }
 
 #[derive(Clone, Default)]
@@ -223,25 +225,30 @@ impl HyperliquidWsClient {
                 .await
                 .context("failed to subscribe to Hyperliquid testnet WebSocket")?;
         }
-        Ok(Self { stream })
+        let start = tokio::time::Instant::now() + SUBSCRIPTION_HEARTBEAT_INTERVAL;
+        let mut heartbeat = tokio::time::interval_at(start, SUBSCRIPTION_HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Ok(Self { stream, heartbeat })
     }
 
     async fn next_json(&mut self) -> Result<Value> {
         loop {
-            let message =
-                match tokio::time::timeout(Duration::from_secs(30), self.stream.next()).await {
-                    Ok(Some(message)) => message.context("Hyperliquid WebSocket read failed")?,
-                    Ok(None) => bail!("Hyperliquid WebSocket closed by server"),
-                    Err(_) => {
-                        self.stream
-                            .send(Message::Text(
-                                serde_json::json!({ "method": "ping" }).to_string().into(),
-                            ))
-                            .await
-                            .context("failed to ping Hyperliquid WebSocket")?;
-                        continue;
-                    }
-                };
+            let message = tokio::select! {
+                biased;
+                _ = self.heartbeat.tick() => {
+                    self.stream
+                        .send(Message::Text(
+                            serde_json::json!({ "method": "ping" }).to_string().into(),
+                        ))
+                        .await
+                        .context("failed to heartbeat Hyperliquid WebSocket")?;
+                    continue;
+                }
+                message = self.stream.next() => match message {
+                    Some(message) => message.context("Hyperliquid WebSocket read failed")?,
+                    None => bail!("Hyperliquid WebSocket closed by server"),
+                },
+            };
             let value: Value = match message {
                 Message::Text(text) => serde_json::from_str(&text)
                     .context("Hyperliquid WebSocket returned invalid JSON")?,

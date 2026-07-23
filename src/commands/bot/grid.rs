@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use futures_util::future::join_all;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::task::JoinSet;
@@ -525,18 +526,30 @@ async fn run_worker(job_id: &str, definition: &GridJobDefinition) -> Result<()> 
                     }
                     let state = book.borrow().clone();
                     if let Some(error) = state.error {
-                        append_market_data(job_id, BOT_NAME, "disconnected", Some(&error))?;
+                        append_market_data(
+                            job_id,
+                            BOT_NAME,
+                            "orderbook",
+                            "disconnected",
+                            Some(&error),
+                        )?;
                     }
                 }
                 event = account_events.recv() => {
                     match event.context("grid account-event task stopped")? {
                         AccountFeedEvent::Connected => {
                             account_connected = true;
-                            append_market_data(job_id, BOT_NAME, "connected", None)?;
+                            append_market_data(job_id, BOT_NAME, "account", "connected", None)?;
                         }
                         AccountFeedEvent::Disconnected(error) => {
                             account_connected = false;
-                            append_market_data(job_id, BOT_NAME, "disconnected", Some(&error))?;
+                            append_market_data(
+                                job_id,
+                                BOT_NAME,
+                                "account",
+                                "disconnected",
+                                Some(&error),
+                            )?;
                         }
                         AccountFeedEvent::Recovery { open_orders, fills } => {
                             reconcile_recovery(
@@ -1195,6 +1208,7 @@ fn apply_account_event(
                 .unwrap_or_default();
             let fill = ObservedFill {
                 timestamp: normalize_timestamp_ms(timestamp),
+                recovered: false,
                 buy: value.get("isBuy").and_then(Value::as_bool).unwrap_or(false),
                 size: value.get("size").and_then(Value::as_f64).unwrap_or(0.0),
                 price: value.get("price").and_then(Value::as_f64).unwrap_or(0.0),
@@ -1340,6 +1354,7 @@ fn reconcile_recovery(
         };
         let observed = ObservedFill {
             timestamp: fill.ts_ms,
+            recovered: true,
             buy: fill.side == OrderSide::Buy,
             size: fill.amount,
             price: fill.price,
@@ -1472,9 +1487,21 @@ async fn cleanup(
         if remaining.is_empty() {
             break;
         }
-        for order in remaining {
-            let plan = cancel_plan(parent, order.order_id.clone())?;
-            match adapter.cancel_order(&plan).await {
+        let cancellation_plans = remaining
+            .into_iter()
+            .map(|order| {
+                let plan = cancel_plan(parent, order.order_id.clone())?;
+                Ok((order, plan))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let cancellation_results = join_all(
+            cancellation_plans
+                .iter()
+                .map(|(_, plan)| adapter.cancel_order(plan)),
+        )
+        .await;
+        for ((order, _), result) in cancellation_plans.into_iter().zip(cancellation_results) {
+            match result {
                 Ok(receipt) => {
                     if let Some(OrderRole::Quote(key)) = order_roles.get(&order.order_id) {
                         append_grid_quote(
@@ -1609,6 +1636,7 @@ mod tests {
         )]);
         let fill = ObservedFill {
             timestamp: 1,
+            recovered: false,
             buy: true,
             size: 0.75,
             price: 100.0,

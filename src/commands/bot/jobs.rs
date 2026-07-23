@@ -268,7 +268,7 @@ fn terminal_log_line(value: &serde_json::Value) -> String {
             number(value, "size"),
         ),
         "bot.fill" => format!(
-            "fill {} {} @ {} buy={} sell={} inventory={} realized={} unrealized={} fees={} pnl={}",
+            "fill {} {} @ {} buy={} sell={} inventory={} realized={} unrealized={} fees={} pnl={}{}",
             value
                 .get("side")
                 .and_then(serde_json::Value::as_str)
@@ -282,9 +282,18 @@ fn terminal_log_line(value: &serde_json::Value) -> String {
             performance_number(value, "unrealizedPnl"),
             performance_number(value, "fees"),
             performance_number(value, "tradingPnl"),
+            recovered_fill_suffix(value),
         ),
         "bot.market_data" => format!(
-            "market data {}{}",
+            "{} {}{}",
+            value
+                .get("feed")
+                .and_then(serde_json::Value::as_str)
+                .map_or("market data", |feed| match feed {
+                    "account" => "account stream",
+                    "orderbook" => "orderbook stream",
+                    _ => "market data",
+                }),
             value
                 .get("status")
                 .and_then(serde_json::Value::as_str)
@@ -365,16 +374,33 @@ fn log_datetime(value: &serde_json::Value) -> String {
         .get("tsMs")
         .or_else(|| value.get("ts_ms"))
         .and_then(serde_json::Value::as_u64)
-        .and_then(|ts_ms| chrono::DateTime::<Utc>::from_timestamp_millis(ts_ms as i64))
-        .map_or_else(
-            || "time unavailable".to_string(),
-            |date_time| {
-                date_time
-                    .with_timezone(&Local)
-                    .format("%Y-%m-%d %H:%M:%S%.3f %Z")
-                    .to_string()
-            },
-        )
+        .and_then(format_datetime)
+        .unwrap_or_else(|| "time unavailable".to_string())
+}
+
+fn recovered_fill_suffix(value: &serde_json::Value) -> String {
+    if !value
+        .get("recovered")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return String::new();
+    }
+    let venue_time = value
+        .get("venueTsMs")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(format_datetime)
+        .unwrap_or_else(|| "time unavailable".to_string());
+    format!(" recovered venue_time={venue_time}")
+}
+
+fn format_datetime(ts_ms: u64) -> Option<String> {
+    chrono::DateTime::<Utc>::from_timestamp_millis(ts_ms as i64).map(|date_time| {
+        date_time
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M:%S%.3f %Z")
+            .to_string()
+    })
 }
 
 fn number(value: &serde_json::Value, key: &str) -> String {
@@ -456,5 +482,36 @@ mod tests {
         }));
 
         assert_eq!(line, "[time unavailable] market data connected");
+    }
+
+    #[test]
+    fn bot_logs_distinguish_account_stream_state() {
+        let line = terminal_log_line(&serde_json::json!({
+            "type": "bot.market_data",
+            "feed": "account",
+            "status": "connected",
+        }));
+
+        assert_eq!(line, "[time unavailable] account stream connected");
+    }
+
+    #[test]
+    fn recovered_fill_logs_include_the_venue_datetime() {
+        let venue_ts_ms = 1_780_000_000_123_u64;
+        let expected = format_datetime(venue_ts_ms).expect("test timestamp should be valid");
+        let line = terminal_log_line(&serde_json::json!({
+            "type": "bot.fill",
+            "recovered": true,
+            "venueTsMs": venue_ts_ms,
+            "side": "BUY",
+            "size": 1.0,
+            "price": 100.0,
+            "boughtSize": 1.0,
+            "soldSize": 0.0,
+            "inventorySize": 1.0,
+            "performance": {},
+        }));
+
+        assert!(line.ends_with(&format!("recovered venue_time={expected}")));
     }
 }
