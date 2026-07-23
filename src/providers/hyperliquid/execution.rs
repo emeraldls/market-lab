@@ -402,7 +402,7 @@ fn resolved_mainnet_market(venue_symbol: &str) -> Result<ResolvedMarket> {
             .context("Hyperliquid market snapshot omitted the native asset id")?,
         size_precision: rules.size_precision,
         lot_size: rules.lot_size,
-        max_leverage: rules.max_leverage,
+        max_leverage: rules.max_leverage as u32, //TODO: look into if casting is needed
         cross_margin: rules.cross_margin,
     })
 }
