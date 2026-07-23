@@ -86,6 +86,7 @@ async fn main() -> Result<()> {
         },
         Commands::Bot { command: bot } => match bot {
             BotCommands::Run { command } => match command {
+                BotRunCommands::Grid(args) => commands::bot::grid::handle(args).await?,
                 BotRunCommands::MidPrice(args) => {
                     commands::bot::mid_price::handle_mid_price(args).await?
                 }

@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+use crate::bots::grid::MAX_GRID_LEVELS_PER_SIDE;
 use crate::domain::enums::{BookMode, ProviderKind, Side};
 use crate::domain::execution::{ExecutionVenue, OrderKind, TimeInForce};
 use crate::domain::requests::{
@@ -463,6 +464,7 @@ pub enum BotCommands {
 
 #[derive(Subcommand, Debug)]
 pub enum BotRunCommands {
+    Grid(RunGridArgs),
     MidPrice(RunMidPriceArgs),
     VolumeMid(RunVolumeMidArgs),
 }
@@ -1663,6 +1665,42 @@ pub struct RunVolumeMidArgs {
 }
 
 #[derive(Clone, Debug, Args)]
+pub struct RunGridArgs {
+    pub symbol: String,
+    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    pub venue: ExecutionVenueArg,
+    /// Hard one-sided inventory limit in base-asset units.
+    #[arg(long, conflicts_with = "margin", required_unless_present = "margin")]
+    pub size: Option<f64>,
+    /// Collateral allocated to the bot. Margin multiplied by leverage is the total working exposure.
+    #[arg(long, conflicts_with = "size", required_unless_present = "size")]
+    pub margin: Option<f64>,
+    /// Maximum bot runtime in seconds.
+    #[arg(long)]
+    pub duration: u64,
+    /// Number of simultaneously maintained price levels on each side.
+    #[arg(long, default_value_t = 3)]
+    pub levels: u16,
+    /// Distance behind the live best bid/ask for level one and between every following level.
+    #[arg(long, default_value_t = 2.0)]
+    pub step_bps: f64,
+    /// Adverse movement from the bot's average entry that activates passive inventory rescue (0-1%).
+    #[arg(long)]
+    pub reset_threshold_pct: Option<f64>,
+    #[arg(long, default_value_t = 1.0)]
+    pub leverage: f64,
+    /// Stop after net bot PnL loses this percentage of allocated margin. Zero disables it.
+    #[arg(long)]
+    pub stop_loss_pct: Option<f64>,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
 pub struct StrategyJobsArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
@@ -1983,6 +2021,68 @@ impl RunVolumeMidArgs {
         }
         if !self.refresh_tolerance_bps.is_finite() || self.refresh_tolerance_bps < 0.0 {
             bail!("--refresh-tolerance-bps must be zero or greater");
+        }
+        Ok(())
+    }
+}
+
+impl RunGridArgs {
+    pub fn validate(&self) -> Result<()> {
+        if !is_valid_symbol(&self.symbol) {
+            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        if self
+            .size
+            .is_some_and(|size| !size.is_finite() || size <= 0.0)
+        {
+            bail!("--size must be > 0");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| !margin.is_finite() || margin <= 0.0)
+        {
+            bail!("--margin must be > 0");
+        }
+        match (self.size, self.margin) {
+            (Some(_), Some(_)) => bail!("set only one of --size or --margin"),
+            (None, None) => bail!("one of --size or --margin is required"),
+            _ => {}
+        }
+        if self.duration == 0 {
+            bail!("--duration must be >= 1 second");
+        }
+        if !(1..=MAX_GRID_LEVELS_PER_SIDE).contains(&self.levels) {
+            bail!("--levels must be between 1 and {MAX_GRID_LEVELS_PER_SIDE}");
+        }
+        if !self.step_bps.is_finite() || self.step_bps <= 0.0 {
+            bail!("--step-bps must be greater than zero");
+        }
+        if self
+            .reset_threshold_pct
+            .is_some_and(|percent| !percent.is_finite() || !(0.0..=1.0).contains(&percent))
+        {
+            bail!("--reset-threshold-pct must be between 0 and 1 percent");
+        }
+        if !self.leverage.is_finite() || self.leverage < 1.0 {
+            bail!("--leverage must be at least 1");
+        }
+        if self
+            .stop_loss_pct
+            .is_some_and(|percent| !percent.is_finite() || !(0.0..=100.0).contains(&percent))
+        {
+            bail!("--stop-loss-pct must be between 0 and 100 percent");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| !(margin * self.leverage).is_finite())
+        {
+            bail!("--margin multiplied by --leverage is too large");
+        }
+        if self.dry_run && self.yes {
+            bail!("--yes is not used with --dry-run");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("bot run supports only --output terminal|json|jsonl");
         }
         Ok(())
     }
@@ -3314,6 +3414,52 @@ mod tests {
                 assert_eq!(args.refresh_tolerance_bps, 0.5);
             }
             _ => panic!("expected bot run volume-mid command"),
+        }
+    }
+
+    #[test]
+    fn parse_multi_level_grid_bot() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "bot",
+            "run",
+            "grid",
+            "BTC/USDT",
+            "--venue",
+            "hyperliquid",
+            "--margin",
+            "100",
+            "--duration",
+            "300",
+            "--levels",
+            "4",
+            "--step-bps",
+            "2",
+            "--reset-threshold-pct",
+            "0.5",
+            "--leverage",
+            "10",
+            "--stop-loss-pct",
+            "5",
+            "--dry-run",
+        ])
+        .expect("grid bot should parse");
+
+        match cli.command {
+            Commands::Bot {
+                command:
+                    BotCommands::Run {
+                        command: BotRunCommands::Grid(args),
+                    },
+            } => {
+                args.validate().expect("grid arguments should validate");
+                assert_eq!(args.margin, Some(100.0));
+                assert_eq!(args.levels, 4);
+                assert_eq!(args.step_bps, 2.0);
+                assert_eq!(args.reset_threshold_pct, Some(0.5));
+                assert_eq!(args.stop_loss_pct, Some(5.0));
+            }
+            _ => panic!("expected bot run grid command"),
         }
     }
 

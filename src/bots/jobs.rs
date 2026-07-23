@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::bots::grid::MAX_GRID_LEVELS_PER_SIDE;
 use crate::domain::execution::ExecutionVenue;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -27,6 +28,78 @@ pub struct MidPriceJobDefinition {
     pub leverage: f64,
     #[serde(default)]
     pub stop_loss_pct: Option<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GridJobDefinition {
+    pub venue: ExecutionVenue,
+    pub symbol: String,
+    /// Hard one-sided inventory limit in normalized base-asset units.
+    pub max_inventory_size: f64,
+    pub requested_margin: Option<f64>,
+    pub max_inventory_margin: f64,
+    pub max_inventory_exposure: f64,
+    pub duration_seconds: u64,
+    pub levels_per_side: u16,
+    pub step_bps: f64,
+    pub reset_threshold_pct: Option<f64>,
+    pub leverage: f64,
+    pub stop_loss_pct: Option<f64>,
+}
+
+impl GridJobDefinition {
+    pub fn validate(&self) -> Result<()> {
+        if self.symbol.trim().is_empty() {
+            bail!("grid bot symbol is required");
+        }
+        if !self.max_inventory_size.is_finite() || self.max_inventory_size <= 0.0 {
+            bail!("grid bot maximum inventory size must be greater than zero");
+        }
+        if self
+            .requested_margin
+            .is_some_and(|margin| !margin.is_finite() || margin <= 0.0)
+        {
+            bail!("grid bot requested margin must be greater than zero");
+        }
+        if !self.max_inventory_margin.is_finite() || self.max_inventory_margin <= 0.0 {
+            bail!("grid bot maximum inventory margin must be greater than zero");
+        }
+        if !self.max_inventory_exposure.is_finite() || self.max_inventory_exposure <= 0.0 {
+            bail!("grid bot maximum inventory exposure must be greater than zero");
+        }
+        if self.duration_seconds == 0 {
+            bail!("grid bot duration must be at least one second");
+        }
+        if !(1..=MAX_GRID_LEVELS_PER_SIDE).contains(&self.levels_per_side) {
+            bail!("grid bot levels per side must be between 1 and {MAX_GRID_LEVELS_PER_SIDE}");
+        }
+        if !self.step_bps.is_finite() || self.step_bps <= 0.0 {
+            bail!("grid bot step must be greater than zero");
+        }
+        if self
+            .reset_threshold_pct
+            .is_some_and(|percent| !percent.is_finite() || !(0.0..=1.0).contains(&percent))
+        {
+            bail!("grid bot reset threshold must be between 0 and 1 percent");
+        }
+        if !self.leverage.is_finite() || self.leverage < 1.0 {
+            bail!("grid bot leverage must be at least 1");
+        }
+        if self
+            .stop_loss_pct
+            .is_some_and(|percent| !percent.is_finite() || !(0.0..=100.0).contains(&percent))
+        {
+            bail!("grid bot stop loss must be between 0 and 100 percent");
+        }
+        let expected_margin = self.max_inventory_exposure / self.leverage;
+        if (self.max_inventory_margin - expected_margin).abs()
+            > 1e-8_f64.max(expected_margin.abs() * 1e-10)
+        {
+            bail!("grid bot margin, exposure, and leverage do not agree");
+        }
+        Ok(())
+    }
 }
 
 impl MidPriceJobDefinition {
@@ -88,6 +161,7 @@ impl MidPriceJobDefinition {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "name", content = "config", rename_all = "snake_case")]
 pub enum BotJobDefinition {
+    Grid(GridJobDefinition),
     MidPrice(MidPriceJobDefinition),
     VolumeMid(MidPriceJobDefinition),
 }
@@ -95,6 +169,7 @@ pub enum BotJobDefinition {
 impl BotJobDefinition {
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Grid(_) => "grid",
             Self::MidPrice(_) => "mid-price",
             Self::VolumeMid(_) => "volume-mid",
         }
@@ -102,24 +177,28 @@ impl BotJobDefinition {
 
     pub fn symbol(&self) -> &str {
         match self {
+            Self::Grid(definition) => &definition.symbol,
             Self::MidPrice(definition) | Self::VolumeMid(definition) => &definition.symbol,
         }
     }
 
     pub fn venue(&self) -> ExecutionVenue {
         match self {
+            Self::Grid(definition) => definition.venue,
             Self::MidPrice(definition) | Self::VolumeMid(definition) => definition.venue,
         }
     }
 
     pub fn leverage(&self) -> f64 {
         match self {
+            Self::Grid(definition) => definition.leverage,
             Self::MidPrice(definition) | Self::VolumeMid(definition) => definition.leverage,
         }
     }
 
     pub fn validate(&self) -> Result<()> {
         match self {
+            Self::Grid(definition) => definition.validate(),
             Self::MidPrice(definition) | Self::VolumeMid(definition) => definition.validate(),
         }
     }

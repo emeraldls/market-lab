@@ -33,7 +33,7 @@ use crate::strategies::jobs::{
 };
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-const RUNTIME_VERSION: u8 = 26;
+const RUNTIME_VERSION: u8 = 29;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -2843,22 +2843,31 @@ async fn execute_bot_trade(
 }
 
 fn validate_bot_trade(definition: &BotJobDefinition, plan: &TradePlan) -> Result<()> {
-    let definition = match definition {
-        BotJobDefinition::MidPrice(definition) | BotJobDefinition::VolumeMid(definition) => {
-            definition
-        }
+    let (venue, symbol, leverage, max_inventory_size, name) = match definition {
+        BotJobDefinition::Grid(definition) => (
+            definition.venue,
+            definition.symbol.as_str(),
+            definition.leverage,
+            definition.max_inventory_size,
+            "grid",
+        ),
+        BotJobDefinition::MidPrice(definition) | BotJobDefinition::VolumeMid(definition) => (
+            definition.venue,
+            definition.symbol.as_str(),
+            definition.leverage,
+            definition.max_inventory_size,
+            "mid-price",
+        ),
     };
-    if plan.venue != definition.venue
-        || plan.internal_symbol != definition.symbol
-        || (plan.leverage - definition.leverage).abs() > f64::EPSILON
+    if plan.venue != venue
+        || plan.internal_symbol != symbol
+        || (plan.leverage - leverage).abs() > f64::EPSILON
         || plan.stop_loss_price.is_some()
         || plan.take_profit_price.is_some()
-        || plan.size
-            > definition.max_inventory_size
-                + 1e-12_f64.max(definition.max_inventory_size.abs() * 1e-12)
+        || plan.size > max_inventory_size + 1e-12_f64.max(max_inventory_size.abs() * 1e-12)
         || crate::domain::execution::OrderSide::from(plan.direction) != plan.side
     {
-        bail!("bot order does not match its persisted mid-price definition");
+        bail!("bot order does not match its persisted {name} definition");
     }
 
     match plan.order_kind {
@@ -2867,12 +2876,12 @@ fn validate_bot_trade(definition: &BotJobDefinition, plan: &TradePlan) -> Result
                 || plan.price.is_none()
                 || plan.time_in_force != Some(crate::domain::execution::TimeInForce::Alo)
             {
-                bail!("mid-price quotes must be non-reduce-only post-only ALO limit orders");
+                bail!("bot quotes must be non-reduce-only post-only ALO limit orders");
             }
         }
         crate::domain::execution::OrderKind::Market => {
             if plan.reduce_only || plan.price.is_some() || plan.time_in_force.is_some() {
-                bail!("mid-price inventory unwinds must be non-reduce-only market orders");
+                bail!("bot inventory exits must be non-reduce-only market orders");
             }
         }
     }
@@ -4560,8 +4569,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_protocol_v26_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 26);
+    fn runtime_protocol_v29_decodes_oiwap_submissions() {
+        assert_eq!(RUNTIME_VERSION, 29);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",
@@ -4597,7 +4606,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_protocol_v26_decodes_mid_price_bot_submissions() {
+    fn runtime_protocol_v29_decodes_mid_price_bot_submissions() {
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_bot_job",
             "submission": {
@@ -4633,7 +4642,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_protocol_v26_decodes_volume_mid_bot_submissions() {
+    fn runtime_protocol_v29_decodes_volume_mid_bot_submissions() {
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_bot_job",
             "submission": {
@@ -4664,6 +4673,42 @@ mod tests {
             RuntimeRequest::SubmitBotJob {
                 submission: BotJobSubmission {
                     definition: BotJobDefinition::VolumeMid(_)
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn runtime_protocol_v29_decodes_grid_bot_submissions() {
+        let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
+            "type": "submit_bot_job",
+            "submission": {
+                "definition": {
+                    "name": "grid",
+                    "config": {
+                        "venue": "hyperliquid",
+                        "symbol": "BTC/USDT",
+                        "maxInventorySize": 0.02,
+                        "requestedMargin": 100.0,
+                        "maxInventoryMargin": 100.0,
+                        "maxInventoryExposure": 1_000.0,
+                        "durationSeconds": 300,
+                        "levelsPerSide": 3,
+                        "stepBps": 2.0,
+                        "resetThresholdPct": 0.5,
+                        "leverage": 10.0,
+                        "stopLossPct": 5.0
+                    }
+                }
+            }
+        }))
+        .expect("runtime protocol should decode grid bot submissions");
+
+        assert!(matches!(
+            request,
+            RuntimeRequest::SubmitBotJob {
+                submission: BotJobSubmission {
+                    definition: BotJobDefinition::Grid(_)
                 }
             }
         ));

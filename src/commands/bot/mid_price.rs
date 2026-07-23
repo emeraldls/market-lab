@@ -91,7 +91,7 @@ struct MidPricePlanView<'a> {
 }
 
 #[derive(Debug)]
-struct BotStopped;
+pub(super) struct BotStopped;
 
 impl fmt::Display for BotStopped {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -229,6 +229,7 @@ async fn handle(
 
 pub async fn handle_worker_job(job_id: &str, job: BotJob) -> Result<()> {
     let (mode, definition) = match job.definition {
+        BotJobDefinition::Grid(_) => bail!("mid-price worker received a grid job"),
         BotJobDefinition::MidPrice(definition) => (MidMode::QuoteProtection, definition),
         BotJobDefinition::VolumeMid(definition) => (MidMode::FillPriority, definition),
     };
@@ -406,7 +407,7 @@ fn render_plan(plan: &MidPricePlanView<'_>, output: OutputFormat) -> Result<()> 
     Ok(())
 }
 
-fn render_submission(job: &BotJob, output: OutputFormat) -> Result<()> {
+pub(super) fn render_submission(job: &BotJob, output: OutputFormat) -> Result<()> {
     match output {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(job)?),
         OutputFormat::Jsonl => println!("{}", serde_json::to_string(job)?),
@@ -424,7 +425,7 @@ fn render_submission(job: &BotJob, output: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-fn confirm_live_execution(venue: ExecutionVenue) -> Result<bool> {
+pub(super) fn confirm_live_execution(venue: ExecutionVenue) -> Result<bool> {
     print!(
         "Deploy this live maker-only bot on {}? [y/N]: ",
         venue_label(venue)
@@ -442,28 +443,31 @@ fn confirm_live_execution(venue: ExecutionVenue) -> Result<bool> {
     ))
 }
 
-fn venue_key(venue: ExecutionVenue) -> &'static str {
+pub(super) fn venue_key(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "bulk",
         ExecutionVenue::Hyperliquid => "hyperliquid",
     }
 }
 
-fn venue_label(venue: ExecutionVenue) -> &'static str {
+pub(super) fn venue_label(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "BULK",
         ExecutionVenue::Hyperliquid => "Hyperliquid testnet",
     }
 }
 
-fn execution_market(
+pub(super) fn execution_market(
     venue: ExecutionVenue,
     symbol: &str,
 ) -> Result<std::sync::Arc<crate::markets::Market>> {
     crate::markets::exchange_market(venue_key(venue), symbol)
 }
 
-async fn live_orderbook(venue: ExecutionVenue, symbol: &str) -> Result<OrderBookSnapshot> {
+pub(super) async fn live_orderbook(
+    venue: ExecutionVenue,
+    symbol: &str,
+) -> Result<OrderBookSnapshot> {
     match venue {
         ExecutionVenue::Bulk => BulkProvider::live_orderbook(symbol, BOOK_DEPTH, None).await,
         ExecutionVenue::Hyperliquid => {
@@ -482,28 +486,28 @@ fn bias_name(bias: f64) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum QuoteSide {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum QuoteSide {
     Buy,
     Sell,
 }
 
 impl QuoteSide {
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Self::Buy => "BUY",
             Self::Sell => "SELL",
         }
     }
 
-    fn order_side(self) -> OrderSide {
+    pub(super) fn order_side(self) -> OrderSide {
         match self {
             Self::Buy => OrderSide::Buy,
             Self::Sell => OrderSide::Sell,
         }
     }
 
-    fn direction(self) -> PositionDirection {
+    pub(super) fn direction(self) -> PositionDirection {
         match self {
             Self::Buy => PositionDirection::Long,
             Self::Sell => PositionDirection::Short,
@@ -565,13 +569,13 @@ impl QuoteSlot {
 }
 
 #[derive(Clone, Debug, Default)]
-struct BookFeedState {
-    revision: u64,
-    top: Option<TopOfBook>,
-    error: Option<String>,
+pub(super) struct BookFeedState {
+    pub(super) revision: u64,
+    pub(super) top: Option<TopOfBook>,
+    pub(super) error: Option<String>,
 }
 
-enum AccountFeedEvent {
+pub(super) enum AccountFeedEvent {
     Connected,
     Disconnected(String),
     Recovery {
@@ -599,7 +603,7 @@ struct ActionCompletion {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct FillKey {
+pub(super) struct FillKey {
     order_id: String,
     timestamp: u64,
     size_bits: u64,
@@ -607,7 +611,7 @@ struct FillKey {
     buy: bool,
 }
 
-struct FillLedger {
+pub(super) struct FillLedger {
     allocated_margin: f64,
     bought_size: f64,
     sold_size: f64,
@@ -642,18 +646,28 @@ impl Default for FillLedger {
 }
 
 impl FillLedger {
-    fn with_allocated_margin(allocated_margin: f64) -> Self {
+    pub(super) fn with_allocated_margin(allocated_margin: f64) -> Self {
         Self {
             allocated_margin,
             ..Self::default()
         }
     }
 
-    fn inventory(&self) -> f64 {
+    pub(super) fn inventory(&self) -> f64 {
         self.position_size
     }
 
-    fn key(order_id: &str, timestamp: u64, buy: bool, size: f64, price: f64) -> Option<FillKey> {
+    pub(super) fn average_entry_price(&self) -> Option<f64> {
+        (self.position_size.abs() > f64::EPSILON).then_some(self.average_entry_price)
+    }
+
+    pub(super) fn key(
+        order_id: &str,
+        timestamp: u64,
+        buy: bool,
+        size: f64,
+        price: f64,
+    ) -> Option<FillKey> {
         if !size.is_finite() || size <= 0.0 || !price.is_finite() || price <= 0.0 {
             return None;
         }
@@ -666,7 +680,7 @@ impl FillLedger {
         })
     }
 
-    fn record_live(&mut self, order_id: &str, fill: &ObservedFill) -> bool {
+    pub(super) fn record_live(&mut self, order_id: &str, fill: &ObservedFill) -> bool {
         let Some(key) = Self::key(order_id, fill.timestamp, fill.buy, fill.size, fill.price) else {
             return false;
         };
@@ -674,7 +688,7 @@ impl FillLedger {
         self.add(fill)
     }
 
-    fn record_recovery_occurrence(
+    pub(super) fn record_recovery_occurrence(
         &mut self,
         order_id: &str,
         fill: &ObservedFill,
@@ -736,7 +750,7 @@ impl FillLedger {
         true
     }
 
-    fn performance(&self, mark_price: f64) -> BotPerformance {
+    pub(super) fn performance(&self, mark_price: f64) -> BotPerformance {
         let unrealized_pnl = if self.position_size > 0.0 {
             (mark_price - self.average_entry_price) * self.position_size
         } else if self.position_size < 0.0 {
@@ -796,7 +810,10 @@ impl BotOrderBookStream {
     }
 }
 
-fn spawn_book_feed(venue: ExecutionVenue, symbol: String) -> watch::Receiver<BookFeedState> {
+pub(super) fn spawn_book_feed(
+    venue: ExecutionVenue,
+    symbol: String,
+) -> watch::Receiver<BookFeedState> {
     let (sender, receiver) = watch::channel(BookFeedState::default());
     tokio::spawn(async move {
         let mut delay = 1_u64;
@@ -881,7 +898,10 @@ impl BotAccountStream {
     }
 }
 
-fn spawn_account_feed(venue: ExecutionVenue, account: String) -> mpsc::Receiver<AccountFeedEvent> {
+pub(super) fn spawn_account_feed(
+    venue: ExecutionVenue,
+    account: String,
+) -> mpsc::Receiver<AccountFeedEvent> {
     let (sender, receiver) = mpsc::channel(1024);
     tokio::spawn(async move {
         let adapter = match ExecutionAdapter::new(venue).await {
@@ -1075,13 +1095,13 @@ fn normalize_hyperliquid_order_status(status: &str) -> &str {
 }
 
 #[derive(Clone, Debug)]
-struct ObservedFill {
-    timestamp: u64,
-    buy: bool,
-    size: f64,
-    price: f64,
+pub(super) struct ObservedFill {
+    pub(super) timestamp: u64,
+    pub(super) buy: bool,
+    pub(super) size: f64,
+    pub(super) price: f64,
     /// Signed venue fee: negative is a cost and positive is a rebate.
-    fee: Option<f64>,
+    pub(super) fee: Option<f64>,
 }
 
 async fn run_worker(job_id: &str, mode: MidMode, definition: &MidPriceJobDefinition) -> Result<()> {
@@ -1721,7 +1741,12 @@ fn apply_action_completion(
     Ok(())
 }
 
-fn quote_plan(parent: &TradePlan, side: QuoteSide, size: f64, price: f64) -> Result<TradePlan> {
+pub(super) fn quote_plan(
+    parent: &TradePlan,
+    side: QuoteSide,
+    size: f64,
+    price: f64,
+) -> Result<TradePlan> {
     let exposure = size * price;
     Ok(TradePlan {
         created_at_ms: now_ms()?,
@@ -1748,7 +1773,7 @@ fn quote_plan(parent: &TradePlan, side: QuoteSide, size: f64, price: f64) -> Res
     })
 }
 
-fn inventory_unwind_plan(
+pub(super) fn inventory_unwind_plan(
     parent: &TradePlan,
     direction: PositionDirection,
     size: f64,
@@ -1782,7 +1807,7 @@ fn inventory_unwind_plan(
     })
 }
 
-fn cancel_plan(parent: &TradePlan, order_id: String) -> Result<CancelPlan> {
+pub(super) fn cancel_plan(parent: &TradePlan, order_id: String) -> Result<CancelPlan> {
     Ok(CancelPlan {
         created_at_ms: now_ms()?,
         venue: parent.venue,
@@ -1996,7 +2021,7 @@ fn apply_fill_to_working_quote(
     }
 }
 
-fn append_fill(
+pub(super) fn append_fill(
     job_id: &str,
     bot: &str,
     mark_price: f64,
@@ -2024,7 +2049,7 @@ fn append_fill(
     )
 }
 
-fn current_mark(book: &watch::Receiver<BookFeedState>, fallback: f64) -> f64 {
+pub(super) fn current_mark(book: &watch::Receiver<BookFeedState>, fallback: f64) -> f64 {
     book.borrow()
         .top
         .as_ref()
@@ -2040,11 +2065,11 @@ fn stop_loss_amount(definition: &MidPriceJobDefinition, allocated_margin: f64) -
         .map(|percent| allocated_margin * percent / 100.0)
 }
 
-fn stop_loss_triggered(performance: &BotPerformance, max_loss: f64) -> bool {
+pub(super) fn stop_loss_triggered(performance: &BotPerformance, max_loss: f64) -> bool {
     performance.trading_pnl.is_some_and(|pnl| pnl <= -max_loss)
 }
 
-fn append_stop_loss(
+pub(super) fn append_stop_loss(
     job_id: &str,
     bot: &str,
     stop_loss_pct: f64,
@@ -2079,7 +2104,7 @@ fn clear_live_order(order_id: &str, buy: &mut QuoteSlot, sell: &mut QuoteSlot) {
     }
 }
 
-fn is_terminal_order_status(status: &str) -> bool {
+pub(super) fn is_terminal_order_status(status: &str) -> bool {
     matches!(
         status,
         "filled"
@@ -2119,7 +2144,12 @@ fn append_quote(
     )
 }
 
-fn append_market_data(job_id: &str, bot: &str, status: &str, error: Option<&str>) -> Result<()> {
+pub(super) fn append_market_data(
+    job_id: &str,
+    bot: &str,
+    status: &str,
+    error: Option<&str>,
+) -> Result<()> {
     crate::runtime::append_bot_output(
         job_id,
         &serde_json::json!({
@@ -2257,18 +2287,18 @@ async fn cleanup(
     Ok(())
 }
 
-fn is_order_gone_error(error: &anyhow::Error) -> bool {
+pub(super) fn is_order_gone_error(error: &anyhow::Error) -> bool {
     is_order_gone_message(&format!("{error:#}"))
 }
 
-fn is_post_only_crossing_message(message: &str) -> bool {
+pub(super) fn is_post_only_crossing_message(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("rejectedcrossing")
         || message.contains("post only order would have immediately matched")
         || message.contains("post-only order would have immediately matched")
 }
 
-fn is_order_gone_message(message: &str) -> bool {
+pub(super) fn is_order_gone_message(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("not found")
         || message.contains("order was never placed")
@@ -2277,7 +2307,7 @@ fn is_order_gone_message(message: &str) -> bool {
         || message.contains("already cancelled")
 }
 
-fn floor_to_step(value: f64, step: f64, precision: u8) -> f64 {
+pub(super) fn floor_to_step(value: f64, step: f64, precision: u8) -> f64 {
     let scale = 10_f64.powi(i32::from(precision));
     (((value / step) + 1e-9).floor() * step * scale).round() / scale
 }
