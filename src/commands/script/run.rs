@@ -24,6 +24,7 @@ use crate::providers::bulk::markets as bulk_markets;
 use crate::providers::bulk::ws::{
     BulkCandleStream, BulkOrderBookStream, BulkTickerStream, BulkTradesStream,
 };
+use crate::providers::hyperliquid::HyperliquidNetwork;
 use crate::providers::hyperliquid::markets as hyperliquid_markets;
 use crate::providers::hyperliquid::ws::{
     HyperliquidAssetContextStream, HyperliquidCandleStream, HyperliquidOrderBookStream,
@@ -166,6 +167,7 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
         sources: args.source,
         params: args.param,
         venue: args.venue.map(Into::into),
+        testnet: args.testnet,
         duration_seconds: args.duration,
         verbose: args.verbose,
     };
@@ -211,6 +213,7 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
         config: None,
         symbol: Some(job.definition.symbol.clone()),
         venue,
+        testnet: job.definition.testnet,
         from: None,
         to: None,
         source: job.definition.sources.clone(),
@@ -309,9 +312,13 @@ async fn stream_sources(
     report.set_phase("connecting_streams");
     write_running_report_best_effort(report);
 
-    let streams = ScriptLiveStreams::connect(&source_configs, &market.symbol).await?;
-    let mut stream_events =
-        spawn_script_stream_supervisor(streams, source_configs.clone(), market.symbol.clone());
+    let streams = ScriptLiveStreams::connect(&source_configs, &market.symbol, args.testnet).await?;
+    let mut stream_events = spawn_script_stream_supervisor(
+        streams,
+        source_configs.clone(),
+        market.symbol.clone(),
+        args.testnet,
+    );
 
     let session = script.start_session_with_execution(
         &resolved_params,
@@ -550,7 +557,7 @@ struct MmtScriptStreams {
 }
 
 impl ScriptLiveStreams {
-    async fn connect(source_configs: &SourceConfigs, symbol: &str) -> Result<Self> {
+    async fn connect(source_configs: &SourceConfigs, symbol: &str, testnet: bool) -> Result<Self> {
         let mmt_configs = configs_for_provider(source_configs, ProviderKind::Mmt);
         let bulk_configs = configs_for_provider(source_configs, ProviderKind::Bulk);
         let hyperliquid_configs = configs_for_provider(source_configs, ProviderKind::Hyperliquid);
@@ -576,7 +583,8 @@ impl ScriptLiveStreams {
         } else {
             let symbol = bulk_markets::market(symbol)?.symbol.clone();
             Some(Box::new(
-                DirectScriptStreams::connect(ProviderKind::Bulk, &bulk_configs, &symbol).await?,
+                DirectScriptStreams::connect(ProviderKind::Bulk, &bulk_configs, &symbol, false)
+                    .await?,
             ))
         };
         let hyperliquid = if hyperliquid_configs.is_empty() {
@@ -588,6 +596,7 @@ impl ScriptLiveStreams {
                     ProviderKind::Hyperliquid,
                     &hyperliquid_configs,
                     &symbol,
+                    testnet,
                 )
                 .await?,
             ))
@@ -630,12 +639,14 @@ fn spawn_script_stream_supervisor(
     streams: ScriptLiveStreams,
     source_configs: SourceConfigs,
     symbol: String,
+    testnet: bool,
 ) -> mpsc::Receiver<ScriptStreamEvent> {
     let (sender, receiver) = mpsc::channel(SCRIPT_STREAM_EVENT_CAPACITY);
     tokio::spawn(supervise_script_streams(
         streams,
         source_configs,
         symbol,
+        testnet,
         sender,
     ));
     receiver
@@ -645,6 +656,7 @@ async fn supervise_script_streams(
     mut streams: ScriptLiveStreams,
     source_configs: SourceConfigs,
     symbol: String,
+    testnet: bool,
     sender: mpsc::Sender<ScriptStreamEvent>,
 ) {
     let mut retry_seconds = 1_u64;
@@ -674,7 +686,7 @@ async fn supervise_script_streams(
                 }
                 loop {
                     tokio::time::sleep(Duration::from_secs(retry_seconds)).await;
-                    match ScriptLiveStreams::connect(&source_configs, &symbol).await {
+                    match ScriptLiveStreams::connect(&source_configs, &symbol, testnet).await {
                         Ok(mut reconnected) => {
                             reconnected.carry_runtime_state_from(&streams);
                             streams = reconnected;
@@ -753,11 +765,15 @@ enum DirectTradesStream {
 }
 
 impl DirectTradesStream {
-    async fn connect(provider: ProviderKind, symbol: &str) -> Result<Self> {
+    async fn connect(provider: ProviderKind, symbol: &str, testnet: bool) -> Result<Self> {
         match provider {
             ProviderKind::Bulk => Ok(Self::Bulk(BulkTradesStream::connect(symbol).await?)),
             ProviderKind::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidTradesStream::connect(symbol).await?,
+                HyperliquidTradesStream::connect_on(
+                    symbol,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
             )),
             ProviderKind::Mmt | ProviderKind::MarketLab => {
                 bail!("provider does not use the direct trade stream")
@@ -779,13 +795,23 @@ enum DirectOrderBookStream {
 }
 
 impl DirectOrderBookStream {
-    async fn connect(provider: ProviderKind, symbol: &str, depth: u16) -> Result<Self> {
+    async fn connect(
+        provider: ProviderKind,
+        symbol: &str,
+        depth: u16,
+        testnet: bool,
+    ) -> Result<Self> {
         match provider {
             ProviderKind::Bulk => Ok(Self::Bulk(
                 BulkOrderBookStream::connect(symbol, depth).await?,
             )),
             ProviderKind::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidOrderBookStream::connect(symbol, depth).await?,
+                HyperliquidOrderBookStream::connect_on(
+                    symbol,
+                    depth,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
             )),
             ProviderKind::Mmt | ProviderKind::MarketLab => {
                 bail!("provider does not use the direct orderbook stream")
@@ -807,11 +833,15 @@ enum DirectTickerStream {
 }
 
 impl DirectTickerStream {
-    async fn connect(provider: ProviderKind, symbol: &str) -> Result<Self> {
+    async fn connect(provider: ProviderKind, symbol: &str, testnet: bool) -> Result<Self> {
         match provider {
             ProviderKind::Bulk => Ok(Self::Bulk(BulkTickerStream::connect(symbol).await?)),
             ProviderKind::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidAssetContextStream::connect(symbol).await?,
+                HyperliquidAssetContextStream::connect_on(
+                    symbol,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
             )),
             ProviderKind::Mmt | ProviderKind::MarketLab => {
                 bail!("provider does not use the direct ticker stream")
@@ -833,13 +863,23 @@ enum DirectCandleStream {
 }
 
 impl DirectCandleStream {
-    async fn connect(provider: ProviderKind, symbol: &str, interval: &str) -> Result<Self> {
+    async fn connect(
+        provider: ProviderKind,
+        symbol: &str,
+        interval: &str,
+        testnet: bool,
+    ) -> Result<Self> {
         match provider {
             ProviderKind::Bulk => Ok(Self::Bulk(
                 BulkCandleStream::connect(symbol, interval).await?,
             )),
             ProviderKind::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidCandleStream::connect(symbol, interval).await?,
+                HyperliquidCandleStream::connect_on(
+                    symbol,
+                    interval,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
             )),
             ProviderKind::Mmt | ProviderKind::MarketLab => {
                 bail!("provider does not use the direct candle stream")
@@ -893,6 +933,7 @@ impl DirectScriptStreams {
         provider: ProviderKind,
         source_configs: &SourceConfigs,
         symbol: &str,
+        testnet: bool,
     ) -> Result<Self> {
         let candle_timeframe = if source_configs
             .values()
@@ -910,7 +951,7 @@ impl DirectScriptStreams {
                 .values()
                 .any(|config| config.source == ScriptSource::Vd)
         {
-            Some(DirectTradesStream::connect(provider, symbol).await?)
+            Some(DirectTradesStream::connect(provider, symbol, testnet).await?)
         } else {
             None
         };
@@ -921,7 +962,7 @@ impl DirectScriptStreams {
             .any(|config| config.source == ScriptSource::Orderbook)
         {
             let depth = source_config(source_configs, &ScriptSource::Orderbook)?.depth_or_default();
-            Some(DirectOrderBookStream::connect(provider, symbol, depth).await?)
+            Some(DirectOrderBookStream::connect(provider, symbol, depth, testnet).await?)
         } else {
             None
         };
@@ -929,7 +970,7 @@ impl DirectScriptStreams {
             .values()
             .any(|config| config.source == ScriptSource::Oi)
         {
-            Some(DirectTickerStream::connect(provider, symbol).await?)
+            Some(DirectTickerStream::connect(provider, symbol, testnet).await?)
         } else {
             None
         };
@@ -940,7 +981,7 @@ impl DirectScriptStreams {
             let seconds = source_config(source_configs, &ScriptSource::Volumes)?
                 .require_timeframe(&ScriptSource::Volumes)?;
             let interval = direct_timeframe(provider, seconds)?;
-            Some(DirectCandleStream::connect(provider, symbol, interval).await?)
+            Some(DirectCandleStream::connect(provider, symbol, interval, testnet).await?)
         } else {
             None
         };

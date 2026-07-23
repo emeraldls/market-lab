@@ -5,24 +5,28 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::HTTP_URL;
+use super::HyperliquidNetwork;
 use super::signing::{HyperliquidWallet, WireSignature};
 use super::ws::HyperliquidTradingClient;
 
 static LAST_NONCE: AtomicU64 = AtomicU64::new(0);
-pub const API_WALLET_NAME: &str = "marketlab";
+pub const MAINNET_API_WALLET_NAME: &str = "mlab-mainnet";
+pub const TESTNET_API_WALLET_NAME: &str = "mlab-testnet";
+pub const LEGACY_TESTNET_API_WALLET_NAME: &str = "marketlab";
 
 #[derive(Clone)]
 pub struct HyperliquidExchangeClient {
     trading: HyperliquidTradingClient,
     wallet: HyperliquidWallet,
+    network: HyperliquidNetwork,
 }
 
 impl HyperliquidExchangeClient {
-    pub fn new(wallet: HyperliquidWallet) -> Result<Self> {
+    pub fn new(wallet: HyperliquidWallet, network: HyperliquidNetwork) -> Result<Self> {
         Ok(Self {
-            trading: HyperliquidTradingClient::shared(),
+            trading: HyperliquidTradingClient::shared(network),
             wallet,
+            network,
         })
     }
 
@@ -57,7 +61,7 @@ impl HyperliquidExchangeClient {
 
     async fn post_l1(&self, action: Action) -> Result<ExchangeResponseStatus> {
         let nonce = next_nonce()?;
-        let signature = self.wallet.sign_l1_action(&action, nonce)?;
+        let signature = self.wallet.sign_l1_action(&action, nonce, self.network)?;
         let response = self
             .trading
             .post_action(&ExchangePayload {
@@ -73,33 +77,36 @@ impl HyperliquidExchangeClient {
 
 pub async fn approve_agent(
     master: &HyperliquidWallet,
+    network: HyperliquidNetwork,
+    agent_name: &str,
 ) -> Result<(HyperliquidWallet, ExchangeResponseStatus)> {
     let agent = HyperliquidWallet::random();
     let nonce = next_nonce()?;
     let action = Action::ApproveAgent {
         signature_chain_id: "0x66eee".to_string(),
-        hyperliquid_chain: "Testnet".to_string(),
+        hyperliquid_chain: network.approval_chain().to_string(),
         agent_address: agent.address(),
-        agent_name: Some(API_WALLET_NAME.to_string()),
+        agent_name: Some(agent_name.to_string()),
         nonce,
     };
-    let signature = master.sign_approve_agent(agent.address_bytes(), API_WALLET_NAME, nonce)?;
+    let signature = master.sign_approve_agent(agent.address_bytes(), agent_name, nonce, network)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
         .context("failed to construct Hyperliquid authorization client")?;
-    let response = post_exchange_http(&client, action, signature, nonce).await?;
+    let response = post_exchange_http(&client, network, action, signature, nonce).await?;
     Ok((agent, response))
 }
 
 async fn post_exchange_http(
     client: &reqwest::Client,
+    network: HyperliquidNetwork,
     action: Action,
     signature: WireSignature,
     nonce: u64,
 ) -> Result<ExchangeResponseStatus> {
     let response = client
-        .post(format!("{HTTP_URL}/exchange"))
+        .post(format!("{}/exchange", network.http_url()))
         .json(&ExchangePayload {
             action,
             signature,
@@ -108,14 +115,22 @@ async fn post_exchange_http(
         })
         .send()
         .await
-        .context("failed to call Hyperliquid testnet exchange API")?;
+        .with_context(|| {
+            format!(
+                "failed to call Hyperliquid {} exchange API",
+                network.label()
+            )
+        })?;
     let status = response.status();
     let body = response
         .text()
         .await
         .context("failed to read Hyperliquid exchange response")?;
     if !status.is_success() {
-        bail!("Hyperliquid testnet exchange returned HTTP {status}: {body}");
+        bail!(
+            "Hyperliquid {} exchange returned HTTP {status}: {body}",
+            network.label()
+        );
     }
     serde_json::from_str(&body)
         .with_context(|| format!("invalid Hyperliquid exchange response: {body}"))
@@ -336,13 +351,13 @@ mod tests {
         );
         let action = Action::ApproveAgent {
             signature_chain_id: "0x66eee".to_string(),
-            hyperliquid_chain: "Testnet".to_string(),
+            hyperliquid_chain: HyperliquidNetwork::Testnet.approval_chain().to_string(),
             agent_address: "0x0000000000000000000000000000000000000001".to_string(),
-            agent_name: Some(API_WALLET_NAME.to_string()),
+            agent_name: Some(TESTNET_API_WALLET_NAME.to_string()),
             nonce: 1,
         };
         let value = serde_json::to_value(action).expect("agent serializes");
-        assert_eq!(value["agentName"], API_WALLET_NAME);
+        assert_eq!(value["agentName"], TESTNET_API_WALLET_NAME);
         assert_eq!(value["signatureChainId"], "0x66eee");
         assert_eq!(value["hyperliquidChain"], "Testnet");
     }

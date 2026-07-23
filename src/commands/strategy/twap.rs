@@ -121,7 +121,9 @@ pub async fn handle(args: RunTwapArgs) -> Result<()> {
     }
     if matches!(args.output, OutputFormat::Terminal) {
         render_plan(&view, args.output)?;
-        if !args.yes && !confirm_live_execution(parent.venue, schedule.children.len())? {
+        if !args.yes
+            && !confirm_live_execution(parent.venue, parent.testnet, schedule.children.len())?
+        {
             println!("cancelled; no strategy job was submitted");
             return Ok(());
         }
@@ -130,6 +132,7 @@ pub async fn handle(args: RunTwapArgs) -> Result<()> {
     let submission = StrategyJobSubmission {
         definition: StrategyJobDefinition::Twap(TwapJobDefinition {
             venue: parent.venue,
+            testnet: parent.testnet,
             symbol: parent.internal_symbol,
             side: strategy_side(args.side),
             total_size: parent.size,
@@ -331,6 +334,7 @@ fn trade_args(args: &RunTwapArgs, size: Option<f64>, margin: Option<f64>) -> Tra
         symbol: args.symbol.clone(),
         config: None,
         venue: args.venue,
+        testnet: args.testnet,
         size,
         margin,
         order_kind: TradeOrderKind::Market,
@@ -354,6 +358,7 @@ fn worker_trade_args(definition: &TwapJobDefinition, size: f64) -> TradeArgs {
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
             ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
         },
+        testnet: definition.testnet,
         size: Some(size),
         margin: None,
         order_kind: TradeOrderKind::Market,
@@ -473,10 +478,10 @@ fn render_submission(job: &StrategyJob, output: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-fn confirm_live_execution(venue: ExecutionVenue, children: usize) -> Result<bool> {
+fn confirm_live_execution(venue: ExecutionVenue, testnet: bool, children: usize) -> Result<bool> {
     print!(
         "Submit a live TWAP job with {children} {} market orders? [y/N]: ",
-        venue_name(venue)
+        execution_venue_name(venue, testnet)
     );
     io::stdout()
         .flush()
@@ -495,6 +500,14 @@ fn venue_name(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "bulk",
         ExecutionVenue::Hyperliquid => "hyperliquid",
+    }
+}
+
+fn execution_venue_name(venue: ExecutionVenue, testnet: bool) -> &'static str {
+    match (venue, testnet) {
+        (ExecutionVenue::Bulk, _) => "BULK testnet",
+        (ExecutionVenue::Hyperliquid, true) => "Hyperliquid testnet",
+        (ExecutionVenue::Hyperliquid, false) => "Hyperliquid mainnet",
     }
 }
 

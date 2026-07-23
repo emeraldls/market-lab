@@ -4,8 +4,10 @@ use rand_core::OsRng;
 use serde::Serialize;
 use sha3::{Digest, Keccak256};
 
+use super::HyperliquidNetwork;
+
 const ZERO_ADDRESS: [u8; 20] = [0; 20];
-const TESTNET_CHAIN_ID: u64 = 421_614;
+const SIGNATURE_CHAIN_ID: u64 = 421_614;
 
 #[derive(Clone)]
 pub struct HyperliquidWallet {
@@ -52,7 +54,12 @@ impl HyperliquidWallet {
         format!("0x{}", hex::encode(self.address_bytes()))
     }
 
-    pub fn sign_l1_action<T: Serialize>(&self, action: &T, nonce: u64) -> Result<WireSignature> {
+    pub fn sign_l1_action<T: Serialize>(
+        &self,
+        action: &T,
+        nonce: u64,
+        network: HyperliquidNetwork,
+    ) -> Result<WireSignature> {
         let mut bytes = rmp_serde::to_vec_named(action)
             .context("failed to encode Hyperliquid action for signing")?;
         bytes.extend(nonce.to_be_bytes());
@@ -61,7 +68,7 @@ impl HyperliquidWallet {
         let connection_id = keccak(bytes);
         let digest = typed_data_digest(
             exchange_domain_separator(),
-            agent_struct_hash("b", connection_id),
+            agent_struct_hash(network.signature_source(), connection_id),
         );
         self.sign_hash(digest)
     }
@@ -71,10 +78,11 @@ impl HyperliquidWallet {
         agent_address: [u8; 20],
         agent_name: &str,
         nonce: u64,
+        network: HyperliquidNetwork,
     ) -> Result<WireSignature> {
         let digest = typed_data_digest(
-            transaction_domain_separator(TESTNET_CHAIN_ID),
-            approve_agent_struct_hash(agent_address, agent_name, nonce),
+            transaction_domain_separator(SIGNATURE_CHAIN_ID),
+            approve_agent_struct_hash(network.approval_chain(), agent_address, agent_name, nonce),
         );
         self.sign_hash(digest)
     }
@@ -131,10 +139,15 @@ fn agent_struct_hash(source: &str, connection_id: [u8; 32]) -> [u8; 32] {
     ]))
 }
 
-fn approve_agent_struct_hash(agent_address: [u8; 20], agent_name: &str, nonce: u64) -> [u8; 32] {
+fn approve_agent_struct_hash(
+    chain: &str,
+    agent_address: [u8; 20],
+    agent_name: &str,
+    nonce: u64,
+) -> [u8; 32] {
     keccak(abi_words([
         keccak(b"HyperliquidTransaction:ApproveAgent(string hyperliquidChain,address agentAddress,string agentName,uint64 nonce)"),
-        keccak(b"Testnet"),
+        keccak(chain.as_bytes()),
         address_word(agent_address),
         keccak(agent_name.as_bytes()),
         uint_word(nonce),
@@ -215,6 +228,28 @@ mod tests {
     }
 
     #[test]
+    fn l1_signature_domain_separates_mainnet_and_testnet() {
+        let wallet = HyperliquidWallet::from_private_key(
+            "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+        )
+        .expect("wallet parses");
+        let action = serde_json::json!({
+            "type": "cancel",
+            "cancels": [{ "a": 3, "o": 42 }]
+        });
+
+        let mainnet = wallet
+            .sign_l1_action(&action, 1_713_825_891_591, HyperliquidNetwork::Mainnet)
+            .expect("mainnet action signs");
+        let testnet = wallet
+            .sign_l1_action(&action, 1_713_825_891_591, HyperliquidNetwork::Testnet)
+            .expect("testnet action signs");
+
+        assert_ne!(mainnet.r, testnet.r);
+        assert_ne!(mainnet.s, testnet.s);
+    }
+
+    #[test]
     fn api_wallet_name_is_covered_by_the_approval_signature() {
         let wallet = HyperliquidWallet::from_private_key(
             "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
@@ -222,12 +257,29 @@ mod tests {
         .expect("wallet parses");
         let agent = [1_u8; 20];
         let named = wallet
-            .sign_approve_agent(agent, "marketlab", 1)
+            .sign_approve_agent(agent, "marketlab", 1, HyperliquidNetwork::Testnet)
             .expect("named agent signs");
         let other = wallet
-            .sign_approve_agent(agent, "another-app", 1)
+            .sign_approve_agent(agent, "another-app", 1, HyperliquidNetwork::Testnet)
             .expect("other agent signs");
         assert_ne!(named.r, other.r);
         assert_ne!(named.s, other.s);
+    }
+
+    #[test]
+    fn api_wallet_approval_separates_mainnet_and_testnet() {
+        let wallet = HyperliquidWallet::from_private_key(
+            "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+        )
+        .expect("wallet parses");
+        let agent = [1_u8; 20];
+        let mainnet = wallet
+            .sign_approve_agent(agent, "marketlab", 1, HyperliquidNetwork::Mainnet)
+            .expect("mainnet agent signs");
+        let testnet = wallet
+            .sign_approve_agent(agent, "marketlab", 1, HyperliquidNetwork::Testnet)
+            .expect("testnet agent signs");
+        assert_ne!(mainnet.r, testnet.r);
+        assert_ne!(mainnet.s, testnet.s);
     }
 }

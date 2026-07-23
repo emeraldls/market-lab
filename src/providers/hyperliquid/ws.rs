@@ -14,7 +14,7 @@ use crate::domain::types::{
     MarketTicker, OhlcvCandle, OrderBookLevel, OrderBookSnapshot, TopOfBook, TradeTick,
 };
 
-use super::WS_URL;
+use super::HyperliquidNetwork;
 use super::markets;
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -29,8 +29,9 @@ struct HyperliquidWsClient {
     heartbeat: tokio::time::Interval,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct HyperliquidTradingClient {
+    network: HyperliquidNetwork,
     connection: Arc<Mutex<Option<mpsc::Sender<TradingCommand>>>>,
 }
 
@@ -40,9 +41,19 @@ struct TradingCommand {
 }
 
 impl HyperliquidTradingClient {
-    pub fn shared() -> Self {
-        static CLIENT: OnceLock<HyperliquidTradingClient> = OnceLock::new();
-        CLIENT.get_or_init(Self::default).clone()
+    pub fn shared(network: HyperliquidNetwork) -> Self {
+        static MAINNET_CLIENT: OnceLock<HyperliquidTradingClient> = OnceLock::new();
+        static TESTNET_CLIENT: OnceLock<HyperliquidTradingClient> = OnceLock::new();
+        let client = match network {
+            HyperliquidNetwork::Mainnet => &MAINNET_CLIENT,
+            HyperliquidNetwork::Testnet => &TESTNET_CLIENT,
+        };
+        client
+            .get_or_init(|| Self {
+                network,
+                connection: Arc::new(Mutex::new(None)),
+            })
+            .clone()
     }
 
     pub async fn post_action(&self, payload: &impl Serialize) -> Result<Value> {
@@ -82,9 +93,14 @@ impl HyperliquidTradingClient {
             return Ok(sender.clone());
         }
 
-        let (stream, _) = connect_async(super::WS_URL)
+        let (stream, _) = connect_async(self.network.ws_url())
             .await
-            .context("failed to connect to Hyperliquid trading WebSocket")?;
+            .with_context(|| {
+                format!(
+                    "failed to connect to Hyperliquid {} trading WebSocket",
+                    self.network.label()
+                )
+            })?;
         let (sender, receiver) = mpsc::channel(MAX_INFLIGHT_POSTS);
         tokio::spawn(run_trading_connection(stream, receiver));
         *connection = Some(sender.clone());
@@ -208,10 +224,16 @@ fn route_trading_response(
 }
 
 impl HyperliquidWsClient {
-    async fn subscribe(subscriptions: impl IntoIterator<Item = Value>) -> Result<Self> {
-        let (mut stream, _) = connect_async(WS_URL)
-            .await
-            .context("failed to connect to Hyperliquid testnet WebSocket")?;
+    async fn subscribe(
+        network: HyperliquidNetwork,
+        subscriptions: impl IntoIterator<Item = Value>,
+    ) -> Result<Self> {
+        let (mut stream, _) = connect_async(network.ws_url()).await.with_context(|| {
+            format!(
+                "failed to connect to Hyperliquid {} WebSocket",
+                network.label()
+            )
+        })?;
         for subscription in subscriptions {
             stream
                 .send(Message::Text(
@@ -223,7 +245,12 @@ impl HyperliquidWsClient {
                     .into(),
                 ))
                 .await
-                .context("failed to subscribe to Hyperliquid testnet WebSocket")?;
+                .with_context(|| {
+                    format!(
+                        "failed to subscribe to Hyperliquid {} WebSocket",
+                        network.label()
+                    )
+                })?;
         }
         let start = tokio::time::Instant::now() + SUBSCRIPTION_HEARTBEAT_INTERVAL;
         let mut heartbeat = tokio::time::interval_at(start, SUBSCRIPTION_HEARTBEAT_INTERVAL);
@@ -284,14 +311,21 @@ pub struct HyperliquidOrderBookStream {
 
 impl HyperliquidOrderBookStream {
     pub async fn connect(symbol: &str, depth: u16) -> Result<Self> {
+        Self::connect_on(symbol, depth, HyperliquidNetwork::Mainnet).await
+    }
+
+    pub async fn connect_on(symbol: &str, depth: u16, network: HyperliquidNetwork) -> Result<Self> {
         if depth == 0 || depth > 20 {
             bail!("Hyperliquid orderbook depth must be between 1 and 20");
         }
         let market = markets::market(symbol)?;
-        let client = HyperliquidWsClient::subscribe([serde_json::json!({
-            "type": "l2Book",
-            "coin": market.venue_symbol,
-        })])
+        let client = HyperliquidWsClient::subscribe(
+            network,
+            [serde_json::json!({
+                "type": "l2Book",
+                "coin": market.venue_symbol,
+            })],
+        )
         .await?;
         Ok(Self {
             client,
@@ -363,11 +397,18 @@ pub struct HyperliquidTradesStream {
 
 impl HyperliquidTradesStream {
     pub async fn connect(symbol: &str) -> Result<Self> {
+        Self::connect_on(symbol, HyperliquidNetwork::Mainnet).await
+    }
+
+    pub async fn connect_on(symbol: &str, network: HyperliquidNetwork) -> Result<Self> {
         let market = markets::market(symbol)?;
-        let client = HyperliquidWsClient::subscribe([serde_json::json!({
-            "type": "trades",
-            "coin": market.venue_symbol,
-        })])
+        let client = HyperliquidWsClient::subscribe(
+            network,
+            [serde_json::json!({
+                "type": "trades",
+                "coin": market.venue_symbol,
+            })],
+        )
         .await?;
         Ok(Self {
             client,
@@ -416,12 +457,23 @@ pub struct HyperliquidCandleStream {
 
 impl HyperliquidCandleStream {
     pub async fn connect(symbol: &str, interval: &str) -> Result<Self> {
+        Self::connect_on(symbol, interval, HyperliquidNetwork::Mainnet).await
+    }
+
+    pub async fn connect_on(
+        symbol: &str,
+        interval: &str,
+        network: HyperliquidNetwork,
+    ) -> Result<Self> {
         let market = markets::market(symbol)?;
-        let client = HyperliquidWsClient::subscribe([serde_json::json!({
-            "type": "candle",
-            "coin": market.venue_symbol,
-            "interval": interval,
-        })])
+        let client = HyperliquidWsClient::subscribe(
+            network,
+            [serde_json::json!({
+                "type": "candle",
+                "coin": market.venue_symbol,
+                "interval": interval,
+            })],
+        )
         .await?;
         Ok(Self {
             client,
@@ -458,11 +510,18 @@ pub struct HyperliquidAssetContextStream {
 
 impl HyperliquidAssetContextStream {
     pub async fn connect(symbol: &str) -> Result<Self> {
+        Self::connect_on(symbol, HyperliquidNetwork::Mainnet).await
+    }
+
+    pub async fn connect_on(symbol: &str, network: HyperliquidNetwork) -> Result<Self> {
         let market = markets::market(symbol)?;
-        let client = HyperliquidWsClient::subscribe([serde_json::json!({
-            "type": "activeAssetCtx",
-            "coin": market.venue_symbol,
-        })])
+        let client = HyperliquidWsClient::subscribe(
+            network,
+            [serde_json::json!({
+                "type": "activeAssetCtx",
+                "coin": market.venue_symbol,
+            })],
+        )
         .await?;
         Ok(Self {
             client,
@@ -500,10 +559,17 @@ pub struct HyperliquidAccountStream {
 
 impl HyperliquidAccountStream {
     pub async fn connect(account: &str) -> Result<Self> {
-        let client = HyperliquidWsClient::subscribe([
-            serde_json::json!({ "type": "orderUpdates", "user": account }),
-            serde_json::json!({ "type": "userEvents", "user": account }),
-        ])
+        Self::connect_on(account, HyperliquidNetwork::Mainnet).await
+    }
+
+    pub async fn connect_on(account: &str, network: HyperliquidNetwork) -> Result<Self> {
+        let client = HyperliquidWsClient::subscribe(
+            network,
+            [
+                serde_json::json!({ "type": "orderUpdates", "user": account }),
+                serde_json::json!({ "type": "userEvents", "user": account }),
+            ],
+        )
         .await?;
         Ok(Self { client })
     }

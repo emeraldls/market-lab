@@ -18,6 +18,7 @@ use crate::domain::types::{OiCandle, OrderBookLevel, OrderBookSnapshot};
 use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::bulk::ws::{BulkOrderBookStream, BulkTradesStream};
 use crate::providers::execution::ExecutionAdapter;
+use crate::providers::hyperliquid::HyperliquidNetwork;
 use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 use crate::providers::hyperliquid::ws::{HyperliquidOrderBookStream, HyperliquidTradesStream};
 use crate::providers::mmt::MmtProvider;
@@ -52,13 +53,23 @@ enum WeightedOrderBookStream {
 }
 
 impl WeightedOrderBookStream {
-    async fn connect(venue: ExecutionVenue, symbol: &str, depth: u16) -> Result<Self> {
+    async fn connect(
+        venue: ExecutionVenue,
+        symbol: &str,
+        depth: u16,
+        testnet: bool,
+    ) -> Result<Self> {
         match venue {
             ExecutionVenue::Bulk => Ok(Self::Bulk(
                 BulkOrderBookStream::connect(symbol, depth).await?,
             )),
             ExecutionVenue::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidOrderBookStream::connect(symbol, depth.min(20)).await?,
+                HyperliquidOrderBookStream::connect_on(
+                    symbol,
+                    depth.min(20),
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
             )),
         }
     }
@@ -77,11 +88,15 @@ enum WeightedTradesStream {
 }
 
 impl WeightedTradesStream {
-    async fn connect(exchange: &str, symbol: &str) -> Result<Self> {
+    async fn connect(exchange: &str, symbol: &str, testnet: bool) -> Result<Self> {
         match exchange {
             "bulk" => Ok(Self::Bulk(BulkTradesStream::connect(symbol).await?)),
             "hyperliquid" => Ok(Self::Hyperliquid(
-                HyperliquidTradesStream::connect(symbol).await?,
+                HyperliquidTradesStream::connect_on(
+                    symbol,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
             )),
             _ => bail!("standalone live trade adapter for `{exchange}` is not implemented"),
         }
@@ -128,6 +143,7 @@ impl VwapFeasibility {
 pub(super) struct WeightedJobDefinition {
     pub(super) strategy: &'static str,
     pub(super) venue: ExecutionVenue,
+    pub(super) testnet: bool,
     pub(super) symbol: String,
     pub(super) side: StrategySide,
     pub(super) total_size: f64,
@@ -141,6 +157,7 @@ impl From<&VwapJobDefinition> for WeightedJobDefinition {
         Self {
             strategy: "vwap",
             venue: definition.venue,
+            testnet: definition.testnet,
             symbol: definition.symbol.clone(),
             side: definition.side,
             total_size: definition.total_size,
@@ -156,6 +173,7 @@ impl From<&OiwapJobDefinition> for WeightedJobDefinition {
         Self {
             strategy: "oiwap",
             venue: definition.venue,
+            testnet: definition.testnet,
             symbol: definition.symbol.clone(),
             side: definition.side,
             total_size: definition.total_size,
@@ -503,7 +521,7 @@ pub async fn handle(args: RunVwapArgs) -> Result<()> {
     }
     if matches!(args.output, OutputFormat::Terminal) {
         render_plan(&view, args.output)?;
-        if !args.yes && !confirm_live_execution(parent.venue)? {
+        if !args.yes && !confirm_live_execution(parent.venue, parent.testnet)? {
             println!("cancelled; no strategy job was submitted");
             return Ok(());
         }
@@ -512,6 +530,7 @@ pub async fn handle(args: RunVwapArgs) -> Result<()> {
     let submission = StrategyJobSubmission {
         definition: StrategyJobDefinition::Vwap(VwapJobDefinition {
             venue: parent.venue,
+            testnet: parent.testnet,
             symbol: parent.internal_symbol,
             side: strategy_side(args.side),
             total_size: parent.size,
@@ -630,17 +649,22 @@ pub(super) async fn run_weighted_execution(
         );
     }
     let arrival_price = parent.reference_price;
-    let adapter = ExecutionAdapter::new(definition.venue).await?;
+    let adapter = ExecutionAdapter::new(definition.venue, definition.testnet).await?;
     let mut orders = StrategyOrderManager::new(job_id, &parent);
     let started = Instant::now();
-    let mut book_stream =
-        WeightedOrderBookStream::connect(definition.venue, &definition.symbol, ORDERBOOK_DEPTH)
-            .await?;
+    let mut book_stream = WeightedOrderBookStream::connect(
+        definition.venue,
+        &definition.symbol,
+        ORDERBOOK_DEPTH,
+        definition.testnet,
+    )
+    .await?;
     let (volume_tx, mut volume_rx) = mpsc::channel(256);
     let trajectory_metric = feed.metric();
     spawn_live_feeds(
         &feed,
         definition.venue,
+        definition.testnet,
         &definition.symbol,
         start_ms,
         volume_tx,
@@ -1044,23 +1068,30 @@ async fn fetch_direct_volume_history(
 fn spawn_live_feeds(
     feed: &TrajectoryFeed,
     execution_venue: ExecutionVenue,
+    testnet: bool,
     symbol: &str,
     start_ms: u64,
     sender: mpsc::Sender<LiveVolumeEvent>,
 ) -> Result<()> {
     match feed {
         TrajectoryFeed::Volume(sources) => {
-            spawn_live_volume_feeds(sources, execution_venue, symbol, sender)
+            spawn_live_volume_feeds(sources, execution_venue, testnet, symbol, sender)
         }
-        TrajectoryFeed::OpenInterest(sources) => {
-            spawn_live_open_interest_feeds(sources, execution_venue, symbol, start_ms, sender)
-        }
+        TrajectoryFeed::OpenInterest(sources) => spawn_live_open_interest_feeds(
+            sources,
+            execution_venue,
+            testnet,
+            symbol,
+            start_ms,
+            sender,
+        ),
     }
 }
 
 fn spawn_live_volume_feeds(
     sources: &[VolumeSource],
     execution_venue: ExecutionVenue,
+    testnet: bool,
     symbol: &str,
     sender: mpsc::Sender<LiveVolumeEvent>,
 ) -> Result<()> {
@@ -1096,6 +1127,7 @@ fn spawn_live_volume_feeds(
             &execution_source,
             &execution_symbol,
             includes_execution_trajectory,
+            testnet,
             execution_sender.clone(),
         )
         .await
@@ -1126,7 +1158,9 @@ fn spawn_live_volume_feeds(
         let symbol = symbol.to_string();
         let sender = sender.clone();
         tokio::spawn(async move {
-            if let Err(error) = stream_direct_trades(&source, &symbol, true, sender.clone()).await {
+            if let Err(error) =
+                stream_direct_trades(&source, &symbol, true, false, sender.clone()).await
+            {
                 let _ = sender
                     .send(LiveVolumeEvent::Degraded {
                         role: LiveVolumeRole::Trajectory,
@@ -1143,6 +1177,7 @@ fn spawn_live_volume_feeds(
 fn spawn_live_open_interest_feeds(
     sources: &[OpenInterestSource],
     execution_venue: ExecutionVenue,
+    testnet: bool,
     symbol: &str,
     start_ms: u64,
     sender: mpsc::Sender<LiveVolumeEvent>,
@@ -1176,8 +1211,14 @@ fn spawn_live_open_interest_feeds(
     let execution_symbol = symbol.to_string();
     let execution_source = execution_venue_name(execution_venue).to_string();
     tokio::spawn(async move {
-        if let Err(error) =
-            stream_direct_trades(&execution_source, &execution_symbol, false, sender.clone()).await
+        if let Err(error) = stream_direct_trades(
+            &execution_source,
+            &execution_symbol,
+            false,
+            testnet,
+            sender.clone(),
+        )
+        .await
         {
             let _ = sender
                 .send(LiveVolumeEvent::Degraded {
@@ -1286,9 +1327,10 @@ async fn stream_direct_trades(
     exchange: &str,
     symbol: &str,
     include_trajectory: bool,
+    testnet: bool,
     sender: mpsc::Sender<LiveVolumeEvent>,
 ) -> Result<()> {
-    let mut stream = WeightedTradesStream::connect(exchange, symbol).await?;
+    let mut stream = WeightedTradesStream::connect(exchange, symbol, testnet).await?;
     loop {
         for trade in stream.next_trades().await? {
             sender
@@ -1679,6 +1721,7 @@ fn trade_args(args: &RunVwapArgs, size: Option<f64>, margin: Option<f64>) -> Tra
         symbol: args.symbol.clone(),
         config: None,
         venue: args.venue,
+        testnet: args.testnet,
         size,
         margin,
         order_kind: TradeOrderKind::Market,
@@ -1706,6 +1749,7 @@ pub(super) fn worker_trade_args(
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
             ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
         },
+        testnet: definition.testnet,
         size: Some(size),
         margin: None,
         order_kind: if maker_price.is_some() {
@@ -1729,10 +1773,10 @@ pub(super) fn worker_trade_args(
     }
 }
 
-fn confirm_live_execution(venue: ExecutionVenue) -> Result<bool> {
+fn confirm_live_execution(venue: ExecutionVenue, testnet: bool) -> Result<bool> {
     print!(
         "Submit a live maker-first VWAP job on {}? [y/N]: ",
-        execution_venue_name(venue)
+        execution_venue_network_name(venue, testnet)
     );
     io::stdout()
         .flush()
@@ -1745,6 +1789,14 @@ fn confirm_live_execution(venue: ExecutionVenue) -> Result<bool> {
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
+}
+
+pub(super) fn execution_venue_network_name(venue: ExecutionVenue, testnet: bool) -> &'static str {
+    match (venue, testnet) {
+        (ExecutionVenue::Bulk, _) => "BULK testnet",
+        (ExecutionVenue::Hyperliquid, true) => "Hyperliquid testnet",
+        (ExecutionVenue::Hyperliquid, false) => "Hyperliquid mainnet",
+    }
 }
 
 pub(super) fn execution_venue_name(venue: ExecutionVenue) -> &'static str {

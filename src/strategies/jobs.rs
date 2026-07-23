@@ -16,6 +16,8 @@ pub enum StrategySide {
 #[serde(rename_all = "camelCase")]
 pub struct TwapJobDefinition {
     pub venue: ExecutionVenue,
+    #[serde(default = "legacy_hyperliquid_testnet")]
+    pub testnet: bool,
     pub symbol: String,
     pub side: StrategySide,
     pub total_size: f64,
@@ -72,6 +74,8 @@ impl TwapJobDefinition {
 #[serde(rename_all = "camelCase")]
 pub struct VwapJobDefinition {
     pub venue: ExecutionVenue,
+    #[serde(default = "legacy_hyperliquid_testnet")]
+    pub testnet: bool,
     pub symbol: String,
     pub side: StrategySide,
     pub total_size: f64,
@@ -133,6 +137,8 @@ impl VwapJobDefinition {
 #[serde(rename_all = "camelCase")]
 pub struct OiwapJobDefinition {
     pub venue: ExecutionVenue,
+    #[serde(default = "legacy_hyperliquid_testnet")]
+    pub testnet: bool,
     pub symbol: String,
     pub side: StrategySide,
     pub total_size: f64,
@@ -223,6 +229,14 @@ impl StrategyJobDefinition {
         }
     }
 
+    pub fn testnet(&self) -> bool {
+        match self {
+            Self::Twap(definition) => definition.testnet,
+            Self::Vwap(definition) => definition.testnet,
+            Self::Oiwap(definition) => definition.testnet,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::Twap(definition) => definition.validate(),
@@ -230,6 +244,10 @@ impl StrategyJobDefinition {
             Self::Oiwap(definition) => definition.validate(),
         }
     }
+}
+
+const fn legacy_hyperliquid_testnet() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

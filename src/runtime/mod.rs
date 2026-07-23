@@ -19,6 +19,7 @@ use crate::credentials;
 use crate::domain::execution::{CancelPlan, ExecutionReceipt, ExecutionVenue, Position, TradePlan};
 use crate::providers::bulk::execution::BulkExecutionAdapter;
 use crate::providers::bulk::ws::BulkAccountStream;
+use crate::providers::hyperliquid::HyperliquidNetwork;
 use crate::providers::hyperliquid::ws::HyperliquidAccountStream;
 use crate::scripting::execution::{
     ScriptCancelRequest, ScriptManagedRequest, ScriptOrderRef, ScriptRawOrderRequest,
@@ -33,13 +34,15 @@ use crate::strategies::jobs::{
 };
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-const RUNTIME_VERSION: u8 = 29;
+const RUNTIME_VERSION: u8 = 30;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TrackedOrder {
     pub venue: ExecutionVenue,
+    #[serde(default = "legacy_hyperliquid_testnet")]
+    pub testnet: bool,
     pub account: String,
     pub internal_symbol: String,
     pub venue_symbol: String,
@@ -49,6 +52,10 @@ pub struct TrackedOrder {
     pub updated_at_ms: u64,
     #[serde(default)]
     pub script_order_id: Option<String>,
+}
+
+const fn legacy_hyperliquid_testnet() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -363,16 +370,19 @@ struct AccountRuntimeEvent<'a> {
 enum AccountConnectionEvent {
     Connected {
         venue: ExecutionVenue,
+        testnet: bool,
         account: String,
         reconnected: bool,
     },
     Data {
         venue: ExecutionVenue,
+        testnet: bool,
         account: String,
         data: serde_json::Value,
     },
     Disconnected {
         venue: ExecutionVenue,
+        testnet: bool,
         account: String,
         error: String,
     },
@@ -451,6 +461,7 @@ pub async fn serve() -> Result<()> {
     if let Ok(account) = credentials::bulk_account() {
         ensure_account_supervisor(
             ExecutionVenue::Bulk,
+            false,
             &account,
             &account_tx,
             &mut account_supervisors,
@@ -641,6 +652,7 @@ pub async fn track_receipt(plan: &TradePlan, receipt: &ExecutionReceipt) -> Resu
     ensure_running().await?;
     let order = TrackedOrder {
         venue: plan.venue,
+        testnet: plan.testnet,
         account: plan.account.clone(),
         internal_symbol: plan.internal_symbol.clone(),
         venue_symbol: plan.venue_symbol.clone(),
@@ -1355,6 +1367,7 @@ fn create_script_job(
         sources: submission.sources,
         params: submission.params,
         venue: submission.venue,
+        testnet: submission.testnet,
         duration_seconds: submission.duration_seconds,
         verbose: submission.verbose,
     };
@@ -1883,14 +1896,16 @@ async fn create_bot_job(
     })?;
 
     if submission.definition.venue() == ExecutionVenue::Hyperliquid {
-        crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new()
-            .await?
-            .configure_leverage(
-                submission.definition.symbol(),
-                submission.definition.leverage(),
-            )
-            .await
-            .context("failed to configure Hyperliquid leverage before starting the bot")?;
+        crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new(
+            HyperliquidNetwork::from_testnet(submission.definition.testnet()),
+        )
+        .await?
+        .configure_leverage(
+            submission.definition.symbol(),
+            submission.definition.leverage(),
+        )
+        .await
+        .context("failed to configure Hyperliquid leverage before starting the bot")?;
     }
 
     fs::create_dir_all(&paths.jobs)
@@ -2277,6 +2292,7 @@ async fn execute_script_order(
         request: request.clone(),
         symbol: job.definition.symbol.clone(),
         venue,
+        testnet: job.definition.testnet,
         status: "pending".to_string(),
         venue_order_id: None,
         created_at_ms,
@@ -2314,13 +2330,16 @@ async fn execute_script_order(
             return Err(error);
         }
     };
-    let venue_adapter = match crate::providers::execution::ExecutionAdapter::new(venue).await {
-        Ok(adapter) => adapter,
-        Err(error) => {
-            fail_script_order(paths, state, job_id, &order.id, &error)?;
-            return Err(error);
-        }
-    };
+    let venue_adapter =
+        match crate::providers::execution::ExecutionAdapter::new(venue, job.definition.testnet)
+            .await
+        {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                fail_script_order(paths, state, job_id, &order.id, &error)?;
+                return Err(error);
+            }
+        };
     let venue_arg = match venue {
         ExecutionVenue::Bulk => crate::cli::ExecutionVenueArg::Bulk,
         ExecutionVenue::Hyperliquid => crate::cli::ExecutionVenueArg::Hyperliquid,
@@ -2389,6 +2408,7 @@ async fn execute_script_order(
                     symbol: job.definition.symbol.clone(),
                     config: None,
                     venue: venue_arg,
+                    testnet: job.definition.testnet,
                     size,
                     margin,
                     order_kind,
@@ -2410,6 +2430,7 @@ async fn execute_script_order(
                 symbol: job.definition.symbol.clone(),
                 config: None,
                 venue: venue_arg,
+                testnet: job.definition.testnet,
                 size: request.size,
                 margin: request.margin,
                 order_kind,
@@ -2433,7 +2454,13 @@ async fn execute_script_order(
             return Err(error);
         }
     };
-    ensure_account_supervisor(venue, &plan.account, account_tx, account_supervisors);
+    ensure_account_supervisor(
+        venue,
+        plan.testnet,
+        &plan.account,
+        account_tx,
+        account_supervisors,
+    );
     let receipt = match execute_trade(paths, adapter, state, &plan, Some(order.id.clone())).await {
         Ok(receipt) => receipt,
         Err(error) => {
@@ -2579,6 +2606,7 @@ async fn execute_script_cancel(
     let plan = CancelPlan {
         created_at_ms: now_ms()?,
         venue,
+        testnet: current.testnet,
         account: crate::providers::execution::ExecutionAdapter::configured_account(venue)?,
         internal_symbol: market.symbol.clone(),
         venue_symbol: market.venue_symbol.clone(),
@@ -3001,7 +3029,10 @@ async fn handle_connection(
         },
         RuntimeRequest::TrackOrder { order } => {
             append_runtime_event(paths, "order_tracking_started", &order)?;
-            state.tracked_orders.insert(order.order_id.clone(), order);
+            state.tracked_orders.insert(
+                tracked_order_key(order.venue, order.testnet, &order.order_id),
+                order,
+            );
             persist_state(paths, state)?;
             RuntimeResponse {
                 ok: true,
@@ -3012,7 +3043,13 @@ async fn handle_connection(
             }
         }
         RuntimeRequest::ExecuteTrade { plan } => {
-            ensure_account_supervisor(plan.venue, &plan.account, account_tx, account_supervisors);
+            ensure_account_supervisor(
+                plan.venue,
+                plan.testnet,
+                &plan.account,
+                account_tx,
+                account_supervisors,
+            );
             match execute_trade(paths, adapter, state, &plan, None).await {
                 Ok(receipt) => RuntimeResponse {
                     ok: true,
@@ -3031,7 +3068,13 @@ async fn handle_connection(
             }
         }
         RuntimeRequest::CancelOrder { plan } => {
-            ensure_account_supervisor(plan.venue, &plan.account, account_tx, account_supervisors);
+            ensure_account_supervisor(
+                plan.venue,
+                plan.testnet,
+                &plan.account,
+                account_tx,
+                account_supervisors,
+            );
             match execute_cancel(paths, adapter, state, &plan).await {
                 Ok(receipt) => RuntimeResponse {
                     ok: true,
@@ -3054,7 +3097,13 @@ async fn handle_connection(
                 && let Ok(account) =
                     crate::providers::execution::ExecutionAdapter::configured_account(venue)
             {
-                ensure_account_supervisor(venue, &account, account_tx, account_supervisors);
+                ensure_account_supervisor(
+                    venue,
+                    submission.testnet,
+                    &account,
+                    account_tx,
+                    account_supervisors,
+                );
             }
             match create_script_job(paths, state, submission) {
                 Ok(job) => RuntimeResponse {
@@ -3270,10 +3319,17 @@ async fn handle_connection(
         }
         RuntimeRequest::SubmitStrategyJob { submission } => {
             let venue = submission.definition.venue();
+            let testnet = submission.definition.testnet();
             if let Ok(account) =
                 crate::providers::execution::ExecutionAdapter::configured_account(venue)
             {
-                ensure_account_supervisor(venue, &account, account_tx, account_supervisors);
+                ensure_account_supervisor(
+                    venue,
+                    testnet,
+                    &account,
+                    account_tx,
+                    account_supervisors,
+                );
             }
             match create_strategy_job(paths, state, submission) {
                 Ok(job) => RuntimeResponse {
@@ -3360,7 +3416,13 @@ async fn handle_connection(
             sequence,
             plan,
         } => {
-            ensure_account_supervisor(plan.venue, &plan.account, account_tx, account_supervisors);
+            ensure_account_supervisor(
+                plan.venue,
+                plan.testnet,
+                &plan.account,
+                account_tx,
+                account_supervisors,
+            );
             match execute_strategy_trade(paths, adapter, state, &job_id, sequence, &plan).await {
                 Ok(receipt) => RuntimeResponse {
                     ok: true,
@@ -3388,10 +3450,17 @@ async fn handle_connection(
         },
         RuntimeRequest::SubmitBotJob { submission } => {
             let venue = submission.definition.venue();
+            let testnet = submission.definition.testnet();
             if let Ok(account) =
                 crate::providers::execution::ExecutionAdapter::configured_account(venue)
             {
-                ensure_account_supervisor(venue, &account, account_tx, account_supervisors);
+                ensure_account_supervisor(
+                    venue,
+                    testnet,
+                    &account,
+                    account_tx,
+                    account_supervisors,
+                );
             }
             match create_bot_job(paths, state, submission).await {
                 Ok(job) => RuntimeResponse {
@@ -3476,7 +3545,13 @@ async fn handle_connection(
             sequence,
             plan,
         } => {
-            ensure_account_supervisor(plan.venue, &plan.account, account_tx, account_supervisors);
+            ensure_account_supervisor(
+                plan.venue,
+                plan.testnet,
+                &plan.account,
+                account_tx,
+                account_supervisors,
+            );
             match execute_bot_trade(paths, adapter, state, &job_id, sequence, &plan).await {
                 Ok(receipt) => RuntimeResponse {
                     ok: true,
@@ -3527,10 +3602,12 @@ async fn execute_trade(
                 .await?
         }
         ExecutionVenue::Hyperliquid => {
-            crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new()
-                .await?
-                .submit_trade(plan)
-                .await?
+            crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new(
+                HyperliquidNetwork::from_testnet(plan.testnet),
+            )
+            .await?
+            .submit_trade(plan)
+            .await?
         }
     };
     if let Err(error) = append_json_line(
@@ -3551,6 +3628,7 @@ async fn execute_trade(
             .context("non-terminal execution receipt omitted its order id")?;
         let order = TrackedOrder {
             venue: plan.venue,
+            testnet: plan.testnet,
             account: plan.account.clone(),
             internal_symbol: plan.internal_symbol.clone(),
             venue_symbol: plan.venue_symbol.clone(),
@@ -3563,7 +3641,10 @@ async fn execute_trade(
         if let Err(error) = append_runtime_event(paths, "order_tracking_started", &order) {
             eprintln!("execution journal warning: {error:#}");
         }
-        state.tracked_orders.insert(order.order_id.clone(), order);
+        state.tracked_orders.insert(
+            tracked_order_key(order.venue, order.testnet, &order.order_id),
+            order,
+        );
         persist_state(paths, state)?;
     }
     Ok(receipt)
@@ -3595,10 +3676,12 @@ async fn execute_cancel(
                 .await?
         }
         ExecutionVenue::Hyperliquid => {
-            crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new()
-                .await?
-                .cancel_order(&plan.venue_symbol, &plan.order_id)
-                .await?
+            crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new(
+                HyperliquidNetwork::from_testnet(plan.testnet),
+            )
+            .await?
+            .cancel_order(&plan.venue_symbol, &plan.order_id)
+            .await?
         }
     };
     if let Err(error) = append_json_line(
@@ -3612,7 +3695,12 @@ async fn execute_cancel(
     ) {
         eprintln!("execution journal warning: {error:#}");
     }
-    if receipt.terminal && state.tracked_orders.remove(&plan.order_id).is_some() {
+    if receipt.terminal
+        && state
+            .tracked_orders
+            .remove(&tracked_order_key(plan.venue, plan.testnet, &plan.order_id))
+            .is_some()
+    {
         persist_state(paths, state)?;
     }
     Ok(receipt)
@@ -3620,19 +3708,44 @@ async fn execute_cancel(
 
 fn ensure_account_supervisor(
     venue: ExecutionVenue,
+    testnet: bool,
     account: &str,
     sender: &mpsc::Sender<AccountConnectionEvent>,
     supervisors: &mut HashSet<String>,
 ) {
-    let key = format!("{}:{account}", execution_exchange(venue));
+    let key = account_cache_key(venue, testnet, account);
     if !supervisors.insert(key) {
         return;
     }
     let account = account.to_string();
     let sender = sender.clone();
     tokio::spawn(async move {
-        supervise_account_stream(venue, account, sender).await;
+        supervise_account_stream(venue, testnet, account, sender).await;
     });
+}
+
+fn network_label(venue: ExecutionVenue, testnet: bool) -> &'static str {
+    match venue {
+        ExecutionVenue::Bulk => "testnet",
+        ExecutionVenue::Hyperliquid if testnet => "testnet",
+        ExecutionVenue::Hyperliquid => "mainnet",
+    }
+}
+
+fn account_cache_key(venue: ExecutionVenue, testnet: bool, account: &str) -> String {
+    format!(
+        "{}:{}:{account}",
+        execution_exchange(venue),
+        network_label(venue, testnet)
+    )
+}
+
+fn tracked_order_key(venue: ExecutionVenue, testnet: bool, order_id: &str) -> String {
+    format!(
+        "{}:{}:{order_id}",
+        execution_exchange(venue),
+        network_label(venue, testnet)
+    )
 }
 
 fn execution_exchange(venue: ExecutionVenue) -> &'static str {
@@ -3648,11 +3761,15 @@ enum VenueAccountStream {
 }
 
 impl VenueAccountStream {
-    async fn connect(venue: ExecutionVenue, account: &str) -> Result<Self> {
+    async fn connect(venue: ExecutionVenue, testnet: bool, account: &str) -> Result<Self> {
         match venue {
             ExecutionVenue::Bulk => Ok(Self::Bulk(BulkAccountStream::connect(account).await?)),
             ExecutionVenue::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidAccountStream::connect(account).await?,
+                HyperliquidAccountStream::connect_on(
+                    account,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
             )),
         }
     }
@@ -3667,17 +3784,19 @@ impl VenueAccountStream {
 
 async fn supervise_account_stream(
     venue: ExecutionVenue,
+    testnet: bool,
     account: String,
     sender: mpsc::Sender<AccountConnectionEvent>,
 ) {
     let mut connected_once = false;
     let mut reconnect_delay_secs = 1_u64;
     loop {
-        match VenueAccountStream::connect(venue, &account).await {
+        match VenueAccountStream::connect(venue, testnet, &account).await {
             Ok(mut stream) => {
                 if sender
                     .send(AccountConnectionEvent::Connected {
                         venue,
+                        testnet,
                         account: account.clone(),
                         reconnected: connected_once,
                     })
@@ -3694,6 +3813,7 @@ async fn supervise_account_stream(
                             if sender
                                 .send(AccountConnectionEvent::Data {
                                     venue,
+                                    testnet,
                                     account: account.clone(),
                                     data,
                                 })
@@ -3707,6 +3827,7 @@ async fn supervise_account_stream(
                             if sender
                                 .send(AccountConnectionEvent::Disconnected {
                                     venue,
+                                    testnet,
                                     account: account.clone(),
                                     error: format!("{error:#}"),
                                 })
@@ -3724,6 +3845,7 @@ async fn supervise_account_stream(
                 if sender
                     .send(AccountConnectionEvent::Disconnected {
                         venue,
+                        testnet,
                         account: account.clone(),
                         error: format!("{error:#}"),
                     })
@@ -3748,19 +3870,21 @@ async fn handle_account_connection_event(
     match event {
         AccountConnectionEvent::Connected {
             venue,
+            testnet,
             account,
             reconnected,
         } => {
             state.account_stream_connected = true;
             state.last_error = None;
-            refresh_account_positions(venue, adapter, state, &account, true).await?;
+            refresh_account_positions(venue, testnet, adapter, state, &account, true).await?;
             persist_state(paths, state)?;
             if reconnected {
-                recover_account_gap(venue, paths, adapter, state, &account).await?;
+                recover_account_gap(venue, testnet, paths, adapter, state, &account).await?;
             }
         }
         AccountConnectionEvent::Disconnected {
             venue,
+            testnet,
             account,
             error,
         } => {
@@ -3770,13 +3894,15 @@ async fn handle_account_connection_event(
                 paths,
                 state,
                 format!(
-                    "{} account WebSocket disconnected for {account}: {error}",
-                    execution_exchange(venue)
+                    "{} {} account WebSocket disconnected for {account}: {error}",
+                    execution_exchange(venue),
+                    network_label(venue, testnet),
                 ),
             );
         }
         AccountConnectionEvent::Data {
             venue,
+            testnet,
             account,
             data,
         } => {
@@ -3792,11 +3918,19 @@ async fn handle_account_connection_event(
                     data: &data,
                 },
             )?;
-            apply_account_event(venue, paths, state, &account, &data, received_at_ms)?;
+            apply_account_event(
+                venue,
+                testnet,
+                paths,
+                state,
+                &account,
+                &data,
+                received_at_ms,
+            )?;
             if venue == ExecutionVenue::Hyperliquid
                 && data.get("channel").and_then(serde_json::Value::as_str) == Some("user")
             {
-                refresh_account_positions(venue, adapter, state, &account, true).await?;
+                refresh_account_positions(venue, testnet, adapter, state, &account, true).await?;
             }
             persist_state(paths, state)?;
         }
@@ -3806,6 +3940,7 @@ async fn handle_account_connection_event(
 
 async fn refresh_account_positions(
     venue: ExecutionVenue,
+    testnet: bool,
     adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
     account: &str,
@@ -3815,7 +3950,7 @@ async fn refresh_account_positions(
     if !force
         && state
             .account_positions_refreshed_at_ms
-            .get(account)
+            .get(&account_cache_key(venue, testnet, account))
             .is_some_and(|last| now.saturating_sub(*last) < 250)
     {
         return Ok(());
@@ -3823,18 +3958,19 @@ async fn refresh_account_positions(
     let snapshot = match venue {
         ExecutionVenue::Bulk => adapter.account_snapshot(account).await?,
         ExecutionVenue::Hyperliquid => {
-            crate::providers::execution::ExecutionAdapter::new(venue)
+            crate::providers::execution::ExecutionAdapter::new(venue, testnet)
                 .await?
                 .account_snapshot(account)
                 .await?
         }
     };
+    let cache_key = account_cache_key(venue, testnet, account);
     state
         .account_positions
-        .insert(account.to_string(), snapshot.positions);
+        .insert(cache_key.clone(), snapshot.positions);
     state
         .account_positions_refreshed_at_ms
-        .insert(account.to_string(), snapshot.fetched_at_ms);
+        .insert(cache_key, snapshot.fetched_at_ms);
     Ok(())
 }
 
@@ -3854,11 +3990,19 @@ async fn script_positions_in_daemon(
     }
     let venue = job.definition.venue.expect("checked execution venue");
     let account = crate::providers::execution::ExecutionAdapter::configured_account(venue)?;
-    refresh_account_positions(venue, adapter, state, &account, false).await?;
+    refresh_account_positions(
+        venue,
+        job.definition.testnet,
+        adapter,
+        state,
+        &account,
+        false,
+    )
+    .await?;
     persist_state(paths, state)?;
     Ok(state
         .account_positions
-        .get(&account)
+        .get(&account_cache_key(venue, job.definition.testnet, &account))
         .into_iter()
         .flatten()
         .filter(|position| {
@@ -3872,6 +4016,7 @@ async fn script_positions_in_daemon(
 
 fn apply_account_event(
     venue: ExecutionVenue,
+    testnet: bool,
     paths: &RuntimePaths,
     state: &mut RuntimeState,
     account: &str,
@@ -3883,7 +4028,7 @@ fn apply_account_event(
             apply_bulk_account_event(paths, state, account, data, received_at_ms)
         }
         ExecutionVenue::Hyperliquid => {
-            apply_hyperliquid_account_event(paths, state, account, data, received_at_ms)
+            apply_hyperliquid_account_event(testnet, paths, state, account, data, received_at_ms)
         }
     }
 }
@@ -3911,6 +4056,7 @@ fn apply_bulk_account_event(
                     apply_tracked_order_status(
                         paths,
                         state,
+                        (ExecutionVenue::Bulk, false),
                         account,
                         order_id,
                         status,
@@ -3919,6 +4065,7 @@ fn apply_bulk_account_event(
                     apply_script_order_status(
                         paths,
                         state,
+                        (ExecutionVenue::Bulk, false),
                         order_id,
                         status,
                         received_at_ms,
@@ -3941,16 +4088,33 @@ fn apply_bulk_account_event(
                 .and_then(serde_json::Value::as_u64)
                 .map(crate::providers::bulk::market_data::normalize_timestamp_ms)
                 .unwrap_or(received_at_ms);
-            apply_tracked_order_status(paths, state, account, order_id, status, event_ms)?;
-            apply_script_order_status(paths, state, order_id, status, event_ms, data.clone())?;
+            apply_tracked_order_status(
+                paths,
+                state,
+                (ExecutionVenue::Bulk, false),
+                account,
+                order_id,
+                status,
+                event_ms,
+            )?;
+            apply_script_order_status(
+                paths,
+                state,
+                (ExecutionVenue::Bulk, false),
+                order_id,
+                status,
+                event_ms,
+                data.clone(),
+            )?;
         }
         _ => {}
     }
-    route_account_event_to_scripts(ExecutionVenue::Bulk, paths, state, data)?;
+    route_account_event_to_scripts(ExecutionVenue::Bulk, false, paths, state, data)?;
     Ok(())
 }
 
 fn apply_hyperliquid_account_event(
+    testnet: bool,
     paths: &RuntimePaths,
     state: &mut RuntimeState,
     account: &str,
@@ -3981,10 +4145,19 @@ fn apply_hyperliquid_account_event(
                     .get("statusTimestamp")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(received_at_ms);
-                apply_tracked_order_status(paths, state, account, &order_id, status, event_ms)?;
+                apply_tracked_order_status(
+                    paths,
+                    state,
+                    (ExecutionVenue::Hyperliquid, testnet),
+                    account,
+                    &order_id,
+                    status,
+                    event_ms,
+                )?;
                 apply_script_order_status(
                     paths,
                     state,
+                    (ExecutionVenue::Hyperliquid, testnet),
                     &order_id,
                     status,
                     event_ms,
@@ -4017,6 +4190,7 @@ fn apply_hyperliquid_account_event(
                     }
                     route_account_event_to_scripts(
                         ExecutionVenue::Hyperliquid,
+                        testnet,
                         paths,
                         state,
                         &normalized,
@@ -4054,15 +4228,21 @@ fn normalize_hyperliquid_order_status(status: &str) -> &str {
 fn apply_script_order_status(
     paths: &RuntimePaths,
     state: &mut RuntimeState,
+    route: (ExecutionVenue, bool),
     venue_order_id: &str,
     status: &str,
     event_ms: u64,
     data: serde_json::Value,
 ) -> Result<()> {
+    let (venue, testnet) = route;
     let local_ids = state
         .script_orders
         .iter()
-        .filter(|(_, order)| order.venue_order_id.as_deref() == Some(venue_order_id))
+        .filter(|(_, order)| {
+            order.venue == venue
+                && order.testnet == testnet
+                && order.venue_order_id.as_deref() == Some(venue_order_id)
+        })
         .map(|(local_id, _)| local_id.clone())
         .collect::<Vec<_>>();
     for local_id in local_ids {
@@ -4106,6 +4286,7 @@ fn apply_script_order_status(
 
 fn route_account_event_to_scripts(
     venue: ExecutionVenue,
+    testnet: bool,
     paths: &RuntimePaths,
     state: &mut RuntimeState,
     data: &serde_json::Value,
@@ -4142,7 +4323,11 @@ fn route_account_event_to_scripts(
         let orders = state
             .script_orders
             .values()
-            .filter(|order| order.venue_order_id.as_deref() == Some(venue_order_id))
+            .filter(|order| {
+                order.venue == venue
+                    && order.testnet == testnet
+                    && order.venue_order_id.as_deref() == Some(venue_order_id)
+            })
             .cloned()
             .collect::<Vec<_>>();
         for order in orders {
@@ -4165,6 +4350,7 @@ fn route_account_event_to_scripts(
         .filter(|job| {
             job.status.is_active()
                 && job.definition.venue == Some(venue)
+                && job.definition.testnet == testnet
                 && internal_symbol
                     .as_deref()
                     .is_none_or(|symbol| job.definition.symbol == symbol)
@@ -4188,17 +4374,30 @@ fn route_account_event_to_scripts(
 fn apply_tracked_order_status(
     paths: &RuntimePaths,
     state: &mut RuntimeState,
+    route: (ExecutionVenue, bool),
     account: &str,
     order_id: &str,
     status: &str,
     event_ms: u64,
 ) -> Result<()> {
-    let Some(order) = state.tracked_orders.get_mut(order_id) else {
+    let (venue, testnet) = route;
+    let key = state
+        .tracked_orders
+        .iter()
+        .find(|(_, order)| {
+            order.venue == venue
+                && order.testnet == testnet
+                && order.account == account
+                && order.order_id == order_id
+        })
+        .map(|(key, _)| key.clone());
+    let Some(key) = key else {
         return Ok(());
     };
-    if order.account != account {
-        return Ok(());
-    }
+    let order = state
+        .tracked_orders
+        .get_mut(&key)
+        .context("tracked order disappeared while applying account status")?;
     let changed = order.status != status;
     order.status = status.to_string();
     order.updated_at_ms = event_ms;
@@ -4207,13 +4406,14 @@ fn apply_tracked_order_status(
         append_runtime_event(paths, "order_status", &snapshot)?;
     }
     if is_terminal_order_status(status) {
-        state.tracked_orders.remove(order_id);
+        state.tracked_orders.remove(&key);
     }
     Ok(())
 }
 
 async fn recover_account_gap(
     venue: ExecutionVenue,
+    testnet: bool,
     paths: &RuntimePaths,
     adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
@@ -4237,6 +4437,7 @@ async fn recover_account_gap(
                 apply_tracked_order_status(
                     paths,
                     state,
+                    (ExecutionVenue::Bulk, false),
                     account,
                     &record.order_id,
                     &record.status,
@@ -4245,6 +4446,7 @@ async fn recover_account_gap(
                 apply_script_order_status(
                     paths,
                     state,
+                    (ExecutionVenue::Bulk, false),
                     &record.order_id,
                     &record.status,
                     record.ts_ms,
@@ -4253,11 +4455,13 @@ async fn recover_account_gap(
             }
         }
         ExecutionVenue::Hyperliquid => {
-            let execution = crate::providers::execution::ExecutionAdapter::new(venue).await?;
+            let execution =
+                crate::providers::execution::ExecutionAdapter::new(venue, testnet).await?;
             for order in execution.open_orders(account).await? {
                 apply_tracked_order_status(
                     paths,
                     state,
+                    (ExecutionVenue::Hyperliquid, testnet),
                     account,
                     &order.order_id,
                     "resting",
@@ -4266,6 +4470,7 @@ async fn recover_account_gap(
                 apply_script_order_status(
                     paths,
                     state,
+                    (ExecutionVenue::Hyperliquid, testnet),
                     &order.order_id,
                     "resting",
                     order.ts_ms,
@@ -4278,7 +4483,7 @@ async fn recover_account_gap(
     let fills = match venue {
         ExecutionVenue::Bulk => adapter.fills(account).await?,
         ExecutionVenue::Hyperliquid => {
-            crate::providers::execution::ExecutionAdapter::new(venue)
+            crate::providers::execution::ExecutionAdapter::new(venue, testnet)
                 .await?
                 .fills(account)
                 .await?
@@ -4315,7 +4520,7 @@ async fn recover_account_gap(
                 serde_json::Value::String(fill.venue_symbol.clone()),
             );
         }
-        route_account_event_to_scripts(venue, paths, state, &routed)?;
+        route_account_event_to_scripts(venue, testnet, paths, state, &routed)?;
     }
     state.last_recovery_ms = Some(now_ms()?);
     state.account_disconnected_at_ms = None;
@@ -4570,7 +4775,7 @@ mod tests {
 
     #[test]
     fn runtime_protocol_v29_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 29);
+        assert_eq!(RUNTIME_VERSION, 30);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",

@@ -52,6 +52,7 @@ impl FillFingerprint {
 pub struct StrategyOrderManager {
     job_id: String,
     venue: ExecutionVenue,
+    testnet: bool,
     account: String,
     internal_symbol: String,
     venue_symbol: String,
@@ -68,6 +69,7 @@ impl StrategyOrderManager {
         Self {
             job_id: job_id.to_string(),
             venue: parent.venue,
+            testnet: parent.testnet,
             account: parent.account.clone(),
             internal_symbol: parent.internal_symbol.clone(),
             venue_symbol: parent.venue_symbol.clone(),
@@ -115,6 +117,7 @@ impl StrategyOrderManager {
         maker_price: Option<f64>,
     ) -> Result<ExecutionReceipt> {
         if plan.venue != self.venue
+            || plan.testnet != self.testnet
             || plan.account != self.account
             || plan.internal_symbol != self.internal_symbol
             || plan.venue_symbol != self.venue_symbol
@@ -149,6 +152,7 @@ impl StrategyOrderManager {
         let plan = CancelPlan {
             created_at_ms: now_ms()?,
             venue: self.venue,
+            testnet: self.testnet,
             account: self.account.clone(),
             internal_symbol: self.internal_symbol.clone(),
             venue_symbol: self.venue_symbol.clone(),
@@ -252,6 +256,7 @@ mod tests {
         TradePlan {
             created_at_ms: 1,
             venue: ExecutionVenue::Bulk,
+            testnet: false,
             account: "account".to_string(),
             internal_symbol: "BTC/USDT".to_string(),
             venue_symbol: "BTC-USD".to_string(),
