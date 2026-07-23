@@ -14,6 +14,7 @@ use crate::commands::script::{
 use crate::commands::study::common::is_empty_object;
 use crate::domain::enums::ProviderKind;
 use crate::domain::types::OrderBookSnapshot;
+use crate::providers::binance::{BinanceMarket, BinanceProvider};
 use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 use crate::providers::mmt::MmtProvider;
@@ -589,6 +590,18 @@ async fn fetch_sources(
                 .series,
         );
     }
+    for provider in [ProviderKind::Binance, ProviderKind::BinanceFutures] {
+        if source_configs
+            .values()
+            .any(|config| config.provider == provider)
+        {
+            data.series.extend(
+                fetch_direct_sources(args, source_configs, report, provider)
+                    .await?
+                    .series,
+            );
+        }
+    }
     Ok(data)
 }
 
@@ -833,6 +846,8 @@ async fn fetch_direct_sources(
         let provider_name = match provider {
             ProviderKind::Bulk => "BULK",
             ProviderKind::Hyperliquid => "Hyperliquid",
+            ProviderKind::Binance => "Binance Spot",
+            ProviderKind::BinanceFutures => "Binance Futures",
             _ => bail!("historical direct source provider is invalid"),
         };
         let interval = match provider {
@@ -841,6 +856,9 @@ async fn fetch_direct_sources(
             }
             ProviderKind::Hyperliquid => {
                 crate::providers::hyperliquid::market_data::timeframe_from_seconds(timeframe)?
+            }
+            ProviderKind::Binance | ProviderKind::BinanceFutures => {
+                crate::providers::binance::market_data::timeframe_from_seconds(timeframe)?
             }
             _ => unreachable!(),
         };
@@ -874,6 +892,26 @@ async fn fetch_direct_sources(
                 }
                 ProviderKind::Hyperliquid => {
                     HyperliquidProvider::candles(&args.symbol, interval, args.from, args.to).await
+                }
+                ProviderKind::Binance => {
+                    BinanceProvider::candles_paginated(
+                        BinanceMarket::Spot,
+                        &args.symbol,
+                        interval,
+                        args.from,
+                        args.to,
+                    )
+                    .await
+                }
+                ProviderKind::BinanceFutures => {
+                    BinanceProvider::candles_paginated(
+                        BinanceMarket::Futures,
+                        &args.symbol,
+                        interval,
+                        args.from,
+                        args.to,
+                    )
+                    .await
                 }
                 _ => unreachable!(),
             }

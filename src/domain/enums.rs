@@ -6,6 +6,8 @@ pub enum ProviderKind {
     Mmt,
     Bulk,
     Hyperliquid,
+    Binance,
+    BinanceFutures,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

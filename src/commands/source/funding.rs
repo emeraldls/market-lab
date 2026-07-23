@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::cli::{OutputFormat, SourceFundingArgs};
 use crate::domain::enums::ProviderKind;
@@ -18,6 +18,9 @@ pub async fn handle(args: SourceFundingArgs) -> Result<()> {
     match args.provider_kind()?.into() {
         ProviderKind::Bulk => handle_bulk(args).await,
         ProviderKind::Hyperliquid => handle_hyperliquid(args).await,
+        ProviderKind::Binance | ProviderKind::BinanceFutures => {
+            bail!("Binance funding is not implemented")
+        }
         ProviderKind::Mmt | ProviderKind::MarketLab => {
             unreachable!("funding source is standalone-only")
         }

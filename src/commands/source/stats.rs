@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::cli::{OutputFormat, SourceStatsArgs};
 use crate::domain::enums::ProviderKind;
@@ -17,6 +17,9 @@ pub async fn handle(args: SourceStatsArgs) -> Result<()> {
     match args.provider_kind()?.into() {
         ProviderKind::Bulk => handle_bulk(args).await,
         ProviderKind::Hyperliquid => handle_hyperliquid(args).await,
+        ProviderKind::Binance | ProviderKind::BinanceFutures => {
+            bail!("Binance statistics are not implemented")
+        }
         ProviderKind::Mmt | ProviderKind::MarketLab => {
             unreachable!("statistics source is standalone-only")
         }

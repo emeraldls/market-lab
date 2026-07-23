@@ -706,6 +706,12 @@ impl SourceVdArgs {
         let provider = validate_source_identity(self.provider, &self.exchange, &self.symbol)?;
         if matches!(
             provider,
+            CliProviderKind::Binance | CliProviderKind::BinanceFutures
+        ) {
+            bail!("Binance live volume delta is not implemented");
+        }
+        if matches!(
+            provider,
             CliProviderKind::Bulk | CliProviderKind::Hyperliquid
         ) {
             if !self.stream {
@@ -874,6 +880,12 @@ pub struct SourceOiArgs {
 impl SourceOiArgs {
     pub fn validate(&self) -> Result<()> {
         let provider = validate_source_identity(self.provider, &self.exchange, &self.symbol)?;
+        if matches!(
+            provider,
+            CliProviderKind::Binance | CliProviderKind::BinanceFutures
+        ) {
+            bail!("Binance open interest is not implemented");
+        }
         if !crate::markets::is_futures_exchange(&self.exchange)? {
             bail!(
                 "open interest requires a futures exchange; `{}` is spot",
@@ -994,6 +1006,14 @@ impl TimeframeSourceValidation<'_> {
             bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
         provider_timeframe_from_seconds(self.provider, self.timeframe)?;
+        if self.stream
+            && matches!(
+                self.provider,
+                CliProviderKind::Binance | CliProviderKind::BinanceFutures
+            )
+        {
+            bail!("Binance live candle and volume streaming is not implemented");
+        }
         if self.stream {
             if self.from.is_some() || self.to.is_some() {
                 bail!("--from/--to are not allowed with --stream");
@@ -2247,6 +2267,12 @@ fn resolve_source_provider(
     if exchange.eq_ignore_ascii_case("hyperliquid") {
         return Ok(CliProviderKind::Hyperliquid);
     }
+    if exchange.eq_ignore_ascii_case("binance") {
+        return Ok(CliProviderKind::Binance);
+    }
+    if exchange.eq_ignore_ascii_case("binancef") {
+        return Ok(CliProviderKind::BinanceFutures);
+    }
     bail!(
         "standalone exchange `{exchange}` is not supported yet; use --provider mmt when `{exchange}` is routed through MMT"
     )
@@ -2277,6 +2303,12 @@ fn resolve_system_provider(
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquid") => {
             Ok(ProviderKind::Hyperliquid)
         }
+        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("binance") => {
+            Ok(ProviderKind::Binance)
+        }
+        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("binancef") => {
+            Ok(ProviderKind::BinanceFutures)
+        }
         (None, Some(exchange)) => bail!("unsupported standalone exchange `{exchange}`"),
         (None, None) => Ok(ProviderKind::MarketLab),
     }
@@ -2292,6 +2324,9 @@ fn provider_timeframe_from_seconds(
         }
         CliProviderKind::Hyperliquid => {
             crate::providers::hyperliquid::market_data::timeframe_from_seconds(seconds)
+        }
+        CliProviderKind::Binance | CliProviderKind::BinanceFutures => {
+            crate::providers::binance::market_data::timeframe_from_seconds(seconds)
         }
         CliProviderKind::Mmt | CliProviderKind::MarketLab => mmt_timeframe_from_seconds(seconds),
     }
@@ -2341,6 +2376,8 @@ pub enum CliProviderKind {
     Mmt,
     Bulk,
     Hyperliquid,
+    Binance,
+    BinanceFutures,
 }
 
 impl From<CliDataProvider> for CliProviderKind {
@@ -2358,6 +2395,8 @@ impl From<CliProviderKind> for ProviderKind {
             CliProviderKind::Mmt => ProviderKind::Mmt,
             CliProviderKind::Bulk => ProviderKind::Bulk,
             CliProviderKind::Hyperliquid => ProviderKind::Hyperliquid,
+            CliProviderKind::Binance => ProviderKind::Binance,
+            CliProviderKind::BinanceFutures => ProviderKind::BinanceFutures,
         }
     }
 }
@@ -3292,27 +3331,55 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_standalone_exchange_explains_mmt_routing() {
-        let cli = Cli::try_parse_from([
+    fn binance_standalone_and_mmt_routes_are_distinct() {
+        let standalone = Cli::try_parse_from([
             "mlab",
             "source",
-            "orderbook",
+            "candles",
             "--exchange",
             "binancef",
             "--symbol",
             "BTC/USDT",
+            "--timeframe",
+            "60",
         ])
-        .expect("syntax should parse before exchange validation");
-        match cli.command {
+        .expect("standalone Binance futures command should parse");
+        match standalone.command {
             Commands::Source {
-                command: SourceCommands::Orderbook(args),
+                command: SourceCommands::Candles(args),
             } => {
-                let error = args
-                    .validate()
-                    .expect_err("binancef is not a standalone exchange yet");
-                assert!(error.to_string().contains("--provider mmt"));
+                assert_eq!(
+                    args.provider_kind().expect("standalone route resolves"),
+                    CliProviderKind::BinanceFutures
+                );
             }
-            _ => panic!("expected standalone orderbook command"),
+            _ => panic!("expected standalone candles command"),
+        }
+
+        let mmt = Cli::try_parse_from([
+            "mlab",
+            "source",
+            "candles",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "binancef",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+        ])
+        .expect("MMT Binance futures command should parse");
+        match mmt.command {
+            Commands::Source {
+                command: SourceCommands::Candles(args),
+            } => {
+                assert_eq!(
+                    args.provider_kind().expect("MMT route resolves"),
+                    CliProviderKind::Mmt
+                );
+            }
+            _ => panic!("expected MMT candles command"),
         }
     }
 
