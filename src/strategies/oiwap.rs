@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn selector_requires_mmt_futures_sources() {
         let selector = OpenInterestSourceSelector::parse(
-            &["binancef@mmt".to_string(), "hyperliquid@mmt".to_string()],
+            &["binancef@mmt".to_string(), "hyperliquidf@mmt".to_string()],
             "BTC/USDT",
         )
         .expect("futures OI selector");

@@ -308,12 +308,13 @@ impl AccountQueryArgs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ExecutionVenueArg {
     Bulk,
+    #[value(name = "hyperliquidf")]
     Hyperliquid,
 }
 
 fn validate_execution_network(venue: ExecutionVenueArg, testnet: bool) -> Result<()> {
     if testnet && venue != ExecutionVenueArg::Hyperliquid {
-        bail!("--testnet is only valid with --venue hyperliquid");
+        bail!("--testnet is only valid with --venue hyperliquidf");
     }
     Ok(())
 }
@@ -596,7 +597,7 @@ impl ScriptRunArgs {
             bail!("--duration must be at least 1 second");
         }
         if self.testnet && self.venue != Some(ExecutionVenueArg::Hyperliquid) {
-            bail!("--testnet requires --venue hyperliquid");
+            bail!("--testnet requires --venue hyperliquidf");
         }
         Ok(())
     }
@@ -1962,7 +1963,7 @@ impl RunVwapArgs {
         }
         let execution_venue = match self.venue {
             ExecutionVenueArg::Bulk => "bulk",
-            ExecutionVenueArg::Hyperliquid => "hyperliquid",
+            ExecutionVenueArg::Hyperliquid => "hyperliquidf",
         };
         crate::strategies::vwap::VolumeSourceSelector::parse(
             &self.volume_sources,
@@ -2253,10 +2254,7 @@ fn resolve_source_provider(
         bail!("--exchange cannot be empty");
     }
     if provider.is_some() {
-        if matches!(
-            exchange.to_ascii_lowercase().as_str(),
-            "bulk" | "hyperliquid"
-        ) {
+        if exchange.eq_ignore_ascii_case("bulk") {
             bail!("omit --provider for the standalone `{exchange}` exchange");
         }
         return Ok(CliProviderKind::Mmt);
@@ -2264,7 +2262,7 @@ fn resolve_source_provider(
     if exchange.eq_ignore_ascii_case("bulk") {
         return Ok(CliProviderKind::Bulk);
     }
-    if exchange.eq_ignore_ascii_case("hyperliquid") {
+    if exchange.eq_ignore_ascii_case("hyperliquidf") {
         return Ok(CliProviderKind::Hyperliquid);
     }
     if exchange.eq_ignore_ascii_case("binance") {
@@ -2290,17 +2288,12 @@ fn resolve_system_provider(
     exchange: Option<&str>,
 ) -> Result<ProviderKind> {
     match (provider, exchange) {
-        (Some(_), Some(exchange))
-            if matches!(
-                exchange.to_ascii_lowercase().as_str(),
-                "bulk" | "hyperliquid"
-            ) =>
-        {
+        (Some(_), Some(exchange)) if exchange.eq_ignore_ascii_case("bulk") => {
             bail!("omit --provider for the standalone `{exchange}` exchange")
         }
         (Some(_), _) => Ok(ProviderKind::Mmt),
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("bulk") => Ok(ProviderKind::Bulk),
-        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquid") => {
+        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquidf") => {
             Ok(ProviderKind::Hyperliquid)
         }
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("binance") => {
@@ -2474,12 +2467,12 @@ mod tests {
     #[test]
     fn parse_hyperliquid_standalone_commands() {
         let markets =
-            Cli::try_parse_from(["mlab", "markets", "--exchange", "hyperliquid", "--refresh"])
+            Cli::try_parse_from(["mlab", "markets", "--exchange", "hyperliquidf", "--refresh"])
                 .expect("Hyperliquid markets command should parse");
         match markets.command {
             Commands::Markets(args) => {
                 assert!(args.provider.is_none());
-                assert_eq!(args.exchange, "hyperliquid");
+                assert_eq!(args.exchange, "hyperliquidf");
                 assert!(args.refresh);
                 args.validate()
                     .expect("standalone Hyperliquid markets should validate");
@@ -2492,7 +2485,7 @@ mod tests {
             "source",
             "orderbook",
             "--exchange",
-            "hyperliquid",
+            "hyperliquidf",
             "--symbol",
             "BTC/USDT",
             "--depth",
@@ -2513,13 +2506,41 @@ mod tests {
             _ => panic!("expected source orderbook command"),
         }
 
+        let mmt_source = Cli::try_parse_from([
+            "mlab",
+            "source",
+            "candles",
+            "--provider",
+            "mmt",
+            "--exchange",
+            "hyperliquidf",
+            "--symbol",
+            "BTC/USDT",
+            "--timeframe",
+            "60",
+            "--stream",
+        ])
+        .expect("MMT Hyperliquid command should parse");
+        match mmt_source.command {
+            Commands::Source {
+                command: SourceCommands::Candles(args),
+            } => {
+                args.validate().expect("MMT Hyperliquid source validates");
+                assert_eq!(
+                    args.provider_kind().expect("MMT route resolves"),
+                    CliProviderKind::Mmt
+                );
+            }
+            _ => panic!("expected source candles command"),
+        }
+
         let trade = Cli::try_parse_from([
             "mlab",
             "trade",
             "long",
             "BTC/USDT",
             "--venue",
-            "hyperliquid",
+            "hyperliquidf",
             "--margin",
             "100",
             "--leverage",
@@ -2537,6 +2558,21 @@ mod tests {
             }
             _ => panic!("expected trade long command"),
         }
+
+        assert!(
+            Cli::try_parse_from([
+                "mlab",
+                "trade",
+                "long",
+                "BTC/USDT",
+                "--venue",
+                "hyperliquid",
+                "--margin",
+                "100",
+            ])
+            .is_err(),
+            "`hyperliquid` is reserved for spot and must not alias perpetual execution"
+        );
     }
 
     #[test]
@@ -3542,7 +3578,7 @@ mod tests {
             "grid",
             "BTC/USDT",
             "--venue",
-            "hyperliquid",
+            "hyperliquidf",
             "--margin",
             "100",
             "--duration",
@@ -3596,7 +3632,7 @@ mod tests {
             "--duration",
             "3600",
             "--volume-sources",
-            "binancef@mmt,hyperliquid@mmt,bulk",
+            "binancef@mmt,hyperliquidf@mmt,bulk",
             "--dry-run",
         ])
         .expect("VWAP should parse");
@@ -3612,7 +3648,7 @@ mod tests {
                 assert_eq!(args.duration, 3600);
                 assert_eq!(
                     args.volume_sources,
-                    ["binancef@mmt", "hyperliquid@mmt", "bulk"]
+                    ["binancef@mmt", "hyperliquidf@mmt", "bulk"]
                 );
                 assert!(args.dry_run);
             }
@@ -3658,7 +3694,7 @@ mod tests {
             "--duration",
             "3600",
             "--oi-sources",
-            "binancef@mmt,hyperliquid@mmt",
+            "binancef@mmt,hyperliquidf@mmt",
             "--dry-run",
         ])
         .expect("OIWAP should parse");
@@ -3672,7 +3708,7 @@ mod tests {
             } => {
                 args.validate().expect("OIWAP arguments should validate");
                 assert_eq!(args.duration, 3600);
-                assert_eq!(args.oi_sources, ["binancef@mmt", "hyperliquid@mmt"]);
+                assert_eq!(args.oi_sources, ["binancef@mmt", "hyperliquidf@mmt"]);
                 assert!(args.dry_run);
             }
             _ => panic!("expected strategy run oiwap command"),

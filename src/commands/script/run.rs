@@ -30,7 +30,9 @@ use crate::providers::hyperliquid::ws::{
     HyperliquidAssetContextStream, HyperliquidCandleStream, HyperliquidOrderBookStream,
     HyperliquidTradesStream,
 };
-use crate::providers::mmt::utils::{normalize_symbol_for_mmt, normalize_to_ms, parse_levels};
+use crate::providers::mmt::utils::{
+    normalize_exchange_for_mmt, normalize_symbol_for_mmt, normalize_to_ms, parse_levels,
+};
 use crate::providers::mmt::ws_client::MmtWsClient;
 use crate::scripting::engine::Script;
 use crate::scripting::execution::{ScriptExecutionCommand, ScriptExecutionContext};
@@ -910,7 +912,7 @@ impl DirectCandleStream {
 fn direct_provider_name(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Bulk => "bulk",
-        ProviderKind::Hyperliquid => "hyperliquid",
+        ProviderKind::Hyperliquid => "hyperliquidf",
         ProviderKind::Binance => "binance",
         ProviderKind::BinanceFutures => "binancef",
         ProviderKind::Mmt => "mmt",
@@ -1133,12 +1135,13 @@ async fn subscribe_mmt_sources(
     for config in configs {
         let exchange = config.exchange.as_str();
         let provider_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
+        let provider_exchange = normalize_exchange_for_mmt(exchange)?;
         match &config.source {
             ScriptSource::Candles => {
                 ws.subscribe(json!({
                     "type": "subscribe",
                     "channel": "trades",
-                    "exchange": exchange,
+                    "exchange": provider_exchange,
                     "symbol": provider_symbol.as_str(),
                 }))
                 .await
@@ -1148,7 +1151,7 @@ async fn subscribe_mmt_sources(
                 ws.subscribe(json!({
                     "type": "subscribe",
                     "channel": "depth",
-                    "exchange": exchange,
+                    "exchange": provider_exchange,
                     "symbol": provider_symbol.as_str(),
                 }))
                 .await
@@ -1162,7 +1165,7 @@ async fn subscribe_mmt_sources(
                 ws.subscribe(json!({
                     "type": "subscribe",
                     "channel": "vd",
-                    "exchange": exchange,
+                    "exchange": provider_exchange,
                     "symbol": provider_symbol.as_str(),
                     "tf": tf,
                     "bucket": bucket,
@@ -1177,7 +1180,7 @@ async fn subscribe_mmt_sources(
                 ws.subscribe(json!({
                     "type": "subscribe",
                     "channel": "oi",
-                    "exchange": exchange,
+                    "exchange": provider_exchange,
                     "symbol": provider_symbol.as_str(),
                     "tf": tf,
                 }))
@@ -1191,7 +1194,7 @@ async fn subscribe_mmt_sources(
                 ws.subscribe(json!({
                     "type": "subscribe",
                     "channel": "volumes",
-                    "exchange": exchange,
+                    "exchange": provider_exchange,
                     "symbol": provider_symbol.as_str(),
                     "tf": tf,
                 }))
@@ -1276,8 +1279,12 @@ async fn next_mmt_update(
                 return Ok(None);
             };
             let depth = config.depth_or_default();
-            Ok(parse_depth_update(value, state, depth)?
-                .map(|snapshot| LiveUpdate::new(config, LiveRecord::Orderbook(snapshot))))
+            Ok(
+                parse_depth_update(value, state, depth)?.map(|mut snapshot| {
+                    snapshot.exchange.clone_from(&config.exchange);
+                    LiveUpdate::new(config, LiveRecord::Orderbook(snapshot))
+                }),
+            )
         }
         ScriptSource::Candles => {
             let payload = value.get("data").context("trade payload missing data")?;
@@ -1322,22 +1329,26 @@ fn mmt_update_config<'a>(
         .get("exchange")
         .and_then(Value::as_str)
         .map(str::to_ascii_lowercase);
-    let mut matching = source_configs
+    let mut matching = Vec::new();
+    for config in source_configs
         .values()
         .filter(|config| &config.source == source)
-        .filter(|config| {
-            exchange
-                .as_ref()
-                .is_none_or(|value| &config.exchange == value)
-        });
-    let config = matching.next();
-    if config.is_some() && matching.next().is_some() {
+    {
+        let matches_exchange = match &exchange {
+            Some(value) => normalize_exchange_for_mmt(&config.exchange)? == *value,
+            None => true,
+        };
+        if matches_exchange {
+            matching.push(config);
+        }
+    }
+    if matching.len() > 1 {
         bail!(
             "MMT {} update did not identify a unique exchange",
             source.as_str()
         );
     }
-    Ok(config)
+    Ok(matching.into_iter().next())
 }
 
 fn parse_depth_update(

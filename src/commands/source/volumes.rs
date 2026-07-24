@@ -12,7 +12,7 @@ use crate::providers::bulk::ws::BulkCandleStream;
 use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 use crate::providers::hyperliquid::ws::HyperliquidCandleStream;
 use crate::providers::mmt::MmtProvider;
-use crate::providers::mmt::utils::normalize_symbol_for_mmt;
+use crate::providers::mmt::utils::{normalize_exchange_for_mmt, normalize_symbol_for_mmt};
 use crate::providers::mmt::ws_client::MmtWsClient;
 
 use super::common::{SourceEnvelope, SourceMeta, render_terminal};
@@ -128,7 +128,7 @@ async fn handle_hyperliquid(args: SourceVolumesArgs) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?,
     )
     .await?;
-    render_direct_volume_bars(&series, args.output, "hyperliquid", "Hyperliquid")
+    render_direct_volume_bars(&series, args.output, "hyperliquidf", "Hyperliquid")
 }
 
 async fn handle_binance(args: SourceVolumesArgs, market: BinanceMarket) -> Result<()> {
@@ -201,11 +201,12 @@ fn render_direct_volume_bars(
 async fn stream_volumes(args: SourceVolumesArgs) -> Result<()> {
     let exchange = args.exchange_name()?.to_string();
     let provider_symbol = normalize_symbol_for_mmt(&exchange, &args.symbol)?;
+    let provider_exchange = normalize_exchange_for_mmt(&exchange)?;
     let ws = MmtWsClient::shared().await?;
     ws.subscribe(serde_json::json!({
         "type": "subscribe",
         "channel": "volumes",
-        "exchange": exchange.to_lowercase(),
+        "exchange": provider_exchange,
         "symbol": provider_symbol,
         "tf": args.timeframe_name()?,
     }))
@@ -375,7 +376,7 @@ async fn stream_hyperliquid_volume_bars(args: SourceVolumesArgs) -> Result<()> {
                 let Some(bar) = latest.as_ref() else { continue; };
                 let env = SourceEnvelope {
                     r#type: "source.volume-bars.stream".to_string(), version: "1",
-                    provider: "hyperliquid", exchange: "hyperliquid".to_string(),
+                    provider: "hyperliquidf", exchange: "hyperliquidf".to_string(),
                     symbol: market.symbol.clone(), ts_ms: bar.t, stream: true, data: bar.clone(),
                     meta: SourceMeta { depth: None, min_size: None, max_size: None, price_group: None,
                         interval_ms: Some(args.interval_ms), timeframe: Some(args.timeframe_name()?.to_string()),

@@ -17,7 +17,10 @@ pub mod ws_candles;
 pub mod ws_client;
 pub mod ws_vd;
 
-use utils::{normalize_symbol_for_mmt, normalize_to_ms, normalize_to_seconds, parse_levels};
+use utils::{
+    normalize_exchange_for_mmt, normalize_symbol_for_mmt, normalize_to_ms, normalize_to_seconds,
+    parse_levels,
+};
 
 const MMT_BASE_URL: &str = "https://eu-central-1.mmt.gg/api/v1";
 const MMT_HTTP_TIMEOUT_SECS: u64 = 8;
@@ -63,7 +66,8 @@ impl MmtProvider {
     ) -> Result<VdSeries> {
         let api_key = mmt_api_key()?;
         let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
-        let exchange = exchange.trim().to_lowercase();
+        let canonical_exchange = exchange.trim().to_ascii_lowercase();
+        let exchange = normalize_exchange_for_mmt(exchange)?;
         let from_s = normalize_to_seconds(from);
         let to_s = normalize_to_seconds(to);
 
@@ -96,7 +100,7 @@ impl MmtProvider {
         let parsed: VdResponse =
             serde_json::from_value(body).context("invalid /vd payload shape")?;
         Ok(VdSeries {
-            exchange: parsed.exchange,
+            exchange: canonical_exchange,
             symbol: parsed.symbol,
             tf: parsed.tf,
             from: normalize_to_ms(parsed.from),
@@ -116,7 +120,8 @@ impl MmtProvider {
     ) -> Result<CandleSeries> {
         let api_key = mmt_api_key()?;
         let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
-        let exchange = exchange.trim().to_lowercase();
+        let canonical_exchange = exchange.trim().to_ascii_lowercase();
+        let exchange = normalize_exchange_for_mmt(exchange)?;
         let from_s = normalize_to_seconds(from);
         let to_s = normalize_to_seconds(to);
 
@@ -148,7 +153,7 @@ impl MmtProvider {
         let parsed: CandleResponse =
             serde_json::from_value(body).context("invalid /candles payload shape")?;
         Ok(CandleSeries {
-            exchange: parsed.exchange,
+            exchange: canonical_exchange,
             symbol: parsed.symbol,
             tf: parsed.tf,
             from: normalize_to_ms(parsed.from),
@@ -167,7 +172,8 @@ impl MmtProvider {
     ) -> Result<OiSeries> {
         let api_key = mmt_api_key()?;
         let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
-        let exchange = exchange.trim().to_lowercase();
+        let canonical_exchange = exchange.trim().to_ascii_lowercase();
+        let exchange = normalize_exchange_for_mmt(exchange)?;
         let from_s = normalize_to_seconds(from);
         let to_s = normalize_to_seconds(to);
 
@@ -199,7 +205,7 @@ impl MmtProvider {
         let parsed: OiResponse =
             serde_json::from_value(body).context("invalid /oi payload shape")?;
         Ok(OiSeries {
-            exchange: parsed.exchange,
+            exchange: canonical_exchange,
             symbol: parsed.symbol,
             tf: parsed.tf,
             from: normalize_to_ms(parsed.from),
@@ -217,8 +223,10 @@ impl MmtProvider {
         to: u64,
     ) -> Result<VolumeProfileSeries> {
         let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
+        let provider_exchange = normalize_exchange_for_mmt(exchange)?;
         fetch_volumes(
-            exchange.trim().to_lowercase(),
+            exchange.trim().to_ascii_lowercase(),
+            provider_exchange,
             normalized_symbol,
             tf,
             from,
@@ -238,6 +246,7 @@ impl MmtProvider {
             bail!("MMT aggregated volumes require at least one exchange");
         }
         let mut normalized_symbol = None;
+        let mut canonical_exchanges = Vec::with_capacity(exchanges.len());
         let mut normalized_exchanges = Vec::with_capacity(exchanges.len());
         for exchange in exchanges {
             let candidate = normalize_symbol_for_mmt(exchange, symbol)?;
@@ -248,10 +257,13 @@ impl MmtProvider {
                 bail!("MMT volume sources do not share one provider symbol for `{symbol}`");
             }
             normalized_symbol.get_or_insert(candidate);
-            normalized_exchanges.push(exchange.trim().to_ascii_lowercase());
+            canonical_exchanges.push(exchange.trim().to_ascii_lowercase());
+            normalized_exchanges.push(normalize_exchange_for_mmt(exchange)?);
         }
+        canonical_exchanges.sort();
         normalized_exchanges.sort();
         fetch_volumes(
+            canonical_exchanges.join(":"),
             normalized_exchanges.join(":"),
             normalized_symbol.expect("non-empty exchanges checked"),
             tf,
@@ -296,6 +308,7 @@ impl MmtProvider {
 }
 
 async fn fetch_volumes(
+    canonical_exchange: String,
     exchange: String,
     normalized_symbol: String,
     tf: &str,
@@ -334,7 +347,7 @@ async fn fetch_volumes(
     let parsed: VolumesResponse =
         serde_json::from_value(body).context("invalid /volumes payload shape")?;
     Ok(VolumeProfileSeries {
-        exchange: parsed.exchange,
+        exchange: canonical_exchange,
         symbol: parsed.symbol,
         tf: parsed.tf,
         from: normalize_to_ms(parsed.from),
@@ -347,7 +360,6 @@ async fn fetch_volumes(
 #[derive(Debug, Deserialize)]
 struct VdResponse {
     data: Vec<VdCandle>,
-    exchange: String,
     symbol: String,
     tf: String,
     from: u64,
@@ -358,7 +370,6 @@ struct VdResponse {
 #[derive(Debug, Deserialize)]
 struct CandleResponse {
     data: Vec<OhlcvtCandle>,
-    exchange: String,
     symbol: String,
     tf: String,
     from: u64,
@@ -369,7 +380,6 @@ struct CandleResponse {
 #[derive(Debug, Deserialize)]
 struct OiResponse {
     data: Vec<OiCandle>,
-    exchange: String,
     symbol: String,
     tf: String,
     from: u64,
@@ -380,7 +390,6 @@ struct OiResponse {
 #[derive(Debug, Deserialize)]
 struct VolumesResponse {
     data: Vec<VolumeProfile>,
-    exchange: String,
     symbol: String,
     tf: String,
     from: u64,
@@ -411,7 +420,8 @@ async fn fetch_orderbook_snapshot(
 ) -> Result<OrderBookSnapshot> {
     let api_key = mmt_api_key()?;
     let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
-    let exchange = exchange.trim().to_lowercase();
+    let canonical_exchange = exchange.trim().to_ascii_lowercase();
+    let exchange = normalize_exchange_for_mmt(exchange)?;
 
     let levels = levels_param(depth);
     let url = format!("{MMT_BASE_URL}/orderbook");
@@ -439,6 +449,7 @@ async fn fetch_orderbook_snapshot(
     }
 
     let mut snapshot = parse_orderbook_body(&body)?;
+    snapshot.exchange = canonical_exchange;
     let max_depth = depth as usize;
     snapshot.bids.truncate(max_depth);
     snapshot.asks.truncate(max_depth);
@@ -506,7 +517,8 @@ async fn fetch_flat_heatmap_hd_snapshot(
 ) -> Result<OrderBookSnapshot> {
     let api_key = mmt_api_key()?;
     let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
-    let exchange = exchange.trim().to_lowercase();
+    let canonical_exchange = exchange.trim().to_ascii_lowercase();
+    let exchange = normalize_exchange_for_mmt(exchange)?;
 
     let tf = "1m";
     let from = at_seconds.saturating_sub(3600);
@@ -548,12 +560,9 @@ async fn fetch_flat_heatmap_hd_snapshot(
         .or_else(|| parsed.data.last())
         .context("/flat_heatmap_hd returned no data points")?;
 
-    Ok(heatmap_point_to_snapshot(
-        &parsed.exchange,
-        &parsed.symbol,
-        point,
-        depth,
-    ))
+    let mut snapshot = heatmap_point_to_snapshot(&parsed.exchange, &parsed.symbol, point, depth);
+    snapshot.exchange = canonical_exchange;
+    Ok(snapshot)
 }
 
 async fn fetch_flat_heatmap_hd_series(
@@ -566,7 +575,8 @@ async fn fetch_flat_heatmap_hd_series(
 ) -> Result<Vec<OrderBookSnapshot>> {
     let api_key = mmt_api_key()?;
     let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
-    let exchange = exchange.trim().to_lowercase();
+    let canonical_exchange = exchange.trim().to_ascii_lowercase();
+    let exchange = normalize_exchange_for_mmt(exchange)?;
     let from_s = normalize_to_seconds(from);
     let to_s = normalize_to_seconds(to);
 
@@ -609,7 +619,12 @@ async fn fetch_flat_heatmap_hd_series(
     Ok(parsed
         .data
         .iter()
-        .map(|point| heatmap_point_to_snapshot(&parsed.exchange, &parsed.symbol, point, depth))
+        .map(|point| {
+            let mut snapshot =
+                heatmap_point_to_snapshot(&parsed.exchange, &parsed.symbol, point, depth);
+            snapshot.exchange.clone_from(&canonical_exchange);
+            snapshot
+        })
         .collect())
 }
 

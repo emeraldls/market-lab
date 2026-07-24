@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::domain::types::OhlcvtCandle;
 
-use super::utils::normalize_symbol_for_mmt;
+use super::utils::{normalize_exchange_for_mmt, normalize_symbol_for_mmt};
 use super::ws_client::MmtWsClient;
 
 pub struct MmtCandlesStream {
@@ -12,12 +12,13 @@ pub struct MmtCandlesStream {
 impl MmtCandlesStream {
     pub async fn connect(exchange: &str, symbol: &str, tf: &str) -> Result<Self> {
         let provider_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
+        let provider_exchange = normalize_exchange_for_mmt(exchange)?;
         let client = MmtWsClient::shared().await?;
 
         let subscribe = serde_json::json!({
             "type": "subscribe",
             "channel": "candles",
-            "exchange": exchange.to_lowercase(),
+            "exchange": provider_exchange,
             "symbol": provider_symbol,
             "tf": tf,
         });

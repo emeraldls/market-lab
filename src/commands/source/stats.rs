@@ -40,7 +40,7 @@ async fn handle_hyperliquid(args: SourceStatsArgs) -> Result<()> {
         return stream_hyperliquid_stats(args).await;
     }
     let stats = HyperliquidProvider::statistics(&args.period, args.symbol.as_deref()).await?;
-    render_stats(stats, &args, "hyperliquid")
+    render_stats(stats, &args, "hyperliquidf")
 }
 
 fn render_stats(
@@ -178,7 +178,7 @@ async fn stream_hyperliquid_stats(args: SourceStatsArgs) -> Result<()> {
                 let Some(snapshot) = latest.as_ref() else { continue; };
                 let env = SourceEnvelope {
                     r#type: "source.stats.stream".to_string(), version: "1",
-                    provider: "hyperliquid", exchange: snapshot.exchange.clone(),
+                    provider: "hyperliquidf", exchange: snapshot.exchange.clone(),
                     symbol: snapshot.symbol.clone(), ts_ms: snapshot.timestamp_ms,
                     stream: true, data: snapshot.clone(),
                     meta: SourceMeta { depth: None, min_size: None, max_size: None, price_group: None,

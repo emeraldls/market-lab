@@ -8,7 +8,7 @@ pub mod ws;
 
 use serde::{Deserialize, Serialize};
 
-pub const EXCHANGE: &str = "hyperliquid";
+pub const EXCHANGE: &str = "hyperliquidf";
 pub const MAINNET_HTTP_URL: &str = "https://api.hyperliquid.xyz";
 pub const MAINNET_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 pub const TESTNET_HTTP_URL: &str = "https://api.hyperliquid-testnet.xyz";

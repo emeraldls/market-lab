@@ -459,7 +459,7 @@ fn execution_venue_label(venue: ExecutionVenue, testnet: bool) -> &'static str {
 pub(super) fn venue_key(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "bulk",
-        ExecutionVenue::Hyperliquid => "hyperliquid",
+        ExecutionVenue::Hyperliquid => "hyperliquidf",
     }
 }
 

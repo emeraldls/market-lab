@@ -22,7 +22,9 @@ use crate::providers::hyperliquid::HyperliquidNetwork;
 use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 use crate::providers::hyperliquid::ws::{HyperliquidOrderBookStream, HyperliquidTradesStream};
 use crate::providers::mmt::MmtProvider;
-use crate::providers::mmt::utils::{normalize_symbol_for_mmt, normalize_to_ms};
+use crate::providers::mmt::utils::{
+    normalize_exchange_for_mmt, normalize_symbol_for_mmt, normalize_to_ms,
+};
 use crate::providers::mmt::ws_client::MmtWsClient;
 use crate::strategies::execution::{FillProgress, StrategyOrderManager};
 use crate::strategies::jobs::{
@@ -91,7 +93,7 @@ impl WeightedTradesStream {
     async fn connect(exchange: &str, symbol: &str, testnet: bool) -> Result<Self> {
         match exchange {
             "bulk" => Ok(Self::Bulk(BulkTradesStream::connect(symbol).await?)),
-            "hyperliquid" => Ok(Self::Hyperliquid(
+            "hyperliquidf" => Ok(Self::Hyperliquid(
                 HyperliquidTradesStream::connect_on(
                     symbol,
                     HyperliquidNetwork::from_testnet(testnet),
@@ -1047,7 +1049,7 @@ async fn fetch_direct_volume_history(
         let chunk_to = cursor.saturating_add(chunk_ms).min(to_ms);
         let series = match exchange {
             "bulk" => BulkProvider::volume_bars(symbol, "1m", cursor, chunk_to).await?,
-            "hyperliquid" => {
+            "hyperliquidf" => {
                 HyperliquidProvider::volume_bars(symbol, "1m", cursor, chunk_to).await?
             }
             _ => bail!("standalone volume adapter for `{exchange}` is not implemented"),
@@ -1237,20 +1239,21 @@ async fn stream_mmt_trades(
     symbol: &str,
     sender: mpsc::Sender<LiveVolumeEvent>,
 ) -> Result<()> {
-    let mut selected = HashSet::new();
+    let mut selected = HashMap::new();
     let ws = MmtWsClient::connect().await?;
     for exchange in exchanges {
-        let exchange = exchange.to_ascii_lowercase();
-        let provider_symbol = normalize_symbol_for_mmt(&exchange, symbol)?;
+        let canonical_exchange = exchange.to_ascii_lowercase();
+        let provider_symbol = normalize_symbol_for_mmt(&canonical_exchange, symbol)?;
+        let provider_exchange = normalize_exchange_for_mmt(&canonical_exchange)?;
         ws.subscribe(serde_json::json!({
             "type": "subscribe",
             "channel": "trades",
-            "exchange": exchange,
+            "exchange": provider_exchange,
             "symbol": provider_symbol,
         }))
         .await
-        .with_context(|| format!("failed to subscribe to {exchange}@mmt trades"))?;
-        selected.insert(exchange);
+        .with_context(|| format!("failed to subscribe to {canonical_exchange}@mmt trades"))?;
+        selected.insert(provider_exchange, canonical_exchange);
     }
     loop {
         let Some(value) = ws.next_json().await? else {
@@ -1259,13 +1262,13 @@ async fn stream_mmt_trades(
         let Some((exchange, trade)) = parse_mmt_trade(value)? else {
             continue;
         };
-        if !selected.contains(&exchange) {
+        let Some(canonical_exchange) = selected.get(&exchange) else {
             continue;
-        }
+        };
         sender
             .send(LiveVolumeEvent::Trade {
                 role: LiveVolumeRole::Trajectory,
-                source: format!("{exchange}@mmt"),
+                source: format!("{canonical_exchange}@mmt"),
                 ts_ms: normalize_to_ms(trade.t),
                 size: trade.q.abs(),
             })
@@ -1280,21 +1283,22 @@ async fn stream_mmt_open_interest(
     start_ms: u64,
     sender: mpsc::Sender<LiveVolumeEvent>,
 ) -> Result<()> {
-    let mut selected = HashSet::new();
+    let mut selected = HashMap::new();
     let ws = MmtWsClient::connect().await?;
     for exchange in exchanges {
-        let exchange = exchange.to_ascii_lowercase();
-        let provider_symbol = normalize_symbol_for_mmt(&exchange, symbol)?;
+        let canonical_exchange = exchange.to_ascii_lowercase();
+        let provider_symbol = normalize_symbol_for_mmt(&canonical_exchange, symbol)?;
+        let provider_exchange = normalize_exchange_for_mmt(&canonical_exchange)?;
         ws.subscribe(serde_json::json!({
             "type": "subscribe",
             "channel": "oi",
-            "exchange": exchange,
+            "exchange": provider_exchange,
             "symbol": provider_symbol,
             "tf": "1m",
         }))
         .await
-        .with_context(|| format!("failed to subscribe to {exchange}@mmt OI"))?;
-        selected.insert(exchange);
+        .with_context(|| format!("failed to subscribe to {canonical_exchange}@mmt OI"))?;
+        selected.insert(provider_exchange, canonical_exchange);
     }
 
     let mut activity = LiveOpenInterestActivity::new(start_ms);
@@ -1305,16 +1309,16 @@ async fn stream_mmt_open_interest(
         let Some((exchange, candle)) = parse_mmt_open_interest(value)? else {
             continue;
         };
-        if !selected.contains(&exchange) {
+        let Some(canonical_exchange) = selected.get(&exchange) else {
             continue;
-        }
-        let Some((ts_ms, change)) = activity.apply(&exchange, candle)? else {
+        };
+        let Some((ts_ms, change)) = activity.apply(canonical_exchange, candle)? else {
             continue;
         };
         sender
             .send(LiveVolumeEvent::Adjustment {
                 role: LiveVolumeRole::Trajectory,
-                source: format!("{exchange}@mmt"),
+                source: format!("{canonical_exchange}@mmt"),
                 ts_ms,
                 delta: change,
             })
@@ -1802,7 +1806,7 @@ pub(super) fn execution_venue_network_name(venue: ExecutionVenue, testnet: bool)
 pub(super) fn execution_venue_name(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "bulk",
-        ExecutionVenue::Hyperliquid => "hyperliquid",
+        ExecutionVenue::Hyperliquid => "hyperliquidf",
     }
 }
 

@@ -41,7 +41,7 @@ async fn handle_hyperliquid(args: SourceFundingArgs) -> Result<()> {
         return stream_hyperliquid_funding(args).await;
     }
     let funding = HyperliquidProvider::funding(&args.symbol).await?;
-    render_funding(funding, &args, "hyperliquid")
+    render_funding(funding, &args, "hyperliquidf")
 }
 
 fn render_funding(
@@ -175,7 +175,7 @@ async fn stream_hyperliquid_funding(args: SourceFundingArgs) -> Result<()> {
                 let Some(snapshot) = latest.as_ref() else { continue; };
                 let env = SourceEnvelope {
                     r#type: "source.funding.stream".to_string(), version: "1",
-                    provider: "hyperliquid", exchange: snapshot.exchange.clone(),
+                    provider: "hyperliquidf", exchange: snapshot.exchange.clone(),
                     symbol: snapshot.symbol.clone(), ts_ms: snapshot.timestamp_ms,
                     stream: true, data: snapshot.clone(),
                     meta: SourceMeta { depth: None, min_size: None, max_size: None, price_group: None,

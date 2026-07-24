@@ -275,7 +275,7 @@ async fn stream_hyperliquid_vd(args: SourceVdArgs) -> Result<()> {
             trades = stream.next_trades() => {
                 let trades = trades?;
                 if let Some(delta) = volume_delta_from_trades(
-                    &trades, &mut cumulative_delta, "hyperliquid", &internal_symbol,
+                    &trades, &mut cumulative_delta, "hyperliquidf", &internal_symbol,
                 ) {
                     latest = Some(delta);
                 }
@@ -284,7 +284,7 @@ async fn stream_hyperliquid_vd(args: SourceVdArgs) -> Result<()> {
                 let Some(delta) = latest.as_ref() else { continue; };
                 let env = SourceEnvelope {
                     r#type: "source.vd.trades.stream".to_string(), version: "1",
-                    provider: "hyperliquid", exchange: "hyperliquid".to_string(),
+                    provider: "hyperliquidf", exchange: "hyperliquidf".to_string(),
                     symbol: internal_symbol.clone(), ts_ms: delta.timestamp_ms,
                     stream: true, data: delta.clone(),
                     meta: SourceMeta { depth: None, min_size: None, max_size: None, price_group: None,

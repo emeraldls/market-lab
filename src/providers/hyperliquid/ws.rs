@@ -361,7 +361,7 @@ impl HyperliquidOrderBookStream {
                     .collect::<Result<Vec<_>>>()
             };
             return Ok(OrderBookSnapshot {
-                exchange: "hyperliquid".to_string(),
+                exchange: "hyperliquidf".to_string(),
                 symbol: self.internal_symbol.clone(),
                 timestamp_ms: book.time,
                 bids: parse(sides.next().expect("book length checked"))?,
@@ -437,7 +437,7 @@ impl HyperliquidTradesStream {
                         bail!("Hyperliquid trade did not match the subscribed native perpetual");
                     }
                     Ok(TradeTick {
-                        exchange: "hyperliquid".to_string(),
+                        exchange: "hyperliquidf".to_string(),
                         symbol: self.internal_symbol.clone(),
                         timestamp_ms: trade.time,
                         price: parse(&trade.px, "trade price")?,
@@ -683,7 +683,7 @@ impl WsContext {
             .map_or(Ok(mark), |value| parse(value, "mid price"))?;
         let quote_volume = parse(&self.day_ntl_vlm, "day notional volume")?;
         Ok(MarketTicker {
-            exchange: "hyperliquid".to_string(),
+            exchange: "hyperliquidf".to_string(),
             symbol: symbol.to_string(),
             timestamp_ms: now_ms(),
             price_change: last - previous,

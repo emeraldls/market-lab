@@ -2,24 +2,28 @@ use crate::core::orderbook::OrderBookState;
 use crate::domain::types::OrderBookSnapshot;
 use anyhow::{Context, Result, bail};
 
-use super::utils::{normalize_symbol_for_mmt, normalize_to_ms, parse_levels};
+use super::utils::{
+    normalize_exchange_for_mmt, normalize_symbol_for_mmt, normalize_to_ms, parse_levels,
+};
 use super::ws_client::MmtWsClient;
 
 pub struct MmtDepthStream {
     client: MmtWsClient,
     state: OrderBookState,
     depth: u16,
+    exchange: String,
 }
 
 impl MmtDepthStream {
     pub async fn connect(exchange: &str, symbol: &str, depth: u16) -> Result<Self> {
         let provider_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
+        let provider_exchange = normalize_exchange_for_mmt(exchange)?;
         let client = MmtWsClient::shared().await?;
 
         let subscribe = serde_json::json!({
             "type": "subscribe",
             "channel": "depth",
-            "exchange": exchange.to_lowercase(),
+            "exchange": provider_exchange,
             "symbol": provider_symbol,
         });
 
@@ -32,6 +36,7 @@ impl MmtDepthStream {
             client,
             state: OrderBookState::default(),
             depth,
+            exchange: exchange.trim().to_ascii_lowercase(),
         })
     }
 
@@ -43,7 +48,8 @@ impl MmtDepthStream {
             if v.is_null() {
                 continue;
             }
-            if let Some(snap) = handle_ws_value(v, &mut self.state, self.depth)? {
+            if let Some(mut snap) = handle_ws_value(v, &mut self.state, self.depth)? {
+                snap.exchange.clone_from(&self.exchange);
                 return Ok(snap);
             }
         }

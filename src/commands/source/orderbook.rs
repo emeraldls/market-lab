@@ -77,7 +77,7 @@ async fn handle_hyperliquid(args: SourceOrderbookArgs) -> Result<()> {
         return stream_hyperliquid_orderbook(args).await;
     }
     let snapshot = HyperliquidProvider::live_orderbook(&args.symbol, args.depth, None).await?;
-    let envelope = build_orderbook_envelope(&snapshot, &args, "hyperliquid", false)?;
+    let envelope = build_orderbook_envelope(&snapshot, &args, "hyperliquidf", false)?;
     render_json_or_terminal(
         &envelope,
         &args.output,
@@ -175,7 +175,7 @@ async fn stream_hyperliquid_orderbook(args: SourceOrderbookArgs) -> Result<()> {
             snapshot = stream.next_snapshot() => latest = Some(snapshot?),
             _ = ticker.tick() => {
                 let Some(snapshot) = latest.as_ref() else { continue; };
-                let envelope = build_orderbook_envelope(snapshot, &args, "hyperliquid", true)?;
+                let envelope = build_orderbook_envelope(snapshot, &args, "hyperliquidf", true)?;
                 match args.output {
                     OutputFormat::Json | OutputFormat::Jsonl => println!("{}", serde_json::to_string(&envelope)?),
                     OutputFormat::Terminal => {

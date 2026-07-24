@@ -184,7 +184,7 @@ pub fn source_provider_name(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Mmt => "mmt",
         ProviderKind::Bulk => "bulk",
-        ProviderKind::Hyperliquid => "hyperliquid",
+        ProviderKind::Hyperliquid => "hyperliquidf",
         ProviderKind::Binance => "binance",
         ProviderKind::BinanceFutures => "binancef",
         ProviderKind::MarketLab => "marketlab",
@@ -425,7 +425,7 @@ fn parse_source_selector(raw: &str) -> Result<(String, ScriptSource, ProviderKin
     let selector = match provider {
         ProviderKind::Mmt => format!("{}@{exchange}@mmt", source.as_str()),
         ProviderKind::Bulk => format!("{}@bulk", source.as_str()),
-        ProviderKind::Hyperliquid => format!("{}@hyperliquid", source.as_str()),
+        ProviderKind::Hyperliquid => format!("{}@hyperliquidf", source.as_str()),
         ProviderKind::Binance => format!("{}@binance", source.as_str()),
         ProviderKind::BinanceFutures => format!("{}@binancef", source.as_str()),
         ProviderKind::MarketLab => unreachable!(),
@@ -437,7 +437,7 @@ fn parse_source_provider(raw: &str) -> Result<ProviderKind> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "mmt" => Ok(ProviderKind::Mmt),
         "bulk" => Ok(ProviderKind::Bulk),
-        "hyperliquid" => Ok(ProviderKind::Hyperliquid),
+        "hyperliquidf" => Ok(ProviderKind::Hyperliquid),
         "binance" => Ok(ProviderKind::Binance),
         "binancef" => Ok(ProviderKind::BinanceFutures),
         other => bail!("unsupported script source provider `{other}`"),
@@ -447,7 +447,7 @@ fn parse_source_provider(raw: &str) -> Result<ProviderKind> {
 fn provider_name_for_exchange(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Bulk => "bulk",
-        ProviderKind::Hyperliquid => "hyperliquid",
+        ProviderKind::Hyperliquid => "hyperliquidf",
         ProviderKind::Binance => "binance",
         ProviderKind::BinanceFutures => "binancef",
         ProviderKind::Mmt => "mmt",
@@ -613,7 +613,7 @@ mod tests {
         let configs = parse_source_configs(&[
             "candles@okx@mmt:timeframe=60".to_string(),
             "orderbook@binancef@mmt:timeframe=60,depth=50".to_string(),
-            "vd@hyperliquid@mmt:timeframe=60,bucket=1".to_string(),
+            "vd@hyperliquidf@mmt:timeframe=60,bucket=1".to_string(),
             "oi@binancef@mmt:timeframe=60".to_string(),
             "volumes@okx@mmt:timeframe=60".to_string(),
         ])
@@ -621,7 +621,7 @@ mod tests {
         assert_eq!(configs["candles@okx@mmt"].exchange, "okx");
         assert_eq!(configs["candles@okx@mmt"].provider, ProviderKind::Mmt);
         assert_eq!(configs["orderbook@binancef@mmt"].depth, Some(50));
-        assert_eq!(configs["vd@hyperliquid@mmt"].bucket, Some(1));
+        assert_eq!(configs["vd@hyperliquidf@mmt"].bucket, Some(1));
         assert_eq!(configs["oi@binancef@mmt"].timeframe, Some(60));
         assert_eq!(configs["volumes@okx@mmt"].timeframe, Some(60));
     }
@@ -695,26 +695,26 @@ mod tests {
             ScriptSource::Volumes,
         ]);
         let configs = parse_source_configs(&[
-            "candles@hyperliquid:timeframe=60".to_string(),
-            "orderbook@hyperliquid:depth=20".to_string(),
-            "vd@hyperliquid".to_string(),
-            "oi@hyperliquid".to_string(),
-            "volumes@hyperliquid:timeframe=60".to_string(),
+            "candles@hyperliquidf:timeframe=60".to_string(),
+            "orderbook@hyperliquidf:depth=20".to_string(),
+            "vd@hyperliquidf".to_string(),
+            "oi@hyperliquidf".to_string(),
+            "volumes@hyperliquidf:timeframe=60".to_string(),
         ])
         .expect("standalone Hyperliquid selectors should parse");
 
         validate_source_configs_for_run(&live_manifest, &configs)
             .expect("standalone Hyperliquid live configs should validate");
         assert_eq!(
-            configs["candles@hyperliquid"].provider,
+            configs["candles@hyperliquidf"].provider,
             ProviderKind::Hyperliquid
         );
-        assert_eq!(configs["orderbook@hyperliquid"].depth, Some(20));
+        assert_eq!(configs["orderbook@hyperliquidf"].depth, Some(20));
 
         let historical_manifest = manifest(vec![ScriptSource::Candles, ScriptSource::Volumes]);
         let historical_configs = parse_source_configs(&[
-            "candles@hyperliquid:timeframe=60".to_string(),
-            "volumes@hyperliquid:timeframe=60".to_string(),
+            "candles@hyperliquidf:timeframe=60".to_string(),
+            "volumes@hyperliquidf:timeframe=60".to_string(),
         ])
         .expect("historical Hyperliquid selectors should parse");
         validate_source_configs(&historical_manifest, &historical_configs)

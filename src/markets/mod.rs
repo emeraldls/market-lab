@@ -65,7 +65,12 @@ pub struct MarketSnapshot {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExchangeMarkets {
+    /// Market Lab's canonical exchange identifier.
     pub exchange: String,
+    /// Exchange identifier expected by the upstream provider when it differs
+    /// from Market Lab's canonical identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_exchange: Option<String>,
     pub name: String,
     pub market_type: MarketType,
     pub markets: Vec<Market>,
@@ -80,6 +85,8 @@ impl<'de> Deserialize<'de> for ExchangeMarkets {
         #[serde(rename_all = "camelCase")]
         struct WireExchangeMarkets {
             exchange: String,
+            #[serde(default)]
+            provider_exchange: Option<String>,
             name: String,
             market_type: Option<MarketType>,
             markets: Vec<Market>,
@@ -91,6 +98,7 @@ impl<'de> Deserialize<'de> for ExchangeMarkets {
                 .market_type
                 .unwrap_or_else(|| classify_exchange_name(&wire.exchange)),
             exchange: wire.exchange,
+            provider_exchange: wire.provider_exchange,
             name: wire.name,
             markets: wire.markets,
         })
@@ -341,11 +349,11 @@ impl MarketSnapshot {
                 self.provider
             );
         }
-        if self.provider.eq_ignore_ascii_case("hyperliquid")
+        if matches!(key(&self.provider).as_str(), "hyperliquid" | "hyperliquidf")
             && self.source_url.contains("hyperliquid-testnet")
         {
             bail!(
-                "the installed Hyperliquid market snapshot is from testnet; run `mlab markets --exchange hyperliquid --refresh` to replace it with mainnet markets"
+                "the installed Hyperliquid market snapshot is from testnet; run `mlab markets --exchange hyperliquidf --refresh` to replace it with mainnet markets"
             );
         }
         if self.provider.trim().is_empty()
@@ -405,11 +413,15 @@ impl MarketRegistry {
             .map(|path| {
                 let source = fs::read_to_string(&path)
                     .with_context(|| format!("failed to read {}", path.display()))?;
-                let snapshot = serde_json::from_str::<MarketSnapshot>(&source)
+                let mut snapshot = serde_json::from_str::<MarketSnapshot>(&source)
                     .with_context(|| format!("market snapshot {} is malformed", path.display()))?;
+                canonicalize_snapshot(&mut snapshot);
                 let expected_name = format!("{}-markets.json", key(&snapshot.provider));
-                if path.file_name().and_then(|value| value.to_str()) != Some(expected_name.as_str())
-                {
+                let actual_name = path.file_name().and_then(|value| value.to_str());
+                let legacy_hyperliquid_name =
+                    snapshot.provider.eq_ignore_ascii_case("hyperliquidf")
+                        && actual_name == Some("hyperliquid-markets.json");
+                if actual_name != Some(expected_name.as_str()) && !legacy_hyperliquid_name {
                     bail!(
                         "market snapshot {} must be named {expected_name}",
                         path.display()
@@ -421,7 +433,8 @@ impl MarketRegistry {
         Self::new(snapshots)
     }
 
-    fn new(snapshots: Vec<MarketSnapshot>) -> Result<Self> {
+    fn new(mut snapshots: Vec<MarketSnapshot>) -> Result<Self> {
+        snapshots.iter_mut().for_each(canonicalize_snapshot);
         let mut registry = Self {
             snapshots,
             provider_markets: HashMap::new(),
@@ -517,6 +530,7 @@ impl MarketRegistry {
 }
 
 pub fn provider_market(provider: &str, exchange: &str, symbol: &str) -> Result<Arc<Market>> {
+    ensure_public_exchange_id(exchange)?;
     let registry = market_registry()?;
     let provider_key = key(provider);
     let exchange_key = key(exchange);
@@ -545,6 +559,7 @@ pub fn provider_market(provider: &str, exchange: &str, symbol: &str) -> Result<A
 }
 
 pub fn exchange_market(exchange: &str, symbol: &str) -> Result<Arc<Market>> {
+    ensure_public_exchange_id(exchange)?;
     let registry = market_registry()?;
     let exchange_key = key(exchange);
     let symbol_key = symbol_key(symbol);
@@ -569,6 +584,7 @@ pub fn provider_exchange(
     provider: &str,
     exchange: &str,
 ) -> Result<(MarketSnapshot, ExchangeMarkets)> {
+    ensure_public_exchange_id(exchange)?;
     let registry = market_registry()?;
     let location = registry
         .provider_exchanges
@@ -587,7 +603,15 @@ pub fn provider_exchange(
     Ok(registry.exchange(*location))
 }
 
+pub fn upstream_exchange(provider: &str, exchange: &str) -> Result<String> {
+    let (_, exchange) = provider_exchange(provider, exchange)?;
+    Ok(exchange
+        .provider_exchange
+        .unwrap_or_else(|| exchange.exchange.clone()))
+}
+
 pub fn direct_exchange(exchange: &str) -> Result<(MarketSnapshot, ExchangeMarkets)> {
+    ensure_public_exchange_id(exchange)?;
     let registry = market_registry()?;
     let location = registry
         .direct_exchanges
@@ -601,6 +625,7 @@ pub fn direct_exchange(exchange: &str) -> Result<(MarketSnapshot, ExchangeMarket
 }
 
 pub fn is_futures_exchange(exchange: &str) -> Result<bool> {
+    ensure_public_exchange_id(exchange)?;
     let registry = market_registry()?;
     registry
         .exchange_types
@@ -615,11 +640,12 @@ pub fn is_futures_exchange(exchange: &str) -> Result<bool> {
 }
 
 pub async fn refresh_route(provider: Option<&str>, exchange: &str) -> Result<MarketSnapshot> {
+    ensure_public_exchange_id(exchange)?;
     let snapshot = match provider.map(key).as_deref() {
         Some("mmt") => fetch_mmt_snapshot().await?,
         Some(provider) => bail!("market refresh is not implemented for provider `{provider}`"),
         None if exchange.eq_ignore_ascii_case("bulk") => fetch_bulk_snapshot().await?,
-        None if exchange.eq_ignore_ascii_case("hyperliquid") => {
+        None if exchange.eq_ignore_ascii_case("hyperliquidf") => {
             fetch_hyperliquid_snapshot().await?
         }
         None if exchange.eq_ignore_ascii_case("binance") => fetch_binance_snapshot(false).await?,
@@ -636,7 +662,7 @@ pub async fn refresh_bulk() -> Result<MarketSnapshot> {
 }
 
 pub async fn refresh_hyperliquid() -> Result<MarketSnapshot> {
-    refresh_route(None, "hyperliquid").await
+    refresh_route(None, "hyperliquidf").await
 }
 
 pub async fn refresh_binance() -> Result<MarketSnapshot> {
@@ -755,6 +781,7 @@ async fn fetch_bulk_snapshot() -> Result<MarketSnapshot> {
         fetched_at: fetched_at(),
         exchanges: vec![ExchangeMarkets {
             exchange: "bulk".to_string(),
+            provider_exchange: None,
             name: "BULK".to_string(),
             market_type: MarketType::Futures,
             markets,
@@ -820,6 +847,7 @@ async fn fetch_binance_snapshot(futures: bool) -> Result<MarketSnapshot> {
         fetched_at: fetched_at(),
         exchanges: vec![ExchangeMarkets {
             exchange: provider.to_string(),
+            provider_exchange: None,
             name: name.to_string(),
             market_type,
             markets,
@@ -961,13 +989,14 @@ async fn fetch_hyperliquid_snapshot() -> Result<MarketSnapshot> {
 
     let snapshot = MarketSnapshot {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
-        provider: "hyperliquid".to_string(),
+        provider: "hyperliquidf".to_string(),
         provider_type: ProviderType::Standalone,
         source_url: HYPERLIQUID_INFO_URL.to_string(),
         fetched_at: fetched_at(),
         exchanges: vec![ExchangeMarkets {
-            exchange: "hyperliquid".to_string(),
-            name: "Hyperliquid".to_string(),
+            exchange: "hyperliquidf".to_string(),
+            provider_exchange: None,
+            name: "Hyperliquid Perpetuals".to_string(),
             market_type: MarketType::Futures,
             markets,
         }],
@@ -1047,9 +1076,12 @@ async fn fetch_mmt_snapshot() -> Result<MarketSnapshot> {
                     execution: None,
                 });
             }
+            let provider_exchange = exchange.id;
+            let canonical_exchange = canonical_mmt_exchange(&provider_exchange);
             ExchangeMarkets {
-                market_type: classify_mmt_exchange(&exchange.id),
-                exchange: exchange.id,
+                market_type: classify_mmt_exchange(&canonical_exchange),
+                exchange: canonical_exchange,
+                provider_exchange: Some(provider_exchange),
                 name: exchange.name,
                 markets: markets.into_values().collect(),
             }
@@ -1101,6 +1133,13 @@ fn write_snapshot(snapshot: &MarketSnapshot) -> Result<()> {
                 destination.display()
             )
         })?;
+        if snapshot.provider.eq_ignore_ascii_case("hyperliquidf") {
+            let legacy = directory.join("hyperliquid-markets.json");
+            if legacy != destination && legacy.exists() {
+                fs::remove_file(&legacy)
+                    .with_context(|| format!("failed to remove {}", legacy.display()))?;
+            }
+        }
         Ok(())
     })();
     if result.is_err() {
@@ -1193,6 +1232,15 @@ fn key(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
+fn ensure_public_exchange_id(exchange: &str) -> Result<()> {
+    if key(exchange) == "hyperliquid" {
+        bail!(
+            "exchange `hyperliquid` is reserved for Hyperliquid spot, which is not available standalone or through MMT; use `hyperliquidf` for Hyperliquid core perpetuals"
+        );
+    }
+    Ok(())
+}
+
 fn classify_mmt_exchange(exchange: &str) -> MarketType {
     classify_exchange_name(exchange)
 }
@@ -1200,10 +1248,51 @@ fn classify_mmt_exchange(exchange: &str) -> MarketType {
 fn classify_exchange_name(exchange: &str) -> MarketType {
     let exchange = key(exchange);
     let family = exchange.split('-').next().unwrap_or(exchange.as_str());
-    if family.ends_with('f') || matches!(family, "bulk" | "hyperliquid") {
+    if family.ends_with('f') || family == "bulk" {
         MarketType::Futures
     } else {
         MarketType::Spot
+    }
+}
+
+fn canonical_mmt_exchange(exchange: &str) -> String {
+    let exchange = key(exchange);
+    match exchange.strip_prefix("hyperliquid-") {
+        Some(suffix) => format!("hyperliquidf-{suffix}"),
+        None if exchange == "hyperliquid" => "hyperliquidf".to_string(),
+        None => exchange,
+    }
+}
+
+fn canonicalize_snapshot(snapshot: &mut MarketSnapshot) {
+    if snapshot.provider_type == ProviderType::Aggregator
+        && snapshot.provider.eq_ignore_ascii_case("mmt")
+    {
+        for exchange in &mut snapshot.exchanges {
+            let upstream = exchange
+                .provider_exchange
+                .clone()
+                .unwrap_or_else(|| exchange.exchange.clone());
+            exchange.provider_exchange = Some(upstream.clone());
+            exchange.exchange = canonical_mmt_exchange(&upstream);
+            exchange.market_type = classify_exchange_name(&exchange.exchange);
+        }
+    }
+
+    if snapshot.provider_type == ProviderType::Standalone
+        && snapshot.provider.eq_ignore_ascii_case("hyperliquid")
+        && snapshot
+            .exchanges
+            .iter()
+            .all(|exchange| exchange.market_type == MarketType::Futures)
+    {
+        snapshot.provider = "hyperliquidf".to_string();
+        for exchange in &mut snapshot.exchanges {
+            if exchange.exchange.eq_ignore_ascii_case("hyperliquid") {
+                exchange.exchange = "hyperliquidf".to_string();
+                exchange.name = "Hyperliquid Perpetuals".to_string();
+            }
+        }
     }
 }
 
@@ -1299,6 +1388,7 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
             fetched_at: "2026-07-19T00:00:00Z".to_string(),
             exchanges: vec![ExchangeMarkets {
                 exchange: "bulk".to_string(),
+                provider_exchange: None,
                 name: "BULK".to_string(),
                 market_type: MarketType::Futures,
                 markets: vec![bulk_market],
@@ -1312,6 +1402,7 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
             fetched_at: "2026-07-19T00:00:00Z".to_string(),
             exchanges: vec![ExchangeMarkets {
                 exchange: "hyperliquid".to_string(),
+                provider_exchange: None,
                 name: "Hyperliquid".to_string(),
                 market_type: MarketType::Futures,
                 markets: vec![hyperliquid_market],
@@ -1325,6 +1416,7 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
             fetched_at: "2026-07-19T00:00:00Z".to_string(),
             exchanges: vec![ExchangeMarkets {
                 exchange: "binance".to_string(),
+                provider_exchange: None,
                 name: "Binance Spot".to_string(),
                 market_type: MarketType::Spot,
                 markets: vec![binance_spot_market],
@@ -1338,6 +1430,7 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
             fetched_at: "2026-07-19T00:00:00Z".to_string(),
             exchanges: vec![ExchangeMarkets {
                 exchange: "binancef".to_string(),
+                provider_exchange: None,
                 name: "Binance USD-M Futures".to_string(),
                 market_type: MarketType::Futures,
                 markets: vec![binance_futures_market],
@@ -1352,18 +1445,28 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
             exchanges: vec![
                 ExchangeMarkets {
                     exchange: "binancef".to_string(),
+                    provider_exchange: Some("binancef".to_string()),
                     name: "binancef".to_string(),
                     market_type: MarketType::Futures,
                     markets: vec![mmt_market.clone()],
                 },
                 ExchangeMarkets {
                     exchange: "binance".to_string(),
+                    provider_exchange: Some("binance".to_string()),
                     name: "binance".to_string(),
                     market_type: MarketType::Spot,
                     markets: vec![mmt_market.clone()],
                 },
                 ExchangeMarkets {
+                    exchange: "okx".to_string(),
+                    provider_exchange: Some("okx".to_string()),
+                    name: "okx".to_string(),
+                    market_type: MarketType::Spot,
+                    markets: vec![mmt_market.clone()],
+                },
+                ExchangeMarkets {
                     exchange: "hyperliquid".to_string(),
+                    provider_exchange: None,
                     name: "hyperliquid".to_string(),
                     market_type: MarketType::Futures,
                     markets: vec![mmt_market],
@@ -1431,8 +1534,12 @@ mod tests {
 
     #[test]
     fn provider_and_direct_routes_are_distinct() {
-        assert!(provider_market("mmt", "hyperliquid", "BTC/USDT").is_ok());
-        let direct = exchange_market("hyperliquid", "BTC/USDT")
+        assert!(provider_market("mmt", "hyperliquidf", "BTC/USDT").is_ok());
+        assert_eq!(
+            upstream_exchange("mmt", "hyperliquidf").expect("MMT exchange mapping resolves"),
+            "hyperliquid"
+        );
+        let direct = exchange_market("hyperliquidf", "BTC/USDT")
             .expect("standalone Hyperliquid market resolves");
         assert_eq!(direct.venue_symbol, "BTC");
         assert_eq!(direct.venue_id, Some(0));
@@ -1451,7 +1558,8 @@ mod tests {
     fn exchange_market_type_is_available_in_constant_time() {
         assert!(is_futures_exchange("bulk").expect("BULK type resolves"));
         assert!(is_futures_exchange("binancef").expect("Binance Futures type resolves"));
-        assert!(is_futures_exchange("hyperliquid").expect("Hyperliquid type resolves"));
+        assert!(is_futures_exchange("hyperliquidf").expect("Hyperliquid type resolves"));
+        assert!(is_futures_exchange("hyperliquid").is_err());
         assert!(!is_futures_exchange("binance").expect("Binance spot type resolves"));
         assert!(is_futures_exchange("missing").is_err());
     }
@@ -1460,12 +1568,14 @@ mod tests {
     fn snapshots_serialize_market_type_and_classify_legacy_exchange_entries() {
         let exchange = ExchangeMarkets {
             exchange: "bybitf".to_string(),
+            provider_exchange: None,
             name: "Bybit Futures".to_string(),
             market_type: MarketType::Futures,
             markets: Vec::new(),
         };
         let encoded = serde_json::to_value(&exchange).expect("exchange serializes");
         assert_eq!(encoded["marketType"], "futures");
+        assert!(encoded.get("providerExchange").is_none());
 
         let legacy: ExchangeMarkets = serde_json::from_value(serde_json::json!({
             "exchange": "bybitf",
@@ -1474,6 +1584,17 @@ mod tests {
         }))
         .expect("legacy exchange entry parses");
         assert_eq!(legacy.market_type, MarketType::Futures);
+
+        let mmt_exchange = ExchangeMarkets {
+            exchange: "hyperliquidf".to_string(),
+            provider_exchange: Some("hyperliquid".to_string()),
+            name: "Hyperliquid Perpetuals".to_string(),
+            market_type: MarketType::Futures,
+            markets: Vec::new(),
+        };
+        let encoded = serde_json::to_value(&mmt_exchange).expect("MMT exchange serializes");
+        assert_eq!(encoded["exchange"], "hyperliquidf");
+        assert_eq!(encoded["providerExchange"], "hyperliquid");
     }
 
     #[test]
@@ -1484,8 +1605,13 @@ mod tests {
         assert_eq!(classify_mmt_exchange("binancef"), MarketType::Futures);
         assert_eq!(classify_mmt_exchange("bybitf-inverse"), MarketType::Futures);
         assert_eq!(
-            classify_mmt_exchange("hyperliquid-xyz"),
+            classify_mmt_exchange("hyperliquidf-xyz"),
             MarketType::Futures
+        );
+        assert_eq!(canonical_mmt_exchange("hyperliquid"), "hyperliquidf");
+        assert_eq!(
+            canonical_mmt_exchange("hyperliquid-xyz"),
+            "hyperliquidf-xyz"
         );
     }
 }

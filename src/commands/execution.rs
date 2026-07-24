@@ -523,7 +523,7 @@ fn execution_market(venue: ExecutionVenue, symbol: &str) -> Result<std::sync::Ar
 fn venue_key(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "bulk",
-        ExecutionVenue::Hyperliquid => "hyperliquid",
+        ExecutionVenue::Hyperliquid => "hyperliquidf",
     }
 }
 

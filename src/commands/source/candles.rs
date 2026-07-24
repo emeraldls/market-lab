@@ -121,7 +121,7 @@ async fn handle_hyperliquid(args: SourceCandlesArgs) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?,
     )
     .await?;
-    render_direct_series(&series, &args, "hyperliquid", "Hyperliquid")
+    render_direct_series(&series, &args, "hyperliquidf", "Hyperliquid")
 }
 
 async fn handle_binance(args: SourceCandlesArgs, market: BinanceMarket) -> Result<()> {
@@ -337,8 +337,8 @@ async fn stream_hyperliquid_candles(args: SourceCandlesArgs) -> Result<()> {
                 let env = SourceEnvelope {
                     r#type: "source.candles.stream".to_string(),
                     version: "1",
-                    provider: "hyperliquid",
-                    exchange: "hyperliquid".to_string(),
+                    provider: "hyperliquidf",
+                    exchange: "hyperliquidf".to_string(),
                     symbol: market.symbol.clone(),
                     ts_ms: candle.t,
                     stream: true,

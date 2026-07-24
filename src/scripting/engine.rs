@@ -741,8 +741,8 @@ export const script = {
 };
 
 export function onData(ctx, input, history) {
-  const candles = history.source("vd@hyperliquid@mmt");
-  const bucket = input.source_configs["vd@hyperliquid@mmt"].bucket;
+  const candles = history.source("vd@hyperliquidf@mmt");
+  const bucket = input.source_configs["vd@hyperliquidf@mmt"].bucket;
   const cvd = ctx.study.cvd(candles, { bucket });
   const single = ctx.study.cvd(candles[candles.length - 1], { bucket });
   return {
@@ -770,7 +770,7 @@ export function onData(ctx, input, history) {
         for candle in vd.as_array().unwrap() {
             session
                 .record_source(
-                    "vd@hyperliquid@mmt",
+                    "vd@hyperliquidf@mmt",
                     candle.clone(),
                     candle.get("t").and_then(serde_json::Value::as_u64),
                 )
@@ -779,9 +779,9 @@ export function onData(ctx, input, history) {
         let execution = session
             .run_on_data(json!({
                 "source_configs": {
-                    "vd@hyperliquid@mmt": {
+                    "vd@hyperliquidf@mmt": {
                         "type": "vd",
-                        "exchange": "hyperliquid",
+                        "exchange": "hyperliquidf",
                         "bucket": 7,
                         "timeframe_sec": 60
                     }
@@ -998,8 +998,8 @@ export const script = {
 };
 
 export function onData(ctx, input, history) {
-  const candles = history.source("vd@hyperliquid@mmt");
-  const latest = history.source("vd@hyperliquid@mmt", 0);
+  const candles = history.source("vd@hyperliquidf@mmt");
+  const latest = history.source("vd@hyperliquidf@mmt", 0);
   return {
     metrics: {
       candles: candles.length,
@@ -1021,7 +1021,7 @@ export function onData(ctx, input, history) {
         for candle in candles.as_array().unwrap() {
             session
                 .record_source(
-                    "vd@hyperliquid@mmt",
+                    "vd@hyperliquidf@mmt",
                     candle.clone(),
                     candle.get("t").and_then(serde_json::Value::as_u64),
                 )

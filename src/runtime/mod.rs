@@ -1336,7 +1336,7 @@ fn create_script_job(
             .context("BULK authentication is required when a script uses --venue bulk")?;
     } else if submission.venue == Some(ExecutionVenue::Hyperliquid) {
         credentials::hyperliquid_account().context(
-            "Hyperliquid authentication is required when a script uses --venue hyperliquid",
+            "Hyperliquid authentication is required when a script uses --venue hyperliquidf",
         )?;
     }
 
@@ -3751,7 +3751,7 @@ fn tracked_order_key(venue: ExecutionVenue, testnet: bool, order_id: &str) -> St
 fn execution_exchange(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "bulk",
-        ExecutionVenue::Hyperliquid => "hyperliquid",
+        ExecutionVenue::Hyperliquid => "hyperliquidf",
     }
 }
 
@@ -4173,7 +4173,7 @@ fn apply_hyperliquid_account_event(
                 for fill in fills {
                     let mut normalized = serde_json::json!({
                         "type": "fill",
-                        "venue": "hyperliquid",
+                        "venue": "hyperliquidf",
                         "symbol": fill.get("coin").cloned().unwrap_or(serde_json::Value::Null),
                         "price": fill.get("px").cloned().unwrap_or(serde_json::Value::Null),
                         "size": fill.get("sz").cloned().unwrap_or(serde_json::Value::Null),
@@ -4791,7 +4791,7 @@ mod tests {
                         "targetMargin": 50.0,
                         "targetExposure": 500.0,
                         "durationSeconds": 3_900,
-                        "oiSources": [{"exchange": "hyperliquid", "provider": "mmt"}],
+                        "oiSources": [{"exchange": "hyperliquidf", "provider": "mmt"}],
                         "leverage": 10.0,
                         "reduceOnly": false
                     }
@@ -4891,7 +4891,7 @@ mod tests {
                 "definition": {
                     "name": "grid",
                     "config": {
-                        "venue": "hyperliquid",
+                        "venue": "hyperliquidf",
                         "symbol": "BTC/USDT",
                         "maxInventorySize": 0.02,
                         "requestedMargin": 100.0,

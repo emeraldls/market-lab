@@ -11,7 +11,7 @@ use crate::providers::bulk::ws::BulkTickerStream;
 use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 use crate::providers::hyperliquid::ws::HyperliquidAssetContextStream;
 use crate::providers::mmt::MmtProvider;
-use crate::providers::mmt::utils::normalize_symbol_for_mmt;
+use crate::providers::mmt::utils::{normalize_exchange_for_mmt, normalize_symbol_for_mmt};
 use crate::providers::mmt::ws_client::MmtWsClient;
 
 use super::common::{SourceEnvelope, SourceMeta, render_terminal};
@@ -112,7 +112,7 @@ async fn handle_hyperliquid(args: SourceOiArgs) -> Result<()> {
         return stream_hyperliquid_oi(args).await;
     }
     let snapshot = HyperliquidProvider::open_interest(&args.symbol).await?;
-    render_direct_snapshot(snapshot, &args, "hyperliquid")
+    render_direct_snapshot(snapshot, &args, "hyperliquidf")
 }
 
 fn render_direct_snapshot(
@@ -159,11 +159,12 @@ fn render_direct_snapshot(
 async fn stream_oi(args: SourceOiArgs) -> Result<()> {
     let exchange = args.exchange_name()?.to_string();
     let provider_symbol = normalize_symbol_for_mmt(&exchange, &args.symbol)?;
+    let provider_exchange = normalize_exchange_for_mmt(&exchange)?;
     let ws = MmtWsClient::shared().await?;
     ws.subscribe(serde_json::json!({
         "type": "subscribe",
         "channel": "oi",
-        "exchange": exchange.to_lowercase(),
+        "exchange": provider_exchange,
         "symbol": provider_symbol,
         "tf": args.mmt_tf()?,
     }))
@@ -337,7 +338,7 @@ async fn stream_hyperliquid_oi(args: SourceOiArgs) -> Result<()> {
                 let Some(snapshot) = latest.as_ref() else { continue; };
                 let env = SourceEnvelope {
                     r#type: "source.oi.stream".to_string(), version: "1",
-                    provider: "hyperliquid", exchange: snapshot.exchange.clone(),
+                    provider: "hyperliquidf", exchange: snapshot.exchange.clone(),
                     symbol: snapshot.symbol.clone(), ts_ms: snapshot.timestamp_ms,
                     stream: true, data: snapshot.clone(),
                     meta: SourceMeta { depth: None, min_size: None, max_size: None, price_group: None,

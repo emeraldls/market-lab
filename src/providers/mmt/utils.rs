@@ -9,6 +9,10 @@ pub fn normalize_symbol_for_mmt(exchange: &str, symbol: &str) -> Result<String> 
         .clone())
 }
 
+pub fn normalize_exchange_for_mmt(exchange: &str) -> Result<String> {
+    crate::markets::upstream_exchange("mmt", exchange)
+}
+
 pub fn normalize_to_ms(ts: u64) -> u64 {
     if ts < 10_000_000_000 { ts * 1000 } else { ts }
 }

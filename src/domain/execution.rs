@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionVenue {
     Bulk,
+    #[serde(rename = "hyperliquidf", alias = "hyperliquid")]
     Hyperliquid,
 }
 
@@ -228,4 +229,19 @@ pub struct CancelPlan {
 // Hyperliquid testnet plans. Keep them on testnet when they are deserialized.
 const fn legacy_hyperliquid_testnet() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hyperliquid_perps_use_the_canonical_id_and_read_legacy_jobs() {
+        let encoded = serde_json::to_value(ExecutionVenue::Hyperliquid).expect("venue serializes");
+        assert_eq!(encoded, serde_json::json!("hyperliquidf"));
+
+        let legacy: ExecutionVenue = serde_json::from_value(serde_json::json!("hyperliquid"))
+            .expect("legacy venue deserializes");
+        assert_eq!(legacy, ExecutionVenue::Hyperliquid);
+    }
 }
