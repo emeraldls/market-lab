@@ -26,7 +26,7 @@ margin = 150
 leverage = 5
 
 [execution]
-venue = "bulk"
+venue = "bulkf"
 
 [backtest]
 from = 1784206676777

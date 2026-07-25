@@ -101,7 +101,7 @@ async fn handle_bulk(args: SourceOiArgs) -> Result<()> {
     }
 
     let snapshot = BulkProvider::open_interest(&args.symbol).await?;
-    render_direct_snapshot(snapshot, &args, "bulk")
+    render_direct_snapshot(snapshot, &args, "bulkf")
 }
 
 async fn handle_hyperliquid(args: SourceOiArgs) -> Result<()> {
@@ -275,7 +275,7 @@ async fn stream_bulk_oi(args: SourceOiArgs) -> Result<()> {
                 let env = SourceEnvelope {
                     r#type: "source.oi.stream".to_string(),
                     version: "1",
-                    provider: "bulk",
+                    provider: "bulkf",
                     exchange: snapshot.exchange.clone(),
                     symbol: snapshot.symbol.clone(),
                     ts_ms: snapshot.timestamp_ms,

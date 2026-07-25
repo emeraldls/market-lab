@@ -217,7 +217,7 @@ fn render_job(job: &BotJob, output: OutputFormat) -> Result<()> {
 
 fn venue_name(venue: crate::domain::execution::ExecutionVenue) -> &'static str {
     match venue {
-        crate::domain::execution::ExecutionVenue::Bulk => "bulk",
+        crate::domain::execution::ExecutionVenue::Bulk => "bulkf",
         crate::domain::execution::ExecutionVenue::Hyperliquid => "hyperliquidf",
     }
 }

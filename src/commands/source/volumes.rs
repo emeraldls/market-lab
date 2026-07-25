@@ -153,7 +153,7 @@ async fn handle_binance(args: SourceVolumesArgs, market: BinanceMarket) -> Resul
 }
 
 fn render_bulk_volume_bars(series: &VolumeBarSeries, output: OutputFormat) -> Result<()> {
-    render_direct_volume_bars(series, output, "bulk", "BULK")
+    render_direct_volume_bars(series, output, "bulkf", "BULK")
 }
 
 fn render_direct_volume_bars(
@@ -318,8 +318,8 @@ async fn stream_bulk_volume_bars(args: SourceVolumesArgs) -> Result<()> {
                 let env = SourceEnvelope {
                     r#type: "source.volume-bars.stream".to_string(),
                     version: "1",
-                    provider: "bulk",
-                    exchange: "bulk".to_string(),
+                    provider: "bulkf",
+                    exchange: "bulkf".to_string(),
                     symbol: market.symbol.clone(),
                     ts_ms: bar.t,
                     stream: true,

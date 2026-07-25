@@ -911,7 +911,7 @@ impl DirectCandleStream {
 
 fn direct_provider_name(provider: ProviderKind) -> &'static str {
     match provider {
-        ProviderKind::Bulk => "bulk",
+        ProviderKind::Bulk => "bulkf",
         ProviderKind::Hyperliquid => "hyperliquidf",
         ProviderKind::Binance => "binance",
         ProviderKind::BinanceFutures => "binancef",

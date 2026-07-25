@@ -484,7 +484,7 @@ impl BulkOrderBookStream {
             let timestamp_ms = normalize_timestamp_ms(raw.timestamp);
             match raw.update_type.as_str() {
                 "snapshot" => self.state.apply_snapshot(
-                    "bulk".to_string(),
+                    "bulkf".to_string(),
                     self.internal_symbol.clone(),
                     timestamp_ms,
                     bids,
@@ -604,7 +604,7 @@ impl BulkTradesStream {
                         );
                     }
                     Ok(TradeTick {
-                        exchange: "bulk".to_string(),
+                        exchange: "bulkf".to_string(),
                         symbol: self.internal_symbol.clone(),
                         timestamp_ms: normalize_timestamp_ms(trade.time),
                         price: trade.price,

@@ -307,6 +307,7 @@ impl AccountQueryArgs {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ExecutionVenueArg {
+    #[value(name = "bulkf")]
     Bulk,
     #[value(name = "hyperliquidf")]
     Hyperliquid,
@@ -1627,7 +1628,7 @@ pub struct RunVwapArgs {
     /// Total execution window in seconds. VWAP requires at least one minute.
     #[arg(long)]
     pub duration: u64,
-    /// Comma-separated volume venues, for example binancef@mmt,okxf@mmt,bulk.
+    /// Comma-separated volume venues, for example binancef@mmt,okxf@mmt,bulkf.
     #[arg(long, value_delimiter = ',')]
     pub volume_sources: Vec<String>,
     /// Exposure multiplier for margin sizing and the leverage setting sent to BULK.
@@ -1962,7 +1963,7 @@ impl RunVwapArgs {
             bail!("strategy run supports only --output terminal|json|jsonl");
         }
         let execution_venue = match self.venue {
-            ExecutionVenueArg::Bulk => "bulk",
+            ExecutionVenueArg::Bulk => "bulkf",
             ExecutionVenueArg::Hyperliquid => "hyperliquidf",
         };
         crate::strategies::vwap::VolumeSourceSelector::parse(
@@ -2254,12 +2255,12 @@ fn resolve_source_provider(
         bail!("--exchange cannot be empty");
     }
     if provider.is_some() {
-        if exchange.eq_ignore_ascii_case("bulk") {
+        if exchange.eq_ignore_ascii_case("bulkf") {
             bail!("omit --provider for the standalone `{exchange}` exchange");
         }
         return Ok(CliProviderKind::Mmt);
     }
-    if exchange.eq_ignore_ascii_case("bulk") {
+    if exchange.eq_ignore_ascii_case("bulkf") {
         return Ok(CliProviderKind::Bulk);
     }
     if exchange.eq_ignore_ascii_case("hyperliquidf") {
@@ -2288,11 +2289,11 @@ fn resolve_system_provider(
     exchange: Option<&str>,
 ) -> Result<ProviderKind> {
     match (provider, exchange) {
-        (Some(_), Some(exchange)) if exchange.eq_ignore_ascii_case("bulk") => {
+        (Some(_), Some(exchange)) if exchange.eq_ignore_ascii_case("bulkf") => {
             bail!("omit --provider for the standalone `{exchange}` exchange")
         }
         (Some(_), _) => Ok(ProviderKind::Mmt),
-        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("bulk") => Ok(ProviderKind::Bulk),
+        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("bulkf") => Ok(ProviderKind::Bulk),
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquidf") => {
             Ok(ProviderKind::Hyperliquid)
         }
@@ -2444,7 +2445,7 @@ mod tests {
             "mlab",
             "markets",
             "--exchange",
-            "bulk",
+            "bulkf",
             "--symbol",
             "BTC/USDT",
             "--json",
@@ -2454,7 +2455,7 @@ mod tests {
         match cli.command {
             Commands::Markets(args) => {
                 assert!(args.provider.is_none());
-                assert_eq!(args.exchange, "bulk");
+                assert_eq!(args.exchange, "bulkf");
                 assert_eq!(args.symbol.as_deref(), Some("BTC/USDT"));
                 assert!(!args.refresh);
                 assert!(args.json);
@@ -2462,6 +2463,23 @@ mod tests {
             }
             _ => panic!("expected markets command"),
         }
+    }
+
+    #[test]
+    fn rejects_bare_bulk_execution_id() {
+        let execution = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "long",
+            "BTC/USDT",
+            "--venue",
+            "bulk",
+            "--margin",
+            "10",
+            "--dry-run",
+        ])
+        .expect_err("bare bulk must not be accepted as an execution venue");
+        assert!(execution.to_string().contains("invalid value 'bulk'"));
     }
 
     #[test]
@@ -2630,7 +2648,7 @@ mod tests {
             "long",
             "BTC/USDT",
             "--venue",
-            "bulk",
+            "bulkf",
             "--size",
             "0.001",
             "--type",
@@ -3233,7 +3251,7 @@ mod tests {
             "source",
             "candles",
             "--exchange",
-            "bulk",
+            "bulkf",
             "--symbol",
             "BTC/USDT",
             "--timeframe",
@@ -3248,7 +3266,7 @@ mod tests {
             Commands::Source {
                 command: SourceCommands::Candles(args),
             } => {
-                assert_eq!(args.exchange, "bulk");
+                assert_eq!(args.exchange, "bulkf");
                 assert!(args.provider.is_none());
                 assert_eq!(
                     args.provider_kind().expect("BULK provider should resolve"),
@@ -3264,7 +3282,7 @@ mod tests {
             "source",
             "stats",
             "--exchange",
-            "bulk",
+            "bulkf",
             "--symbol",
             "BTC/USDT",
         ])
@@ -3281,7 +3299,7 @@ mod tests {
             "source",
             "funding",
             "--exchange",
-            "bulk",
+            "bulkf",
             "--symbol",
             "BTC/USDT",
         ])
@@ -3301,16 +3319,16 @@ mod tests {
             "source",
             "orderbook",
             "--provider",
-            "bulk",
+            "bulkf",
             "--exchange",
-            "bulk",
+            "bulkf",
             "--symbol",
             "BTC/USDT",
         ])
         .expect_err("BULK must not be accepted as a provider");
 
         let message = error.to_string();
-        assert!(message.contains("invalid value 'bulk'"));
+        assert!(message.contains("invalid value 'bulkf'"));
         assert!(message.contains("mmt"));
     }
 
@@ -3348,7 +3366,7 @@ mod tests {
             "--provider",
             "mmt",
             "--exchange",
-            "bulk",
+            "bulkf",
             "--symbol",
             "BTC/USDT",
         ])
@@ -3426,7 +3444,7 @@ mod tests {
             "source",
             "candles",
             "--exchange",
-            "bulk",
+            "bulkf",
             "--symbol",
             "BTC/USDT",
             "--timeframe",
@@ -3457,7 +3475,7 @@ mod tests {
             "twap",
             "BTC/USDT",
             "--venue",
-            "bulk",
+            "bulkf",
             "--side",
             "buy",
             "--margin",
@@ -3496,7 +3514,7 @@ mod tests {
             "mid-price",
             "BTC/USDT",
             "--venue",
-            "bulk",
+            "bulkf",
             "--margin",
             "100",
             "--duration",
@@ -3624,7 +3642,7 @@ mod tests {
             "vwap",
             "BTC/USDT",
             "--venue",
-            "bulk",
+            "bulkf",
             "--side",
             "buy",
             "--margin",
@@ -3632,7 +3650,7 @@ mod tests {
             "--duration",
             "3600",
             "--volume-sources",
-            "binancef@mmt,hyperliquidf@mmt,bulk",
+            "binancef@mmt,hyperliquidf@mmt,bulkf",
             "--dry-run",
         ])
         .expect("VWAP should parse");
@@ -3648,7 +3666,7 @@ mod tests {
                 assert_eq!(args.duration, 3600);
                 assert_eq!(
                     args.volume_sources,
-                    ["binancef@mmt", "hyperliquidf@mmt", "bulk"]
+                    ["binancef@mmt", "hyperliquidf@mmt", "bulkf"]
                 );
                 assert!(args.dry_run);
             }
@@ -3686,7 +3704,7 @@ mod tests {
             "oiwap",
             "BTC/USDT",
             "--venue",
-            "bulk",
+            "bulkf",
             "--side",
             "buy",
             "--margin",
@@ -4014,13 +4032,13 @@ mod tests {
             "--symbol",
             "BTC/USDT",
             "--source",
-            "candles@bulk:timeframe=60",
+            "candles@bulkf:timeframe=60",
         ])
         .expect("BULK script run should parse without exchange");
         match run.command {
             Commands::Script {
                 command: ScriptCommands::Run(args),
-            } => assert_eq!(args.source, vec!["candles@bulk:timeframe=60"]),
+            } => assert_eq!(args.source, vec!["candles@bulkf:timeframe=60"]),
             _ => panic!("expected script run command"),
         }
 
@@ -4036,14 +4054,14 @@ mod tests {
             "--to",
             "1704067800000",
             "--source",
-            "candles@bulk:timeframe=60",
+            "candles@bulkf:timeframe=60",
         ])
         .expect("BULK script backtest should parse without exchange");
         match backtest.command {
             Commands::Script {
                 command: ScriptCommands::Backtest(args),
             } => {
-                assert_eq!(args.source, vec!["candles@bulk:timeframe=60"]);
+                assert_eq!(args.source, vec!["candles@bulkf:timeframe=60"]);
                 args.validate().expect("BULK backtest should validate");
             }
             _ => panic!("expected script backtest command"),
@@ -4115,7 +4133,7 @@ mod tests {
             "--symbol",
             "BTC/USDT",
             "--venue",
-            "bulk",
+            "bulkf",
         ])
         .expect("detached script execution should parse");
         match run.command {

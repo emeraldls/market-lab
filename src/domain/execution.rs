@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionVenue {
+    #[serde(rename = "bulkf")]
     Bulk,
     #[serde(rename = "hyperliquidf", alias = "hyperliquid")]
     Hyperliquid,
@@ -234,6 +235,13 @@ const fn legacy_hyperliquid_testnet() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_perps_use_the_canonical_id() {
+        let encoded = serde_json::to_value(ExecutionVenue::Bulk).expect("venue serializes");
+        assert_eq!(encoded, serde_json::json!("bulkf"));
+        assert!(serde_json::from_value::<ExecutionVenue>(serde_json::json!("bulk")).is_err());
+    }
 
     #[test]
     fn hyperliquid_perps_use_the_canonical_id_and_read_legacy_jobs() {

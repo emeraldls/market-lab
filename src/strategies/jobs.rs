@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn twap_job_without_target_margin_can_be_read_from_a_running_daemon() {
         let definition: TwapJobDefinition = serde_json::from_value(json!({
-            "venue": "bulk",
+            "venue": "bulkf",
             "symbol": "BTC/USDT",
             "side": "buy",
             "totalSize": 0.01,

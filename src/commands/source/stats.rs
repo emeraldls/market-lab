@@ -32,7 +32,7 @@ async fn handle_bulk(args: SourceStatsArgs) -> Result<()> {
     }
 
     let stats = BulkProvider::statistics(&args.period, args.symbol.as_deref()).await?;
-    render_stats(stats, &args, "bulk")
+    render_stats(stats, &args, "bulkf")
 }
 
 async fn handle_hyperliquid(args: SourceStatsArgs) -> Result<()> {
@@ -116,7 +116,7 @@ async fn stream_bulk_stats(args: SourceStatsArgs) -> Result<()> {
                 let env = SourceEnvelope {
                     r#type: "source.stats.stream".to_string(),
                     version: "1",
-                    provider: "bulk",
+                    provider: "bulkf",
                     exchange: snapshot.exchange.clone(),
                     symbol: snapshot.symbol.clone(),
                     ts_ms: snapshot.timestamp_ms,

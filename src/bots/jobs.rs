@@ -295,7 +295,7 @@ mod tests {
         let definition: BotJobDefinition = serde_json::from_value(serde_json::json!({
             "name": "mid_price",
             "config": {
-                "venue": "bulk",
+                "venue": "bulkf",
                 "symbol": "BTC/USDT",
                 "targetSizePerSide": 0.01,
                 "requestedMargin": 100.0,

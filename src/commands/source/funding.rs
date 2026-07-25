@@ -33,7 +33,7 @@ async fn handle_bulk(args: SourceFundingArgs) -> Result<()> {
     }
 
     let funding = BulkProvider::funding(&args.symbol).await?;
-    render_funding(funding, &args, "bulk")
+    render_funding(funding, &args, "bulkf")
 }
 
 async fn handle_hyperliquid(args: SourceFundingArgs) -> Result<()> {
@@ -118,7 +118,7 @@ async fn stream_bulk_funding(args: SourceFundingArgs) -> Result<()> {
                 let env = SourceEnvelope {
                     r#type: "source.funding.stream".to_string(),
                     version: "1",
-                    provider: "bulk",
+                    provider: "bulkf",
                     exchange: snapshot.exchange.clone(),
                     symbol: snapshot.symbol.clone(),
                     ts_ms: snapshot.timestamp_ms,

@@ -203,7 +203,7 @@ mod tests {
     fn snapshot_and_deltas_maintain_an_ordered_book() {
         let mut book = OrderBookState::default();
         book.apply_snapshot(
-            "bulk".to_string(),
+            "bulkf".to_string(),
             "BTC/USDT".to_string(),
             10,
             vec![level(99.0, 1.0), level(100.0, 2.0), level(98.0, 3.0)],
@@ -243,7 +243,7 @@ mod tests {
     fn deleting_top_level_reveals_the_next_full_book_level() {
         let mut book = OrderBookState::default();
         book.apply_snapshot(
-            "bulk".to_string(),
+            "bulkf".to_string(),
             "BTC/USDT".to_string(),
             1,
             vec![level(100.0, 1.0), level(99.0, 2.0), level(98.0, 3.0)],
@@ -265,7 +265,7 @@ mod tests {
         assert_eq!(book.best_bid_ask(), None);
 
         book.apply_snapshot(
-            "bulk".to_string(),
+            "bulkf".to_string(),
             "BTC/USDT".to_string(),
             2,
             vec![level(100.0, 1.0)],

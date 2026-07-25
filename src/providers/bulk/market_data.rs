@@ -12,7 +12,7 @@ use crate::domain::types::{
 use super::client::BulkClient;
 use super::markets;
 
-const EXCHANGE: &str = "bulk";
+const EXCHANGE: &str = "bulkf";
 
 pub struct BulkProvider;
 
@@ -33,7 +33,7 @@ impl BulkProvider {
                 "provider_conversion": "adapter-only"
             },
             "execution": {
-                "venue": "bulk",
+                "venue": "bulkf",
                 "orders": ["market", "limit"],
                 "time_in_force": ["GTC", "IOC", "ALO"],
                 "reduce_only": true,

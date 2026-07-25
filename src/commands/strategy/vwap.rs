@@ -92,7 +92,7 @@ enum WeightedTradesStream {
 impl WeightedTradesStream {
     async fn connect(exchange: &str, symbol: &str, testnet: bool) -> Result<Self> {
         match exchange {
-            "bulk" => Ok(Self::Bulk(BulkTradesStream::connect(symbol).await?)),
+            "bulkf" => Ok(Self::Bulk(BulkTradesStream::connect(symbol).await?)),
             "hyperliquidf" => Ok(Self::Hyperliquid(
                 HyperliquidTradesStream::connect_on(
                     symbol,
@@ -1048,7 +1048,7 @@ async fn fetch_direct_volume_history(
     while cursor < to_ms {
         let chunk_to = cursor.saturating_add(chunk_ms).min(to_ms);
         let series = match exchange {
-            "bulk" => BulkProvider::volume_bars(symbol, "1m", cursor, chunk_to).await?,
+            "bulkf" => BulkProvider::volume_bars(symbol, "1m", cursor, chunk_to).await?,
             "hyperliquidf" => {
                 HyperliquidProvider::volume_bars(symbol, "1m", cursor, chunk_to).await?
             }
@@ -1805,7 +1805,7 @@ pub(super) fn execution_venue_network_name(venue: ExecutionVenue, testnet: bool)
 
 pub(super) fn execution_venue_name(venue: ExecutionVenue) -> &'static str {
     match venue {
-        ExecutionVenue::Bulk => "bulk",
+        ExecutionVenue::Bulk => "bulkf",
         ExecutionVenue::Hyperliquid => "hyperliquidf",
     }
 }
@@ -1862,19 +1862,19 @@ mod tests {
         let mut tracker = LiveVolumeTracker::new(75_000);
         tracker.apply(LiveVolumeEvent::Trade {
             role: LiveVolumeRole::Execution,
-            source: "bulk".to_string(),
+            source: "bulkf".to_string(),
             ts_ms: 74_999,
             size: 10.0,
         });
         tracker.apply(LiveVolumeEvent::Trade {
             role: LiveVolumeRole::Execution,
-            source: "bulk".to_string(),
+            source: "bulkf".to_string(),
             ts_ms: 75_000,
             size: 2.0,
         });
         tracker.apply(LiveVolumeEvent::Trade {
             role: LiveVolumeRole::Execution,
-            source: "bulk".to_string(),
+            source: "bulkf".to_string(),
             ts_ms: 75_001,
             size: 1.5,
         });
@@ -1990,7 +1990,7 @@ mod tests {
             },
         ];
         let book = OrderBookSnapshot {
-            exchange: "bulk".to_string(),
+            exchange: "bulkf".to_string(),
             symbol: "BTC/USDT".to_string(),
             timestamp_ms: 0,
             bids: Vec::new(),
@@ -2004,7 +2004,7 @@ mod tests {
     #[test]
     fn dust_absorption_never_exceeds_guarded_depth() {
         let book = OrderBookSnapshot {
-            exchange: "bulk".to_string(),
+            exchange: "bulkf".to_string(),
             symbol: "BTC/USDT".to_string(),
             timestamp_ms: 0,
             bids: Vec::new(),

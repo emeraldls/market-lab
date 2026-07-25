@@ -1438,7 +1438,7 @@ fn queue_simulated_order_event(
         "type": event_type,
         "orderId": order.order.id,
         "key": order.order.key,
-        "venue": "bulk",
+        "venue": "bulkf",
         "status": status,
         "terminal": terminal,
         "data": data,

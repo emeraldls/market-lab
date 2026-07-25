@@ -183,7 +183,7 @@ pub fn source_provider_label(configs: &SourceConfigs) -> String {
 pub fn source_provider_name(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Mmt => "mmt",
-        ProviderKind::Bulk => "bulk",
+        ProviderKind::Bulk => "bulkf",
         ProviderKind::Hyperliquid => "hyperliquidf",
         ProviderKind::Binance => "binance",
         ProviderKind::BinanceFutures => "binancef",
@@ -424,7 +424,7 @@ fn parse_source_selector(raw: &str) -> Result<(String, ScriptSource, ProviderKin
     validate_exchange_name(&exchange)?;
     let selector = match provider {
         ProviderKind::Mmt => format!("{}@{exchange}@mmt", source.as_str()),
-        ProviderKind::Bulk => format!("{}@bulk", source.as_str()),
+        ProviderKind::Bulk => format!("{}@bulkf", source.as_str()),
         ProviderKind::Hyperliquid => format!("{}@hyperliquidf", source.as_str()),
         ProviderKind::Binance => format!("{}@binance", source.as_str()),
         ProviderKind::BinanceFutures => format!("{}@binancef", source.as_str()),
@@ -436,7 +436,7 @@ fn parse_source_selector(raw: &str) -> Result<(String, ScriptSource, ProviderKin
 fn parse_source_provider(raw: &str) -> Result<ProviderKind> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "mmt" => Ok(ProviderKind::Mmt),
-        "bulk" => Ok(ProviderKind::Bulk),
+        "bulkf" => Ok(ProviderKind::Bulk),
         "hyperliquidf" => Ok(ProviderKind::Hyperliquid),
         "binance" => Ok(ProviderKind::Binance),
         "binancef" => Ok(ProviderKind::BinanceFutures),
@@ -446,7 +446,7 @@ fn parse_source_provider(raw: &str) -> Result<ProviderKind> {
 
 fn provider_name_for_exchange(provider: ProviderKind) -> &'static str {
     match provider {
-        ProviderKind::Bulk => "bulk",
+        ProviderKind::Bulk => "bulkf",
         ProviderKind::Hyperliquid => "hyperliquidf",
         ProviderKind::Binance => "binance",
         ProviderKind::BinanceFutures => "binancef",
@@ -646,7 +646,7 @@ mod tests {
         let manifest = manifest(vec![ScriptSource::Candles]);
         for selector in [
             "candles@binancef@mmt:timeframe=1",
-            "candles@bulk:timeframe=1",
+            "candles@bulkf:timeframe=1",
         ] {
             let configs = parse_source_configs(&[selector.to_string()]).unwrap();
             validate_source_configs_for_run(&manifest, &configs)
@@ -664,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_bare_bulk_bindings_for_snapshot_sources() {
+    fn validates_bulkf_bindings_for_snapshot_sources() {
         let live_manifest = manifest(vec![
             ScriptSource::Candles,
             ScriptSource::Orderbook,
@@ -672,17 +672,28 @@ mod tests {
             ScriptSource::Oi,
         ]);
         let configs = parse_source_configs(&[
-            "candles@bulk:timeframe=60".to_string(),
-            "orderbook@bulk:depth=50".to_string(),
-            "vd@bulk".to_string(),
-            "oi@bulk".to_string(),
+            "candles@bulkf:timeframe=60".to_string(),
+            "orderbook@bulkf:depth=50".to_string(),
+            "vd@bulkf".to_string(),
+            "oi@bulkf".to_string(),
         ])
         .unwrap();
 
         validate_source_configs_for_run(&live_manifest, &configs)
             .expect("BULK live configs should validate");
-        assert!(configs.contains_key("vd@bulk"));
-        assert!(configs.contains_key("oi@bulk"));
+        assert!(configs.contains_key("vd@bulkf"));
+        assert!(configs.contains_key("oi@bulkf"));
+    }
+
+    #[test]
+    fn rejects_bare_bulk_source_bindings() {
+        let error = parse_source_configs(&["orderbook@bulk:depth=50".to_string()])
+            .expect_err("bare bulk must not be accepted as a script source");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported script source provider `bulk`")
+        );
     }
 
     #[test]
@@ -755,7 +766,7 @@ mod tests {
     #[test]
     fn rejects_bulk_historical_sources_that_do_not_exist() {
         let manifest = manifest(vec![ScriptSource::Orderbook]);
-        let configs = parse_source_configs(&["orderbook@bulk:depth=50".to_string()])
+        let configs = parse_source_configs(&["orderbook@bulkf:depth=50".to_string()])
             .expect("parse book binding");
 
         let error = validate_source_configs(&manifest, &configs)

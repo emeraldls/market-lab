@@ -207,7 +207,7 @@ async fn stream_bulk_vd(args: SourceVdArgs) -> Result<()> {
             }
             trades = stream.next_trades() => {
                 let trades = trades?;
-                if let Some(delta) = volume_delta_from_trades(&trades, &mut cumulative_delta, "bulk", &internal_symbol) {
+                if let Some(delta) = volume_delta_from_trades(&trades, &mut cumulative_delta, "bulkf", &internal_symbol) {
                     latest = Some(delta);
                 }
             }
@@ -216,8 +216,8 @@ async fn stream_bulk_vd(args: SourceVdArgs) -> Result<()> {
                 let env = SourceEnvelope {
                     r#type: "source.vd.trades.stream".to_string(),
                     version: "1",
-                    provider: "bulk",
-                    exchange: "bulk".to_string(),
+                    provider: "bulkf",
+                    exchange: "bulkf".to_string(),
                     symbol: internal_symbol.clone(),
                     ts_ms: delta.timestamp_ms,
                     stream: true,
@@ -348,7 +348,7 @@ mod tests {
     fn derives_side_signed_live_volume_delta() {
         let trades = vec![
             TradeTick {
-                exchange: "bulk".to_string(),
+                exchange: "bulkf".to_string(),
                 symbol: "BTC/USDT".to_string(),
                 timestamp_ms: 1_700_000_000_000,
                 price: 100_000.0,
@@ -356,7 +356,7 @@ mod tests {
                 taker_buy: true,
             },
             TradeTick {
-                exchange: "bulk".to_string(),
+                exchange: "bulkf".to_string(),
                 symbol: "BTC/USDT".to_string(),
                 timestamp_ms: 1_700_000_000_001,
                 price: 100_001.0,
@@ -365,7 +365,7 @@ mod tests {
             },
         ];
         let mut cumulative = 1.0;
-        let delta = volume_delta_from_trades(&trades, &mut cumulative, "bulk", "BTC/USDT")
+        let delta = volume_delta_from_trades(&trades, &mut cumulative, "bulkf", "BTC/USDT")
             .expect("non-empty trades yield a delta");
 
         assert!((delta.delta - 0.10).abs() < f64::EPSILON);

@@ -53,7 +53,7 @@ impl VolumeSourceSelector {
             let source = match parts.as_slice() {
                 [exchange] if !exchange.is_empty() => {
                     crate::markets::exchange_market(exchange, symbol)?;
-                    if !matches!(*exchange, "bulk" | "hyperliquidf") {
+                    if !matches!(*exchange, "bulkf" | "hyperliquidf") {
                         bail!(
                             "standalone volume adapter for `{exchange}` is not implemented; use `{exchange}@mmt`"
                         );
@@ -277,8 +277,8 @@ mod tests {
     #[test]
     fn selector_defaults_to_execution_venue() {
         let selector =
-            VolumeSourceSelector::parse(&[], "bulk", "BTC/USDT").expect("BULK default selector");
-        assert_eq!(selector.sources()[0].selector(), "bulk");
+            VolumeSourceSelector::parse(&[], "bulkf", "BTC/USDT").expect("BULK default selector");
+        assert_eq!(selector.sources()[0].selector(), "bulkf");
 
         let selector = VolumeSourceSelector::parse(&[], "hyperliquidf", "BTC/USDT")
             .expect("Hyperliquid default selector");
@@ -288,8 +288,8 @@ mod tests {
     #[test]
     fn selector_rejects_one_exchange_through_two_providers() {
         let error = VolumeSourceSelector::parse(
-            &["bulk".to_string(), "bulk".to_string()],
-            "bulk",
+            &["bulkf".to_string(), "bulkf".to_string()],
+            "bulkf",
             "BTC/USDT",
         )
         .expect_err("duplicate venue must fail");

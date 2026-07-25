@@ -1274,7 +1274,7 @@ export function onData(ctx, input, history) {
     metrics: {
       candle: history.source("candles@binancef@mmt", 0)?.c ?? null,
       previous_candle: history.source("candles@binancef@mmt", 1)?.c ?? null,
-      book_ts: history.source("orderbook@bulk", 0)?.timestamp_ms ?? null
+      book_ts: history.source("orderbook@bulkf", 0)?.timestamp_ms ?? null
     }
   };
 }
@@ -1293,7 +1293,7 @@ export function onData(ctx, input, history) {
             .expect("candle stream run");
         let book = session
             .run_event(json!({
-                "source": "orderbook@bulk",
+                "source": "orderbook@bulkf",
                 "source_type": "orderbook",
                 "data": {
                     "snapshot": { "timestamp_ms": 2, "bids": [], "asks": [] }

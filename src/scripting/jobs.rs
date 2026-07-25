@@ -147,12 +147,12 @@ mod tests {
             "scriptName": "maker",
             "originalPath": "maker.js",
             "snapshotPath": "/tmp/maker.js",
-            "providers": ["bulk"],
-            "exchanges": ["bulk"],
+            "providers": ["bulkf"],
+            "exchanges": ["bulkf"],
             "symbol": "BTC/USDT",
-            "sources": ["orderbook@bulk:depth=20"],
+            "sources": ["orderbook@bulkf:depth=20"],
             "params": [],
-            "venue": "bulk",
+            "venue": "bulkf",
             "verbose": false
         }))
         .expect("older job definition should deserialize");

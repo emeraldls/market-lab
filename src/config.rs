@@ -488,7 +488,7 @@ duration = 3600
 [sources."candles@okx@mmt"]
 timeframe = 60
 
-[sources."orderbook@bulk"]
+[sources."orderbook@bulkf"]
 depth = 20
 
 [script.params]
@@ -518,7 +518,7 @@ max_spread = 1
                 assert_eq!(args.symbol.as_deref(), Some("BTC/USDT"));
                 assert_eq!(
                     args.source,
-                    vec!["candles@okx@mmt:timeframe=60", "orderbook@bulk:depth=20",]
+                    vec!["candles@okx@mmt:timeframe=60", "orderbook@bulkf:depth=20",]
                 );
                 assert_eq!(args.param, vec!["max_spread=1"]);
                 assert_eq!(args.duration, Some(3600));
@@ -566,7 +566,7 @@ version = 1
 symbol = "BTC/USDT"
 
 [execution]
-venue = "bulk"
+venue = "bulkf"
 margin = 100
 order_type = "market"
 leverage = 3

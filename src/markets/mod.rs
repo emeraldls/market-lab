@@ -386,7 +386,7 @@ impl MarketRegistry {
     fn load(directory: &Path) -> Result<Self> {
         let entries = fs::read_dir(directory).with_context(|| {
             format!(
-                "market snapshots are not installed at {}; run `mlab markets --exchange bulk --refresh`",
+                "market snapshots are not installed at {}; run `mlab markets --exchange bulkf --refresh`",
                 directory.display()
             )
         })?;
@@ -403,7 +403,7 @@ impl MarketRegistry {
         paths.sort();
         if paths.is_empty() {
             bail!(
-                "market snapshots are not installed at {}; run `mlab markets --exchange bulk --refresh`",
+                "market snapshots are not installed at {}; run `mlab markets --exchange bulkf --refresh`",
                 directory.display()
             );
         }
@@ -644,7 +644,7 @@ pub async fn refresh_route(provider: Option<&str>, exchange: &str) -> Result<Mar
     let snapshot = match provider.map(key).as_deref() {
         Some("mmt") => fetch_mmt_snapshot().await?,
         Some(provider) => bail!("market refresh is not implemented for provider `{provider}`"),
-        None if exchange.eq_ignore_ascii_case("bulk") => fetch_bulk_snapshot().await?,
+        None if exchange.eq_ignore_ascii_case("bulkf") => fetch_bulk_snapshot().await?,
         None if exchange.eq_ignore_ascii_case("hyperliquidf") => {
             fetch_hyperliquid_snapshot().await?
         }
@@ -658,7 +658,7 @@ pub async fn refresh_route(provider: Option<&str>, exchange: &str) -> Result<Mar
 }
 
 pub async fn refresh_bulk() -> Result<MarketSnapshot> {
-    refresh_route(None, "bulk").await
+    refresh_route(None, "bulkf").await
 }
 
 pub async fn refresh_hyperliquid() -> Result<MarketSnapshot> {
@@ -775,12 +775,12 @@ async fn fetch_bulk_snapshot() -> Result<MarketSnapshot> {
         .collect();
     let snapshot = MarketSnapshot {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
-        provider: "bulk".to_string(),
+        provider: "bulkf".to_string(),
         provider_type: ProviderType::Standalone,
         source_url: BULK_MARKETS_URL.to_string(),
         fetched_at: fetched_at(),
         exchanges: vec![ExchangeMarkets {
-            exchange: "bulk".to_string(),
+            exchange: "bulkf".to_string(),
             provider_exchange: None,
             name: "BULK".to_string(),
             market_type: MarketType::Futures,
@@ -1133,12 +1133,19 @@ fn write_snapshot(snapshot: &MarketSnapshot) -> Result<()> {
                 destination.display()
             )
         })?;
-        if snapshot.provider.eq_ignore_ascii_case("hyperliquidf") {
-            let legacy = directory.join("hyperliquid-markets.json");
-            if legacy != destination && legacy.exists() {
-                fs::remove_file(&legacy)
-                    .with_context(|| format!("failed to remove {}", legacy.display()))?;
-            }
+        let legacy = if snapshot.provider.eq_ignore_ascii_case("hyperliquidf") {
+            Some(directory.join("hyperliquid-markets.json"))
+        } else if snapshot.provider.eq_ignore_ascii_case("bulkf") {
+            Some(directory.join("bulk-markets.json"))
+        } else {
+            None
+        };
+        if let Some(legacy) = legacy
+            && legacy != destination
+            && legacy.exists()
+        {
+            fs::remove_file(&legacy)
+                .with_context(|| format!("failed to remove {}", legacy.display()))?;
         }
         Ok(())
     })();
@@ -1233,6 +1240,9 @@ fn key(value: &str) -> String {
 }
 
 fn ensure_public_exchange_id(exchange: &str) -> Result<()> {
+    if key(exchange) == "bulk" {
+        bail!("exchange `bulk` is not available; use `bulkf` for BULK perpetuals");
+    }
     if key(exchange) == "hyperliquid" {
         bail!(
             "exchange `hyperliquid` is reserved for Hyperliquid spot, which is not available standalone or through MMT; use `hyperliquidf` for Hyperliquid core perpetuals"
@@ -1248,7 +1258,7 @@ fn classify_mmt_exchange(exchange: &str) -> MarketType {
 fn classify_exchange_name(exchange: &str) -> MarketType {
     let exchange = key(exchange);
     let family = exchange.split('-').next().unwrap_or(exchange.as_str());
-    if family.ends_with('f') || family == "bulk" {
+    if family.ends_with('f') {
         MarketType::Futures
     } else {
         MarketType::Spot
@@ -1382,12 +1392,12 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
     vec![
         MarketSnapshot {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
-            provider: "bulk".to_string(),
+            provider: "bulkf".to_string(),
             provider_type: ProviderType::Standalone,
             source_url: BULK_MARKETS_URL.to_string(),
             fetched_at: "2026-07-19T00:00:00Z".to_string(),
             exchanges: vec![ExchangeMarkets {
-                exchange: "bulk".to_string(),
+                exchange: "bulkf".to_string(),
                 provider_exchange: None,
                 name: "BULK".to_string(),
                 market_type: MarketType::Futures,
@@ -1485,7 +1495,7 @@ mod tests {
         let registry = MarketRegistry::new(test_snapshots()).expect("snapshots index");
         assert_eq!(registry.snapshots.len(), 5);
 
-        let bulk = exchange_market("bulk", "btc/usdt").expect("BULK market resolves");
+        let bulk = exchange_market("bulkf", "btc/usdt").expect("BULK market resolves");
         assert_eq!(bulk.symbol, "BTC/USDT");
         assert_eq!(bulk.venue_symbol, "BTC-USD");
         assert_eq!(
@@ -1548,15 +1558,22 @@ mod tests {
 
     #[test]
     fn bulk_native_and_usd_aliases_resolve() {
-        let native = exchange_market("bulk", "BTC-USD").expect("native symbol resolves");
-        let usd = exchange_market("bulk", "BTC/USD").expect("USD alias resolves");
+        let native = exchange_market("bulkf", "BTC-USD").expect("native symbol resolves");
+        let usd = exchange_market("bulkf", "BTC/USD").expect("USD alias resolves");
         assert_eq!(native.symbol, "BTC/USDT");
         assert_eq!(native.symbol, usd.symbol);
     }
 
     #[test]
+    fn bare_bulk_exchange_id_is_rejected() {
+        let error = exchange_market("bulk", "BTC/USDT")
+            .expect_err("bare bulk must not resolve as a public exchange");
+        assert!(error.to_string().contains("use `bulkf`"));
+    }
+
+    #[test]
     fn exchange_market_type_is_available_in_constant_time() {
-        assert!(is_futures_exchange("bulk").expect("BULK type resolves"));
+        assert!(is_futures_exchange("bulkf").expect("BULK type resolves"));
         assert!(is_futures_exchange("binancef").expect("Binance Futures type resolves"));
         assert!(is_futures_exchange("hyperliquidf").expect("Hyperliquid type resolves"));
         assert!(is_futures_exchange("hyperliquid").is_err());

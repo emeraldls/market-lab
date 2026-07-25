@@ -1333,7 +1333,7 @@ fn create_script_job(
     submission.validate()?;
     if submission.venue == Some(ExecutionVenue::Bulk) {
         credentials::bulk_account()
-            .context("BULK authentication is required when a script uses --venue bulk")?;
+            .context("BULK authentication is required when a script uses --venue bulkf")?;
     } else if submission.venue == Some(ExecutionVenue::Hyperliquid) {
         credentials::hyperliquid_account().context(
             "Hyperliquid authentication is required when a script uses --venue hyperliquidf",
@@ -3750,7 +3750,7 @@ fn tracked_order_key(venue: ExecutionVenue, testnet: bool, order_id: &str) -> St
 
 fn execution_exchange(venue: ExecutionVenue) -> &'static str {
     match venue {
-        ExecutionVenue::Bulk => "bulk",
+        ExecutionVenue::Bulk => "bulkf",
         ExecutionVenue::Hyperliquid => "hyperliquidf",
     }
 }
@@ -4783,7 +4783,7 @@ mod tests {
                 "definition": {
                     "name": "oiwap",
                     "config": {
-                        "venue": "bulk",
+                        "venue": "bulkf",
                         "symbol": "ZEC/USDT",
                         "side": "buy",
                         "totalSize": 1.0,
@@ -4818,7 +4818,7 @@ mod tests {
                 "definition": {
                     "name": "mid_price",
                     "config": {
-                        "venue": "bulk",
+                        "venue": "bulkf",
                         "symbol": "BTC/USDT",
                         "maxInventorySize": 0.02,
                         "requestedMargin": 100.0,
@@ -4854,7 +4854,7 @@ mod tests {
                 "definition": {
                     "name": "volume_mid",
                     "config": {
-                        "venue": "bulk",
+                        "venue": "bulkf",
                         "symbol": "BTC/USDT",
                         "maxInventorySize": 0.02,
                         "requestedMargin": 100.0,

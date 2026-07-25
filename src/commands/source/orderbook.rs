@@ -60,7 +60,7 @@ async fn handle_bulk(args: SourceOrderbookArgs) -> Result<()> {
     }
 
     let snap = BulkProvider::live_orderbook(&args.symbol, args.depth, None).await?;
-    let env = build_orderbook_envelope(&snap, &args, "bulk", false)?;
+    let env = build_orderbook_envelope(&snap, &args, "bulkf", false)?;
     render_json_or_terminal(
         &env,
         &args.output,
@@ -144,7 +144,7 @@ async fn stream_bulk_orderbook(args: SourceOrderbookArgs) -> Result<()> {
             }
             _ = ticker.tick() => {
                 let Some(snapshot) = latest.as_ref() else { continue; };
-                let env = build_orderbook_envelope(snapshot, &args, "bulk", true)?;
+                let env = build_orderbook_envelope(snapshot, &args, "bulkf", true)?;
                 match args.output {
                     OutputFormat::Json | OutputFormat::Jsonl => println!("{}", serde_json::to_string(&env)?),
                     OutputFormat::Terminal => {

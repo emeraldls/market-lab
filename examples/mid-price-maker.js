@@ -27,9 +27,9 @@ function place(ctx, side, price) {
 }
 
 export function onData(ctx, input, history) {
-  if (input.source !== "orderbook@bulk") return
+  if (input.source !== "orderbook@bulkf") return
 
-  const book = history.source("orderbook@bulk", 0)
+  const book = history.source("orderbook@bulkf", 0)
   const bestBid = book?.bids?.[0]?.price
   const bestAsk = book?.asks?.[0]?.price
   if (!bestBid || !bestAsk || bestBid >= bestAsk) return

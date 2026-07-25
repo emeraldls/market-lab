@@ -498,7 +498,7 @@ fn confirm_live_execution(venue: ExecutionVenue, testnet: bool, children: usize)
 
 fn venue_name(venue: ExecutionVenue) -> &'static str {
     match venue {
-        ExecutionVenue::Bulk => "bulk",
+        ExecutionVenue::Bulk => "bulkf",
         ExecutionVenue::Hyperliquid => "hyperliquidf",
     }
 }

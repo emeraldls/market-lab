@@ -146,7 +146,7 @@ async fn handle_binance(args: SourceCandlesArgs, market: BinanceMarket) -> Resul
 }
 
 fn render_bulk_series(series: &OhlcvSeries, args: &SourceCandlesArgs) -> Result<()> {
-    render_direct_series(series, args, "bulk", "BULK")
+    render_direct_series(series, args, "bulkf", "BULK")
 }
 
 fn render_direct_series(
@@ -281,8 +281,8 @@ async fn stream_bulk_candles(args: SourceCandlesArgs) -> Result<()> {
                 let env = SourceEnvelope {
                     r#type: "source.candles.stream".to_string(),
                     version: "1",
-                    provider: "bulk",
-                    exchange: "bulk".to_string(),
+                    provider: "bulkf",
+                    exchange: "bulkf".to_string(),
                     symbol: crate::providers::bulk::markets::market(&args.symbol)?.symbol.clone(),
                     ts_ms: candle.t,
                     stream: true,
