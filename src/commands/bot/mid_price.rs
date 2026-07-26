@@ -2453,6 +2453,31 @@ mod tests {
     }
 
     #[test]
+    fn fill_ledger_skips_recovered_hyperliquid_partial_fills_seen_live() {
+        let mut ledger = FillLedger::default();
+        let first = ObservedFill {
+            timestamp: 1_785_104_956_859,
+            recovered: false,
+            buy: true,
+            size: 0.1065,
+            price: 1_937.8,
+            fee: Some(-0.030_958),
+        };
+        let second = ObservedFill {
+            size: 0.1028,
+            fee: Some(-0.029_878),
+            ..first
+        };
+
+        assert!(ledger.record_live("57028724010", &first));
+        assert!(ledger.record_live("57028724010", &second));
+        assert!(!ledger.record_recovery_occurrence("57028724010", &first, 1));
+        assert!(!ledger.record_recovery_occurrence("57028724010", &second, 1));
+        assert!((ledger.bought_size - 0.2093).abs() < 1e-12);
+        assert!((ledger.inventory() - 0.2093).abs() < 1e-12);
+    }
+
+    #[test]
     fn fill_ledger_accounts_for_realized_unrealized_fees_and_position_flips() {
         let mut ledger = FillLedger::with_allocated_margin(100.0);
         assert!(ledger.record_live(

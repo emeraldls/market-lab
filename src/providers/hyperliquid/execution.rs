@@ -157,11 +157,7 @@ impl HyperliquidExecutionAdapter {
     pub async fn fills(&self, account: &str) -> Result<Vec<Fill>> {
         ensure_account(account, &self.account)?;
         let raw: Vec<HyperliquidFill> = HyperliquidClient::for_network(self.network)?
-            .info(&serde_json::json!({
-                "type": "userFills",
-                "user": account,
-                "aggregateByTime": true
-            }))
+            .info(&user_fills_request(account))
             .await?;
         raw.into_iter().map(HyperliquidFill::into_fill).collect()
     }
@@ -974,6 +970,16 @@ impl HyperliquidFill {
     }
 }
 
+fn user_fills_request(account: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "userFills",
+        "user": account,
+        // Recovery must preserve the same partial-fill granularity as the
+        // userEvents stream so the fill ledger can identify duplicates.
+        "aggregateByTime": false
+    })
+}
+
 fn side(value: &str) -> Result<OrderSide> {
     match value.to_ascii_uppercase().as_str() {
         "B" | "BUY" => Ok(OrderSide::Buy),
@@ -1016,6 +1022,15 @@ mod tests {
         let fill = raw.into_fill().expect("normalized fill");
 
         assert_eq!(fill.fee, Some(-0.187391));
+    }
+
+    #[test]
+    fn recovery_requests_individual_hyperliquid_fills() {
+        let request = user_fills_request("0xabc");
+
+        assert_eq!(request["type"], "userFills");
+        assert_eq!(request["user"], "0xabc");
+        assert_eq!(request["aggregateByTime"], false);
     }
 
     #[test]
