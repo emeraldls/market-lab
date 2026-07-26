@@ -269,6 +269,11 @@ fn validate_source_config(config: &SourceConfig, historical: bool) -> Result<()>
                     crate::cli::mmt_timeframe_from_seconds(timeframe)?;
                 }
             }
+            ScriptSource::Trades => {
+                if historical {
+                    bail!("MMT raw trades are live-only and cannot be backtested");
+                }
+            }
             ScriptSource::Orderbook => {
                 if historical {
                     config.require_timeframe(&config.source)?;
@@ -290,6 +295,17 @@ fn validate_source_config(config: &SourceConfig, historical: bool) -> Result<()>
                 let timeframe = config.require_timeframe(&config.source)?;
                 if historical {
                     direct_timeframe_from_seconds(config.provider, timeframe)?;
+                }
+            }
+            ScriptSource::Trades if historical => {
+                bail!(
+                    "{} raw trades are live-only and cannot be backtested",
+                    source_provider_name(config.provider)
+                );
+            }
+            ScriptSource::Trades => {
+                if config.timeframe.is_some() {
+                    bail!("standalone live trades do not use a timeframe");
                 }
             }
             ScriptSource::Volumes => {
@@ -344,7 +360,10 @@ fn validate_source_config(config: &SourceConfig, historical: bool) -> Result<()>
                     let timeframe = config.require_timeframe(&config.source)?;
                     direct_timeframe_from_seconds(config.provider, timeframe)?;
                 }
-                ScriptSource::Orderbook | ScriptSource::Vd | ScriptSource::Oi => {
+                ScriptSource::Orderbook
+                | ScriptSource::Trades
+                | ScriptSource::Vd
+                | ScriptSource::Oi => {
                     bail!(
                         "{} does not provide historical {} for script backtests",
                         source_provider_name(config.provider),
@@ -387,6 +406,7 @@ fn parse_source(source: &str) -> Result<ScriptSource> {
     match source {
         "candles" => Ok(ScriptSource::Candles),
         "orderbook" => Ok(ScriptSource::Orderbook),
+        "trades" => Ok(ScriptSource::Trades),
         "vd" => Ok(ScriptSource::Vd),
         "oi" => Ok(ScriptSource::Oi),
         "volumes" => Ok(ScriptSource::Volumes),
@@ -613,6 +633,7 @@ mod tests {
         let configs = parse_source_configs(&[
             "candles@okx@mmt:timeframe=60".to_string(),
             "orderbook@binancef@mmt:timeframe=60,depth=50".to_string(),
+            "trades@hyperliquidf@mmt".to_string(),
             "vd@hyperliquidf@mmt:timeframe=60,bucket=1".to_string(),
             "oi@binancef@mmt:timeframe=60".to_string(),
             "volumes@okx@mmt:timeframe=60".to_string(),
@@ -621,6 +642,7 @@ mod tests {
         assert_eq!(configs["candles@okx@mmt"].exchange, "okx");
         assert_eq!(configs["candles@okx@mmt"].provider, ProviderKind::Mmt);
         assert_eq!(configs["orderbook@binancef@mmt"].depth, Some(50));
+        assert_eq!(configs["trades@hyperliquidf@mmt"].timeframe, None);
         assert_eq!(configs["vd@hyperliquidf@mmt"].bucket, Some(1));
         assert_eq!(configs["oi@binancef@mmt"].timeframe, Some(60));
         assert_eq!(configs["volumes@okx@mmt"].timeframe, Some(60));
@@ -668,12 +690,14 @@ mod tests {
         let live_manifest = manifest(vec![
             ScriptSource::Candles,
             ScriptSource::Orderbook,
+            ScriptSource::Trades,
             ScriptSource::Vd,
             ScriptSource::Oi,
         ]);
         let configs = parse_source_configs(&[
             "candles@bulkf:timeframe=60".to_string(),
             "orderbook@bulkf:depth=50".to_string(),
+            "trades@bulkf".to_string(),
             "vd@bulkf".to_string(),
             "oi@bulkf".to_string(),
         ])
@@ -683,6 +707,7 @@ mod tests {
             .expect("BULK live configs should validate");
         assert!(configs.contains_key("vd@bulkf"));
         assert!(configs.contains_key("oi@bulkf"));
+        assert!(configs.contains_key("trades@bulkf"));
     }
 
     #[test]
@@ -701,6 +726,7 @@ mod tests {
         let live_manifest = manifest(vec![
             ScriptSource::Candles,
             ScriptSource::Orderbook,
+            ScriptSource::Trades,
             ScriptSource::Vd,
             ScriptSource::Oi,
             ScriptSource::Volumes,
@@ -708,6 +734,7 @@ mod tests {
         let configs = parse_source_configs(&[
             "candles@hyperliquidf:timeframe=60".to_string(),
             "orderbook@hyperliquidf:depth=20".to_string(),
+            "trades@hyperliquidf".to_string(),
             "vd@hyperliquidf".to_string(),
             "oi@hyperliquidf".to_string(),
             "volumes@hyperliquidf:timeframe=60".to_string(),
@@ -721,6 +748,7 @@ mod tests {
             ProviderKind::Hyperliquid
         );
         assert_eq!(configs["orderbook@hyperliquidf"].depth, Some(20));
+        assert_eq!(configs["trades@hyperliquidf"].timeframe, None);
 
         let historical_manifest = manifest(vec![ScriptSource::Candles, ScriptSource::Volumes]);
         let historical_configs = parse_source_configs(&[
@@ -772,5 +800,16 @@ mod tests {
         let error = validate_source_configs(&manifest, &configs)
             .expect_err("historical BULK orderbook should fail");
         assert!(error.to_string().contains("historical orderbooks"));
+    }
+
+    #[test]
+    fn rejects_raw_trades_for_backtests() {
+        for selector in ["trades@binancef@mmt", "trades@bulkf", "trades@hyperliquidf"] {
+            let manifest = manifest(vec![ScriptSource::Trades]);
+            let configs = parse_source_configs(&[selector.to_string()]).expect("parse trades");
+            let error = validate_source_configs(&manifest, &configs)
+                .expect_err("raw trades must remain live-only");
+            assert!(error.to_string().contains("live-only"));
+        }
     }
 }

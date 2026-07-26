@@ -247,7 +247,22 @@ impl ScriptSession {
     }
 
     pub fn run_event(&self, mut payload: JsonValue) -> Result<ScriptExecution> {
+        let source_type = payload
+            .get("source_type")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                payload
+                    .get("source")
+                    .and_then(JsonValue::as_str)
+                    .and_then(|selector| selector.split_once('@').map(|(source, _)| source))
+                    .unwrap_or_default()
+                    .to_string()
+            });
         let (source, record, identity) = event_history_entry(&payload)?;
+        if source_type == "trades" && source != "trades" {
+            self.record_source("trades", record.clone(), identity)?;
+        }
         self.record_source(&source, record, identity)?;
         strip_source_data(&mut payload);
         self.run_on_data(payload)
@@ -480,6 +495,7 @@ fn event_history_entry(input: &JsonValue) -> Result<(String, JsonValue, Option<u
     let record = match source {
         "candles" => current.and_then(|value| value.get("candle")),
         "orderbook" => current.and_then(|value| value.get("snapshot")),
+        "trades" => current.and_then(|value| value.get("record")),
         "vd" => current.and_then(|value| value.get("record").or_else(|| value.get("candle"))),
         "oi" => current.and_then(|value| value.get("record").or_else(|| value.get("candle"))),
         "volumes" => current.and_then(|value| value.get("record").or_else(|| value.get("profile"))),
@@ -491,7 +507,7 @@ fn event_history_entry(input: &JsonValue) -> Result<(String, JsonValue, Option<u
         "candles" | "volumes" => true,
         "vd" => record.get("delta").is_none(),
         "oi" => record.get("mark_price").is_none(),
-        "orderbook" => false,
+        "orderbook" | "trades" => false,
         _ => unreachable!(),
     };
     let identity = replaces_same_timestamp
@@ -510,6 +526,7 @@ fn strip_source_data(input: &mut JsonValue) {
         "sources",
         "candles",
         "orderbook",
+        "trades",
         "vd",
         "oi",
         "volumes",
@@ -1201,6 +1218,57 @@ export function onData(ctx, input, history) {
         assert_eq!(third.output.metrics["latest"], 12.0);
         assert_eq!(third.output.metrics["missing_list"], 0);
         assert_eq!(third.output.metrics["frozen"], true);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn trades_history_exposes_the_live_buffer_and_latest_index() {
+        let path = write_temp_script(
+            r#"
+export const script = {
+  name: "trades-history",
+  version: "1",
+  sources: ["trades"],
+  lookback: 2,
+  params: {}
+};
+
+export function onData(ctx, input, history) {
+  const trades = history.source("trades");
+  return {
+    metrics: {
+      count: trades.length,
+      first: trades[0].price,
+      latest: history.source("trades", 0).price,
+      exact_latest: history.source("trades@bulkf", 0).price
+    }
+  };
+}
+"#,
+            "trades-history",
+        );
+
+        let script = Script::load(&path).expect("load script");
+        let session = script.start_session(&json!({})).expect("start session");
+        session
+            .run_event(json!({
+                "source": "trades@bulkf",
+                "source_type": "trades",
+                "data": { "record": { "price": 100.0, "size": 0.5 } }
+            }))
+            .expect("first trade");
+        let second = session
+            .run_event(json!({
+                "source": "trades@bulkf",
+                "source_type": "trades",
+                "data": { "record": { "price": 101.0, "size": 0.25 } }
+            }))
+            .expect("second trade");
+
+        assert_eq!(second.output.metrics["count"], 2);
+        assert_eq!(second.output.metrics["first"], 100.0);
+        assert_eq!(second.output.metrics["latest"], 101.0);
+        assert_eq!(second.output.metrics["exact_latest"], 101.0);
         let _ = fs::remove_file(path);
     }
 

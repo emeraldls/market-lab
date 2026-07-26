@@ -5,6 +5,21 @@ use crate::domain::types::{
     VolumeDeltaTick, VolumeProfile,
 };
 
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct ScriptTrade {
+    pub price: f64,
+    pub size: f64,
+}
+
+impl ScriptTrade {
+    pub fn from_tick(trade: &TradeTick) -> Self {
+        Self {
+            price: trade.price,
+            size: trade.size,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ScriptCandle {
     pub t: u64,
@@ -381,6 +396,19 @@ fn profile_price(profile: &VolumeProfile) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn script_trade_exposes_only_price_and_size() {
+        let trade = ScriptTrade::from_tick(&trade(1_700_000_000_000, 42_000.0, 0.25, true));
+
+        assert_eq!(
+            serde_json::to_value(trade).expect("serialize trade"),
+            serde_json::json!({
+                "price": 42_000.0,
+                "size": 0.25,
+            })
+        );
+    }
 
     #[test]
     fn normalizes_mmt_candles_to_milliseconds_and_common_volume() {

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -44,7 +44,8 @@ use crate::scripting::inputs::{
 use crate::scripting::jobs::ScriptJobSubmission;
 use crate::scripting::manifest::ScriptSource;
 use crate::scripting::market_data::{
-    ScriptCandle, ScriptOpenInterest, ScriptVolume, ScriptVolumeDelta, TradeCandleAggregator,
+    ScriptCandle, ScriptOpenInterest, ScriptTrade, ScriptVolume, ScriptVolumeDelta,
+    TradeCandleAggregator,
 };
 
 const SCRIPT_STREAM_RECONNECT_MAX_SECS: u64 = 30;
@@ -95,9 +96,16 @@ struct ScriptRunOutput {
 enum LiveRecord {
     Candles(ScriptCandle),
     Orderbook(OrderBookSnapshot),
+    Trades(LiveTrade),
     Vd(ScriptVolumeDelta),
     Oi(ScriptOpenInterest),
     Volumes(ScriptVolume),
+}
+
+#[derive(Debug, Clone)]
+struct LiveTrade {
+    timestamp_ms: u64,
+    record: ScriptTrade,
 }
 
 #[derive(Debug, Clone)]
@@ -556,6 +564,7 @@ struct MmtScriptStreams {
     source_configs: SourceConfigs,
     orderbook_states: BTreeMap<String, OrderBookState>,
     candle_aggregators: BTreeMap<String, TradeCandleAggregator>,
+    pending: VecDeque<LiveUpdate>,
 }
 
 impl ScriptLiveStreams {
@@ -578,6 +587,7 @@ impl ScriptLiveStreams {
                 source_configs: mmt_configs,
                 orderbook_states,
                 candle_aggregators,
+                pending: VecDeque::new(),
             })
         };
         let bulk = if bulk_configs.is_empty() {
@@ -726,13 +736,19 @@ fn next_stream_reconnect_delay(current: u64) -> u64 {
 
 impl MmtScriptStreams {
     async fn next_update(&mut self) -> Result<Option<LiveUpdate>> {
-        next_mmt_update(
-            &self.ws,
-            &self.source_configs,
-            &mut self.orderbook_states,
-            &mut self.candle_aggregators,
-        )
-        .await
+        if let Some(update) = self.pending.pop_front() {
+            return Ok(Some(update));
+        }
+        self.pending.extend(
+            next_mmt_updates(
+                &self.ws,
+                &self.source_configs,
+                &mut self.orderbook_states,
+                &mut self.candle_aggregators,
+            )
+            .await?,
+        );
+        Ok(self.pending.pop_front())
     }
 }
 
@@ -968,7 +984,7 @@ impl DirectScriptStreams {
         let trades = if candle_timeframe.is_some()
             || source_configs
                 .values()
-                .any(|config| config.source == ScriptSource::Vd)
+                .any(|config| matches!(config.source, ScriptSource::Trades | ScriptSource::Vd))
         {
             Some(DirectTradesStream::connect(provider, symbol, testnet).await?)
         } else {
@@ -1040,6 +1056,9 @@ impl DirectScriptStreams {
             let orderbook_config = source_config(&self.source_configs, &ScriptSource::Orderbook)
                 .ok()
                 .cloned();
+            let trades_config = source_config(&self.source_configs, &ScriptSource::Trades)
+                .ok()
+                .cloned();
             let vd_config = source_config(&self.source_configs, &ScriptSource::Vd)
                 .ok()
                 .cloned();
@@ -1056,6 +1075,17 @@ impl DirectScriptStreams {
                 }
                 batch = async { trades.as_mut().expect("guarded trades stream").next_trades().await }, if has_trades => {
                     let batch = batch?;
+                    if let Some(config) = trades_config.as_ref() {
+                        pending.extend(batch.iter().map(|trade| {
+                            LiveUpdate::new(
+                                config,
+                                LiveRecord::Trades(LiveTrade {
+                                    timestamp_ms: trade.timestamp_ms,
+                                    record: ScriptTrade::from_tick(trade),
+                                }),
+                            )
+                        }));
+                    }
                     if let (Some(aggregator), Some(config)) = (candle_aggregator.as_mut(), candles_config.as_ref()) {
                         pending.extend(
                             aggregator
@@ -1130,6 +1160,7 @@ async fn subscribe_mmt_sources(
     source_configs: &SourceConfigs,
     symbol: &str,
 ) -> Result<()> {
+    let mut raw_trade_subscriptions = BTreeSet::new();
     let mut configs = source_configs.values().collect::<Vec<_>>();
     configs.sort_by_key(|config| config.position);
     for config in configs {
@@ -1137,15 +1168,19 @@ async fn subscribe_mmt_sources(
         let provider_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
         let provider_exchange = normalize_exchange_for_mmt(exchange)?;
         match &config.source {
-            ScriptSource::Candles => {
-                ws.subscribe(json!({
-                    "type": "subscribe",
-                    "channel": "trades",
-                    "exchange": provider_exchange,
-                    "symbol": provider_symbol.as_str(),
-                }))
-                .await
-                .with_context(|| format!("failed to subscribe {}", config.selector))?;
+            ScriptSource::Candles | ScriptSource::Trades => {
+                if raw_trade_subscriptions
+                    .insert((provider_exchange.clone(), provider_symbol.clone()))
+                {
+                    ws.subscribe(json!({
+                        "type": "subscribe",
+                        "channel": "trades",
+                        "exchange": provider_exchange,
+                        "symbol": provider_symbol.as_str(),
+                    }))
+                    .await
+                    .with_context(|| format!("failed to subscribe {}", config.selector))?;
+                }
             }
             ScriptSource::Orderbook => {
                 ws.subscribe(json!({
@@ -1214,36 +1249,38 @@ fn orderbook_states(source_configs: &SourceConfigs) -> BTreeMap<String, OrderBoo
         .collect()
 }
 
-async fn next_mmt_update(
+async fn next_mmt_updates(
     ws: &MmtWsClient,
     source_configs: &SourceConfigs,
     orderbook_states: &mut BTreeMap<String, OrderBookState>,
     candle_aggregators: &mut BTreeMap<String, TradeCandleAggregator>,
-) -> Result<Option<LiveUpdate>> {
+) -> Result<Vec<LiveUpdate>> {
     let Some(value) = ws.next_json().await? else {
         bail!("websocket closed by server");
     };
     if value.is_null() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     if value.get("type").and_then(Value::as_str) == Some("subscribed") {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     if value.get("type").and_then(Value::as_str) != Some("data") {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     let source = match value.get("channel").and_then(Value::as_str) {
-        Some("trades") => ScriptSource::Candles,
+        Some("trades") => {
+            return mmt_trade_updates(&value, source_configs, candle_aggregators);
+        }
         Some("depth") => ScriptSource::Orderbook,
         Some("vd") => ScriptSource::Vd,
         Some("oi") => ScriptSource::Oi,
         Some("volumes") => ScriptSource::Volumes,
-        _ => return Ok(None),
+        _ => return Ok(Vec::new()),
     };
     let config = mmt_update_config(&value, source_configs, &source)?;
     let Some(config) = config else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
 
     match source {
@@ -1251,65 +1288,94 @@ async fn next_mmt_update(
             let payload = value.get("data").context("vd payload missing data")?;
             let candle: VdCandle =
                 serde_json::from_value(payload.clone()).context("invalid vd candle shape")?;
-            Ok(Some(LiveUpdate::new(
+            Ok(vec![LiveUpdate::new(
                 config,
                 LiveRecord::Vd(ScriptVolumeDelta::from_mmt(candle)),
-            )))
+            )])
         }
         ScriptSource::Oi => {
             let payload = value.get("data").context("oi payload missing data")?;
             let candle: OiCandle =
                 serde_json::from_value(payload.clone()).context("invalid oi candle shape")?;
-            Ok(Some(LiveUpdate::new(
+            Ok(vec![LiveUpdate::new(
                 config,
                 LiveRecord::Oi(ScriptOpenInterest::from_mmt(candle)),
-            )))
+            )])
         }
         ScriptSource::Volumes => {
             let payload = value.get("data").context("volumes payload missing data")?;
             let profile: VolumeProfile =
                 serde_json::from_value(payload.clone()).context("invalid volumes profile shape")?;
-            Ok(Some(LiveUpdate::new(
+            Ok(vec![LiveUpdate::new(
                 config,
                 LiveRecord::Volumes(ScriptVolume::from_mmt(profile)),
-            )))
+            )])
         }
         ScriptSource::Orderbook => {
             let Some(state) = orderbook_states.get_mut(&config.selector) else {
-                return Ok(None);
+                return Ok(Vec::new());
             };
             let depth = config.depth_or_default();
-            Ok(
-                parse_depth_update(value, state, depth)?.map(|mut snapshot| {
+            Ok(parse_depth_update(value, state, depth)?
+                .map(|mut snapshot| {
                     snapshot.exchange.clone_from(&config.exchange);
                     LiveUpdate::new(config, LiveRecord::Orderbook(snapshot))
-                }),
-            )
+                })
+                .into_iter()
+                .collect())
         }
-        ScriptSource::Candles => {
-            let payload = value.get("data").context("trade payload missing data")?;
-            let trade: MmtTrade =
-                serde_json::from_value(payload.clone()).context("invalid MMT trade shape")?;
-            let trade = TradeTick {
-                exchange: config.exchange.clone(),
-                symbol: value
-                    .get("symbol")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string(),
-                timestamp_ms: normalize_to_ms(trade.t),
-                price: trade.p,
-                size: trade.q,
-                taker_buy: trade.b,
-            };
-            let aggregator = candle_aggregators
-                .get_mut(&config.selector)
-                .context("missing MMT candle aggregator")?;
-            Ok(aggregator
-                .push(&trade)
-                .map(|candle| LiveUpdate::new(config, LiveRecord::Candles(candle))))
+        ScriptSource::Candles | ScriptSource::Trades => {
+            unreachable!("MMT trades are routed before single-source updates")
         }
     }
+}
+
+fn mmt_trade_updates(
+    value: &Value,
+    source_configs: &SourceConfigs,
+    candle_aggregators: &mut BTreeMap<String, TradeCandleAggregator>,
+) -> Result<Vec<LiveUpdate>> {
+    let payload = value.get("data").context("trade payload missing data")?;
+    let raw: MmtTrade =
+        serde_json::from_value(payload.clone()).context("invalid MMT trade shape")?;
+    let timestamp_ms = normalize_to_ms(raw.t);
+    let mut updates = Vec::with_capacity(2);
+
+    if let Some(config) = mmt_update_config(value, source_configs, &ScriptSource::Trades)? {
+        updates.push(LiveUpdate::new(
+            config,
+            LiveRecord::Trades(LiveTrade {
+                timestamp_ms,
+                record: ScriptTrade {
+                    price: raw.p,
+                    size: raw.q,
+                },
+            }),
+        ));
+    }
+
+    if let Some(config) = mmt_update_config(value, source_configs, &ScriptSource::Candles)? {
+        let trade = TradeTick {
+            exchange: config.exchange.clone(),
+            symbol: value
+                .get("symbol")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            timestamp_ms,
+            price: raw.p,
+            size: raw.q,
+            taker_buy: !raw.b,
+        };
+        let aggregator = candle_aggregators
+            .get_mut(&config.selector)
+            .context("missing MMT candle aggregator")?;
+        if let Some(candle) = aggregator.push(&trade) {
+            updates.push(LiveUpdate::new(config, LiveRecord::Candles(candle)));
+        }
+    }
+
+    Ok(updates)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1404,6 +1470,7 @@ impl LiveUpdate {
         match &self.record {
             LiveRecord::Candles(candle) => candle.t,
             LiveRecord::Orderbook(snapshot) => snapshot.timestamp_ms,
+            LiveRecord::Trades(trade) => trade.timestamp_ms,
             LiveRecord::Vd(candle) => candle.t,
             LiveRecord::Oi(candle) => candle.t,
             LiveRecord::Volumes(profile) => profile.t,
@@ -1528,6 +1595,7 @@ fn live_record_payload(record: &LiveRecord, config: &SourceConfig) -> Value {
     match record {
         LiveRecord::Candles(candle) => json!({ "candle": candle }),
         LiveRecord::Orderbook(snapshot) => json!({ "snapshot": snapshot }),
+        LiveRecord::Trades(trade) => json!({ "record": trade.record }),
         LiveRecord::Vd(candle) => json!({
             "candle": candle,
             "record": candle,
@@ -1697,6 +1765,83 @@ mod tests {
         assert_eq!(trade.p, 42_050.0);
         assert_eq!(trade.q, 0.5);
         assert!(trade.b);
+    }
+
+    #[test]
+    fn mmt_trade_updates_feed_trades_and_trade_derived_candles() {
+        let configs = parse_source_configs(&[
+            "trades@binancef@mmt".to_string(),
+            "candles@binancef@mmt:timeframe=60".to_string(),
+        ])
+        .expect("parse trade source configs");
+        let mut aggregators =
+            trade_candle_aggregators(&configs, 60_000).expect("create aggregators");
+
+        let first = json!({
+            "type": "data",
+            "channel": "trades",
+            "exchange": "binancef",
+            "symbol": "btc/usdt",
+            "data": {
+                "id": "1",
+                "t": 60_000,
+                "p": 100.0,
+                "q": 0.5,
+                "b": true
+            }
+        });
+        let first_updates =
+            mmt_trade_updates(&first, &configs, &mut aggregators).expect("route first trade");
+        assert_eq!(first_updates.len(), 1);
+        assert!(matches!(first_updates[0].record, LiveRecord::Trades(_)));
+
+        let second = json!({
+            "type": "data",
+            "channel": "trades",
+            "exchange": "binancef",
+            "symbol": "btc/usdt",
+            "data": {
+                "id": "2",
+                "t": 120_000,
+                "p": 101.0,
+                "q": 0.25,
+                "b": false
+            }
+        });
+        let second_updates =
+            mmt_trade_updates(&second, &configs, &mut aggregators).expect("route second trade");
+        assert_eq!(second_updates.len(), 2);
+        assert!(matches!(second_updates[0].record, LiveRecord::Trades(_)));
+        let LiveRecord::Candles(candle) = &second_updates[1].record else {
+            panic!("second update should close the candle");
+        };
+        assert_eq!(candle.vb, Some(0.0));
+        assert_eq!(candle.vs, Some(0.5));
+    }
+
+    #[test]
+    fn trades_live_payload_contains_only_price_and_size() {
+        let configs =
+            parse_source_configs(&["trades@bulkf".to_string()]).expect("parse trades config");
+        let update = LiveUpdate::new(
+            &configs["trades@bulkf"],
+            LiveRecord::Trades(LiveTrade {
+                timestamp_ms: 1_700_000_000_000,
+                record: ScriptTrade {
+                    price: 42_000.0,
+                    size: 0.25,
+                },
+            }),
+        );
+
+        let payload =
+            live_stream_payload(&update, &configs, "BTC/USDT", &[]).expect("build payload");
+
+        assert_eq!(payload["source_type"], "trades");
+        assert_eq!(
+            payload["data"]["record"],
+            json!({ "price": 42_000.0, "size": 0.25 })
+        );
     }
 
     #[test]

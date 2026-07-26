@@ -10,6 +10,7 @@ use super::limits::SCRIPT_MAX_LOOKBACK_CANDLES;
 pub enum ScriptSource {
     Candles,
     Orderbook,
+    Trades,
     Vd,
     Oi,
     Volumes,
@@ -99,6 +100,7 @@ impl ScriptSource {
         match self {
             ScriptSource::Candles => "candles",
             ScriptSource::Orderbook => "orderbook",
+            ScriptSource::Trades => "trades",
             ScriptSource::Vd => "vd",
             ScriptSource::Oi => "oi",
             ScriptSource::Volumes => "volumes",

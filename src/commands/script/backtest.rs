@@ -620,6 +620,9 @@ async fn fetch_mmt_sources(
         let source = &config.source;
         let exchange = config.exchange.as_str();
         match source {
+            ScriptSource::Trades => {
+                bail!("MMT raw trades are live-only and cannot be backtested");
+            }
             ScriptSource::Candles => {
                 let timeframe = config.require_timeframe(source)?;
                 let tf = mmt_timeframe_from_seconds(timeframe)?;
@@ -865,7 +868,10 @@ async fn fetch_direct_sources(
         let phase = match source {
             ScriptSource::Candles => "fetching_candles",
             ScriptSource::Volumes => "fetching_volumes",
-            ScriptSource::Orderbook | ScriptSource::Vd | ScriptSource::Oi => {
+            ScriptSource::Orderbook
+            | ScriptSource::Trades
+            | ScriptSource::Vd
+            | ScriptSource::Oi => {
                 bail!(
                     "{} does not provide historical {} for script backtests",
                     provider_name,
@@ -949,7 +955,10 @@ async fn fetch_direct_sources(
                     ),
                 );
             }
-            ScriptSource::Orderbook | ScriptSource::Vd | ScriptSource::Oi => unreachable!(),
+            ScriptSource::Orderbook
+            | ScriptSource::Trades
+            | ScriptSource::Vd
+            | ScriptSource::Oi => unreachable!(),
         }
         eprintln!(
             "fetched {points} {} {} records in {}ms",
@@ -1134,6 +1143,7 @@ fn backtest_record_payload(
     Ok(match &config.source {
         ScriptSource::Candles => json!({ "candle": record }),
         ScriptSource::Orderbook => json!({ "snapshot": record }),
+        ScriptSource::Trades => unreachable!("raw trades are not available in backtests"),
         ScriptSource::Vd => json!({
             "candle": record,
             "record": record,
