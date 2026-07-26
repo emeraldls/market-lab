@@ -314,6 +314,16 @@ fn terminal_log_line(value: &serde_json::Value) -> String {
             number(value, "previousCenter"),
             number(value, "center"),
         ),
+        "bot.grid.batch" => format!(
+            "batch {} {}/{} orders in {}ms",
+            value
+                .get("operation")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("update"),
+            number(value, "succeeded"),
+            number(value, "orders"),
+            number(value, "latencyMs"),
+        ),
         "bot.grid.soft_reset" => {
             let status = value
                 .get("status")

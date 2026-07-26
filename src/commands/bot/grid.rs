@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use futures_util::future::join_all;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::task::JoinSet;
@@ -32,6 +31,7 @@ use crate::providers::execution::ExecutionAdapter;
 
 const BOT_NAME: &str = "grid";
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
+const SOFT_RESET_MINIMUM_QUOTE_AGE: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -369,6 +369,7 @@ struct WorkingQuote {
     order_id: String,
     price: f64,
     remaining_size: f64,
+    submitted_at: Instant,
     cancel_requested: bool,
 }
 
@@ -412,6 +413,8 @@ struct ActionCompletion {
     kind: ActionKind,
     result: std::result::Result<ExecutionReceipt, String>,
 }
+
+type ActionBatch = Vec<ActionCompletion>;
 
 #[derive(Clone, Debug)]
 enum OrderRole {
@@ -514,7 +517,7 @@ async fn run_worker(job_id: &str, definition: &GridJobDefinition) -> Result<()> 
     let mut order_roles = HashMap::<String, OrderRole>::new();
     let mut pending_fills = HashMap::<String, Vec<ObservedFill>>::new();
     let mut terminal_statuses = HashMap::<String, String>::new();
-    let mut actions = JoinSet::<ActionCompletion>::new();
+    let mut actions = JoinSet::<ActionBatch>::new();
     let mut order_sequence = 0_u64;
     let mut cancel_sequence = 0_u64;
     let mut previous_inventory_sign = 0.0_f64;
@@ -593,19 +596,21 @@ async fn run_worker(job_id: &str, definition: &GridJobDefinition) -> Result<()> 
                     }
                 }
                 completion = actions.join_next(), if !actions.is_empty() => {
-                    let completion = completion
+                    let completions = completion
                         .context("grid action set ended unexpectedly")?
                         .context("grid action task panicked")?;
-                    apply_action_completion(
-                        job_id,
-                        current_mark(&book, parent.reference_price),
-                        completion,
-                        &mut slots,
-                        &mut order_roles,
-                        &mut pending_fills,
-                        &mut terminal_statuses,
-                        &mut ledger,
-                    )?;
+                    for completion in completions {
+                        apply_action_completion(
+                            job_id,
+                            current_mark(&book, parent.reference_price),
+                            completion,
+                            &mut slots,
+                            &mut order_roles,
+                            &mut pending_fills,
+                            &mut terminal_statuses,
+                            &mut ledger,
+                        )?;
+                    }
                 }
                 _ = heartbeat.tick() => {
                     let performance = ledger.performance(current_mark(&book, parent.reference_price));
@@ -740,22 +745,21 @@ async fn run_worker(job_id: &str, definition: &GridJobDefinition) -> Result<()> 
                 rules.size_precision,
                 rules.min_notional,
             );
-            for key in &keys {
-                reconcile_quote(
-                    job_id,
-                    *key,
-                    desired.get(key).copied(),
-                    &parent,
-                    rules.lot_size,
-                    rules.min_notional,
-                    book_revision,
-                    soft_reset.is_some(),
-                    slots.get_mut(key).expect("all grid slots are initialized"),
-                    &mut actions,
-                    &mut order_sequence,
-                    &mut cancel_sequence,
-                )?;
-            }
+            reconcile_quotes(
+                job_id,
+                &keys,
+                &desired,
+                &parent,
+                rules.lot_size,
+                rules.min_notional,
+                definition.step_bps,
+                book_revision,
+                soft_reset.is_some(),
+                &mut slots,
+                &mut actions,
+                &mut order_sequence,
+                &mut cancel_sequence,
+            )?;
         };
         Ok(outcome)
     }
@@ -764,18 +768,20 @@ async fn run_worker(job_id: &str, definition: &GridJobDefinition) -> Result<()> 
     let mut action_error = None;
     while let Some(completion) = actions.join_next().await {
         match completion {
-            Ok(completion) => {
-                if let Err(error) = apply_action_completion(
-                    job_id,
-                    current_mark(&book, parent.reference_price),
-                    completion,
-                    &mut slots,
-                    &mut order_roles,
-                    &mut pending_fills,
-                    &mut terminal_statuses,
-                    &mut ledger,
-                ) {
-                    action_error.get_or_insert(error);
+            Ok(completions) => {
+                for completion in completions {
+                    if let Err(error) = apply_action_completion(
+                        job_id,
+                        current_mark(&book, parent.reference_price),
+                        completion,
+                        &mut slots,
+                        &mut order_roles,
+                        &mut pending_fills,
+                        &mut terminal_statuses,
+                        &mut ledger,
+                    ) {
+                        action_error.get_or_insert(error);
+                    }
                 }
             }
             Err(error) => {
@@ -965,9 +971,11 @@ fn cap_replenishment_to_inventory(
 }
 
 fn should_replace_quote(
+    key: GridKey,
     live: &WorkingQuote,
     desired: Option<(f64, f64)>,
-    replace_size: bool,
+    soft_reset_active: bool,
+    step_bps: f64,
     lot_size: f64,
     min_notional: f64,
 ) -> bool {
@@ -975,9 +983,22 @@ fn should_replace_quote(
         return true;
     };
     if (price - live.price).abs() > f64::EPSILON {
-        return true;
+        if !soft_reset_active {
+            return true;
+        }
+        let moved_away = match key.side {
+            QuoteSide::Buy => price > live.price,
+            QuoteSide::Sell => price < live.price,
+        };
+        let deviation_bps = (price - live.price).abs() / live.price * 10_000.0;
+        if moved_away
+            && live.submitted_at.elapsed() >= SOFT_RESET_MINIMUM_QUOTE_AGE
+            && deviation_bps >= step_bps
+        {
+            return true;
+        }
     }
-    if !replace_size {
+    if !soft_reset_active {
         return false;
     }
     let size_difference = (size - live.remaining_size).abs();
@@ -985,70 +1006,179 @@ fn should_replace_quote(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn reconcile_quote(
+fn reconcile_quotes(
     job_id: &str,
-    key: GridKey,
-    desired: Option<(f64, f64)>,
+    keys: &[GridKey],
+    desired: &HashMap<GridKey, (f64, f64)>,
     parent: &TradePlan,
     lot_size: f64,
     min_notional: f64,
+    step_bps: f64,
     book_revision: u64,
-    replace_size: bool,
-    slot: &mut QuoteSlot,
-    actions: &mut JoinSet<ActionCompletion>,
+    soft_reset_active: bool,
+    slots: &mut HashMap<GridKey, QuoteSlot>,
+    actions: &mut JoinSet<ActionBatch>,
     order_sequence: &mut u64,
     cancel_sequence: &mut u64,
 ) -> Result<()> {
-    if slot.busy || !slot.accepts_book_revision(book_revision) {
-        return Ok(());
-    }
-    if let Some(live) = slot.live.as_mut() {
-        let replace = should_replace_quote(live, desired, replace_size, lot_size, min_notional);
-        if replace && !live.cancel_requested {
-            live.cancel_requested = true;
-            slot.busy = true;
-            *cancel_sequence = cancel_sequence.saturating_add(1);
-            let sequence = *cancel_sequence;
-            let order_id = live.order_id.clone();
-            let plan = cancel_plan(parent, order_id.clone())?;
-            let job_id = job_id.to_string();
-            actions.spawn(async move {
-                let result = crate::runtime::submit_bot_cancel(&job_id, sequence, &plan)
-                    .await
-                    .map_err(|error| format!("{error:#}"));
-                ActionCompletion {
-                    kind: ActionKind::CancelQuote { key, order_id },
-                    result,
-                }
-            });
-        }
+    if !actions.is_empty() {
         return Ok(());
     }
 
-    let Some((price, size)) = desired else {
-        return Ok(());
-    };
-    slot.busy = true;
-    slot.pending_size = Some(size);
-    *order_sequence = order_sequence.saturating_add(1);
-    let sequence = *order_sequence;
-    let plan = quote_plan(parent, key.side, size, price)?;
-    let job_id = job_id.to_string();
-    actions.spawn(async move {
-        let result = crate::runtime::submit_bot_trade(&job_id, sequence, &plan)
-            .await
-            .map_err(|error| format!("{error:#}"));
-        ActionCompletion {
-            kind: ActionKind::SubmitQuote {
-                key,
-                price,
-                size,
-                book_revision,
-            },
-            result,
+    let mut cancel_items = Vec::new();
+    let mut cancel_kinds = Vec::new();
+    for key in keys {
+        let slot = slots.get_mut(key).context("grid quote slot disappeared")?;
+        if slot.busy || !slot.accepts_book_revision(book_revision) {
+            continue;
         }
-    });
+        if let Some(live) = slot.live.as_mut() {
+            let replace = should_replace_quote(
+                *key,
+                live,
+                desired.get(key).copied(),
+                soft_reset_active,
+                step_bps,
+                lot_size,
+                min_notional,
+            );
+            if !replace || live.cancel_requested {
+                continue;
+            }
+            live.cancel_requested = true;
+            slot.busy = true;
+            *cancel_sequence = cancel_sequence.saturating_add(1);
+            let order_id = live.order_id.clone();
+            let plan = cancel_plan(parent, order_id.clone())?;
+            cancel_items.push((*cancel_sequence, plan));
+            cancel_kinds.push(ActionKind::CancelQuote {
+                key: *key,
+                order_id,
+            });
+        }
+    }
+    if !cancel_items.is_empty() {
+        let job_id = job_id.to_string();
+        actions.spawn(async move {
+            let started = Instant::now();
+            let completions = match crate::runtime::submit_bot_cancels(&job_id, &cancel_items).await
+            {
+                Ok(outcomes) if outcomes.len() == cancel_kinds.len() => cancel_kinds
+                    .into_iter()
+                    .zip(outcomes)
+                    .map(|(kind, outcome)| ActionCompletion {
+                        kind,
+                        result: outcome.into_result(),
+                    })
+                    .collect(),
+                Ok(outcomes) => batch_action_failures(
+                    cancel_kinds,
+                    format!(
+                        "mlabd returned {} cancellation outcomes for {} grid quotes",
+                        outcomes.len(),
+                        cancel_items.len()
+                    ),
+                ),
+                Err(error) => batch_action_failures(cancel_kinds, format!("{error:#}")),
+            };
+            if let Err(error) =
+                append_grid_batch(&job_id, "cancel", started.elapsed(), &completions)
+            {
+                eprintln!("grid batch telemetry warning: {error:#}");
+            }
+            completions
+        });
+        return Ok(());
+    }
+
+    let mut submit_items = Vec::new();
+    let mut submit_kinds = Vec::new();
+    for key in keys {
+        let Some((price, size)) = desired.get(key).copied() else {
+            continue;
+        };
+        let slot = slots.get_mut(key).context("grid quote slot disappeared")?;
+        if slot.busy || slot.live.is_some() || !slot.accepts_book_revision(book_revision) {
+            continue;
+        }
+        slot.busy = true;
+        slot.pending_size = Some(size);
+        *order_sequence = order_sequence.saturating_add(1);
+        submit_items.push((*order_sequence, quote_plan(parent, key.side, size, price)?));
+        submit_kinds.push(ActionKind::SubmitQuote {
+            key: *key,
+            price,
+            size,
+            book_revision,
+        });
+    }
+    if !submit_items.is_empty() {
+        let job_id = job_id.to_string();
+        actions.spawn(async move {
+            let started = Instant::now();
+            let completions = match crate::runtime::submit_bot_trades(&job_id, &submit_items).await
+            {
+                Ok(outcomes) if outcomes.len() == submit_kinds.len() => submit_kinds
+                    .into_iter()
+                    .zip(outcomes)
+                    .map(|(kind, outcome)| ActionCompletion {
+                        kind,
+                        result: outcome.into_result(),
+                    })
+                    .collect(),
+                Ok(outcomes) => batch_action_failures(
+                    submit_kinds,
+                    format!(
+                        "mlabd returned {} execution outcomes for {} grid quotes",
+                        outcomes.len(),
+                        submit_items.len()
+                    ),
+                ),
+                Err(error) => batch_action_failures(submit_kinds, format!("{error:#}")),
+            };
+            if let Err(error) = append_grid_batch(&job_id, "place", started.elapsed(), &completions)
+            {
+                eprintln!("grid batch telemetry warning: {error:#}");
+            }
+            completions
+        });
+    }
     Ok(())
+}
+
+fn batch_action_failures(kinds: Vec<ActionKind>, error: String) -> Vec<ActionCompletion> {
+    kinds
+        .into_iter()
+        .map(|kind| ActionCompletion {
+            kind,
+            result: Err(error.clone()),
+        })
+        .collect()
+}
+
+fn append_grid_batch(
+    job_id: &str,
+    operation: &str,
+    elapsed: Duration,
+    completions: &[ActionCompletion],
+) -> Result<()> {
+    let succeeded = completions
+        .iter()
+        .filter(|completion| completion.result.is_ok())
+        .count();
+    crate::runtime::append_bot_output(
+        job_id,
+        &serde_json::json!({
+            "type": "bot.grid.batch",
+            "bot": BOT_NAME,
+            "jobId": job_id,
+            "operation": operation,
+            "orders": completions.len(),
+            "succeeded": succeeded,
+            "failed": completions.len() - succeeded,
+            "latencyMs": elapsed.as_secs_f64() * 1_000.0,
+        }),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1106,6 +1236,7 @@ fn apply_action_completion(
                             order_id: order_id.clone(),
                             price,
                             remaining_size,
+                            submitted_at: Instant::now(),
                             // Do not replenish this level until its terminal fill event has
                             // updated inventory and consumed the remaining working quantity.
                             cancel_requested: awaiting_fill,
@@ -1503,13 +1634,23 @@ async fn cleanup(
                 Ok((order, plan))
             })
             .collect::<Result<Vec<_>>>()?;
-        let cancellation_results = join_all(
-            cancellation_plans
-                .iter()
-                .map(|(_, plan)| adapter.cancel_order(plan)),
-        )
-        .await;
-        for ((order, _), result) in cancellation_plans.into_iter().zip(cancellation_results) {
+        let plans = cancellation_plans
+            .iter()
+            .map(|(_, plan)| plan.clone())
+            .collect::<Vec<_>>();
+        let cancellation_results = adapter
+            .cancel_orders(&plans)
+            .await
+            .context("failed to submit the grid cancellation batch")?;
+        if cancellation_results.len() != cancellation_plans.len() {
+            bail!(
+                "venue returned {} outcomes for {} grid cleanup cancellations",
+                cancellation_results.len(),
+                cancellation_plans.len()
+            );
+        }
+        for ((order, _), outcome) in cancellation_plans.into_iter().zip(cancellation_results) {
+            let result = outcome.into_result().map_err(anyhow::Error::msg);
             match result {
                 Ok(receipt) => {
                     if let Some(OrderRole::Quote(key)) = order_roles.get(&order.order_id) {
@@ -1636,6 +1777,7 @@ mod tests {
                     order_id: "order-1".to_string(),
                     price: 100.0,
                     remaining_size: 2.0,
+                    submitted_at: Instant::now(),
                     cancel_requested: false,
                 }),
                 pending_size: None,
@@ -1698,27 +1840,94 @@ mod tests {
             order_id: "order-1".to_string(),
             price: 100.0,
             remaining_size: 1.0,
+            submitted_at: Instant::now() - SOFT_RESET_MINIMUM_QUOTE_AGE,
             cancel_requested: false,
+        };
+        let key = GridKey {
+            side: QuoteSide::Buy,
+            level: 1,
         };
 
         assert!(!should_replace_quote(
+            key,
             &live,
             Some((100.0, 0.5)),
             false,
+            1.0,
             0.1,
             1.0,
         ));
         assert!(should_replace_quote(
+            key,
             &live,
             Some((100.0, 0.5)),
             true,
+            1.0,
             0.1,
             1.0,
         ));
         assert!(should_replace_quote(
+            key,
             &live,
             Some((100.1, 1.0)),
             false,
+            1.0,
+            0.1,
+            1.0,
+        ));
+    }
+
+    #[test]
+    fn soft_reset_quote_only_chases_price_moving_away_after_resting() {
+        let key = GridKey {
+            side: QuoteSide::Buy,
+            level: 1,
+        };
+        let recent = WorkingQuote {
+            order_id: "recent".to_string(),
+            price: 100.0,
+            remaining_size: 1.0,
+            submitted_at: Instant::now(),
+            cancel_requested: false,
+        };
+        assert!(!should_replace_quote(
+            key,
+            &recent,
+            Some((100.02, 1.0)),
+            true,
+            1.0,
+            0.1,
+            1.0,
+        ));
+
+        let rested = WorkingQuote {
+            submitted_at: Instant::now() - SOFT_RESET_MINIMUM_QUOTE_AGE,
+            ..recent
+        };
+        assert!(!should_replace_quote(
+            key,
+            &rested,
+            Some((99.0, 1.0)),
+            true,
+            1.0,
+            0.1,
+            1.0,
+        ));
+        assert!(!should_replace_quote(
+            key,
+            &rested,
+            Some((100.005, 1.0)),
+            true,
+            1.0,
+            0.1,
+            1.0,
+        ));
+        assert!(should_replace_quote(
+            key,
+            &rested,
+            Some((100.02, 1.0)),
+            true,
+            1.0,
             0.1,
             1.0,
         ));
@@ -1746,6 +1955,7 @@ mod tests {
                         order_id: "live".to_string(),
                         price: 100.0,
                         remaining_size: 0.05,
+                        submitted_at: Instant::now(),
                         cancel_requested: false,
                     }),
                     pending_size: None,

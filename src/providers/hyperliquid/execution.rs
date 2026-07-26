@@ -8,16 +8,16 @@ use tokio::sync::Mutex;
 
 use crate::credentials::{self, ActiveHyperliquidCredential};
 use crate::domain::execution::{
-    AccountSnapshot, ExecutionReceipt, ExecutionVenue, Fill, LeverageSetting, MarginSummary,
-    OpenOrder, OrderKind, OrderSide, Position, PositionDirection, TimeInForce, TradePlan,
-    VenueCapabilities,
+    AccountSnapshot, CancelPlan, ExecutionOutcome, ExecutionReceipt, ExecutionVenue, Fill,
+    LeverageSetting, MarginSummary, OpenOrder, OrderKind, OrderSide, Position, PositionDirection,
+    TimeInForce, TradePlan, VenueCapabilities,
 };
 
 use super::HyperliquidNetwork;
 use super::client::HyperliquidClient;
 use super::exchange::{
-    ExchangeDataStatus, ExchangeResponseStatus, HyperliquidExchangeClient, OrderGrouping,
-    OrderRequest, WireOrder, raw_response, wire_number,
+    CancelRequest, ExchangeDataStatus, ExchangeResponseStatus, HyperliquidExchangeClient,
+    OrderGrouping, OrderRequest, WireOrder, raw_response, wire_number,
 };
 use super::markets;
 
@@ -248,6 +248,69 @@ impl HyperliquidExecutionAdapter {
         receipt_from_response(&plan.account, response, "order")
     }
 
+    pub async fn submit_trades(&self, plans: &[TradePlan]) -> Result<Vec<ExecutionOutcome>> {
+        if plans.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut orders = Vec::with_capacity(plans.len());
+        for plan in plans {
+            validate_trade_plan(plan)?;
+            if self.network != HyperliquidNetwork::from_testnet(plan.testnet) {
+                bail!("Hyperliquid trade plan network does not match the execution adapter");
+            }
+            ensure_account(&plan.account, &self.account)?;
+            if plan.stop_loss_price.is_some() || plan.take_profit_price.is_some() {
+                bail!("Hyperliquid batch orders do not support attached protection");
+            }
+            let market = markets::market(&plan.internal_symbol)?;
+            let resolved = self.resolve_market(&market.venue_symbol).await?;
+            validate_resolved_trade_plan(plan, &resolved)?;
+            if !plan.reduce_only {
+                self.ensure_leverage(resolved.asset, plan.leverage, resolved.cross_margin)
+                    .await?;
+            }
+            let entry_price = match plan.order_kind {
+                OrderKind::Market => {
+                    let guarded = if plan.side == OrderSide::Buy {
+                        plan.reference_price * (1.0 + MARKET_SLIPPAGE)
+                    } else {
+                        plan.reference_price * (1.0 - MARKET_SLIPPAGE)
+                    };
+                    normalize_price(
+                        guarded,
+                        resolved.size_precision,
+                        plan.side == OrderSide::Buy,
+                    )
+                }
+                OrderKind::Limit => plan.price.context("limit plan is missing its price")?,
+            };
+            orders.push(OrderRequest {
+                asset: resolved.asset,
+                is_buy: plan.side == OrderSide::Buy,
+                reduce_only: plan.reduce_only,
+                limit_px: wire_number(entry_price),
+                size: wire_number(plan.size),
+                order_type: WireOrder::Limit {
+                    tif: match plan.order_kind {
+                        OrderKind::Market => "Ioc".to_string(),
+                        OrderKind::Limit => hyperliquid_tif(
+                            plan.time_in_force
+                                .context("limit plan is missing its TIF")?,
+                        )
+                        .to_string(),
+                    },
+                },
+            });
+        }
+        let response = self.exchange.order(orders, OrderGrouping::None).await?;
+        Ok(batch_outcomes_from_response(
+            &self.account,
+            response,
+            plans.len(),
+            "order",
+        ))
+    }
+
     pub async fn configure_leverage(&self, internal_symbol: &str, leverage: f64) -> Result<()> {
         let market = markets::market(internal_symbol)?;
         let resolved = self.resolve_market(&market.venue_symbol).await?;
@@ -310,6 +373,35 @@ impl HyperliquidExecutionAdapter {
         let mut receipt = receipt_from_response(&self.account, response, "cancellation")?;
         receipt.order_id = Some(order_id.to_string());
         Ok(receipt)
+    }
+
+    pub async fn cancel_orders(&self, plans: &[CancelPlan]) -> Result<Vec<ExecutionOutcome>> {
+        if plans.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut cancels = Vec::with_capacity(plans.len());
+        for plan in plans {
+            if self.network != HyperliquidNetwork::from_testnet(plan.testnet) {
+                bail!("Hyperliquid cancellation network does not match the execution adapter");
+            }
+            ensure_account(&plan.account, &self.account)?;
+            let oid = plan
+                .order_id
+                .parse::<u64>()
+                .context("Hyperliquid order id must be an unsigned integer")?;
+            let market = markets::market(&plan.venue_symbol)?;
+            let asset = self.resolve_market(&market.venue_symbol).await?.asset;
+            cancels.push(CancelRequest { asset, oid });
+        }
+        let response = self.exchange.cancel_many(cancels).await?;
+        let mut outcomes =
+            batch_outcomes_from_response(&self.account, response, plans.len(), "cancellation");
+        for (outcome, plan) in outcomes.iter_mut().zip(plans) {
+            if let Some(receipt) = outcome.receipt.as_mut() {
+                receipt.order_id = Some(plan.order_id.clone());
+            }
+        }
+        Ok(outcomes)
     }
 
     async fn resolve_market(&self, venue_symbol: &str) -> Result<ResolvedMarket> {
@@ -542,6 +634,79 @@ fn receipt_from_response(
         submitted_at_ms: now_ms()?,
         raw_status,
     })
+}
+
+fn batch_outcomes_from_response(
+    account: &str,
+    response: ExchangeResponseStatus,
+    expected: usize,
+    operation: &str,
+) -> Vec<ExecutionOutcome> {
+    let response = match response {
+        ExchangeResponseStatus::Ok(response) => response,
+        ExchangeResponseStatus::Err(error) => {
+            let error = format!("Hyperliquid rejected {operation}: {error}");
+            return (0..expected)
+                .map(|_| ExecutionOutcome::failure(error.clone()))
+                .collect();
+        }
+    };
+    let Some(data) = response.data else {
+        let error = format!("Hyperliquid exchange response omitted {operation} statuses");
+        return (0..expected)
+            .map(|_| ExecutionOutcome::failure(error.clone()))
+            .collect();
+    };
+    if expected > 1
+        && data.statuses.len() == 1
+        && let ExchangeDataStatus::Error(error) = &data.statuses[0]
+    {
+        let error = format!("Hyperliquid rejected {operation}: {error}");
+        return (0..expected)
+            .map(|_| ExecutionOutcome::failure(error.clone()))
+            .collect();
+    }
+    if data.statuses.len() != expected {
+        let error = format!(
+            "Hyperliquid exchange response returned {} {operation} statuses for {expected} requests",
+            data.statuses.len()
+        );
+        return (0..expected)
+            .map(|_| ExecutionOutcome::failure(error.clone()))
+            .collect();
+    }
+    data.statuses
+        .into_iter()
+        .map(|status| {
+            let raw_status = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
+            let (order_id, name, terminal) = match status {
+                ExchangeDataStatus::Filled(order) => (Some(order.oid.to_string()), "filled", true),
+                ExchangeDataStatus::Resting(order) => {
+                    (Some(order.oid.to_string()), "resting", false)
+                }
+                ExchangeDataStatus::Success => (None, "cancelled", true),
+                ExchangeDataStatus::WaitingForFill => (None, "waitingForFill", false),
+                ExchangeDataStatus::WaitingForTrigger => (None, "waitingForTrigger", false),
+                ExchangeDataStatus::Error(error) => {
+                    return ExecutionOutcome::failure(format!(
+                        "Hyperliquid rejected {operation}: {error}"
+                    ));
+                }
+            };
+            match now_ms() {
+                Ok(submitted_at_ms) => ExecutionOutcome::success(ExecutionReceipt {
+                    venue: ExecutionVenue::Hyperliquid,
+                    account: account.to_string(),
+                    order_id,
+                    status: name.to_string(),
+                    terminal,
+                    submitted_at_ms,
+                    raw_status,
+                }),
+                Err(error) => ExecutionOutcome::failure(format!("{error:#}")),
+            }
+        })
+        .collect()
 }
 
 fn ensure_account(account: &str, configured: &str) -> Result<()> {
@@ -851,5 +1016,56 @@ mod tests {
         let fill = raw.into_fill().expect("normalized fill");
 
         assert_eq!(fill.fee, Some(-0.187391));
+    }
+
+    #[test]
+    fn batch_response_preserves_each_order_outcome() {
+        let response: ExchangeResponseStatus = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [
+                        { "resting": { "oid": 42 } },
+                        { "error": "Post only order would have immediately matched" }
+                    ]
+                }
+            }
+        }))
+        .expect("valid response");
+        let outcomes = batch_outcomes_from_response("0xabc", response, 2, "order");
+
+        assert_eq!(
+            outcomes[0]
+                .receipt
+                .as_ref()
+                .and_then(|receipt| receipt.order_id.as_deref()),
+            Some("42")
+        );
+        assert!(outcomes[0].error.is_none());
+        assert!(
+            outcomes[1]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Post only"))
+        );
+    }
+
+    #[test]
+    fn batch_level_rejection_is_applied_to_every_order() {
+        let outcomes = batch_outcomes_from_response(
+            "0xabc",
+            ExchangeResponseStatus::Err("invalid nonce".to_string()),
+            3,
+            "order",
+        );
+
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes.iter().all(|outcome| {
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("invalid nonce"))
+        }));
     }
 }

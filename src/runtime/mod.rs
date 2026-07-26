@@ -16,7 +16,9 @@ use tokio::sync::mpsc;
 
 use crate::bots::jobs::{BotJob, BotJobDefinition, BotJobStatus, BotJobSubmission, BotPerformance};
 use crate::credentials;
-use crate::domain::execution::{CancelPlan, ExecutionReceipt, ExecutionVenue, Position, TradePlan};
+use crate::domain::execution::{
+    CancelPlan, ExecutionOutcome, ExecutionReceipt, ExecutionVenue, Position, TradePlan,
+};
 use crate::providers::bulk::execution::BulkExecutionAdapter;
 use crate::providers::bulk::ws::BulkAccountStream;
 use crate::providers::hyperliquid::HyperliquidNetwork;
@@ -34,7 +36,7 @@ use crate::strategies::jobs::{
 };
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-const RUNTIME_VERSION: u8 = 30;
+const RUNTIME_VERSION: u8 = 31;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -238,6 +240,28 @@ enum RuntimeRequest {
         sequence: u64,
         plan: CancelPlan,
     },
+    BotExecuteTrades {
+        job_id: String,
+        items: Vec<SequencedTradePlan>,
+    },
+    BotCancelOrders {
+        job_id: String,
+        items: Vec<SequencedCancelPlan>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SequencedTradePlan {
+    sequence: u64,
+    plan: TradePlan,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SequencedCancelPlan {
+    sequence: u64,
+    plan: CancelPlan,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -247,6 +271,8 @@ struct RuntimeResponse {
     status: Option<RuntimeStatus>,
     #[serde(default)]
     receipt: Option<ExecutionReceipt>,
+    #[serde(default)]
+    outcomes: Option<Vec<crate::domain::execution::ExecutionOutcome>>,
     #[serde(default)]
     job: Option<ScriptJob>,
     #[serde(default)]
@@ -274,6 +300,7 @@ impl RuntimeResponse {
             message: String::new(),
             status: None,
             receipt: None,
+            outcomes: None,
             job: None,
             jobs: None,
             script_order: None,
@@ -963,6 +990,52 @@ pub async fn submit_bot_cancel(
     response
         .receipt
         .context("mlabd omitted the bot cancellation receipt")
+}
+
+pub async fn submit_bot_trades(
+    job_id: &str,
+    items: &[(u64, TradePlan)],
+) -> Result<Vec<crate::domain::execution::ExecutionOutcome>> {
+    let response = request(RuntimeRequest::BotExecuteTrades {
+        job_id: job_id.to_string(),
+        items: items
+            .iter()
+            .map(|(sequence, plan)| SequencedTradePlan {
+                sequence: *sequence,
+                plan: plan.clone(),
+            })
+            .collect(),
+    })
+    .await?;
+    if !response.ok {
+        bail!("bot trade batch failed: {}", response.message);
+    }
+    response
+        .outcomes
+        .context("mlabd omitted the bot batch execution outcomes")
+}
+
+pub async fn submit_bot_cancels(
+    job_id: &str,
+    items: &[(u64, CancelPlan)],
+) -> Result<Vec<crate::domain::execution::ExecutionOutcome>> {
+    let response = request(RuntimeRequest::BotCancelOrders {
+        job_id: job_id.to_string(),
+        items: items
+            .iter()
+            .map(|(sequence, plan)| SequencedCancelPlan {
+                sequence: *sequence,
+                plan: plan.clone(),
+            })
+            .collect(),
+    })
+    .await?;
+    if !response.ok {
+        bail!("bot cancellation batch failed: {}", response.message);
+    }
+    response
+        .outcomes
+        .context("mlabd omitted the bot batch cancellation outcomes")
 }
 
 pub fn append_bot_output(job_id: &str, value: &impl Serialize) -> Result<()> {
@@ -2956,6 +3029,166 @@ async fn execute_bot_cancel(
     Ok(receipt)
 }
 
+async fn execute_bot_trades(
+    paths: &RuntimePaths,
+    adapter: &BulkExecutionAdapter,
+    state: &mut RuntimeState,
+    job_id: &str,
+    items: &[SequencedTradePlan],
+) -> Result<Vec<ExecutionOutcome>> {
+    if items.is_empty() {
+        bail!("bot order batch cannot be empty");
+    }
+    let job = state
+        .bot_jobs
+        .get(job_id)
+        .cloned()
+        .with_context(|| format!("bot job `{job_id}` was not found"))?;
+    if !job.status.is_active() {
+        bail!("bot job `{job_id}` is not running");
+    }
+    let mut sequences = HashSet::with_capacity(items.len());
+    let mut outcomes = vec![None; items.len()];
+    let mut pending_indices = Vec::new();
+    let mut pending_plans = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        if item.sequence == 0 || !sequences.insert(item.sequence) {
+            bail!("bot order batch sequences must be unique and start at 1");
+        }
+        validate_bot_trade(&job.definition, &item.plan)?;
+        let execution_key = format!("{job_id}:{}", item.sequence);
+        if let Some(receipt) = state.bot_executions.get(&execution_key) {
+            outcomes[index] = Some(ExecutionOutcome::success(receipt.clone()));
+        } else {
+            pending_indices.push(index);
+            pending_plans.push(item.plan.clone());
+        }
+    }
+    if !pending_plans.is_empty() {
+        let batch = match pending_plans[0].venue {
+            ExecutionVenue::Bulk => {
+                adapter
+                    .submit_trades(credentials::active_bulk_credential()?, &pending_plans)
+                    .await?
+            }
+            ExecutionVenue::Hyperliquid => {
+                crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new(
+                    HyperliquidNetwork::from_testnet(pending_plans[0].testnet),
+                )
+                .await?
+                .submit_trades(&pending_plans)
+                .await?
+            }
+        };
+        if batch.len() != pending_plans.len() {
+            bail!(
+                "venue returned {} outcomes for {} bot orders",
+                batch.len(),
+                pending_plans.len()
+            );
+        }
+        for ((index, plan), outcome) in pending_indices.into_iter().zip(&pending_plans).zip(batch) {
+            if let Some(receipt) = outcome.receipt.as_ref() {
+                record_trade_receipt(paths, state, plan, None, receipt)?;
+                state.bot_executions.insert(
+                    format!("{job_id}:{}", items[index].sequence),
+                    receipt.clone(),
+                );
+            }
+            outcomes[index] = Some(outcome);
+        }
+        persist_state(paths, state)?;
+    }
+    outcomes
+        .into_iter()
+        .map(|outcome| outcome.context("bot order batch outcome was not populated"))
+        .collect()
+}
+
+async fn execute_bot_cancels(
+    paths: &RuntimePaths,
+    adapter: &BulkExecutionAdapter,
+    state: &mut RuntimeState,
+    job_id: &str,
+    items: &[SequencedCancelPlan],
+) -> Result<Vec<ExecutionOutcome>> {
+    if items.is_empty() {
+        bail!("bot cancellation batch cannot be empty");
+    }
+    let job = state
+        .bot_jobs
+        .get(job_id)
+        .with_context(|| format!("bot job `{job_id}` was not found"))?;
+    if !job.status.is_active() {
+        bail!("bot job `{job_id}` is not running");
+    }
+    let order_prefix = format!("{job_id}:");
+    let mut sequences = HashSet::with_capacity(items.len());
+    let mut outcomes = vec![None; items.len()];
+    let mut pending_indices = Vec::new();
+    let mut pending_plans = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        if item.sequence == 0 || !sequences.insert(item.sequence) {
+            bail!("bot cancellation batch sequences must be unique and start at 1");
+        }
+        if item.plan.venue != job.definition.venue()
+            || item.plan.internal_symbol != job.definition.symbol()
+            || !state.bot_executions.iter().any(|(key, receipt)| {
+                key.starts_with(&order_prefix)
+                    && receipt.order_id.as_deref() == Some(item.plan.order_id.as_str())
+            })
+        {
+            bail!("bot cannot cancel an order it does not own");
+        }
+        let cancellation_key = format!("{job_id}:{}", item.sequence);
+        if let Some(receipt) = state.bot_cancellations.get(&cancellation_key) {
+            outcomes[index] = Some(ExecutionOutcome::success(receipt.clone()));
+        } else {
+            pending_indices.push(index);
+            pending_plans.push(item.plan.clone());
+        }
+    }
+    if !pending_plans.is_empty() {
+        let batch = match pending_plans[0].venue {
+            ExecutionVenue::Bulk => {
+                adapter
+                    .cancel_orders(credentials::active_bulk_credential()?, &pending_plans)
+                    .await?
+            }
+            ExecutionVenue::Hyperliquid => {
+                crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new(
+                    HyperliquidNetwork::from_testnet(pending_plans[0].testnet),
+                )
+                .await?
+                .cancel_orders(&pending_plans)
+                .await?
+            }
+        };
+        if batch.len() != pending_plans.len() {
+            bail!(
+                "venue returned {} outcomes for {} bot cancellations",
+                batch.len(),
+                pending_plans.len()
+            );
+        }
+        for ((index, plan), outcome) in pending_indices.into_iter().zip(&pending_plans).zip(batch) {
+            if let Some(receipt) = outcome.receipt.as_ref() {
+                record_cancel_receipt(paths, state, plan, receipt)?;
+                state.bot_cancellations.insert(
+                    format!("{job_id}:{}", items[index].sequence),
+                    receipt.clone(),
+                );
+            }
+            outcomes[index] = Some(outcome);
+        }
+        persist_state(paths, state)?;
+    }
+    outcomes
+        .into_iter()
+        .map(|outcome| outcome.context("bot cancellation batch outcome was not populated"))
+        .collect()
+}
+
 async fn handle_connection(
     stream: UnixStream,
     paths: &RuntimePaths,
@@ -3577,6 +3810,39 @@ async fn handle_connection(
             },
             Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
         },
+        RuntimeRequest::BotExecuteTrades { job_id, items } => {
+            for item in &items {
+                ensure_account_supervisor(
+                    item.plan.venue,
+                    item.plan.testnet,
+                    &item.plan.account,
+                    account_tx,
+                    account_supervisors,
+                );
+            }
+            match execute_bot_trades(paths, adapter, state, &job_id, &items).await {
+                Ok(outcomes) => RuntimeResponse {
+                    ok: true,
+                    message: "bot order batch processed".to_string(),
+                    status: Some(runtime_status(state)),
+                    outcomes: Some(outcomes),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
+        RuntimeRequest::BotCancelOrders { job_id, items } => {
+            match execute_bot_cancels(paths, adapter, state, &job_id, &items).await {
+                Ok(outcomes) => RuntimeResponse {
+                    ok: true,
+                    message: "bot cancellation batch processed".to_string(),
+                    status: Some(runtime_status(state)),
+                    outcomes: Some(outcomes),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
     };
     let mut encoded = serde_json::to_vec(&response).context("failed to encode mlabd response")?;
     encoded.push(b'\n');
@@ -3610,13 +3876,24 @@ async fn execute_trade(
             .await?
         }
     };
+    record_trade_receipt(paths, state, plan, script_order_id, &receipt)?;
+    Ok(receipt)
+}
+
+fn record_trade_receipt(
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
+    plan: &TradePlan,
+    script_order_id: Option<String>,
+    receipt: &ExecutionReceipt,
+) -> Result<()> {
     if let Err(error) = append_json_line(
         &paths.events,
         &TradeSubmissionEvent {
             ts_ms: now_ms()?,
             event: "order_submitted",
             plan,
-            receipt: &receipt,
+            receipt,
         },
     ) {
         eprintln!("execution journal warning: {error:#}");
@@ -3647,7 +3924,7 @@ async fn execute_trade(
         );
         persist_state(paths, state)?;
     }
-    Ok(receipt)
+    Ok(())
 }
 
 async fn execute_cancel(
@@ -3684,13 +3961,23 @@ async fn execute_cancel(
             .await?
         }
     };
+    record_cancel_receipt(paths, state, plan, &receipt)?;
+    Ok(receipt)
+}
+
+fn record_cancel_receipt(
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
+    plan: &CancelPlan,
+    receipt: &ExecutionReceipt,
+) -> Result<()> {
     if let Err(error) = append_json_line(
         &paths.events,
         &CancelSubmissionEvent {
             ts_ms: now_ms()?,
             event: "order_cancelled",
             plan,
-            receipt: &receipt,
+            receipt,
         },
     ) {
         eprintln!("execution journal warning: {error:#}");
@@ -3703,7 +3990,7 @@ async fn execute_cancel(
     {
         persist_state(paths, state)?;
     }
-    Ok(receipt)
+    Ok(())
 }
 
 fn ensure_account_supervisor(
@@ -4775,7 +5062,7 @@ mod tests {
 
     #[test]
     fn runtime_protocol_v29_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 30);
+        assert_eq!(RUNTIME_VERSION, 31);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",

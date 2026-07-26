@@ -13,9 +13,9 @@ use tokio::sync::Mutex;
 
 use crate::credentials::ActiveBulkCredential;
 use crate::domain::execution::{
-    AccountSnapshot, ExecutionReceipt, ExecutionVenue, Fill, LeverageSetting, MarginSummary,
-    OpenOrder, OrderKind, OrderRecord, OrderSide, Position, PositionDirection, TradePlan,
-    VenueCapabilities,
+    AccountSnapshot, CancelPlan, ExecutionOutcome, ExecutionReceipt, ExecutionVenue, Fill,
+    LeverageSetting, MarginSummary, OpenOrder, OrderKind, OrderRecord, OrderSide, Position,
+    PositionDirection, TradePlan, VenueCapabilities,
 };
 
 use super::client::BulkClient;
@@ -212,6 +212,85 @@ impl BulkExecutionAdapter {
         }
     }
 
+    pub async fn submit_trades(
+        &self,
+        credential: ActiveBulkCredential,
+        plans: &[TradePlan],
+    ) -> Result<Vec<ExecutionOutcome>> {
+        if plans.is_empty() {
+            return Ok(Vec::new());
+        }
+        let account = credential.account;
+        let mut signer = Signer::new(credential.agent).with_batch_order_ids();
+        let mut orders = Vec::with_capacity(plans.len());
+        for plan in plans {
+            validate_trade_plan(plan)?;
+            if account.to_base58() != plan.account {
+                bail!("trade plan account no longer matches the configured BULK account");
+            }
+            if plan.stop_loss_price.is_some() || plan.take_profit_price.is_some() {
+                bail!("BULK batch orders do not support attached protection");
+            }
+            if !plan.reduce_only {
+                self.ensure_leverage(&mut signer, &account, plan).await?;
+            }
+            orders.push(OrderItem::Order(order_from_plan(plan)?));
+        }
+        let signed = signer
+            .sign_action(&Action::Order { orders }, next_nonce()?, &account)
+            .context("failed to sign BULK order batch")?;
+        let order_ids = signed_order_ids(&signed, plans.len())?;
+        match self.trading.post(&signed).await {
+            Ok(response) if is_trading_acknowledgement(&response) => Ok(order_ids
+                .into_iter()
+                .map(|order_id| {
+                    acknowledged_receipt(
+                        &account.to_base58(),
+                        order_id,
+                        "submitted",
+                        response.clone(),
+                    )
+                    .map_or_else(
+                        |error| ExecutionOutcome::failure(format!("{error:#}")),
+                        ExecutionOutcome::success,
+                    )
+                })
+                .collect()),
+            Ok(response) => Ok(batch_receipts_from_response(
+                &account.to_base58(),
+                &order_ids,
+                response,
+                "order",
+            )),
+            Err(submission_error) => {
+                let submission_error = format!("{submission_error:#}");
+                let reconciled = futures_util::future::join_all(
+                    order_ids.iter().zip(plans).map(|(order_id, plan)| {
+                        let submission_error = submission_error.clone();
+                        async move {
+                            self.reconcile_order_submission(
+                                &plan.account,
+                                order_id,
+                                plan.order_kind,
+                            )
+                            .await
+                            .map_or_else(
+                                |error| {
+                                    ExecutionOutcome::failure(format!(
+                                        "BULK order {order_id} submission outcome is unknown after the batch request failed: {submission_error}; reconciliation failed: {error:#}"
+                                    ))
+                                },
+                                ExecutionOutcome::success,
+                            )
+                        }
+                    }),
+                )
+                .await;
+                Ok(reconciled)
+            }
+        }
+    }
+
     async fn ensure_leverage(
         &self,
         signer: &mut Signer,
@@ -267,6 +346,59 @@ impl BulkExecutionAdapter {
             )
         } else {
             receipt_from_response(&account.to_base58(), Some(order_id.to_string()), response)
+        }
+    }
+
+    pub async fn cancel_orders(
+        &self,
+        credential: ActiveBulkCredential,
+        plans: &[CancelPlan],
+    ) -> Result<Vec<ExecutionOutcome>> {
+        if plans.is_empty() {
+            return Ok(Vec::new());
+        }
+        let account = credential.account;
+        let mut orders = Vec::with_capacity(plans.len());
+        let mut order_ids = Vec::with_capacity(plans.len());
+        for plan in plans {
+            if plan.account != account.to_base58() {
+                bail!("cancellation account no longer matches the configured BULK account");
+            }
+            let hash = Hash::from_base58(&plan.order_id).context("invalid BULK order id")?;
+            orders.push(OrderItem::Cancel(Cancel::new(
+                plan.venue_symbol.clone(),
+                hash,
+            )));
+            order_ids.push(plan.order_id.clone());
+        }
+        let mut signer = Signer::new(credential.agent);
+        let signed = signer
+            .sign_action(&Action::Order { orders }, next_nonce()?, &account)
+            .context("failed to sign BULK cancellation batch")?;
+        let response = self.trading.post(&signed).await?;
+        if is_trading_acknowledgement(&response) {
+            Ok(order_ids
+                .into_iter()
+                .map(|order_id| {
+                    acknowledged_receipt(
+                        &account.to_base58(),
+                        order_id,
+                        "cancelSubmitted",
+                        response.clone(),
+                    )
+                    .map_or_else(
+                        |error| ExecutionOutcome::failure(format!("{error:#}")),
+                        ExecutionOutcome::success,
+                    )
+                })
+                .collect())
+        } else {
+            Ok(batch_receipts_from_response(
+                &account.to_base58(),
+                &order_ids,
+                response,
+                "cancellation",
+            ))
         }
     }
 
@@ -408,27 +540,7 @@ fn sign_trade_order(
     plan: &TradePlan,
     nonce: u64,
 ) -> Result<SignedTransaction> {
-    let mut order = match plan.order_kind {
-        OrderKind::Market => Order::market(
-            plan.venue_symbol.clone(),
-            plan.side == OrderSide::Buy,
-            plan.size,
-        ),
-        OrderKind::Limit => Order::limit(
-            plan.venue_symbol.clone(),
-            plan.side == OrderSide::Buy,
-            plan.price
-                .context("limit trade plan is missing its price")?,
-            plan.size,
-            bulk_tif(
-                plan.time_in_force
-                    .context("limit trade plan is missing its TIF")?,
-            ),
-        ),
-    };
-    if plan.reduce_only {
-        order = order.reduce_only();
-    }
+    let order = order_from_plan(plan)?;
     let mut orders = vec![OrderItem::Order(order)];
     let mut protection = Vec::new();
     match (plan.stop_loss_price, plan.take_profit_price) {
@@ -475,6 +587,51 @@ fn sign_trade_order(
     signer
         .sign_action(&Action::Order { orders }, nonce, account)
         .context("failed to sign BULK order")
+}
+
+fn order_from_plan(plan: &TradePlan) -> Result<Order> {
+    let mut order = match plan.order_kind {
+        OrderKind::Market => Order::market(
+            plan.venue_symbol.clone(),
+            plan.side == OrderSide::Buy,
+            plan.size,
+        ),
+        OrderKind::Limit => Order::limit(
+            plan.venue_symbol.clone(),
+            plan.side == OrderSide::Buy,
+            plan.price
+                .context("limit trade plan is missing its price")?,
+            plan.size,
+            bulk_tif(
+                plan.time_in_force
+                    .context("limit trade plan is missing its TIF")?,
+            ),
+        ),
+    };
+    if plan.reduce_only {
+        order = order.reduce_only();
+    }
+    Ok(order)
+}
+
+fn signed_order_ids(signed: &SignedTransaction, expected: usize) -> Result<Vec<String>> {
+    let order_ids = match signed.order_ids.clone() {
+        Some(order_ids) => order_ids,
+        None if expected == 1 => vec![
+            signed
+                .order_id
+                .clone()
+                .context("signed BULK order omitted its deterministic order id")?,
+        ],
+        None => bail!("signed BULK order batch omitted deterministic order ids"),
+    };
+    if order_ids.len() != expected {
+        bail!(
+            "signed BULK order batch returned {} ids for {expected} orders",
+            order_ids.len()
+        );
+    }
+    Ok(order_ids)
 }
 
 fn validate_trade_plan(plan: &TradePlan) -> Result<()> {
@@ -668,6 +825,14 @@ fn receipt_from_response(
     let status = response
         .pointer("/response/data/statuses/0")
         .context("BULK order response contained no status")?;
+    receipt_from_status(account, optimistic_order_id, status)
+}
+
+fn receipt_from_status(
+    account: &str,
+    optimistic_order_id: Option<String>,
+    status: &Value,
+) -> Result<ExecutionReceipt> {
     let (name, details) = status
         .as_object()
         .and_then(|object| object.iter().next())
@@ -701,6 +866,53 @@ fn receipt_from_response(
         submitted_at_ms: now_ms()?,
         raw_status: status.clone(),
     })
+}
+
+fn batch_receipts_from_response(
+    account: &str,
+    order_ids: &[String],
+    response: Value,
+    operation: &str,
+) -> Vec<ExecutionOutcome> {
+    let Some(statuses) = response
+        .pointer("/response/data/statuses")
+        .and_then(Value::as_array)
+    else {
+        let error = format!(
+            "BULK {operation} response omitted statuses: {}",
+            response_message(&response)
+        );
+        return order_ids
+            .iter()
+            .map(|_| ExecutionOutcome::failure(error.clone()))
+            .collect();
+    };
+    if statuses.len() != order_ids.len() {
+        let error = format!(
+            "BULK {operation} response returned {} statuses for {} requests",
+            statuses.len(),
+            order_ids.len()
+        );
+        return order_ids
+            .iter()
+            .map(|_| ExecutionOutcome::failure(error.clone()))
+            .collect();
+    }
+    statuses
+        .iter()
+        .zip(order_ids)
+        .map(|(status, order_id)| {
+            if let Some(error) = status_error(status) {
+                return ExecutionOutcome::failure(
+                    transaction_rejection(operation, error).to_string(),
+                );
+            }
+            receipt_from_status(account, Some(order_id.clone()), status).map_or_else(
+                |error| ExecutionOutcome::failure(format!("{error:#}")),
+                ExecutionOutcome::success,
+            )
+        })
+        .collect()
 }
 
 fn acknowledged_receipt(
@@ -1452,6 +1664,81 @@ mod tests {
         assert_eq!(
             receipt.raw_status.pointer("/data/ok"),
             Some(&Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn batch_response_preserves_successful_and_rejected_siblings() {
+        let response = serde_json::json!({
+            "status": "ok",
+            "response": {
+                "data": {
+                    "statuses": [
+                        { "resting": { "oid": "venue-order-a" } },
+                        { "rejectedCrossing": { "oid": "venue-order-b" } }
+                    ]
+                }
+            }
+        });
+        let outcomes = batch_receipts_from_response(
+            "account",
+            &["optimistic-a".to_string(), "optimistic-b".to_string()],
+            response,
+            "order",
+        );
+
+        assert_eq!(
+            outcomes[0]
+                .receipt
+                .as_ref()
+                .and_then(|receipt| receipt.order_id.as_deref()),
+            Some("venue-order-a")
+        );
+        assert!(
+            outcomes[1]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("rejectedCrossing"))
+        );
+    }
+
+    #[test]
+    fn signed_batch_ids_cover_single_and_multi_order_actions() {
+        let account = bulk_keychain::Keypair::generate().pubkey();
+        let mut signer = Signer::new(bulk_keychain::Keypair::generate()).with_batch_order_ids();
+        let order = || {
+            OrderItem::Order(Order::limit(
+                "BTC-USD",
+                true,
+                65_000.0,
+                0.001,
+                TimeInForce::Alo,
+            ))
+        };
+
+        let single = signer
+            .sign_action(
+                &Action::Order {
+                    orders: vec![order()],
+                },
+                100,
+                &account,
+            )
+            .expect("single order signs");
+        let multiple = signer
+            .sign_action(
+                &Action::Order {
+                    orders: vec![order(), order()],
+                },
+                101,
+                &account,
+            )
+            .expect("batch signs");
+
+        assert_eq!(signed_order_ids(&single, 1).expect("single id").len(), 1);
+        assert_eq!(
+            signed_order_ids(&multiple, 2).expect("multiple ids").len(),
+            2
         );
     }
 }

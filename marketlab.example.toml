@@ -29,5 +29,5 @@ leverage = 5
 venue = "bulkf"
 
 [backtest]
-from = 1784206676777
-to = 1784326676777
+from = 1785068774363
+to =  1785080682385

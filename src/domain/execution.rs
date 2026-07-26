@@ -214,6 +214,42 @@ pub struct ExecutionReceipt {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionOutcome {
+    #[serde(default)]
+    pub receipt: Option<ExecutionReceipt>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl ExecutionOutcome {
+    pub fn success(receipt: ExecutionReceipt) -> Self {
+        Self {
+            receipt: Some(receipt),
+            error: None,
+        }
+    }
+
+    pub fn failure(error: impl Into<String>) -> Self {
+        Self {
+            receipt: None,
+            error: Some(error.into()),
+        }
+    }
+
+    pub fn into_result(self) -> Result<ExecutionReceipt, String> {
+        match (self.receipt, self.error) {
+            (Some(receipt), None) => Ok(receipt),
+            (None, Some(error)) => Err(error),
+            (Some(_), Some(error)) => Err(format!(
+                "execution outcome contained both a receipt and an error: {error}"
+            )),
+            (None, None) => Err("execution outcome omitted both receipt and error".to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CancelPlan {
     pub created_at_ms: u64,
     pub venue: ExecutionVenue,

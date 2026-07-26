@@ -53,10 +53,11 @@ impl HyperliquidExchangeClient {
     }
 
     pub async fn cancel(&self, asset: u32, oid: u64) -> Result<ExchangeResponseStatus> {
-        self.post_l1(Action::Cancel {
-            cancels: vec![CancelRequest { asset, oid }],
-        })
-        .await
+        self.cancel_many(vec![CancelRequest { asset, oid }]).await
+    }
+
+    pub async fn cancel_many(&self, cancels: Vec<CancelRequest>) -> Result<ExchangeResponseStatus> {
+        self.post_l1(Action::Cancel { cancels }).await
     }
 
     async fn post_l1(&self, action: Action) -> Result<ExchangeResponseStatus> {

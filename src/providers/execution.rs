@@ -2,8 +2,8 @@ use anyhow::Result;
 
 use crate::credentials;
 use crate::domain::execution::{
-    AccountSnapshot, CancelPlan, ExecutionReceipt, ExecutionVenue, Fill, OpenOrder, TradePlan,
-    VenueCapabilities,
+    AccountSnapshot, CancelPlan, ExecutionOutcome, ExecutionReceipt, ExecutionVenue, Fill,
+    OpenOrder, TradePlan, VenueCapabilities,
 };
 use crate::providers::bulk::execution::BulkExecutionAdapter;
 use crate::providers::hyperliquid::HyperliquidNetwork;
@@ -86,6 +86,28 @@ impl ExecutionAdapter {
                     .cancel_order(&plan.venue_symbol, &plan.order_id)
                     .await
             }
+        }
+    }
+
+    pub async fn submit_trades(&self, plans: &[TradePlan]) -> Result<Vec<ExecutionOutcome>> {
+        match self {
+            Self::Bulk(adapter) => {
+                adapter
+                    .submit_trades(credentials::active_bulk_credential()?, plans)
+                    .await
+            }
+            Self::Hyperliquid(adapter) => adapter.submit_trades(plans).await,
+        }
+    }
+
+    pub async fn cancel_orders(&self, plans: &[CancelPlan]) -> Result<Vec<ExecutionOutcome>> {
+        match self {
+            Self::Bulk(adapter) => {
+                adapter
+                    .cancel_orders(credentials::active_bulk_credential()?, plans)
+                    .await
+            }
+            Self::Hyperliquid(adapter) => adapter.cancel_orders(plans).await,
         }
     }
 }
