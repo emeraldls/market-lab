@@ -677,10 +677,6 @@ impl FillLedger {
         self.position_size
     }
 
-    pub(super) fn average_entry_price(&self) -> Option<f64> {
-        (self.position_size.abs() > f64::EPSILON).then_some(self.average_entry_price)
-    }
-
     pub(super) fn key(
         order_id: &str,
         timestamp: u64,

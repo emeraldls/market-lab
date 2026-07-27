@@ -1687,7 +1687,7 @@ pub struct RunMidPriceArgs {
     /// Execute through Hyperliquid testnet instead of the default mainnet.
     #[arg(long, default_value_t = false)]
     pub testnet: bool,
-    /// Hard one-sided inventory limit in base-asset units.
+    /// Total base-asset quantity allocated across both initial grid ladders.
     #[arg(long, conflicts_with = "margin", required_unless_present = "margin")]
     pub size: Option<f64>,
     /// Collateral allocated to the one-sided inventory limit.
@@ -1744,15 +1744,12 @@ pub struct RunGridArgs {
     /// Maximum bot runtime in seconds.
     #[arg(long)]
     pub duration: u64,
-    /// Number of simultaneously maintained price levels on each side.
+    /// Number of fixed grid levels initially placed on each side.
     #[arg(long, default_value_t = 3)]
     pub levels: u16,
-    /// Distance behind the live best bid/ask for level one and between every following level.
+    /// Distance in basis points between adjacent fixed grid prices.
     #[arg(long, default_value_t = 2.0)]
     pub step_bps: f64,
-    /// Adverse movement from the bot's average entry that activates passive inventory rescue (0-1%).
-    #[arg(long)]
-    pub reset_threshold_pct: Option<f64>,
     #[arg(long, default_value_t = 1.0)]
     pub leverage: f64,
     /// Stop after net bot PnL loses this percentage of allocated margin. Zero disables it.
@@ -2126,12 +2123,6 @@ impl RunGridArgs {
         }
         if !self.step_bps.is_finite() || self.step_bps <= 0.0 {
             bail!("--step-bps must be greater than zero");
-        }
-        if self
-            .reset_threshold_pct
-            .is_some_and(|percent| !percent.is_finite() || !(0.0..=1.0).contains(&percent))
-        {
-            bail!("--reset-threshold-pct must be between 0 and 1 percent");
         }
         if !self.leverage.is_finite() || self.leverage < 1.0 {
             bail!("--leverage must be at least 1");
@@ -3605,8 +3596,6 @@ mod tests {
             "4",
             "--step-bps",
             "2",
-            "--reset-threshold-pct",
-            "0.5",
             "--leverage",
             "10",
             "--stop-loss-pct",
@@ -3626,7 +3615,6 @@ mod tests {
                 assert_eq!(args.margin, Some(100.0));
                 assert_eq!(args.levels, 4);
                 assert_eq!(args.step_bps, 2.0);
-                assert_eq!(args.reset_threshold_pct, Some(0.5));
                 assert_eq!(args.stop_loss_pct, Some(5.0));
             }
             _ => panic!("expected bot run grid command"),

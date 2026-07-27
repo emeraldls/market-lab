@@ -5187,7 +5187,6 @@ mod tests {
                         "durationSeconds": 300,
                         "levelsPerSide": 3,
                         "stepBps": 2.0,
-                        "resetThresholdPct": 0.5,
                         "leverage": 10.0,
                         "stopLossPct": 5.0
                     }

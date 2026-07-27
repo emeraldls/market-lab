@@ -95,28 +95,21 @@ fn render_job(job: &BotJob, output: OutputFormat) -> Result<()> {
             match &job.definition {
                 BotJobDefinition::Grid(definition) => {
                     println!("  venue:            {}", venue_name(definition.venue));
-                    println!("  max inventory:    {}", definition.max_inventory_size);
+                    println!("  allocated size:   {}", definition.max_inventory_size);
                     if let Some(margin) = definition.requested_margin {
                         println!("  requested margin: {margin}");
                     }
-                    println!("  max margin:       {}", definition.max_inventory_margin);
-                    println!("  max exposure:     {}", definition.max_inventory_exposure);
+                    println!("  allocated margin: {}", definition.max_inventory_margin);
+                    println!("  working exposure: {}", definition.max_inventory_exposure);
                     println!("  levels per side:  {}", definition.levels_per_side);
                     println!(
-                        "  grid step:        {} bps behind touch",
+                        "  grid step:        {} bps between fixed prices",
                         definition.step_bps
                     );
-                    println!(
-                        "  flat recentering: automatic after {} bps full-grid movement",
-                        f64::from(definition.levels_per_side) * definition.step_bps
-                    );
-                    println!("  profit lock:      reducing levels stay beyond average entry");
-                    if let Some(percent) =
-                        definition.reset_threshold_pct.filter(|value| *value > 0.0)
-                    {
-                        println!("  soft reset:       {percent}% adverse move from average entry");
-                    }
-                    println!("  sizing:           equal levels, inventory-skewed");
+                    println!("  recentering:      disabled");
+                    println!("  cycle:            each fill flips one step to the opposite side");
+                    println!("  take profit:      uncapped");
+                    println!("  sizing:           equal, fixed paired cells");
                     println!("  duration:         {}s", definition.duration_seconds);
                     println!("  leverage:         {}x", definition.leverage);
                     if let Some(percent) = definition.stop_loss_pct.filter(|value| *value > 0.0) {
@@ -309,10 +302,23 @@ fn terminal_log_line(value: &serde_json::Value) -> String {
             number(value, "maxLoss"),
             number(value, "markPrice"),
         ),
-        "bot.grid.recenter" => format!(
-            "recentered grid {} -> {}",
-            number(value, "previousCenter"),
-            number(value, "center"),
+        "bot.grid.flip" => format!(
+            "paired {} {} L{} -> {} @ {} size={}",
+            value
+                .get("lane")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("grid"),
+            value
+                .get("fromSide")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("order"),
+            number(value, "level"),
+            value
+                .get("toSide")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("opposite"),
+            number(value, "price"),
+            number(value, "size"),
         ),
         "bot.grid.batch" => format!(
             "batch {} {}/{} orders in {}ms",
@@ -324,33 +330,6 @@ fn terminal_log_line(value: &serde_json::Value) -> String {
             number(value, "orders"),
             number(value, "latencyMs"),
         ),
-        "bot.grid.soft_reset" => {
-            let status = value
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("updated");
-            if status == "triggered" {
-                format!(
-                    "SOFT RESET {} exposure={} trigger={} mark={}; quoting {} near mid",
-                    value
-                        .get("inventory")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("inventory"),
-                    number(value, "exposurePrice"),
-                    number(value, "triggerPrice"),
-                    number(value, "markPrice"),
-                    value
-                        .get("reducingSide")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("reducing side"),
-                )
-            } else {
-                format!(
-                    "soft reset completed at mark={}; inventory rebalanced",
-                    number(value, "markPrice"),
-                )
-            }
-        }
         "bot.run.finished" => format!(
             "{} bought={} sold={} residual={} realized={} unrealized={} fees={} pnl={} return={}% elapsed={}ms",
             value

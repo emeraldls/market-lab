@@ -6,17 +6,15 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::task::JoinSet;
 
-use crate::bots::grid::{
-    GridQuote, GridSpec, passive_mid_price, quote_grid, should_recenter, soft_reset_triggered,
-};
+use crate::bots::grid::{GridQuote, GridSpec, quote_grid};
 use crate::bots::jobs::{BotJob, BotJobDefinition, BotJobSubmission, GridJobDefinition};
 use crate::cli::{
     ExecutionVenueArg, OutputFormat, RunGridArgs, TradeArgs, TradeOrderKind, TradeTimeInForce,
 };
 use crate::commands::bot::mid_price::{
-    AccountFeedEvent, BookFeedState, BotStopped, FillKey, FillLedger, ObservedFill, QuoteSide,
-    append_fill, append_market_data, append_stop_loss, cancel_plan, confirm_live_execution,
-    current_mark, execution_market, floor_to_step, inventory_unwind_plan, is_order_gone_error,
+    AccountFeedEvent, BotStopped, FillKey, FillLedger, ObservedFill, QuoteSide, append_fill,
+    append_market_data, append_stop_loss, cancel_plan, confirm_live_execution, current_mark,
+    execution_market, floor_to_step, inventory_unwind_plan, is_order_gone_error,
     is_order_gone_message, is_post_only_crossing_message, is_terminal_order_status, live_orderbook,
     quote_plan, render_submission, spawn_account_feed, spawn_book_feed, stop_loss_triggered,
     venue_key, venue_label,
@@ -25,13 +23,11 @@ use crate::commands::execution::build_trade_plan;
 use crate::domain::execution::{
     ExecutionReceipt, ExecutionVenue, Fill, OpenOrder, OrderSide, PositionDirection, TradePlan,
 };
-use crate::domain::types::OrderBookLevel;
 use crate::providers::bulk::market_data::normalize_timestamp_ms;
 use crate::providers::execution::ExecutionAdapter;
 
 const BOT_NAME: &str = "grid";
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
-const SOFT_RESET_MINIMUM_QUOTE_AGE: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +35,7 @@ struct GridPlanLevel {
     level: u16,
     side: &'static str,
     price: f64,
+    paired_price: f64,
     size: f64,
     exposure: f64,
 }
@@ -58,8 +55,6 @@ struct GridPlanView<'a> {
     levels_per_side: u16,
     levels: Vec<GridPlanLevel>,
     step_bps: f64,
-    automatic_recenter_range_bps: f64,
-    reset_threshold_pct: Option<f64>,
     stop_loss_pct: Option<f64>,
     duration_secs: u64,
     leverage: f64,
@@ -91,15 +86,10 @@ pub async fn handle(args: RunGridArgs) -> Result<()> {
         .with_context(|| format!("{} book has no ask", venue_label(parent.venue)))?;
     let center = (best_bid.price + best_ask.price) / 2.0;
     let raw = quote_grid(GridSpec {
-        anchor_bid: best_bid,
-        anchor_ask: best_ask,
-        best_bid,
-        best_ask,
+        center_price: center,
         levels_per_side: args.levels,
         step_bps: args.step_bps,
         max_inventory_size: parent.size,
-        inventory_size: 0.0,
-        exposure_price: None,
         tick_size: rules.tick_size,
         price_precision: rules.price_precision,
     })?;
@@ -127,7 +117,6 @@ pub async fn handle(args: RunGridArgs) -> Result<()> {
         duration_seconds: args.duration,
         levels_per_side: args.levels,
         step_bps: args.step_bps,
-        reset_threshold_pct: args.reset_threshold_pct.filter(|percent| *percent > 0.0),
         leverage: args.leverage,
         stop_loss_pct: args.stop_loss_pct.filter(|percent| *percent > 0.0),
     };
@@ -254,18 +243,17 @@ fn plan_view<'a>(
                 level: quote.level,
                 side: side_name(quote.side),
                 price: quote.price,
+                paired_price: quote.paired_price,
                 size: quote.size,
                 exposure: quote.size * quote.price,
             })
             .collect(),
         step_bps: definition.step_bps,
-        automatic_recenter_range_bps: f64::from(definition.levels_per_side) * definition.step_bps,
-        reset_threshold_pct: definition.reset_threshold_pct,
         stop_loss_pct: definition.stop_loss_pct,
         duration_secs: definition.duration_seconds,
         leverage: definition.leverage,
-        sizing: "equal levels with automatic inventory skew",
-        execution: "maker-only post-only ALO grid quotes",
+        sizing: "equal, fixed paired grid cells",
+        execution: "maker-only post-only ALO paired grid orders",
         shutdown: "cancel owned quotes, then unwind bot-owned inventory",
         dry_run,
     }
@@ -277,7 +265,7 @@ fn render_plan(plan: &GridPlanView<'_>, output: OutputFormat) -> Result<()> {
         OutputFormat::Jsonl => println!("{}", serde_json::to_string(plan)?),
         OutputFormat::Terminal => {
             println!(
-                "grid market maker{}",
+                "classic grid{}",
                 if plan.dry_run {
                     " (dry run — nothing will be submitted)"
                 } else {
@@ -286,32 +274,35 @@ fn render_plan(plan: &GridPlanView<'_>, output: OutputFormat) -> Result<()> {
             );
             println!("  venue:              {}", plan.venue);
             println!("  symbol:             {}", plan.symbol);
-            println!("  max inventory size: {}", plan.max_inventory_size);
+            println!("  allocated grid size: {}", plan.max_inventory_size);
             if let Some(margin) = plan.requested_margin {
                 println!("  requested margin:   {margin:.8}");
             }
-            println!("  max margin:         {:.8}", plan.max_inventory_margin);
-            println!("  total exposure:     {:.8}", plan.max_inventory_exposure);
+            println!("  allocated margin:   {:.8}", plan.max_inventory_margin);
+            println!("  working exposure:   {:.8}", plan.max_inventory_exposure);
             println!("  reference midpoint: {}", plan.reference_price);
             println!("  levels per side:    {}", plan.levels_per_side);
-            println!("  grid step:          {} bps behind touch", plan.step_bps);
             println!(
-                "  flat recentering:   automatic after {} bps full-grid movement",
-                plan.automatic_recenter_range_bps
+                "  grid step:          {} bps between fixed prices",
+                plan.step_bps
             );
+            println!("  recentering:        disabled");
             for level in &plan.levels {
                 println!(
-                    "  {:<4} {:>2}:          {} size={} exposure={:.8}",
-                    level.side, level.level, level.price, level.size, level.exposure
+                    "  {:<4} {:>2}:          {} -> {} size={} exposure={:.8}",
+                    level.side,
+                    level.level,
+                    level.price,
+                    level.paired_price,
+                    level.size,
+                    level.exposure
                 );
             }
             if let Some(percent) = plan.stop_loss_pct {
                 println!("  stop loss:          {percent}% of allocated margin");
             }
-            if let Some(percent) = plan.reset_threshold_pct {
-                println!("  soft reset:         {percent}% adverse move from average entry");
-            }
-            println!("  profit lock:        reducing levels stay beyond average entry");
+            println!("  cycle:              each fill flips one grid step to the opposite side");
+            println!("  take profit:        uncapped");
             println!("  sizing:             {}", plan.sizing);
             println!("  duration:           {}s", plan.duration_secs);
             println!("  leverage:           {}x", plan.leverage);
@@ -348,14 +339,16 @@ fn side_name(side: OrderSide) -> &'static str {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct GridKey {
-    side: QuoteSide,
+    /// The side this cell starts on. It identifies the cell after the working
+    /// order flips to its paired side.
+    lane: QuoteSide,
     level: u16,
 }
 
 impl GridKey {
     fn from_quote(quote: GridQuote) -> Self {
         Self {
-            side: match quote.side {
+            lane: match quote.side {
                 OrderSide::Buy => QuoteSide::Buy,
                 OrderSide::Sell => QuoteSide::Sell,
             },
@@ -367,23 +360,67 @@ impl GridKey {
 #[derive(Clone, Debug)]
 struct WorkingQuote {
     order_id: String,
+    side: QuoteSide,
     price: f64,
     remaining_size: f64,
-    submitted_at: Instant,
     cancel_requested: bool,
 }
 
-#[derive(Default)]
 struct QuoteSlot {
+    side: QuoteSide,
+    buy_price: f64,
+    sell_price: f64,
+    cycle_size: f64,
+    cycle_remaining: f64,
     live: Option<WorkingQuote>,
-    /// Size reserved by an in-flight submission that has not returned its
-    /// venue order id yet. It still counts against inventory headroom.
     pending_size: Option<f64>,
     busy: bool,
     retry_after_book_revision: Option<u64>,
 }
 
 impl QuoteSlot {
+    fn from_quote(quote: GridQuote) -> Self {
+        let (buy_price, sell_price) = match quote.side {
+            OrderSide::Buy => (quote.price, quote.paired_price),
+            OrderSide::Sell => (quote.paired_price, quote.price),
+        };
+        Self {
+            side: match quote.side {
+                OrderSide::Buy => QuoteSide::Buy,
+                OrderSide::Sell => QuoteSide::Sell,
+            },
+            buy_price,
+            sell_price,
+            cycle_size: quote.size,
+            cycle_remaining: quote.size,
+            live: None,
+            pending_size: None,
+            busy: false,
+            retry_after_book_revision: None,
+        }
+    }
+
+    fn desired(&self) -> DesiredQuote {
+        DesiredQuote {
+            side: self.side,
+            price: match self.side {
+                QuoteSide::Buy => self.buy_price,
+                QuoteSide::Sell => self.sell_price,
+            },
+            size: self.cycle_remaining,
+        }
+    }
+
+    fn flip(&mut self) {
+        self.side = match self.side {
+            QuoteSide::Buy => QuoteSide::Sell,
+            QuoteSide::Sell => QuoteSide::Buy,
+        };
+        self.cycle_remaining = self.cycle_size;
+        self.live = None;
+        self.retry_after_book_revision = None;
+    }
+
     fn accepts_book_revision(&mut self, revision: u64) -> bool {
         match self.retry_after_book_revision {
             Some(rejected) if revision > rejected => {
@@ -396,15 +433,38 @@ impl QuoteSlot {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DesiredQuote {
+    side: QuoteSide,
+    price: f64,
+    size: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MakerBook {
+    best_bid: f64,
+    best_ask: f64,
+}
+
+struct QuoteReconcileState<'a> {
+    parent: &'a TradePlan,
+    slots: &'a mut HashMap<GridKey, QuoteSlot>,
+    actions: &'a mut JoinSet<ActionBatch>,
+    order_sequence: &'a mut u64,
+    cancel_sequence: &'a mut u64,
+}
+
 enum ActionKind {
     SubmitQuote {
         key: GridKey,
+        side: QuoteSide,
         price: f64,
         size: f64,
         book_revision: u64,
     },
     CancelQuote {
         key: GridKey,
+        side: QuoteSide,
         order_id: String,
     },
 }
@@ -418,37 +478,17 @@ type ActionBatch = Vec<ActionCompletion>;
 
 #[derive(Clone, Debug)]
 enum OrderRole {
-    Quote(GridKey),
+    Quote { key: GridKey, side: QuoteSide },
     Cleanup,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct SoftResetState {
-    inventory_sign: f64,
-    exposure_price: f64,
-}
-
-fn soft_reset_inventory_rebalanced(
-    previous_inventory_sign: f64,
-    inventory_sign: f64,
-    soft_reset_active: bool,
-) -> bool {
-    soft_reset_active && previous_inventory_sign != 0.0 && inventory_sign != previous_inventory_sign
-}
-
-fn all_grid_keys(levels_per_side: u16) -> Vec<GridKey> {
-    let mut keys = Vec::with_capacity(usize::from(levels_per_side) * 2);
-    for level in 1..=levels_per_side {
-        keys.push(GridKey {
-            side: QuoteSide::Buy,
-            level,
-        });
-        keys.push(GridKey {
-            side: QuoteSide::Sell,
-            level,
-        });
-    }
-    keys
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GridFlip {
+    key: GridKey,
+    from: QuoteSide,
+    to: QuoteSide,
+    price: f64,
+    size: f64,
 }
 
 async fn run_worker(job_id: &str, definition: &GridJobDefinition) -> Result<()> {
@@ -468,20 +508,13 @@ async fn run_worker(job_id: &str, definition: &GridJobDefinition) -> Result<()> 
         .first()
         .copied()
         .with_context(|| format!("{} book has no ask", venue_label(definition.venue)))?;
-    let mut anchor_bid = initial_bid;
-    let mut anchor_ask = initial_ask;
-    let mut anchor_mid = (anchor_bid.price + anchor_ask.price) / 2.0;
+    let anchor_mid = (initial_bid.price + initial_ask.price) / 2.0;
     let initial_quotes = executable_quotes(
         quote_grid(GridSpec {
-            anchor_bid,
-            anchor_ask,
-            best_bid: initial_bid,
-            best_ask: initial_ask,
+            center_price: anchor_mid,
             levels_per_side: definition.levels_per_side,
             step_bps: definition.step_bps,
             max_inventory_size: definition.max_inventory_size,
-            inventory_size: 0.0,
-            exposure_price: None,
             tick_size: rules.tick_size,
             price_precision: rules.price_precision,
         })?,
@@ -494,11 +527,15 @@ async fn run_worker(job_id: &str, definition: &GridJobDefinition) -> Result<()> 
         &plan_view(&parent, definition, anchor_mid, &initial_quotes, false),
     )?;
 
-    let keys = all_grid_keys(definition.levels_per_side);
-    let mut slots = keys
+    let keys = initial_quotes
         .iter()
         .copied()
-        .map(|key| (key, QuoteSlot::default()))
+        .map(GridKey::from_quote)
+        .collect::<Vec<_>>();
+    let mut slots = initial_quotes
+        .iter()
+        .copied()
+        .map(|quote| (GridKey::from_quote(quote), QuoteSlot::from_quote(quote)))
         .collect::<HashMap<_, _>>();
     let started = Instant::now();
     let deadline = started + Duration::from_secs(definition.duration_seconds);
@@ -520,8 +557,6 @@ async fn run_worker(job_id: &str, definition: &GridJobDefinition) -> Result<()> 
     let mut actions = JoinSet::<ActionBatch>::new();
     let mut order_sequence = 0_u64;
     let mut cancel_sequence = 0_u64;
-    let mut previous_inventory_sign = 0.0_f64;
-    let mut soft_reset: Option<SoftResetState> = None;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(2));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let deadline_sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
@@ -643,122 +678,30 @@ async fn run_worker(job_id: &str, definition: &GridJobDefinition) -> Result<()> 
 
             let state = book.borrow().clone();
             let book_revision = state.revision;
-            let inventory = ledger.inventory();
-            let inventory_sign = if inventory.abs() < rules.lot_size / 2.0 {
-                0.0
-            } else {
-                inventory.signum()
-            };
-
-            if soft_reset_inventory_rebalanced(
-                previous_inventory_sign,
-                inventory_sign,
-                soft_reset.is_some(),
-            ) {
-                let reset = soft_reset
-                    .take()
-                    .expect("an active grid soft reset must have state");
-                append_soft_reset(
-                    job_id,
-                    "completed",
-                    reset.inventory_sign,
-                    reset.exposure_price,
-                    mark_price,
-                    definition.reset_threshold_pct,
-                )?;
-                if let Some(top) = state.top.as_ref()
-                    && let (Some(best_bid), Some(best_ask)) = (top.best_bid, top.best_ask)
-                {
-                    let previous = anchor_mid;
-                    anchor_bid = best_bid;
-                    anchor_ask = best_ask;
-                    anchor_mid = (best_bid.price + best_ask.price) / 2.0;
-                    append_recenter(job_id, previous, anchor_mid, book_revision)?;
-                }
-            }
-
-            if soft_reset.is_none()
-                && inventory_sign != 0.0
-                && let Some(threshold) = definition.reset_threshold_pct
-                && let Some(exposure_price) = ledger.average_entry_price()
-                && soft_reset_triggered(inventory, exposure_price, mark_price, threshold)?
-            {
-                soft_reset = Some(SoftResetState {
-                    inventory_sign,
-                    exposure_price,
-                });
-                append_soft_reset(
-                    job_id,
-                    "triggered",
-                    inventory_sign,
-                    exposure_price,
-                    mark_price,
-                    Some(threshold),
-                )?;
-            }
-
-            if let Some(top) = state.top.as_ref()
-                && let (Some(best_bid), Some(best_ask)) = (top.best_bid, top.best_ask)
-            {
-                let fair_price = (best_bid.price + best_ask.price) / 2.0;
-                let recenter_flat_grid = inventory_sign == 0.0
-                    && should_recenter(
-                        anchor_mid,
-                        fair_price,
-                        definition.levels_per_side,
-                        definition.step_bps,
-                    )?;
-                if recenter_flat_grid {
-                    let previous = anchor_mid;
-                    anchor_bid = best_bid;
-                    anchor_ask = best_ask;
-                    anchor_mid = fair_price;
-                    append_recenter(job_id, previous, anchor_mid, book_revision)?;
-                }
-            }
-            previous_inventory_sign = inventory_sign;
-
-            let mut desired = if account_connected {
-                if soft_reset.is_some() {
-                    desired_soft_reset_quote(&state, inventory, rules)?
-                } else {
-                    desired_quotes(
-                        definition,
-                        anchor_bid,
-                        anchor_ask,
-                        &state,
-                        inventory,
-                        ledger.average_entry_price(),
-                        rules,
-                    )?
-                }
+            let maker_book = state.top.and_then(|top| {
+                Some(MakerBook {
+                    best_bid: top.best_bid?.price,
+                    best_ask: top.best_ask?.price,
+                })
+            });
+            let desired = if account_connected {
+                desired_quotes(&slots, rules.lot_size, rules.min_notional)
             } else {
                 HashMap::new()
             };
-            cap_replenishment_to_inventory(
-                &keys,
-                &mut desired,
-                &slots,
-                inventory,
-                definition.max_inventory_size,
-                rules.lot_size,
-                rules.size_precision,
-                rules.min_notional,
-            );
             reconcile_quotes(
                 job_id,
                 &keys,
                 &desired,
-                &parent,
-                rules.lot_size,
-                rules.min_notional,
-                definition.step_bps,
                 book_revision,
-                soft_reset.is_some(),
-                &mut slots,
-                &mut actions,
-                &mut order_sequence,
-                &mut cancel_sequence,
+                maker_book,
+                QuoteReconcileState {
+                    parent: &parent,
+                    slots: &mut slots,
+                    actions: &mut actions,
+                    order_sequence: &mut order_sequence,
+                    cancel_sequence: &mut cancel_sequence,
+                },
             )?;
         };
         Ok(outcome)
@@ -838,228 +781,77 @@ async fn run_worker(job_id: &str, definition: &GridJobDefinition) -> Result<()> 
 }
 
 fn desired_quotes(
-    definition: &GridJobDefinition,
-    anchor_bid: OrderBookLevel,
-    anchor_ask: OrderBookLevel,
-    state: &BookFeedState,
-    inventory_size: f64,
-    exposure_price: Option<f64>,
-    rules: &crate::markets::ExecutionRules,
-) -> Result<HashMap<GridKey, (f64, f64)>> {
-    let Some(top) = state.top.as_ref() else {
-        return Ok(HashMap::new());
-    };
-    let (Some(best_bid), Some(best_ask)) = (top.best_bid, top.best_ask) else {
-        return Ok(HashMap::new());
-    };
-    Ok(executable_quotes(
-        quote_grid(GridSpec {
-            anchor_bid,
-            anchor_ask,
-            best_bid,
-            best_ask,
-            levels_per_side: definition.levels_per_side,
-            step_bps: definition.step_bps,
-            max_inventory_size: definition.max_inventory_size,
-            inventory_size,
-            exposure_price,
-            tick_size: rules.tick_size,
-            price_precision: rules.price_precision,
-        })?,
-        rules.lot_size,
-        rules.size_precision,
-        rules.min_notional,
-    )
-    .into_iter()
-    .map(|quote| (GridKey::from_quote(quote), (quote.price, quote.size)))
-    .collect())
-}
-
-fn desired_soft_reset_quote(
-    state: &BookFeedState,
-    inventory_size: f64,
-    rules: &crate::markets::ExecutionRules,
-) -> Result<HashMap<GridKey, (f64, f64)>> {
-    let Some(top) = state.top.as_ref() else {
-        return Ok(HashMap::new());
-    };
-    let (Some(best_bid), Some(best_ask)) = (top.best_bid, top.best_ask) else {
-        return Ok(HashMap::new());
-    };
-    let size = floor_to_step(inventory_size.abs(), rules.lot_size, rules.size_precision);
-    if size < rules.lot_size / 2.0 {
-        return Ok(HashMap::new());
-    }
-    let (side, price) = if inventory_size > 0.0 {
-        (
-            QuoteSide::Sell,
-            passive_mid_price(
-                OrderSide::Sell,
-                best_bid,
-                best_ask,
-                rules.tick_size,
-                rules.price_precision,
-            )?,
-        )
-    } else {
-        (
-            QuoteSide::Buy,
-            passive_mid_price(
-                OrderSide::Buy,
-                best_bid,
-                best_ask,
-                rules.tick_size,
-                rules.price_precision,
-            )?,
-        )
-    };
-    if size * price < rules.min_notional {
-        return Ok(HashMap::new());
-    }
-
-    Ok(HashMap::from([(GridKey { side, level: 1 }, (price, size))]))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn cap_replenishment_to_inventory(
-    keys: &[GridKey],
-    desired: &mut HashMap<GridKey, (f64, f64)>,
     slots: &HashMap<GridKey, QuoteSlot>,
-    inventory_size: f64,
-    max_inventory_size: f64,
     lot_size: f64,
-    size_precision: u8,
     min_notional: f64,
-) {
-    let mut working_buy = 0.0;
-    let mut working_sell = 0.0;
-    for (key, slot) in slots {
-        let size = slot.live.as_ref().map_or_else(
-            || slot.pending_size.unwrap_or_default(),
-            |quote| quote.remaining_size,
-        );
-        match key.side {
-            QuoteSide::Buy => working_buy += size,
-            QuoteSide::Sell => working_sell += size,
-        }
-    }
-
-    let mut available_buy = (max_inventory_size - inventory_size - working_buy).max(0.0);
-    let mut available_sell = (max_inventory_size + inventory_size - working_sell).max(0.0);
-    for key in keys {
-        let Some(slot) = slots.get(key) else {
-            continue;
-        };
-        if slot.live.is_some() || slot.pending_size.is_some() {
-            continue;
-        }
-        let Some((price, requested_size)) = desired.get(key).copied() else {
-            continue;
-        };
-        let available = match key.side {
-            QuoteSide::Buy => &mut available_buy,
-            QuoteSide::Sell => &mut available_sell,
-        };
-        let size = floor_to_step(requested_size.min(*available), lot_size, size_precision);
-        if size < lot_size / 2.0 || size * price < min_notional {
-            desired.remove(key);
-            continue;
-        }
-        desired.insert(*key, (price, size));
-        *available = (*available - size).max(0.0);
-    }
+) -> HashMap<GridKey, DesiredQuote> {
+    slots
+        .iter()
+        .filter_map(|(key, slot)| {
+            let desired = slot.desired();
+            (desired.size >= lot_size / 2.0 && desired.size * desired.price >= min_notional)
+                .then_some((*key, desired))
+        })
+        .collect()
 }
 
-fn should_replace_quote(
-    key: GridKey,
-    live: &WorkingQuote,
-    desired: Option<(f64, f64)>,
-    soft_reset_active: bool,
-    step_bps: f64,
-    lot_size: f64,
-    min_notional: f64,
-) -> bool {
-    let Some((price, size)) = desired else {
+fn should_replace_quote(live: &WorkingQuote, desired: Option<DesiredQuote>) -> bool {
+    let Some(desired) = desired else {
         return true;
     };
-    if (price - live.price).abs() > f64::EPSILON {
-        if !soft_reset_active {
-            return true;
-        }
-        let moved_away = match key.side {
-            QuoteSide::Buy => price > live.price,
-            QuoteSide::Sell => price < live.price,
-        };
-        let deviation_bps = (price - live.price).abs() / live.price * 10_000.0;
-        if moved_away
-            && live.submitted_at.elapsed() >= SOFT_RESET_MINIMUM_QUOTE_AGE
-            && deviation_bps >= step_bps
-        {
-            return true;
-        }
-    }
-    if !soft_reset_active {
-        return false;
-    }
-    let size_difference = (size - live.remaining_size).abs();
-    size_difference >= lot_size && size_difference * price >= min_notional
+    desired.side != live.side || (desired.price - live.price).abs() > f64::EPSILON
 }
 
-#[allow(clippy::too_many_arguments)]
+fn maker_safe(quote: DesiredQuote, book: MakerBook) -> bool {
+    match quote.side {
+        QuoteSide::Buy => quote.price < book.best_ask,
+        QuoteSide::Sell => quote.price > book.best_bid,
+    }
+}
+
 fn reconcile_quotes(
     job_id: &str,
     keys: &[GridKey],
-    desired: &HashMap<GridKey, (f64, f64)>,
-    parent: &TradePlan,
-    lot_size: f64,
-    min_notional: f64,
-    step_bps: f64,
+    desired: &HashMap<GridKey, DesiredQuote>,
     book_revision: u64,
-    soft_reset_active: bool,
-    slots: &mut HashMap<GridKey, QuoteSlot>,
-    actions: &mut JoinSet<ActionBatch>,
-    order_sequence: &mut u64,
-    cancel_sequence: &mut u64,
+    maker_book: Option<MakerBook>,
+    state: QuoteReconcileState<'_>,
 ) -> Result<()> {
-    if !actions.is_empty() {
+    if !state.actions.is_empty() {
         return Ok(());
     }
 
     let mut cancel_items = Vec::new();
     let mut cancel_kinds = Vec::new();
     for key in keys {
-        let slot = slots.get_mut(key).context("grid quote slot disappeared")?;
+        let slot = state
+            .slots
+            .get_mut(key)
+            .context("grid quote slot disappeared")?;
         if slot.busy || !slot.accepts_book_revision(book_revision) {
             continue;
         }
         if let Some(live) = slot.live.as_mut() {
-            let replace = should_replace_quote(
-                *key,
-                live,
-                desired.get(key).copied(),
-                soft_reset_active,
-                step_bps,
-                lot_size,
-                min_notional,
-            );
+            let replace = should_replace_quote(live, desired.get(key).copied());
             if !replace || live.cancel_requested {
                 continue;
             }
             live.cancel_requested = true;
             slot.busy = true;
-            *cancel_sequence = cancel_sequence.saturating_add(1);
+            *state.cancel_sequence = state.cancel_sequence.saturating_add(1);
             let order_id = live.order_id.clone();
-            let plan = cancel_plan(parent, order_id.clone())?;
-            cancel_items.push((*cancel_sequence, plan));
+            let plan = cancel_plan(state.parent, order_id.clone())?;
+            cancel_items.push((*state.cancel_sequence, plan));
             cancel_kinds.push(ActionKind::CancelQuote {
                 key: *key,
+                side: live.side,
                 order_id,
             });
         }
     }
     if !cancel_items.is_empty() {
         let job_id = job_id.to_string();
-        actions.spawn(async move {
+        state.actions.spawn(async move {
             let started = Instant::now();
             let completions = match crate::runtime::submit_bot_cancels(&job_id, &cancel_items).await
             {
@@ -1094,19 +886,32 @@ fn reconcile_quotes(
     let mut submit_items = Vec::new();
     let mut submit_kinds = Vec::new();
     for key in keys {
-        let Some((price, size)) = desired.get(key).copied() else {
+        let Some(DesiredQuote { side, price, size }) = desired.get(key).copied() else {
             continue;
         };
-        let slot = slots.get_mut(key).context("grid quote slot disappeared")?;
+        let Some(book) = maker_book else {
+            continue;
+        };
+        if !maker_safe(DesiredQuote { side, price, size }, book) {
+            continue;
+        }
+        let slot = state
+            .slots
+            .get_mut(key)
+            .context("grid quote slot disappeared")?;
         if slot.busy || slot.live.is_some() || !slot.accepts_book_revision(book_revision) {
             continue;
         }
         slot.busy = true;
         slot.pending_size = Some(size);
-        *order_sequence = order_sequence.saturating_add(1);
-        submit_items.push((*order_sequence, quote_plan(parent, key.side, size, price)?));
+        *state.order_sequence = state.order_sequence.saturating_add(1);
+        submit_items.push((
+            *state.order_sequence,
+            quote_plan(state.parent, side, size, price)?,
+        ));
         submit_kinds.push(ActionKind::SubmitQuote {
             key: *key,
+            side,
             price,
             size,
             book_revision,
@@ -1114,7 +919,7 @@ fn reconcile_quotes(
     }
     if !submit_items.is_empty() {
         let job_id = job_id.to_string();
-        actions.spawn(async move {
+        state.actions.spawn(async move {
             let started = Instant::now();
             let completions = match crate::runtime::submit_bot_trades(&job_id, &submit_items).await
             {
@@ -1195,35 +1000,37 @@ fn apply_action_completion(
     match completion.kind {
         ActionKind::SubmitQuote {
             key,
+            side,
             price,
             size,
             book_revision,
         } => {
-            let slot = slots.get_mut(&key).context("grid quote slot disappeared")?;
-            slot.busy = false;
-            slot.pending_size = None;
+            {
+                let slot = slots.get_mut(&key).context("grid quote slot disappeared")?;
+                slot.busy = false;
+                slot.pending_size = None;
+            }
             match completion.result {
                 Ok(receipt) => {
                     let order_id = receipt
                         .order_id
                         .context("grid quote omitted its order id")?;
-                    order_roles.insert(order_id.clone(), OrderRole::Quote(key));
-                    let mut remaining_size = size;
+                    let role = OrderRole::Quote { key, side };
+                    order_roles.insert(order_id.clone(), role.clone());
                     if let Some(fills) = pending_fills.remove(&order_id) {
                         for fill in fills {
-                            if record_fill(
-                                job_id,
-                                mark_price,
-                                ledger,
-                                &order_id,
-                                &OrderRole::Quote(key),
-                                &fill,
-                                slots,
-                            )? {
-                                remaining_size = (remaining_size - fill.size).max(0.0);
-                            }
+                            record_fill(
+                                job_id, mark_price, ledger, &order_id, &role, &fill, slots,
+                            )?;
                         }
                     }
+                    let remaining_size = slots.get(&key).map_or(0.0, |slot| {
+                        if slot.side == side {
+                            slot.cycle_remaining
+                        } else {
+                            0.0
+                        }
+                    });
                     let terminal_status = terminal_statuses.remove(&order_id);
                     let terminal = receipt.terminal || terminal_status.is_some();
                     let awaiting_fill = terminal_status
@@ -1234,17 +1041,16 @@ fn apply_action_completion(
                     if (!terminal || awaiting_fill) && remaining_size > f64::EPSILON {
                         slots.get_mut(&key).expect("grid slot exists").live = Some(WorkingQuote {
                             order_id: order_id.clone(),
+                            side,
                             price,
                             remaining_size,
-                            submitted_at: Instant::now(),
-                            // Do not replenish this level until its terminal fill event has
-                            // updated inventory and consumed the remaining working quantity.
                             cancel_requested: awaiting_fill,
                         });
                     }
                     append_grid_quote(
                         job_id,
                         key,
+                        side,
                         terminal_status.as_deref().unwrap_or(&receipt.status),
                         &order_id,
                         price,
@@ -1256,6 +1062,7 @@ fn apply_action_completion(
                     append_grid_quote(
                         job_id,
                         key,
+                        side,
                         if crossing {
                             "rejectedCrossing"
                         } else {
@@ -1273,14 +1080,18 @@ fn apply_action_completion(
                     } else {
                         bail!(
                             "{} level {} quote submission failed: {error}",
-                            key.side.name(),
+                            side.name(),
                             key.level
                         );
                     }
                 }
             }
         }
-        ActionKind::CancelQuote { key, order_id } => {
+        ActionKind::CancelQuote {
+            key,
+            side,
+            order_id,
+        } => {
             let slot = slots.get_mut(&key).context("grid quote slot disappeared")?;
             slot.busy = false;
             match completion.result {
@@ -1311,7 +1122,7 @@ fn apply_action_completion(
                     }
                     bail!(
                         "{} level {} quote cancellation failed: {error}",
-                        key.side.name(),
+                        side.name(),
                         key.level
                     );
                 }
@@ -1380,7 +1191,7 @@ fn apply_account_event(
                 return Ok(());
             };
             if is_terminal_order_status(status) {
-                if let Some(OrderRole::Quote(key)) = state.order_roles.get(order_id) {
+                if let Some(OrderRole::Quote { key, side }) = state.order_roles.get(order_id) {
                     let size = state
                         .slots
                         .get(key)
@@ -1406,6 +1217,7 @@ fn apply_account_event(
                     append_grid_quote(
                         job_id,
                         *key,
+                        *side,
                         status,
                         order_id,
                         value.get("px").and_then(Value::as_f64).unwrap_or(0.0),
@@ -1441,23 +1253,53 @@ fn record_fill(
         return Ok(false);
     }
     append_fill(job_id, BOT_NAME, mark_price, ledger, order_id, fill)?;
-    apply_fill_role(role, fill, slots);
+    if let Some(flip) = apply_fill_role(order_id, role, fill, slots) {
+        append_grid_flip(job_id, flip)?;
+    }
     Ok(true)
 }
 
-fn apply_fill_role(role: &OrderRole, fill: &ObservedFill, slots: &mut HashMap<GridKey, QuoteSlot>) {
+fn apply_fill_role(
+    order_id: &str,
+    role: &OrderRole,
+    fill: &ObservedFill,
+    slots: &mut HashMap<GridKey, QuoteSlot>,
+) -> Option<GridFlip> {
     match role {
-        OrderRole::Quote(key) => {
-            if let Some(slot) = slots.get_mut(key)
-                && let Some(live) = slot.live.as_mut()
+        OrderRole::Quote { key, side } => {
+            let slot = slots.get_mut(key)?;
+            if let Some(live) = slot.live.as_mut()
+                && live.order_id == order_id
             {
                 live.remaining_size = (live.remaining_size - fill.size).max(0.0);
-                if live.remaining_size <= f64::EPSILON {
+                if live.remaining_size <= 1e-12 {
                     slot.live = None;
                 }
             }
+            if slot.side != *side {
+                return None;
+            }
+            slot.cycle_remaining = (slot.cycle_remaining - fill.size).max(0.0);
+            if slot.cycle_remaining > 1e-12 {
+                return None;
+            }
+            let flip = GridFlip {
+                key: *key,
+                from: *side,
+                to: match side {
+                    QuoteSide::Buy => QuoteSide::Sell,
+                    QuoteSide::Sell => QuoteSide::Buy,
+                },
+                price: match side {
+                    QuoteSide::Buy => slot.sell_price,
+                    QuoteSide::Sell => slot.buy_price,
+                },
+                size: slot.cycle_size,
+            };
+            slot.flip();
+            Some(flip)
         }
-        OrderRole::Cleanup => {}
+        OrderRole::Cleanup => None,
     }
 }
 
@@ -1513,7 +1355,9 @@ fn reconcile_recovery(
         *occurrence += 1;
         if ledger.record_recovery_occurrence(order_id, &observed, *occurrence) {
             append_fill(job_id, BOT_NAME, mark_price, ledger, order_id, &observed)?;
-            apply_fill_role(role, &observed, slots);
+            if let Some(flip) = apply_fill_role(order_id, role, &observed, slots) {
+                append_grid_flip(job_id, flip)?;
+            }
         }
     }
     Ok(())
@@ -1522,6 +1366,7 @@ fn reconcile_recovery(
 fn append_grid_quote(
     job_id: &str,
     key: GridKey,
+    side: QuoteSide,
     status: &str,
     order_id: &str,
     price: f64,
@@ -1534,7 +1379,8 @@ fn append_grid_quote(
             "bot": BOT_NAME,
             "jobId": job_id,
             "status": status,
-            "side": key.side.name(),
+            "side": side.name(),
+            "lane": key.lane.name(),
             "level": key.level,
             "orderId": order_id,
             "price": price,
@@ -1543,52 +1389,19 @@ fn append_grid_quote(
     )
 }
 
-fn append_recenter(
-    job_id: &str,
-    previous_center: f64,
-    center: f64,
-    book_revision: u64,
-) -> Result<()> {
+fn append_grid_flip(job_id: &str, flip: GridFlip) -> Result<()> {
     crate::runtime::append_bot_output(
         job_id,
         &serde_json::json!({
-            "type": "bot.grid.recenter",
+            "type": "bot.grid.flip",
             "bot": BOT_NAME,
             "jobId": job_id,
-            "previousCenter": previous_center,
-            "center": center,
-            "bookRevision": book_revision,
-        }),
-    )
-}
-
-fn append_soft_reset(
-    job_id: &str,
-    status: &str,
-    inventory_sign: f64,
-    exposure_price: f64,
-    mark_price: f64,
-    reset_threshold_pct: Option<f64>,
-) -> Result<()> {
-    let threshold = reset_threshold_pct.unwrap_or_default() / 100.0;
-    let trigger_price = if inventory_sign > 0.0 {
-        exposure_price * (1.0 - threshold)
-    } else {
-        exposure_price * (1.0 + threshold)
-    };
-    crate::runtime::append_bot_output(
-        job_id,
-        &serde_json::json!({
-            "type": "bot.grid.soft_reset",
-            "bot": BOT_NAME,
-            "jobId": job_id,
-            "status": status,
-            "inventory": if inventory_sign > 0.0 { "long" } else { "short" },
-            "reducingSide": if inventory_sign > 0.0 { "SELL" } else { "BUY" },
-            "exposurePrice": exposure_price,
-            "markPrice": mark_price,
-            "resetThresholdPct": reset_threshold_pct,
-            "triggerPrice": trigger_price,
+            "lane": flip.key.lane.name(),
+            "level": flip.key.level,
+            "fromSide": flip.from.name(),
+            "toSide": flip.to.name(),
+            "price": flip.price,
+            "size": flip.size,
         }),
     )
 }
@@ -1653,10 +1466,11 @@ async fn cleanup(
             let result = outcome.into_result().map_err(anyhow::Error::msg);
             match result {
                 Ok(receipt) => {
-                    if let Some(OrderRole::Quote(key)) = order_roles.get(&order.order_id) {
+                    if let Some(OrderRole::Quote { key, side }) = order_roles.get(&order.order_id) {
                         append_grid_quote(
                             job_id,
                             *key,
+                            *side,
                             &receipt.status,
                             &order.order_id,
                             order.price,
@@ -1732,273 +1546,204 @@ async fn cleanup(
 mod tests {
     use super::*;
 
-    fn rules() -> crate::markets::ExecutionRules {
-        crate::markets::ExecutionRules {
-            price_precision: 1,
-            size_precision: 1,
-            tick_size: 0.1,
-            lot_size: 0.1,
-            min_notional: 1.0,
-            max_leverage: 10,
-            cross_margin: true,
-            order_types: vec!["limit".to_string(), "market".to_string()],
-            time_in_forces: vec!["alo".to_string()],
+    fn key(lane: QuoteSide) -> GridKey {
+        GridKey { lane, level: 1 }
+    }
+
+    fn slot(side: QuoteSide) -> QuoteSlot {
+        QuoteSlot {
+            side,
+            buy_price: 99.0,
+            sell_price: 100.0,
+            cycle_size: 2.0,
+            cycle_remaining: 2.0,
+            live: Some(WorkingQuote {
+                order_id: "order-1".to_string(),
+                side,
+                price: match side {
+                    QuoteSide::Buy => 99.0,
+                    QuoteSide::Sell => 100.0,
+                },
+                remaining_size: 2.0,
+                cancel_requested: false,
+            }),
+            pending_size: None,
+            busy: false,
+            retry_after_book_revision: None,
         }
     }
 
-    fn book() -> BookFeedState {
-        BookFeedState {
-            revision: 1,
-            top: Some(crate::domain::types::TopOfBook {
-                timestamp_ms: 1,
-                best_bid: Some(OrderBookLevel {
-                    price: 99.0,
-                    quantity: 1.0,
-                }),
-                best_ask: Some(OrderBookLevel {
-                    price: 101.0,
-                    quantity: 1.0,
-                }),
-            }),
-            error: None,
+    fn fill(buy: bool, size: f64, price: f64) -> ObservedFill {
+        ObservedFill {
+            timestamp: 1,
+            recovered: false,
+            buy,
+            size,
+            price,
+            fee: Some(0.0),
         }
     }
 
     #[test]
-    fn quote_fill_reduces_only_its_working_level() {
-        let key = GridKey {
-            side: QuoteSide::Buy,
-            level: 2,
-        };
-        let mut slots = HashMap::from([(
-            key,
-            QuoteSlot {
-                live: Some(WorkingQuote {
-                    order_id: "order-1".to_string(),
-                    price: 100.0,
-                    remaining_size: 2.0,
-                    submitted_at: Instant::now(),
-                    cancel_requested: false,
-                }),
-                pending_size: None,
-                busy: false,
-                retry_after_book_revision: None,
+    fn partial_fill_keeps_the_same_cycle_and_remaining_quantity() {
+        let key = key(QuoteSide::Buy);
+        let mut slots = HashMap::from([(key, slot(QuoteSide::Buy))]);
+
+        let flip = apply_fill_role(
+            "order-1",
+            &OrderRole::Quote {
+                key,
+                side: QuoteSide::Buy,
             },
-        )]);
-        let fill = ObservedFill {
-            timestamp: 1,
-            recovered: false,
-            buy: true,
-            size: 0.75,
-            price: 100.0,
-            fee: Some(0.0),
-        };
+            &fill(true, 0.75, 99.0),
+            &mut slots,
+        );
 
-        apply_fill_role(&OrderRole::Quote(key), &fill, &mut slots);
-
+        assert_eq!(flip, None);
+        assert_eq!(slots[&key].side, QuoteSide::Buy);
+        assert_eq!(slots[&key].cycle_remaining, 1.25);
         assert_eq!(
             slots[&key]
                 .live
                 .as_ref()
-                .expect("partially filled quote remains live")
+                .expect("partial order remains live")
                 .remaining_size,
             1.25
         );
     }
 
     #[test]
-    fn soft_reset_long_quotes_only_the_reducing_side_at_mid() {
-        let quotes = desired_soft_reset_quote(&book(), 0.5, &rules()).expect("valid reset quote");
+    fn completed_buy_flips_to_the_paired_sell() {
+        let key = key(QuoteSide::Buy);
+        let mut slots = HashMap::from([(key, slot(QuoteSide::Buy))]);
 
-        assert_eq!(quotes.len(), 1);
-        assert_eq!(
-            quotes[&GridKey {
-                side: QuoteSide::Sell,
-                level: 1,
-            }],
-            (100.0, 0.5)
-        );
-    }
-
-    #[test]
-    fn soft_reset_short_quotes_only_the_reducing_side_at_mid() {
-        let quotes = desired_soft_reset_quote(&book(), -0.5, &rules()).expect("valid reset quote");
-
-        assert_eq!(quotes.len(), 1);
-        assert_eq!(
-            quotes[&GridKey {
+        let flip = apply_fill_role(
+            "order-1",
+            &OrderRole::Quote {
+                key,
                 side: QuoteSide::Buy,
-                level: 1,
-            }],
-            (100.0, 0.5)
+            },
+            &fill(true, 2.0, 99.0),
+            &mut slots,
+        )
+        .expect("completed cycle should flip");
+
+        assert_eq!(flip.from, QuoteSide::Buy);
+        assert_eq!(flip.to, QuoteSide::Sell);
+        assert_eq!(flip.price, 100.0);
+        assert_eq!(slots[&key].side, QuoteSide::Sell);
+        assert_eq!(slots[&key].cycle_remaining, 2.0);
+        assert!(slots[&key].live.is_none());
+    }
+
+    #[test]
+    fn completed_sell_flips_to_the_paired_buy() {
+        let key = key(QuoteSide::Sell);
+        let mut slots = HashMap::from([(key, slot(QuoteSide::Sell))]);
+
+        let flip = apply_fill_role(
+            "order-1",
+            &OrderRole::Quote {
+                key,
+                side: QuoteSide::Sell,
+            },
+            &fill(false, 2.0, 100.0),
+            &mut slots,
+        )
+        .expect("completed cycle should flip");
+
+        assert_eq!(flip.from, QuoteSide::Sell);
+        assert_eq!(flip.to, QuoteSide::Buy);
+        assert_eq!(flip.price, 99.0);
+        assert_eq!(slots[&key].side, QuoteSide::Buy);
+    }
+
+    #[test]
+    fn canceled_partial_order_is_resubmitted_only_for_its_remainder() {
+        let key = key(QuoteSide::Buy);
+        let mut partial = slot(QuoteSide::Buy);
+        partial.cycle_remaining = 0.6;
+        partial.live = None;
+        let slots = HashMap::from([(key, partial)]);
+
+        let desired = desired_quotes(&slots, 0.1, 1.0);
+
+        assert_eq!(
+            desired[&key],
+            DesiredQuote {
+                side: QuoteSide::Buy,
+                price: 99.0,
+                size: 0.6,
+            }
         );
     }
 
     #[test]
-    fn normal_inventory_skew_does_not_resize_a_safe_resting_quote() {
+    fn fixed_quote_is_not_replaced_for_a_size_only_difference() {
         let live = WorkingQuote {
             order_id: "order-1".to_string(),
-            price: 100.0,
-            remaining_size: 1.0,
-            submitted_at: Instant::now() - SOFT_RESET_MINIMUM_QUOTE_AGE,
+            side: QuoteSide::Buy,
+            price: 99.0,
+            remaining_size: 0.5,
             cancel_requested: false,
         };
-        let key = GridKey {
-            side: QuoteSide::Buy,
-            level: 1,
-        };
 
         assert!(!should_replace_quote(
-            key,
             &live,
-            Some((100.0, 0.5)),
-            false,
-            1.0,
-            0.1,
-            1.0,
+            Some(DesiredQuote {
+                side: QuoteSide::Buy,
+                price: 99.0,
+                size: 1.0,
+            }),
         ));
         assert!(should_replace_quote(
-            key,
             &live,
-            Some((100.0, 0.5)),
-            true,
-            1.0,
-            0.1,
-            1.0,
-        ));
-        assert!(should_replace_quote(
-            key,
-            &live,
-            Some((100.1, 1.0)),
-            false,
-            1.0,
-            0.1,
-            1.0,
+            Some(DesiredQuote {
+                side: QuoteSide::Sell,
+                price: 100.0,
+                size: 1.0,
+            }),
         ));
     }
 
     #[test]
-    fn soft_reset_quote_only_chases_price_moving_away_after_resting() {
-        let key = GridKey {
-            side: QuoteSide::Buy,
-            level: 1,
+    fn crossing_fixed_quote_waits_instead_of_being_submitted() {
+        let book = MakerBook {
+            best_bid: 100.0,
+            best_ask: 101.0,
         };
-        let recent = WorkingQuote {
-            order_id: "recent".to_string(),
-            price: 100.0,
-            remaining_size: 1.0,
-            submitted_at: Instant::now(),
-            cancel_requested: false,
-        };
-        assert!(!should_replace_quote(
-            key,
-            &recent,
-            Some((100.02, 1.0)),
-            true,
-            1.0,
-            0.1,
-            1.0,
+
+        assert!(maker_safe(
+            DesiredQuote {
+                side: QuoteSide::Buy,
+                price: 100.0,
+                size: 1.0,
+            },
+            book,
         ));
-
-        let rested = WorkingQuote {
-            submitted_at: Instant::now() - SOFT_RESET_MINIMUM_QUOTE_AGE,
-            ..recent
-        };
-        assert!(!should_replace_quote(
-            key,
-            &rested,
-            Some((99.0, 1.0)),
-            true,
-            1.0,
-            0.1,
-            1.0,
+        assert!(!maker_safe(
+            DesiredQuote {
+                side: QuoteSide::Buy,
+                price: 101.0,
+                size: 1.0,
+            },
+            book,
         ));
-        assert!(!should_replace_quote(
-            key,
-            &rested,
-            Some((100.005, 1.0)),
-            true,
-            1.0,
-            0.1,
-            1.0,
+        assert!(maker_safe(
+            DesiredQuote {
+                side: QuoteSide::Sell,
+                price: 101.0,
+                size: 1.0,
+            },
+            book,
         ));
-        assert!(should_replace_quote(
-            key,
-            &rested,
-            Some((100.02, 1.0)),
-            true,
-            1.0,
-            0.1,
-            1.0,
+        assert!(!maker_safe(
+            DesiredQuote {
+                side: QuoteSide::Sell,
+                price: 100.0,
+                size: 1.0,
+            },
+            book,
         ));
-    }
-
-    #[test]
-    fn replenishment_is_capped_by_live_and_pending_inventory_headroom() {
-        let sell_one = GridKey {
-            side: QuoteSide::Sell,
-            level: 1,
-        };
-        let sell_two = GridKey {
-            side: QuoteSide::Sell,
-            level: 2,
-        };
-        let sell_three = GridKey {
-            side: QuoteSide::Sell,
-            level: 3,
-        };
-        let slots = HashMap::from([
-            (
-                sell_one,
-                QuoteSlot {
-                    live: Some(WorkingQuote {
-                        order_id: "live".to_string(),
-                        price: 100.0,
-                        remaining_size: 0.05,
-                        submitted_at: Instant::now(),
-                        cancel_requested: false,
-                    }),
-                    pending_size: None,
-                    busy: false,
-                    retry_after_book_revision: None,
-                },
-            ),
-            (
-                sell_two,
-                QuoteSlot {
-                    live: None,
-                    pending_size: Some(0.03),
-                    busy: true,
-                    retry_after_book_revision: None,
-                },
-            ),
-            (sell_three, QuoteSlot::default()),
-        ]);
-        let mut desired = HashMap::from([
-            (sell_one, (100.0, 0.05)),
-            (sell_two, (100.0, 0.05)),
-            (sell_three, (100.0, 0.05)),
-        ]);
-
-        cap_replenishment_to_inventory(
-            &[sell_one, sell_two, sell_three],
-            &mut desired,
-            &slots,
-            -0.9,
-            1.0,
-            0.01,
-            2,
-            1.0,
-        );
-
-        assert_eq!(desired[&sell_three], (100.0, 0.02));
-    }
-
-    #[test]
-    fn normal_flattening_does_not_bypass_the_grid_recenter_threshold() {
-        assert!(!soft_reset_inventory_rebalanced(1.0, 0.0, false));
-        assert!(!soft_reset_inventory_rebalanced(-1.0, 1.0, false));
-        assert!(soft_reset_inventory_rebalanced(1.0, 0.0, true));
-        assert!(soft_reset_inventory_rebalanced(-1.0, 1.0, true));
     }
 }

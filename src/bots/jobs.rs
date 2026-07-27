@@ -11,7 +11,7 @@ pub struct MidPriceJobDefinition {
     #[serde(default = "legacy_hyperliquid_testnet")]
     pub testnet: bool,
     pub symbol: String,
-    /// Hard one-sided inventory limit in normalized base-asset units.
+    /// Total base-asset quantity allocated across both initial grid ladders.
     #[serde(default)]
     pub max_inventory_size: f64,
     pub requested_margin: Option<f64>,
@@ -47,7 +47,6 @@ pub struct GridJobDefinition {
     pub duration_seconds: u64,
     pub levels_per_side: u16,
     pub step_bps: f64,
-    pub reset_threshold_pct: Option<f64>,
     pub leverage: f64,
     pub stop_loss_pct: Option<f64>,
 }
@@ -80,12 +79,6 @@ impl GridJobDefinition {
         }
         if !self.step_bps.is_finite() || self.step_bps <= 0.0 {
             bail!("grid bot step must be greater than zero");
-        }
-        if self
-            .reset_threshold_pct
-            .is_some_and(|percent| !percent.is_finite() || !(0.0..=1.0).contains(&percent))
-        {
-            bail!("grid bot reset threshold must be between 0 and 1 percent");
         }
         if !self.leverage.is_finite() || self.leverage < 1.0 {
             bail!("grid bot leverage must be at least 1");
