@@ -1,4 +1,9 @@
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use bulk_keychain::{Keypair, Pubkey};
@@ -15,16 +20,17 @@ use crate::providers::hyperliquid::exchange::{
 use crate::providers::hyperliquid::signing::{HyperliquidWallet, canonical_address};
 
 const MMT_API_KEY_ENV: &str = "MMT_API_KEY";
-const KEYRING_SERVICE: &str = "market-lab";
-const MMT_KEYRING_ACCOUNT: &str = "mmt-api-key";
-const BULK_KEYRING_ACCOUNT: &str = "bulk-agent";
-const HYPERLIQUID_KEYRING_ACCOUNT: &str = "hyperliquid-agents";
-const LEGACY_HYPERLIQUID_KEYRING_ACCOUNT: &str = "hyperliquid-testnet-agent";
+const CREDENTIAL_DIRECTORY_MODE: u32 = 0o700;
+const CREDENTIAL_FILE_MODE: u32 = 0o600;
+const MMT_CREDENTIAL_FILE: &str = "mmt-api-key";
+const BULK_CREDENTIAL_FILE: &str = "bulk-agent.json";
+const HYPERLIQUID_CREDENTIAL_FILE: &str = "hyperliquid-agents.json";
 const BULK_CREDENTIAL_VERSION: u8 = 1;
 const LEGACY_HYPERLIQUID_CREDENTIAL_VERSION: u8 = 1;
 const HYPERLIQUID_CREDENTIAL_VERSION: u8 = 2;
 
 static MMT_API_KEY: OnceLock<String> = OnceLock::new();
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub struct ActiveBulkCredential {
     pub account: Pubkey,
@@ -183,10 +189,9 @@ pub fn mmt_api_key() -> Result<String> {
     let key = if let Ok(key) = std::env::var(MMT_API_KEY_ENV) {
         validate_key(key, MMT_API_KEY_ENV)?
     } else {
-        let key = mmt_entry()?
-            .get_password()
+        let key = load_credential_file(MMT_CREDENTIAL_FILE, "MMT API key")?
             .context("MMT credentials are not configured; run `mlab auth set mmt`")?;
-        validate_key(key, "stored MMT API key")?
+        validate_key(key.to_string(), "stored MMT API key")?
     };
 
     let _ = MMT_API_KEY.set(key.clone());
@@ -197,11 +202,8 @@ pub fn mmt_is_configured() -> Result<bool> {
     if std::env::var(MMT_API_KEY_ENV).is_ok_and(|key| !key.trim().is_empty()) {
         return Ok(true);
     }
-    match mmt_entry()?.get_password() {
-        Ok(key) => Ok(!key.trim().is_empty()),
-        Err(keyring::Error::NoEntry) => Ok(false),
-        Err(error) => Err(error).context("failed to read MMT keychain status"),
-    }
+    Ok(load_credential_file(MMT_CREDENTIAL_FILE, "MMT API key")?
+        .is_some_and(|key| !key.trim().is_empty()))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -318,14 +320,13 @@ pub async fn handle_set(args: AuthSetArgs) -> Result<()> {
             }
             let key = rpassword::prompt_password("MMT API key: ")?;
             let key = validate_key(key, "MMT API key")?;
-            mmt_entry()?
-                .set_password(&key)
-                .context("failed to store MMT API key in the OS keychain")?;
+            save_credential_file(MMT_CREDENTIAL_FILE, key.as_bytes(), "MMT API key")?;
             crate::markets::refresh_mmt()
                 .await
                 .context("MMT was configured, but its market snapshot could not be initialized")?;
             crate::runtime::reload_markets_if_running().await?;
             println!("mmt: configured");
+            print_credential_location(MMT_CREDENTIAL_FILE)?;
         }
         AuthProvider::Bulk => handle_set_bulk(args.reauthorize).await?,
         AuthProvider::Hyperliquid => handle_set_hyperliquid(args.reauthorize).await?,
@@ -349,7 +350,7 @@ fn print_hyperliquid_status() -> Result<()> {
             } else {
                 "partially configured"
             };
-            println!("hyperliquid: {status} in OS keychain");
+            println!("hyperliquid: {status} in local credential store");
             println!("  account: {}", credential.account);
             if let Some(agent) = &credential.mainnet_agent {
                 println!("  mainnet agent: {} ({})", agent.address, agent.name);
@@ -373,10 +374,11 @@ fn print_mmt_status() -> Result<()> {
         return Ok(());
     }
 
-    match mmt_entry()?.get_password() {
-        Ok(key) if !key.trim().is_empty() => println!("mmt: configured in OS keychain"),
-        Ok(_) | Err(keyring::Error::NoEntry) => println!("mmt: not configured"),
-        Err(err) => return Err(err).context("failed to read MMT keychain status"),
+    match load_credential_file(MMT_CREDENTIAL_FILE, "MMT API key")? {
+        Some(key) if !key.trim().is_empty() => {
+            println!("mmt: configured in local credential store");
+        }
+        Some(_) | None => println!("mmt: not configured"),
     }
     Ok(())
 }
@@ -388,7 +390,7 @@ fn print_bulk_status() -> Result<()> {
                 BulkCredentialStatus::Pending => "pending registration",
                 BulkCredentialStatus::Active => "configured",
             };
-            println!("bulk: {status} in OS keychain");
+            println!("bulk: {status} in local credential store");
             if let Some(account) = &credential.account {
                 println!("  account: {account}");
             }
@@ -401,10 +403,10 @@ fn print_bulk_status() -> Result<()> {
 
 pub async fn handle_remove(args: AuthProviderArgs) -> Result<()> {
     match args.provider {
-        AuthProvider::Mmt => match mmt_entry()?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => println!("mmt: removed"),
-            Err(err) => return Err(err).context("failed to remove MMT API key from OS keychain"),
-        },
+        AuthProvider::Mmt => {
+            delete_credential_file(MMT_CREDENTIAL_FILE, "MMT API key")?;
+            println!("mmt: removed");
+        }
         AuthProvider::Bulk => handle_remove_bulk().await?,
         AuthProvider::Hyperliquid => handle_remove_hyperliquid().await?,
     }
@@ -517,6 +519,7 @@ async fn handle_set_hyperliquid(reauthorize: bool) -> Result<()> {
     println!("hyperliquid: configured for mainnet and testnet");
     println!("  account: {account}");
     print_hyperliquid_agents(&credential);
+    print_credential_location(HYPERLIQUID_CREDENTIAL_FILE)?;
     Ok(())
 }
 
@@ -675,7 +678,7 @@ async fn handle_set_bulk(reauthorize: bool) -> Result<()> {
         let recovery = if reauthorize {
             "BULK agent reauthorization was not confirmed; the existing local agent was preserved and `mlab auth set bulk --reauthorize` can safely retry it"
         } else {
-            "BULK agent registration was not confirmed; the pending agent remains in the OS keychain and `mlab auth set bulk` can safely retry it"
+            "BULK agent registration was not confirmed; the pending agent remains in the local credential store and `mlab auth set bulk` can safely retry it"
         };
         error.context(recovery)
     })?;
@@ -689,9 +692,9 @@ async fn handle_set_bulk(reauthorize: bool) -> Result<()> {
     credential.status = BulkCredentialStatus::Active;
     save_bulk_credential(&credential).with_context(|| {
         if reauthorize {
-            "BULK reauthorized the agent, but Market Lab could not refresh it in the OS keychain; the existing credential was preserved"
+            "BULK reauthorized the agent, but Market Lab could not refresh it in the local credential store; the existing credential was preserved"
         } else {
-            "BULK registered the agent, but Market Lab could not mark it active in the OS keychain; the pending credential was preserved"
+            "BULK registered the agent, but Market Lab could not mark it active in the local credential store; the pending credential was preserved"
         }
     })?;
 
@@ -705,6 +708,7 @@ async fn handle_set_bulk(reauthorize: bool) -> Result<()> {
     );
     println!("  account: {account}");
     println!("  agent: {}", credential.agent_public_key);
+    print_credential_location(BULK_CREDENTIAL_FILE)?;
     Ok(())
 }
 
@@ -749,9 +753,9 @@ async fn handle_remove_bulk() -> Result<()> {
     };
 
     println!("bulk: revoking agent {}", credential.agent_public_key);
-    bulk::revoke_agent(master, agent)
-        .await
-        .context("BULK agent revocation was not confirmed; the agent remains in the OS keychain")?;
+    bulk::revoke_agent(master, agent).await.context(
+        "BULK agent revocation was not confirmed; the agent remains in the local credential store",
+    )?;
 
     delete_bulk_credential()?;
     println!("bulk: revoked and removed");
@@ -759,37 +763,12 @@ async fn handle_remove_bulk() -> Result<()> {
 }
 
 fn delete_bulk_credential() -> Result<()> {
-    match bulk_entry()?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(err) => Err(err).context("failed to remove BULK agent from OS keychain"),
-    }
-}
-
-fn mmt_entry() -> Result<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, MMT_KEYRING_ACCOUNT)
-        .context("failed to access the OS keychain")
-}
-
-fn bulk_entry() -> Result<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, BULK_KEYRING_ACCOUNT)
-        .context("failed to access the OS keychain")
-}
-
-fn hyperliquid_entry() -> Result<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, HYPERLIQUID_KEYRING_ACCOUNT)
-        .context("failed to access the OS keychain")
-}
-
-fn legacy_hyperliquid_entry() -> Result<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, LEGACY_HYPERLIQUID_KEYRING_ACCOUNT)
-        .context("failed to access the legacy Hyperliquid OS keychain entry")
+    delete_credential_file(BULK_CREDENTIAL_FILE, "BULK agent")
 }
 
 fn load_bulk_credential() -> Result<Option<BulkCredential>> {
-    let encoded = match bulk_entry()?.get_password() {
-        Ok(encoded) => Zeroizing::new(encoded),
-        Err(keyring::Error::NoEntry) => return Ok(None),
-        Err(err) => return Err(err).context("failed to read BULK agent from OS keychain"),
+    let Some(encoded) = load_credential_file(BULK_CREDENTIAL_FILE, "BULK agent")? else {
+        return Ok(None);
     };
 
     let credential: BulkCredential = serde_json::from_str(encoded.as_str())
@@ -803,25 +782,13 @@ fn save_bulk_credential(credential: &BulkCredential) -> Result<()> {
     let encoded = Zeroizing::new(
         serde_json::to_string(credential).context("failed to encode BULK agent credential")?,
     );
-    bulk_entry()?
-        .set_password(encoded.as_str())
-        .context("failed to store BULK agent in the OS keychain")
+    save_credential_file(BULK_CREDENTIAL_FILE, encoded.as_bytes(), "BULK agent")
 }
 
 fn load_hyperliquid_credential() -> Result<Option<HyperliquidCredential>> {
-    let encoded = match hyperliquid_entry()?.get_password() {
-        Ok(encoded) => Zeroizing::new(encoded),
-        Err(keyring::Error::NoEntry) => match legacy_hyperliquid_entry()?.get_password() {
-            Ok(encoded) => Zeroizing::new(encoded),
-            Err(keyring::Error::NoEntry) => return Ok(None),
-            Err(error) => {
-                return Err(error)
-                    .context("failed to read legacy Hyperliquid agent from OS keychain");
-            }
-        },
-        Err(error) => {
-            return Err(error).context("failed to read Hyperliquid agent from OS keychain");
-        }
+    let Some(encoded) = load_credential_file(HYPERLIQUID_CREDENTIAL_FILE, "Hyperliquid agent")?
+    else {
+        return Ok(None);
     };
     let header: CredentialVersion = serde_json::from_str(encoded.as_str())
         .context("stored Hyperliquid agent credential is malformed")?;
@@ -847,27 +814,228 @@ fn save_hyperliquid_credential(credential: &HyperliquidCredential) -> Result<()>
         serde_json::to_string(credential)
             .context("failed to encode Hyperliquid agent credential")?,
     );
-    hyperliquid_entry()?
-        .set_password(encoded.as_str())
-        .context("failed to store Hyperliquid agent in the OS keychain")?;
-    match legacy_hyperliquid_entry()?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => {
-            Err(error).context("failed to remove the migrated Hyperliquid keychain entry")
-        }
-    }
+    save_credential_file(
+        HYPERLIQUID_CREDENTIAL_FILE,
+        encoded.as_bytes(),
+        "Hyperliquid agent",
+    )
 }
 
 fn delete_hyperliquid_credential() -> Result<()> {
-    for entry in [hyperliquid_entry()?, legacy_hyperliquid_entry()?] {
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => {}
-            Err(error) => {
-                return Err(error).context("failed to remove Hyperliquid agent from OS keychain");
-            }
-        }
+    delete_credential_file(HYPERLIQUID_CREDENTIAL_FILE, "Hyperliquid agent")
+}
+
+fn credential_directory() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME is required for the credential directory")?;
+    Ok(PathBuf::from(home).join(".market-lab").join("credentials"))
+}
+
+fn credential_path(file_name: &str) -> Result<PathBuf> {
+    Ok(credential_directory()?.join(file_name))
+}
+
+fn print_credential_location(file_name: &str) -> Result<()> {
+    println!("  stored: {}", credential_path(file_name)?.display());
+    println!("  permissions: 0600");
+    Ok(())
+}
+
+fn load_credential_file(file_name: &str, label: &str) -> Result<Option<Zeroizing<String>>> {
+    read_credential_at(&credential_directory()?, file_name, label)
+}
+
+fn save_credential_file(file_name: &str, contents: &[u8], label: &str) -> Result<()> {
+    write_credential_at(&credential_directory()?, file_name, contents, label)
+}
+
+fn delete_credential_file(file_name: &str, label: &str) -> Result<()> {
+    delete_credential_at(&credential_directory()?, file_name, label)
+}
+
+fn ensure_credential_directory(directory: &Path) -> Result<()> {
+    fs::create_dir_all(directory).with_context(|| {
+        format!(
+            "failed to create credential directory {}",
+            directory.display()
+        )
+    })?;
+    let metadata = fs::symlink_metadata(directory).with_context(|| {
+        format!(
+            "failed to inspect credential directory {}",
+            directory.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "credential directory {} must be a real directory, not a symlink",
+            directory.display()
+        );
+    }
+    ensure_current_user_owns(directory, &metadata, "credential directory")?;
+    fs::set_permissions(
+        directory,
+        fs::Permissions::from_mode(CREDENTIAL_DIRECTORY_MODE),
+    )
+    .with_context(|| {
+        format!(
+            "failed to secure credential directory {}",
+            directory.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn ensure_current_user_owns(path: &Path, metadata: &fs::Metadata, label: &str) -> Result<()> {
+    // `geteuid` has no preconditions and only reads the process's effective uid.
+    let current_user = unsafe { libc::geteuid() };
+    if metadata.uid() != current_user {
+        bail!(
+            "{label} {} is owned by uid {}, not the current uid {current_user}",
+            path.display(),
+            metadata.uid()
+        );
     }
     Ok(())
+}
+
+fn validate_credential_metadata(path: &Path, metadata: &fs::Metadata, label: &str) -> Result<()> {
+    if !metadata.is_file() {
+        bail!(
+            "{label} credential {} must be a regular file",
+            path.display()
+        );
+    }
+    ensure_current_user_owns(path, metadata, &format!("{label} credential"))?;
+    let mode = metadata.mode() & 0o777;
+    if mode != CREDENTIAL_FILE_MODE {
+        bail!(
+            "{label} credential {} has permissions {mode:04o}; run `chmod 600 {}`",
+            path.display(),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn read_credential_at(
+    directory: &Path,
+    file_name: &str,
+    label: &str,
+) -> Result<Option<Zeroizing<String>>> {
+    ensure_credential_directory(directory)?;
+    let path = directory.join(file_name);
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to open {label} credential {}", path.display()));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect {label} credential {}", path.display()))?;
+    validate_credential_metadata(&path, &metadata, label)?;
+
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .with_context(|| format!("failed to read {label} credential {}", path.display()))?;
+    Ok(Some(Zeroizing::new(contents)))
+}
+
+fn write_credential_at(
+    directory: &Path,
+    file_name: &str,
+    contents: &[u8],
+    label: &str,
+) -> Result<()> {
+    ensure_credential_directory(directory)?;
+    let path = directory.join(file_name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => validate_credential_metadata(&path, &metadata, label)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect {label} credential {}", path.display())
+            });
+        }
+    }
+
+    let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp_path = directory.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(CREDENTIAL_FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temp_path)
+            .with_context(|| {
+                format!(
+                    "failed to create temporary {label} credential {}",
+                    temp_path.display()
+                )
+            })?;
+        file.write_all(contents).with_context(|| {
+            format!(
+                "failed to write temporary {label} credential {}",
+                temp_path.display()
+            )
+        })?;
+        file.sync_all().with_context(|| {
+            format!(
+                "failed to sync temporary {label} credential {}",
+                temp_path.display()
+            )
+        })?;
+        drop(file);
+        fs::rename(&temp_path, &path)
+            .with_context(|| format!("failed to replace {label} credential {}", path.display()))?;
+        File::open(directory)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| {
+                format!(
+                    "failed to sync credential directory {}",
+                    directory.display()
+                )
+            })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn delete_credential_at(directory: &Path, file_name: &str, label: &str) -> Result<()> {
+    ensure_credential_directory(directory)?;
+    let path = directory.join(file_name);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect {label} credential {}", path.display())
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "refusing to remove symlinked {label} credential {}",
+            path.display()
+        );
+    }
+    validate_credential_metadata(&path, &metadata, label)?;
+    fs::remove_file(&path)
+        .with_context(|| format!("failed to remove {label} credential {}", path.display()))
 }
 
 fn parse_hyperliquid_address(address: &str, name: &str) -> Result<String> {
@@ -886,6 +1054,86 @@ fn validate_key(key: String, name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn test_credential_directory(name: &str) -> PathBuf {
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "market-lab-credentials-{name}-{}-{sequence}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn credential_file_round_trip_is_private_and_atomic() {
+        let directory = test_credential_directory("round-trip");
+        write_credential_at(&directory, "secret", b"first", "test").expect("credential writes");
+
+        let directory_mode = fs::metadata(&directory).expect("directory metadata").mode() & 0o777;
+        let file_mode = fs::metadata(directory.join("secret"))
+            .expect("file metadata")
+            .mode()
+            & 0o777;
+        assert_eq!(directory_mode, CREDENTIAL_DIRECTORY_MODE);
+        assert_eq!(file_mode, CREDENTIAL_FILE_MODE);
+        assert_eq!(
+            read_credential_at(&directory, "secret", "test")
+                .expect("credential reads")
+                .expect("credential exists")
+                .as_str(),
+            "first"
+        );
+
+        write_credential_at(&directory, "secret", b"second", "test")
+            .expect("credential replaces atomically");
+        assert_eq!(
+            read_credential_at(&directory, "secret", "test")
+                .expect("replacement reads")
+                .expect("replacement exists")
+                .as_str(),
+            "second"
+        );
+        assert_eq!(
+            fs::read_dir(&directory).expect("directory reads").count(),
+            1
+        );
+
+        delete_credential_at(&directory, "secret", "test").expect("credential deletes");
+        assert!(
+            read_credential_at(&directory, "secret", "test")
+                .expect("deleted credential check")
+                .is_none()
+        );
+        fs::remove_dir_all(directory).expect("test directory cleans up");
+    }
+
+    #[test]
+    fn credential_file_rejects_broad_permissions() {
+        let directory = test_credential_directory("permissions");
+        write_credential_at(&directory, "secret", b"value", "test").expect("credential writes");
+        fs::set_permissions(directory.join("secret"), fs::Permissions::from_mode(0o644))
+            .expect("permissions change");
+
+        let error = read_credential_at(&directory, "secret", "test")
+            .expect_err("broad permissions must fail");
+        assert!(error.to_string().contains("chmod 600"));
+        fs::remove_dir_all(directory).expect("test directory cleans up");
+    }
+
+    #[test]
+    fn credential_file_rejects_symlinks() {
+        let directory = test_credential_directory("symlink");
+        ensure_credential_directory(&directory).expect("credential directory exists");
+        let target = directory.with_extension("target");
+        fs::write(&target, "outside").expect("target writes");
+        symlink(&target, directory.join("secret")).expect("symlink creates");
+
+        let error =
+            read_credential_at(&directory, "secret", "test").expect_err("symlink must fail");
+        assert!(error.to_string().contains("failed to open"));
+        fs::remove_dir_all(directory).expect("test directory cleans up");
+        fs::remove_file(target).expect("test target cleans up");
+    }
 
     #[test]
     fn generated_bulk_credential_contains_matching_agent_keys() {
