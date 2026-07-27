@@ -2273,7 +2273,7 @@ async fn cleanup(
         let cancellation_results = join_all(
             cancellation_plans
                 .iter()
-                .map(|(_, plan)| adapter.cancel_order(plan)),
+                .map(|(_, plan)| adapter.cancel_order_fast(plan)),
         )
         .await;
         for ((order, _), result) in cancellation_plans.into_iter().zip(cancellation_results) {

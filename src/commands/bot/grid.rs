@@ -1452,7 +1452,7 @@ async fn cleanup(
             .map(|(_, plan)| plan.clone())
             .collect::<Vec<_>>();
         let cancellation_results = adapter
-            .cancel_orders(&plans)
+            .cancel_orders_fast(&plans)
             .await
             .context("failed to submit the grid cancellation batch")?;
         if cancellation_results.len() != cancellation_plans.len() {

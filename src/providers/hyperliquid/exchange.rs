@@ -56,8 +56,32 @@ impl HyperliquidExchangeClient {
         self.cancel_many(vec![CancelRequest { asset, oid }]).await
     }
 
+    pub async fn cancel_fast(&self, asset: u32, oid: u64) -> Result<ExchangeResponseStatus> {
+        self.cancel_many_fast(vec![CancelRequest { asset, oid }])
+            .await
+    }
+
     pub async fn cancel_many(&self, cancels: Vec<CancelRequest>) -> Result<ExchangeResponseStatus> {
-        self.post_l1(Action::Cancel { cancels }).await
+        self.cancel_many_with_priority(cancels, false).await
+    }
+
+    pub async fn cancel_many_fast(
+        &self,
+        cancels: Vec<CancelRequest>,
+    ) -> Result<ExchangeResponseStatus> {
+        self.cancel_many_with_priority(cancels, true).await
+    }
+
+    async fn cancel_many_with_priority(
+        &self,
+        cancels: Vec<CancelRequest>,
+        fast: bool,
+    ) -> Result<ExchangeResponseStatus> {
+        self.post_l1(Action::Cancel {
+            cancels,
+            fast: fast.then_some(true),
+        })
+        .await
     }
 
     async fn post_l1(&self, action: Action) -> Result<ExchangeResponseStatus> {
@@ -161,6 +185,8 @@ pub enum Action {
     },
     Cancel {
         cancels: Vec<CancelRequest>,
+        #[serde(rename = "f", skip_serializing_if = "Option::is_none")]
+        fast: Option<bool>,
     },
     ApproveAgent {
         #[serde(rename = "signatureChainId")]
@@ -361,6 +387,30 @@ mod tests {
         assert_eq!(value["agentName"], TESTNET_API_WALLET_NAME);
         assert_eq!(value["signatureChainId"], "0x66eee");
         assert_eq!(value["hyperliquidChain"], "Testnet");
+    }
+
+    #[test]
+    fn fast_cancel_uses_the_hyperliquid_priority_flag() {
+        let fast = serde_json::to_value(Action::Cancel {
+            cancels: vec![CancelRequest { asset: 3, oid: 42 }],
+            fast: Some(true),
+        })
+        .expect("fast cancel serializes");
+        assert_eq!(
+            fast,
+            serde_json::json!({
+                "type": "cancel",
+                "cancels": [{ "a": 3, "o": 42 }],
+                "f": true
+            })
+        );
+
+        let normal = serde_json::to_value(Action::Cancel {
+            cancels: vec![CancelRequest { asset: 3, oid: 42 }],
+            fast: None,
+        })
+        .expect("normal cancel serializes");
+        assert!(normal.get("f").is_none());
     }
 
     #[test]

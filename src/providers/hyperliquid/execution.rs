@@ -355,12 +355,36 @@ impl HyperliquidExecutionAdapter {
         venue_symbol: &str,
         order_id: &str,
     ) -> Result<ExecutionReceipt> {
+        self.cancel_order_with_priority(venue_symbol, order_id, false)
+            .await
+    }
+
+    pub async fn cancel_order_fast(
+        &self,
+        venue_symbol: &str,
+        order_id: &str,
+    ) -> Result<ExecutionReceipt> {
+        self.cancel_order_with_priority(venue_symbol, order_id, true)
+            .await
+    }
+
+    async fn cancel_order_with_priority(
+        &self,
+        venue_symbol: &str,
+        order_id: &str,
+        fast: bool,
+    ) -> Result<ExecutionReceipt> {
         let oid = order_id
             .parse::<u64>()
             .context("Hyperliquid order id must be an unsigned integer")?;
         let market = markets::market(venue_symbol)?;
         let asset = self.resolve_market(&market.venue_symbol).await?.asset;
-        let response = self.exchange.cancel(asset, oid).await.with_context(|| {
+        let response = if fast {
+            self.exchange.cancel_fast(asset, oid).await
+        } else {
+            self.exchange.cancel(asset, oid).await
+        }
+        .with_context(|| {
             format!(
                 "failed to cancel Hyperliquid {} order",
                 self.network.label()
@@ -372,6 +396,18 @@ impl HyperliquidExecutionAdapter {
     }
 
     pub async fn cancel_orders(&self, plans: &[CancelPlan]) -> Result<Vec<ExecutionOutcome>> {
+        self.cancel_orders_with_priority(plans, false).await
+    }
+
+    pub async fn cancel_orders_fast(&self, plans: &[CancelPlan]) -> Result<Vec<ExecutionOutcome>> {
+        self.cancel_orders_with_priority(plans, true).await
+    }
+
+    async fn cancel_orders_with_priority(
+        &self,
+        plans: &[CancelPlan],
+        fast: bool,
+    ) -> Result<Vec<ExecutionOutcome>> {
         if plans.is_empty() {
             return Ok(Vec::new());
         }
@@ -389,7 +425,11 @@ impl HyperliquidExecutionAdapter {
             let asset = self.resolve_market(&market.venue_symbol).await?.asset;
             cancels.push(CancelRequest { asset, oid });
         }
-        let response = self.exchange.cancel_many(cancels).await?;
+        let response = if fast {
+            self.exchange.cancel_many_fast(cancels).await?
+        } else {
+            self.exchange.cancel_many(cancels).await?
+        };
         let mut outcomes =
             batch_outcomes_from_response(&self.account, response, plans.len(), "cancellation");
         for (outcome, plan) in outcomes.iter_mut().zip(plans) {

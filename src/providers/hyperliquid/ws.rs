@@ -319,14 +319,9 @@ impl HyperliquidOrderBookStream {
             bail!("Hyperliquid orderbook depth must be between 1 and 20");
         }
         let market = markets::market(symbol)?;
-        let client = HyperliquidWsClient::subscribe(
-            network,
-            [serde_json::json!({
-                "type": "l2Book",
-                "coin": market.venue_symbol,
-            })],
-        )
-        .await?;
+        let client =
+            HyperliquidWsClient::subscribe(network, [orderbook_subscription(&market.venue_symbol)])
+                .await?;
         Ok(Self {
             client,
             internal_symbol: market.symbol.clone(),
@@ -387,6 +382,14 @@ impl HyperliquidOrderBookStream {
             });
         }
     }
+}
+
+fn orderbook_subscription(coin: &str) -> Value {
+    serde_json::json!({
+        "type": "l2Book",
+        "coin": coin,
+        "fast": true,
+    })
 }
 
 pub struct HyperliquidTradesStream {
@@ -732,6 +735,18 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orderbook_subscription_requests_the_latency_sensitive_feed() {
+        assert_eq!(
+            orderbook_subscription("BTC"),
+            serde_json::json!({
+                "type": "l2Book",
+                "coin": "BTC",
+                "fast": true
+            })
+        );
+    }
 
     #[test]
     fn trading_action_request_matches_official_websocket_shape() {

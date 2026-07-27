@@ -2904,7 +2904,7 @@ async fn execute_strategy_cancel(
     if let Some(receipt) = state.strategy_cancellations.get(&cancellation_key) {
         return Ok(receipt.clone());
     }
-    let receipt = execute_cancel(paths, adapter, state, plan).await?;
+    let receipt = execute_cancel_with_priority(paths, adapter, state, plan, true).await?;
     state
         .strategy_cancellations
         .insert(cancellation_key, receipt.clone());
@@ -3021,7 +3021,7 @@ async fn execute_bot_cancel(
     if let Some(receipt) = state.bot_cancellations.get(&cancellation_key) {
         return Ok(receipt.clone());
     }
-    let receipt = execute_cancel(paths, adapter, state, plan).await?;
+    let receipt = execute_cancel_with_priority(paths, adapter, state, plan, true).await?;
     state
         .bot_cancellations
         .insert(cancellation_key, receipt.clone());
@@ -3160,7 +3160,7 @@ async fn execute_bot_cancels(
                     HyperliquidNetwork::from_testnet(pending_plans[0].testnet),
                 )
                 .await?
-                .cancel_orders(&pending_plans)
+                .cancel_orders_fast(&pending_plans)
                 .await?
             }
         };
@@ -3933,6 +3933,16 @@ async fn execute_cancel(
     state: &mut RuntimeState,
     plan: &CancelPlan,
 ) -> Result<ExecutionReceipt> {
+    execute_cancel_with_priority(paths, adapter, state, plan, false).await
+}
+
+async fn execute_cancel_with_priority(
+    paths: &RuntimePaths,
+    adapter: &BulkExecutionAdapter,
+    state: &mut RuntimeState,
+    plan: &CancelPlan,
+    fast: bool,
+) -> Result<ExecutionReceipt> {
     let market =
         crate::markets::exchange_market(execution_exchange(plan.venue), &plan.internal_symbol)?;
     if market.venue_symbol != plan.venue_symbol {
@@ -3953,12 +3963,20 @@ async fn execute_cancel(
                 .await?
         }
         ExecutionVenue::Hyperliquid => {
-            crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new(
-                HyperliquidNetwork::from_testnet(plan.testnet),
-            )
-            .await?
-            .cancel_order(&plan.venue_symbol, &plan.order_id)
-            .await?
+            let adapter =
+                crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new(
+                    HyperliquidNetwork::from_testnet(plan.testnet),
+                )
+                .await?;
+            if fast {
+                adapter
+                    .cancel_order_fast(&plan.venue_symbol, &plan.order_id)
+                    .await?
+            } else {
+                adapter
+                    .cancel_order(&plan.venue_symbol, &plan.order_id)
+                    .await?
+            }
         }
     };
     record_cancel_receipt(paths, state, plan, &receipt)?;

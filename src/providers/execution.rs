@@ -89,6 +89,25 @@ impl ExecutionAdapter {
         }
     }
 
+    pub async fn cancel_order_fast(&self, plan: &CancelPlan) -> Result<ExecutionReceipt> {
+        match self {
+            Self::Bulk(adapter) => {
+                adapter
+                    .cancel_order(
+                        credentials::active_bulk_credential()?,
+                        &plan.venue_symbol,
+                        &plan.order_id,
+                    )
+                    .await
+            }
+            Self::Hyperliquid(adapter) => {
+                adapter
+                    .cancel_order_fast(&plan.venue_symbol, &plan.order_id)
+                    .await
+            }
+        }
+    }
+
     pub async fn submit_trades(&self, plans: &[TradePlan]) -> Result<Vec<ExecutionOutcome>> {
         match self {
             Self::Bulk(adapter) => {
@@ -108,6 +127,17 @@ impl ExecutionAdapter {
                     .await
             }
             Self::Hyperliquid(adapter) => adapter.cancel_orders(plans).await,
+        }
+    }
+
+    pub async fn cancel_orders_fast(&self, plans: &[CancelPlan]) -> Result<Vec<ExecutionOutcome>> {
+        match self {
+            Self::Bulk(adapter) => {
+                adapter
+                    .cancel_orders(credentials::active_bulk_credential()?, plans)
+                    .await
+            }
+            Self::Hyperliquid(adapter) => adapter.cancel_orders_fast(plans).await,
         }
     }
 }
