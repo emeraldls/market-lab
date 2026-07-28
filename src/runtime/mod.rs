@@ -1436,7 +1436,6 @@ fn create_script_job(
         snapshot_path,
         providers: submission.providers,
         exchanges: submission.exchanges,
-        symbol: submission.symbol,
         sources: submission.sources,
         params: submission.params,
         venue: submission.venue,
@@ -2242,6 +2241,7 @@ fn emit_script_event(
         event_type: event_type.into(),
         order_id: order.map(|order| order.order.id.clone()),
         key: order.map(|order| order.order.key.clone()),
+        symbol: order.map(|order| order.request.symbol().to_string()),
         venue: order.map(|order| order.venue),
         venue_order_id: order.and_then(|order| order.venue_order_id.clone()),
         status: order.map(|order| order.status.clone()),
@@ -2343,6 +2343,13 @@ async fn execute_script_order(
     if !job.status.is_active() {
         bail!("script job `{job_id}` is not running");
     }
+    let internal_symbol = crate::scripting::inputs::script_symbol_to_market(request.symbol());
+    if !script_job_tracks_symbol(&job, &internal_symbol) {
+        bail!(
+            "{operation_name} symbol `{}` is not declared by this script job's sources",
+            request.symbol()
+        );
+    }
     let venue = job
         .definition
         .venue
@@ -2363,7 +2370,7 @@ async fn execute_script_order(
         job_id: job_id.to_string(),
         order: order.clone(),
         request: request.clone(),
-        symbol: job.definition.symbol.clone(),
+        symbol: internal_symbol.clone(),
         venue,
         testnet: job.definition.testnet,
         status: "pending".to_string(),
@@ -2429,7 +2436,7 @@ async fn execute_script_order(
             let symbol_position = snapshot.positions.iter().find(|position| {
                 position
                     .internal_symbol
-                    .eq_ignore_ascii_case(&job.definition.symbol)
+                    .eq_ignore_ascii_case(&internal_symbol)
                     && position.size > f64::EPSILON
             });
             let target_direction = request.position.position_direction();
@@ -2458,7 +2465,7 @@ async fn execute_script_order(
                         "ctx.trade {} requires an open {:?} position for {}",
                         request.position.as_str(),
                         target_direction,
-                        job.definition.symbol
+                        internal_symbol
                     );
                     fail_script_order(paths, state, job_id, &order.id, &error)?;
                     return Err(error);
@@ -2478,7 +2485,7 @@ async fn execute_script_order(
             };
             (
                 crate::cli::TradeArgs {
-                    symbol: job.definition.symbol.clone(),
+                    symbol: internal_symbol.clone(),
                     config: None,
                     venue: venue_arg,
                     testnet: job.definition.testnet,
@@ -2500,7 +2507,7 @@ async fn execute_script_order(
         }
         ScriptManagedRequest::Order(request) => (
             crate::cli::TradeArgs {
-                symbol: job.definition.symbol.clone(),
+                symbol: internal_symbol.clone(),
                 config: None,
                 venue: venue_arg,
                 testnet: job.definition.testnet,
@@ -4305,15 +4312,19 @@ async fn script_positions_in_daemon(
     )
     .await?;
     persist_state(paths, state)?;
+    let source_symbols = crate::scripting::inputs::parse_source_configs(&job.definition.sources)?
+        .values()
+        .map(crate::scripting::inputs::SourceConfig::market_symbol)
+        .collect::<HashSet<_>>();
     Ok(state
         .account_positions
         .get(&account_cache_key(venue, job.definition.testnet, &account))
         .into_iter()
         .flatten()
         .filter(|position| {
-            position
-                .internal_symbol
-                .eq_ignore_ascii_case(&job.definition.symbol)
+            source_symbols
+                .iter()
+                .any(|symbol| position.internal_symbol.eq_ignore_ascii_case(symbol))
         })
         .cloned()
         .collect())
@@ -4658,7 +4669,7 @@ fn route_account_event_to_scripts(
                 && job.definition.testnet == testnet
                 && internal_symbol
                     .as_deref()
-                    .is_none_or(|symbol| job.definition.symbol == symbol)
+                    .is_none_or(|symbol| script_job_tracks_symbol(job, symbol))
         })
         .map(|job| job.id.clone())
         .collect::<HashSet<_>>();
@@ -4674,6 +4685,16 @@ fn route_account_event_to_scripts(
         )?;
     }
     Ok(())
+}
+
+fn script_job_tracks_symbol(job: &ScriptJob, symbol: &str) -> bool {
+    crate::scripting::inputs::parse_source_configs(&job.definition.sources)
+        .map(|configs| {
+            configs
+                .values()
+                .any(|config| config.market_symbol().eq_ignore_ascii_case(symbol))
+        })
+        .unwrap_or(false)
 }
 
 fn apply_tracked_order_status(
@@ -5231,6 +5252,7 @@ mod tests {
             "order": { "id": "ord_1", "key": "ask-1" },
             "request": {
                 "key": "ask-1",
+                "symbol": "btc",
                 "side": "short",
                 "size": 1,
                 "leverage": 5,

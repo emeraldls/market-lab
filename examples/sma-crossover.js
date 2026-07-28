@@ -12,10 +12,10 @@ export const script = {
 }
 
 export function onData(ctx, input, history) {
-  if (input.source !== "candles@binancef@mmt") return
+  if (input.source !== "btc@candles@binancef@mmt") return
 
-  const candles = history.source("candles@binancef@mmt")
-  const book = history.source("orderbook@lighterf@mmt", 0)
+  const candles = history.source("btc@candles@binancef@mmt")
+  const book = history.source("btc@orderbook@lighterf@mmt", 0)
   if (candles.length < 9 || !book) return
 
   const fast = ctx.study.sma(candles, { window: 3 })
@@ -42,15 +42,17 @@ export function onData(ctx, input, history) {
     slippage.slippage_bps > ctx.params.max_slippage
   ) return
 
-  const candle = history.source("candles@binancef@mmt", 0)
+  const candle = history.source("btc@candles@binancef@mmt", 0)
   if (open) {
     ctx.trade({
       key: `sma-close-${candle.t}`,
+      symbol: "btc",
       position: open.side === "long" ? "close-long" : "close-short"
     })
   }
   ctx.trade({
     key: `sma-open-${candle.t}`,
+    symbol: "btc",
     position: long ? "open-long" : "open-short",
     margin: ctx.params.margin,
     order: { type: "market" },

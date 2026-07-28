@@ -147,10 +147,6 @@ fn append_script_config_flags(
     config: &MarketLabConfig,
     mode: &str,
 ) -> Result<()> {
-    if let Some(market) = &config.market {
-        append_optional(args, "--symbol", market.symbol.as_deref());
-    }
-
     if let Some(sources) = &config.sources {
         for (source, values) in sources {
             if values.is_empty() {
@@ -306,7 +302,7 @@ fn config_command(args: &[OsString]) -> Option<ConfigCommand<'_>> {
 
 fn has_script_positional(args: &[OsString], start: usize) -> bool {
     let value_flags = [
-        "--config", "--symbol", "--venue", "--from", "--to", "--source", "--param", "--output",
+        "--config", "--venue", "--from", "--to", "--source", "--param", "--output",
     ];
     let mut skip_value = false;
     for arg in &args[start..] {
@@ -425,7 +421,7 @@ symbol = "HYPE/USDT"
 [script]
 path = "strategy.js"
 
-[sources."candles@bybitf@mmt"]
+[sources."btc@candles@bybitf@mmt"]
 timeframe = 60
 
 [script.params]
@@ -445,8 +441,6 @@ to = 2000
                 "backtest",
                 "--config",
                 path.to_str().expect("utf8 path"),
-                "--symbol",
-                "BTC/USDT",
             ]
             .into_iter()
             .map(OsString::from),
@@ -458,8 +452,7 @@ to = 2000
             Commands::Script {
                 command: ScriptCommands::Backtest(args),
             } => {
-                assert_eq!(args.symbol, "BTC/USDT");
-                assert_eq!(args.source, vec!["candles@bybitf@mmt:timeframe=60"]);
+                assert_eq!(args.source, vec!["btc@candles@bybitf@mmt:timeframe=60"]);
                 assert_eq!(args.param, vec!["fast=20"]);
                 assert!(args.script.ends_with("strategy.js"));
             }
@@ -485,10 +478,10 @@ symbol = "BTC/USDT"
 path = "strategy.js"
 duration = 3600
 
-[sources."candles@okx@mmt"]
+[sources."btc@candles@okx@mmt"]
 timeframe = 60
 
-[sources."orderbook@bulkf"]
+[sources."btc@orderbook@bulkf"]
 depth = 20
 
 [script.params]
@@ -515,10 +508,12 @@ max_spread = 1
             Commands::Script {
                 command: ScriptCommands::Run(args),
             } => {
-                assert_eq!(args.symbol.as_deref(), Some("BTC/USDT"));
                 assert_eq!(
                     args.source,
-                    vec!["candles@okx@mmt:timeframe=60", "orderbook@bulkf:depth=20",]
+                    vec![
+                        "btc@candles@okx@mmt:timeframe=60",
+                        "btc@orderbook@bulkf:depth=20",
+                    ]
                 );
                 assert_eq!(args.param, vec!["max_spread=1"]);
                 assert_eq!(args.duration, Some(3600));

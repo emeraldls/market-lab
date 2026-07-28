@@ -147,6 +147,7 @@ impl ScriptPositionOperation {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ScriptTradeRequest {
     pub key: String,
+    pub symbol: String,
     pub position: ScriptPositionOperation,
     #[serde(default)]
     pub size: Option<f64>,
@@ -169,6 +170,8 @@ impl ScriptTradeRequest {
 
     pub fn validate(&self) -> Result<()> {
         validate_key(&self.key)?;
+        crate::scripting::inputs::normalize_script_symbol(&self.symbol)
+            .context("ctx.trade symbol is invalid")?;
         if self.position.is_open() {
             match (self.size, self.margin) {
                 (Some(_), Some(_)) => bail!("ctx.trade requires only one of size or margin"),
@@ -240,6 +243,7 @@ impl ScriptTradeRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ScriptRawOrderRequest {
     pub key: String,
+    pub symbol: String,
     pub side: ScriptOrderSide,
     #[serde(default)]
     pub size: Option<f64>,
@@ -260,6 +264,8 @@ impl ScriptRawOrderRequest {
 
     pub fn validate(&self) -> Result<()> {
         validate_key(&self.key)?;
+        crate::scripting::inputs::normalize_script_symbol(&self.symbol)
+            .context("ctx.order symbol is invalid")?;
         match (self.size, self.margin) {
             (Some(_), Some(_)) => bail!("ctx.order requires only one of size or margin"),
             (None, None) => bail!("ctx.order requires size or margin"),
@@ -325,6 +331,13 @@ impl ScriptManagedRequest {
         match self {
             Self::Trade(request) => &request.order,
             Self::Order(request) => &request.order,
+        }
+    }
+
+    pub fn symbol(&self) -> &str {
+        match self {
+            Self::Trade(request) => &request.symbol,
+            Self::Order(request) => &request.symbol,
         }
     }
 
@@ -553,6 +566,7 @@ mod tests {
     fn validates_limit_trade_with_protection() {
         let request: ScriptTradeRequest = serde_json::from_value(json!({
             "key": "entry-1",
+            "symbol": "btc",
             "position": "open-long",
             "margin": 100,
             "leverage": 5,
@@ -569,6 +583,7 @@ mod tests {
     fn rejects_legacy_notional_trade_sizing() {
         let error = serde_json::from_value::<ScriptTradeRequest>(json!({
             "key": "entry-1",
+            "symbol": "btc",
             "position": "open-long",
             "notional": 100,
             "leverage": 5
@@ -582,6 +597,7 @@ mod tests {
     fn validates_full_position_close_without_sizing() {
         let request: ScriptTradeRequest = serde_json::from_value(json!({
             "key": "exit-1",
+            "symbol": "btc",
             "position": "close-long"
         }))
         .expect("decode close request");
@@ -595,6 +611,7 @@ mod tests {
     fn rejects_margin_on_position_close() {
         let request: ScriptTradeRequest = serde_json::from_value(json!({
             "key": "exit-1",
+            "symbol": "btc",
             "position": "close-short",
             "margin": 100
         }))
@@ -607,6 +624,7 @@ mod tests {
     fn raw_order_accepts_direction_aliases_and_serializes_canonical_sides() {
         let buy: ScriptRawOrderRequest = serde_json::from_value(json!({
             "key": "bid-1",
+            "symbol": "btc",
             "side": "long",
             "size": 1,
             "order": { "type": "limit", "price": 99, "tif": "alo" }
@@ -614,6 +632,7 @@ mod tests {
         .expect("long alias decodes");
         let sell: ScriptRawOrderRequest = serde_json::from_value(json!({
             "key": "ask-1",
+            "symbol": "btc",
             "side": "short",
             "margin": 100,
             "leverage": 2,
@@ -633,12 +652,14 @@ mod tests {
     fn managed_request_distinguishes_position_intent_from_raw_side() {
         let trade: ScriptManagedRequest = serde_json::from_value(json!({
             "key": "entry",
+            "symbol": "btc",
             "position": "open-long",
             "size": 1
         }))
         .expect("trade request decodes");
         let order: ScriptManagedRequest = serde_json::from_value(json!({
             "key": "ask",
+            "symbol": "btc",
             "side": "sell",
             "size": 1
         }))

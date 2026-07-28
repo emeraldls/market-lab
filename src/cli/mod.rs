@@ -499,8 +499,6 @@ pub struct ScriptRunArgs {
     pub script: String,
     #[arg(long)]
     pub config: Option<PathBuf>,
-    #[arg(long)]
-    pub symbol: Option<String>,
     /// Arms live execution for ctx.trade/ctx.cancel while data may come from any provider.
     #[arg(long, value_enum)]
     pub venue: Option<ExecutionVenueArg>,
@@ -610,8 +608,6 @@ pub struct ScriptBacktestArgs {
     #[arg(long)]
     pub config: Option<PathBuf>,
     #[arg(long)]
-    pub symbol: String,
-    #[arg(long)]
     pub from: u64,
     #[arg(long)]
     pub to: u64,
@@ -629,9 +625,6 @@ impl ScriptBacktestArgs {
     pub fn validate(&self) -> Result<()> {
         if self.script.trim().is_empty() {
             bail!("script path is required");
-        }
-        if !is_valid_symbol(&self.symbol) {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
         validate_millisecond_timestamp(self.from, "--from")?;
         validate_millisecond_timestamp(self.to, "--to")?;
@@ -3867,10 +3860,8 @@ mod tests {
             "script",
             "run",
             "./studies/buy-pressure.js",
-            "--symbol",
-            "BTC/USDT",
             "--source",
-            "candles@bybitf@mmt:timeframe=60",
+            "btc@candles@bybitf@mmt:timeframe=60",
             "--param",
             "min_vbuy=50000",
             "--duration",
@@ -3885,8 +3876,7 @@ mod tests {
                 command: ScriptCommands::Run(args),
             } => {
                 assert_eq!(args.script, "./studies/buy-pressure.js");
-                assert_eq!(args.symbol.as_deref(), Some("BTC/USDT"));
-                assert_eq!(args.source, vec!["candles@bybitf@mmt:timeframe=60"]);
+                assert_eq!(args.source, vec!["btc@candles@bybitf@mmt:timeframe=60"]);
                 assert_eq!(args.param, vec!["min_vbuy=50000"]);
                 assert_eq!(args.duration, Some(3600));
                 args.validate().expect("validate should succeed");
@@ -3905,7 +3895,6 @@ mod tests {
                 command: ScriptCommands::Run(args),
             } => {
                 assert_eq!(args.script, "test/buy-pressure.js");
-                assert!(args.symbol.is_none());
                 assert!(args.from.is_none());
                 assert!(args.to.is_none());
                 assert!(args.duration.is_none());
@@ -3945,14 +3934,12 @@ mod tests {
             "script",
             "backtest",
             "./scripts/sma-cross.js",
-            "--symbol",
-            "BTC/USDT",
             "--from",
             "1704067200000",
             "--to",
             "1704067800000",
             "--source",
-            "candles@bybitf@mmt:timeframe=60",
+            "btc@candles@bybitf@mmt:timeframe=60",
             "--param",
             "fast=20",
             "--output",
@@ -3965,7 +3952,7 @@ mod tests {
                 command: ScriptCommands::Backtest(args),
             } => {
                 assert_eq!(args.script, "./scripts/sma-cross.js");
-                assert_eq!(args.source, vec!["candles@bybitf@mmt:timeframe=60"]);
+                assert_eq!(args.source, vec!["btc@candles@bybitf@mmt:timeframe=60"]);
                 assert_eq!(args.param, vec!["fast=20"]);
                 args.validate().expect("validate should succeed");
             }
@@ -3980,16 +3967,14 @@ mod tests {
             "script",
             "backtest",
             "./scripts/cross-exchange.js",
-            "--symbol",
-            "BTC/USDT",
             "--from",
             "1704067200000",
             "--to",
             "1704067800000",
             "--source",
-            "candles@binancef@mmt:timeframe=60",
+            "btc@candles@binancef@mmt:timeframe=60",
             "--source",
-            "candles@okx@mmt:timeframe=60",
+            "btc@candles@okx@mmt:timeframe=60",
         ])
         .expect("qualified script sources should parse without --exchange");
 
@@ -4000,8 +3985,8 @@ mod tests {
                 assert_eq!(
                     args.source,
                     vec![
-                        "candles@binancef@mmt:timeframe=60",
-                        "candles@okx@mmt:timeframe=60"
+                        "btc@candles@binancef@mmt:timeframe=60",
+                        "btc@candles@okx@mmt:timeframe=60"
                     ]
                 );
                 args.validate().expect("backtest should validate");
@@ -4017,16 +4002,14 @@ mod tests {
             "script",
             "run",
             "./examples/candle-summary.js",
-            "--symbol",
-            "BTC/USDT",
             "--source",
-            "candles@bulkf:timeframe=60",
+            "btc@candles@bulkf:timeframe=60",
         ])
         .expect("BULK script run should parse without exchange");
         match run.command {
             Commands::Script {
                 command: ScriptCommands::Run(args),
-            } => assert_eq!(args.source, vec!["candles@bulkf:timeframe=60"]),
+            } => assert_eq!(args.source, vec!["btc@candles@bulkf:timeframe=60"]),
             _ => panic!("expected script run command"),
         }
 
@@ -4035,21 +4018,19 @@ mod tests {
             "script",
             "backtest",
             "./examples/sma-cross.js",
-            "--symbol",
-            "BTC/USDT",
             "--from",
             "1704067200000",
             "--to",
             "1704067800000",
             "--source",
-            "candles@bulkf:timeframe=60",
+            "btc@candles@bulkf:timeframe=60",
         ])
         .expect("BULK script backtest should parse without exchange");
         match backtest.command {
             Commands::Script {
                 command: ScriptCommands::Backtest(args),
             } => {
-                assert_eq!(args.source, vec!["candles@bulkf:timeframe=60"]);
+                assert_eq!(args.source, vec!["btc@candles@bulkf:timeframe=60"]);
                 args.validate().expect("BULK backtest should validate");
             }
             _ => panic!("expected script backtest command"),
@@ -4113,17 +4094,8 @@ mod tests {
 
     #[test]
     fn parses_detached_script_execution_and_job_commands() {
-        let run = Cli::try_parse_from([
-            "mlab",
-            "script",
-            "run",
-            "strategy.js",
-            "--symbol",
-            "BTC/USDT",
-            "--venue",
-            "bulkf",
-        ])
-        .expect("detached script execution should parse");
+        let run = Cli::try_parse_from(["mlab", "script", "run", "strategy.js", "--venue", "bulkf"])
+            .expect("detached script execution should parse");
         match run.command {
             Commands::Script {
                 command: ScriptCommands::Run(args),
@@ -4142,5 +4114,20 @@ mod tests {
             }
             _ => panic!("expected script logs command"),
         }
+    }
+
+    #[test]
+    fn script_commands_reject_the_removed_symbol_flag() {
+        let error = Cli::try_parse_from([
+            "mlab",
+            "script",
+            "run",
+            "strategy.js",
+            "--symbol",
+            "BTC/USDT",
+        ])
+        .expect_err("script --symbol must remain removed");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 }

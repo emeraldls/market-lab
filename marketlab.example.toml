@@ -1,16 +1,16 @@
 version = 1
 
-[market]
-symbol = "BTC/USDT"
+# [market]
+# symbol = "BTC/USDT"
 
 [output]
 format = "terminal"
 verbose = false
 
-[sources."candles@binancef@mmt"]
+[sources."btc@candles@binancef@mmt"]
 timeframe = 60
 
-[sources."orderbook@lighterf@mmt"]
+[sources."btc@orderbook@lighterf@mmt"]
 depth = 20
 timeframe = 60
 

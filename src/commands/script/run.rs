@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -111,6 +113,7 @@ struct LiveTrade {
 #[derive(Debug, Clone)]
 struct LiveUpdate {
     selector: String,
+    symbol: String,
     source: ScriptSource,
     provider: ProviderKind,
     exchange: String,
@@ -121,10 +124,6 @@ enum ScriptStreamEvent {
     Update(LiveUpdate),
     Disconnected { error: String, retry_seconds: u64 },
     Reconnected,
-}
-
-struct ScriptRunMarket {
-    symbol: String,
 }
 
 struct ScriptWorkerState<'a> {
@@ -153,7 +152,6 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
         );
     }
     let script = Script::load(&args.script)?;
-    let symbol = require_symbol(args.symbol.as_deref())?.to_string();
     let source_configs = parse_source_configs(&args.source)?;
     validate_source_configs_for_run(&script.manifest, &source_configs)?;
     let raw_params = parse_param_values(&args.param)?;
@@ -173,7 +171,6 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
         source: script.source().to_string(),
         providers,
         exchanges,
-        symbol,
         sources: args.source,
         params: args.param,
         venue: args.venue.map(Into::into),
@@ -188,7 +185,16 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
             println!("  job:       {}", job.id);
             println!("  status:    starting");
             println!("  providers: {}", job.definition.providers.join(","));
-            println!("  symbol:    {}", job.definition.symbol);
+            println!(
+                "  symbols:   {}",
+                source_configs
+                    .values()
+                    .map(|config| config.symbol.as_str())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
             println!(
                 "  venue:     {}",
                 job.definition.venue.map_or_else(
@@ -221,7 +227,6 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
     let args = ScriptRunArgs {
         script: job.definition.snapshot_path.display().to_string(),
         config: None,
-        symbol: Some(job.definition.symbol.clone()),
         venue,
         testnet: job.definition.testnet,
         from: None,
@@ -237,7 +242,7 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
         &script,
         Some(job.definition.providers.join(",")),
         Some(job.definition.exchanges.join(",")),
-        Some(job.definition.symbol.clone()),
+        None,
     );
     let pid = std::process::id();
     crate::runtime::script_worker_started(job_id, pid).await?;
@@ -286,20 +291,16 @@ async fn run(
             "--from/--to are not allowed with script run; use script backtest for historical data"
         );
     }
-    let symbol = require_symbol(args.symbol.as_deref())?.to_string();
-
     let source_configs = parse_source_configs(&args.source)?;
     validate_source_configs_for_run(&script.manifest, &source_configs)?;
     let raw_params = parse_param_values(&args.param)?;
     let resolved_params = resolve_params(&script.manifest, &raw_params)?;
 
-    let market = ScriptRunMarket { symbol };
     stream_sources(
         args,
         script,
         source_configs,
         resolved_params,
-        market,
         report,
         ScriptWorkerState {
             job_id,
@@ -314,7 +315,6 @@ async fn stream_sources(
     script: Script,
     source_configs: SourceConfigs,
     resolved_params: Value,
-    market: ScriptRunMarket,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
     worker: ScriptWorkerState<'_>,
 ) -> Result<()> {
@@ -322,13 +322,9 @@ async fn stream_sources(
     report.set_phase("connecting_streams");
     write_running_report_best_effort(report);
 
-    let streams = ScriptLiveStreams::connect(&source_configs, &market.symbol, args.testnet).await?;
-    let mut stream_events = spawn_script_stream_supervisor(
-        streams,
-        source_configs.clone(),
-        market.symbol.clone(),
-        args.testnet,
-    );
+    let streams = ScriptLiveStreams::connect(&source_configs, args.testnet).await?;
+    let mut stream_events =
+        spawn_script_stream_supervisor(streams, source_configs.clone(), args.testnet);
 
     let session = script.start_session_with_execution(
         &resolved_params,
@@ -424,7 +420,7 @@ async fn stream_sources(
         };
 
         let ts_ms = update.ts_ms();
-        let payload = live_stream_payload(&update, &source_configs, &market.symbol, &positions)?;
+        let payload = live_stream_payload(&update, &source_configs, &positions)?;
         let execution = match session.run_event(payload) {
             Ok(execution) => execution,
             Err(err) => {
@@ -454,7 +450,7 @@ async fn stream_sources(
             version: "1",
             provider: source_provider_name(update.provider),
             exchange: update.exchange.clone(),
-            symbol: market.symbol.clone(),
+            symbol: update.symbol.clone(),
             ts_ms,
             stream: true,
             script: ScriptDescriptor {
@@ -555,9 +551,10 @@ fn now_ms() -> u64 {
 
 struct ScriptLiveStreams {
     mmt: Option<MmtScriptStreams>,
-    bulk: Option<Box<DirectScriptStreams>>,
-    hyperliquid: Option<Box<DirectScriptStreams>>,
+    direct: Vec<Box<DirectScriptStreams>>,
 }
+
+type LiveUpdateFuture<'a> = Pin<Box<dyn Future<Output = Result<Option<LiveUpdate>>> + Send + 'a>>;
 
 struct MmtScriptStreams {
     ws: MmtWsClient,
@@ -568,18 +565,16 @@ struct MmtScriptStreams {
 }
 
 impl ScriptLiveStreams {
-    async fn connect(source_configs: &SourceConfigs, symbol: &str, testnet: bool) -> Result<Self> {
+    async fn connect(source_configs: &SourceConfigs, testnet: bool) -> Result<Self> {
         let mmt_configs = configs_for_provider(source_configs, ProviderKind::Mmt);
-        let bulk_configs = configs_for_provider(source_configs, ProviderKind::Bulk);
-        let hyperliquid_configs = configs_for_provider(source_configs, ProviderKind::Hyperliquid);
         let mmt = if mmt_configs.is_empty() {
             None
         } else {
             for config in mmt_configs.values() {
-                normalize_symbol_for_mmt(&config.exchange, symbol)?;
+                normalize_symbol_for_mmt(&config.exchange, &config.market_symbol())?;
             }
             let ws = MmtWsClient::connect().await?;
-            subscribe_mmt_sources(&ws, &mmt_configs, symbol).await?;
+            subscribe_mmt_sources(&ws, &mmt_configs).await?;
             let orderbook_states = orderbook_states(&mmt_configs);
             let candle_aggregators = trade_candle_aggregators(&mmt_configs, now_ms())?;
             Some(MmtScriptStreams {
@@ -590,59 +585,62 @@ impl ScriptLiveStreams {
                 pending: VecDeque::new(),
             })
         };
-        let bulk = if bulk_configs.is_empty() {
-            None
-        } else {
-            let symbol = bulk_markets::market(symbol)?.symbol.clone();
-            Some(Box::new(
-                DirectScriptStreams::connect(ProviderKind::Bulk, &bulk_configs, &symbol, false)
+        let mut direct = Vec::new();
+        for provider in [ProviderKind::Bulk, ProviderKind::Hyperliquid] {
+            for configs in configs_grouped_by_symbol(source_configs, provider).into_values() {
+                let config = configs
+                    .values()
+                    .next()
+                    .context("direct source group is empty")?;
+                let requested = config.market_symbol();
+                let venue_symbol = match provider {
+                    ProviderKind::Bulk => bulk_markets::market(&requested)?.symbol.clone(),
+                    ProviderKind::Hyperliquid => {
+                        hyperliquid_markets::market(&requested)?.symbol.clone()
+                    }
+                    _ => unreachable!(),
+                };
+                direct.push(Box::new(
+                    DirectScriptStreams::connect(
+                        provider,
+                        &configs,
+                        &venue_symbol,
+                        testnet && provider == ProviderKind::Hyperliquid,
+                    )
                     .await?,
-            ))
-        };
-        let hyperliquid = if hyperliquid_configs.is_empty() {
-            None
-        } else {
-            let symbol = hyperliquid_markets::market(symbol)?.symbol.clone();
-            Some(Box::new(
-                DirectScriptStreams::connect(
-                    ProviderKind::Hyperliquid,
-                    &hyperliquid_configs,
-                    &symbol,
-                    testnet,
-                )
-                .await?,
-            ))
-        };
-        if mmt.is_none() && bulk.is_none() && hyperliquid.is_none() {
+                ));
+            }
+        }
+        if mmt.is_none() && direct.is_empty() {
             bail!("script has no supported live source providers");
         }
-        Ok(Self {
-            mmt,
-            bulk,
-            hyperliquid,
-        })
+        Ok(Self { mmt, direct })
     }
 
     async fn next_update(&mut self) -> Result<Option<LiveUpdate>> {
-        let has_mmt = self.mmt.is_some();
-        let has_bulk = self.bulk.is_some();
-        let has_hyperliquid = self.hyperliquid.is_some();
-        tokio::select! {
-            update = async { self.mmt.as_mut().expect("guarded MMT streams").next_update().await }, if has_mmt => update,
-            update = async { self.bulk.as_mut().expect("guarded BULK streams").next_update().await }, if has_bulk => update.map(Some),
-            update = async { self.hyperliquid.as_mut().expect("guarded Hyperliquid streams").next_update().await }, if has_hyperliquid => update.map(Some),
-            else => bail!("script has no active live source streams"),
+        let mut futures = Vec::<LiveUpdateFuture<'_>>::new();
+        if let Some(mmt) = self.mmt.as_mut() {
+            futures.push(Box::pin(mmt.next_update()));
         }
+        for stream in &mut self.direct {
+            futures.push(Box::pin(
+                async move { stream.next_update().await.map(Some) },
+            ));
+        }
+        if futures.is_empty() {
+            bail!("script has no active live source streams");
+        }
+        let (result, _, _) = futures_util::future::select_all(futures).await;
+        result
     }
 
     fn carry_runtime_state_from(&mut self, previous: &Self) {
-        if let (Some(current), Some(previous)) = (self.bulk.as_mut(), previous.bulk.as_ref()) {
-            current.cumulative_delta = previous.cumulative_delta;
-        }
-        if let (Some(current), Some(previous)) =
-            (self.hyperliquid.as_mut(), previous.hyperliquid.as_ref())
-        {
-            current.cumulative_delta = previous.cumulative_delta;
+        for current in &mut self.direct {
+            if let Some(previous) = previous.direct.iter().find(|previous| {
+                previous.provider == current.provider && previous.symbol == current.symbol
+            }) {
+                current.cumulative_delta = previous.cumulative_delta;
+            }
         }
     }
 }
@@ -650,14 +648,12 @@ impl ScriptLiveStreams {
 fn spawn_script_stream_supervisor(
     streams: ScriptLiveStreams,
     source_configs: SourceConfigs,
-    symbol: String,
     testnet: bool,
 ) -> mpsc::Receiver<ScriptStreamEvent> {
     let (sender, receiver) = mpsc::channel(SCRIPT_STREAM_EVENT_CAPACITY);
     tokio::spawn(supervise_script_streams(
         streams,
         source_configs,
-        symbol,
         testnet,
         sender,
     ));
@@ -667,7 +663,6 @@ fn spawn_script_stream_supervisor(
 async fn supervise_script_streams(
     mut streams: ScriptLiveStreams,
     source_configs: SourceConfigs,
-    symbol: String,
     testnet: bool,
     sender: mpsc::Sender<ScriptStreamEvent>,
 ) {
@@ -698,7 +693,7 @@ async fn supervise_script_streams(
                 }
                 loop {
                     tokio::time::sleep(Duration::from_secs(retry_seconds)).await;
-                    match ScriptLiveStreams::connect(&source_configs, &symbol, testnet).await {
+                    match ScriptLiveStreams::connect(&source_configs, testnet).await {
                         Ok(mut reconnected) => {
                             reconnected.carry_runtime_state_from(&streams);
                             streams = reconnected;
@@ -758,6 +753,23 @@ fn configs_for_provider(configs: &SourceConfigs, provider: ProviderKind) -> Sour
         .filter(|(_, config)| config.provider == provider)
         .map(|(selector, config)| (selector.clone(), config.clone()))
         .collect()
+}
+
+fn configs_grouped_by_symbol(
+    configs: &SourceConfigs,
+    provider: ProviderKind,
+) -> BTreeMap<String, SourceConfigs> {
+    let mut grouped = BTreeMap::<String, SourceConfigs>::new();
+    for (selector, config) in configs
+        .iter()
+        .filter(|(_, config)| config.provider == provider)
+    {
+        grouped
+            .entry(config.symbol.clone())
+            .or_default()
+            .insert(selector.clone(), config.clone());
+    }
+    grouped
 }
 
 fn trade_candle_aggregators(
@@ -953,6 +965,7 @@ fn direct_timeframe(provider: ProviderKind, seconds: u32) -> Result<&'static str
 
 struct DirectScriptStreams {
     provider: ProviderKind,
+    symbol: String,
     source_configs: SourceConfigs,
     trades: Option<DirectTradesStream>,
     candle_aggregator: Option<TradeCandleAggregator>,
@@ -1022,6 +1035,12 @@ impl DirectScriptStreams {
         };
         Ok(Self {
             provider,
+            symbol: source_configs
+                .values()
+                .next()
+                .context("direct source group is empty")?
+                .symbol
+                .clone(),
             source_configs: source_configs.clone(),
             trades,
             candle_aggregator,
@@ -1155,17 +1174,13 @@ fn direct_vd_update(
     }))
 }
 
-async fn subscribe_mmt_sources(
-    ws: &MmtWsClient,
-    source_configs: &SourceConfigs,
-    symbol: &str,
-) -> Result<()> {
+async fn subscribe_mmt_sources(ws: &MmtWsClient, source_configs: &SourceConfigs) -> Result<()> {
     let mut raw_trade_subscriptions = BTreeSet::new();
     let mut configs = source_configs.values().collect::<Vec<_>>();
     configs.sort_by_key(|config| config.position);
     for config in configs {
         let exchange = config.exchange.as_str();
-        let provider_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
+        let provider_symbol = normalize_symbol_for_mmt(exchange, &config.market_symbol())?;
         let provider_exchange = normalize_exchange_for_mmt(exchange)?;
         match &config.source {
             ScriptSource::Candles | ScriptSource::Trades => {
@@ -1395,6 +1410,7 @@ fn mmt_update_config<'a>(
         .get("exchange")
         .and_then(Value::as_str)
         .map(str::to_ascii_lowercase);
+    let symbol = value.get("symbol").and_then(Value::as_str);
     let mut matching = Vec::new();
     for config in source_configs
         .values()
@@ -1404,13 +1420,18 @@ fn mmt_update_config<'a>(
             Some(value) => normalize_exchange_for_mmt(&config.exchange)? == *value,
             None => true,
         };
-        if matches_exchange {
+        let matches_symbol = match symbol {
+            Some(value) => normalize_symbol_for_mmt(&config.exchange, &config.market_symbol())?
+                .eq_ignore_ascii_case(value),
+            None => true,
+        };
+        if matches_exchange && matches_symbol {
             matching.push(config);
         }
     }
     if matching.len() > 1 {
         bail!(
-            "MMT {} update did not identify a unique exchange",
+            "MMT {} update did not identify a unique symbol and exchange",
             source.as_str()
         );
     }
@@ -1459,6 +1480,7 @@ impl LiveUpdate {
     fn new(config: &SourceConfig, record: LiveRecord) -> Self {
         Self {
             selector: config.selector.clone(),
+            symbol: config.symbol.clone(),
             source: config.source.clone(),
             provider: config.provider,
             exchange: config.exchange.clone(),
@@ -1532,7 +1554,6 @@ fn render_run_summary(
 fn live_stream_payload(
     update: &LiveUpdate,
     source_configs: &SourceConfigs,
-    symbol: &str,
     positions: &[Position],
 ) -> Result<Value> {
     let mut payload = serde_json::Map::new();
@@ -1549,7 +1570,7 @@ fn live_stream_payload(
         "exchange".to_string(),
         Value::String(update.exchange.clone()),
     );
-    payload.insert("symbol".to_string(), Value::String(symbol.to_string()));
+    payload.insert("symbol".to_string(), Value::String(update.symbol.clone()));
 
     let current_config = source_configs
         .get(&update.selector)
@@ -1688,22 +1709,6 @@ impl fmt::Display for ScriptCancelled {
 
 impl std::error::Error for ScriptCancelled {}
 
-fn require_non_empty<'a>(value: Option<&'a str>, flag: &str) -> Result<&'a str> {
-    let value = value.ok_or_else(|| anyhow::anyhow!("{flag} is required"))?;
-    if value.trim().is_empty() {
-        bail!("{flag} cannot be empty");
-    }
-    Ok(value)
-}
-
-fn require_symbol(value: Option<&str>) -> Result<&str> {
-    let symbol = require_non_empty(value, "--symbol")?;
-    if !symbol.contains('/') {
-        bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-    }
-    Ok(symbol)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1727,8 +1732,8 @@ mod tests {
 
     fn cross_exchange_configs() -> SourceConfigs {
         parse_source_configs(&[
-            "candles@binancef@mmt:timeframe=60".to_string(),
-            "candles@okx@mmt:timeframe=60".to_string(),
+            "btc@candles@binancef@mmt:timeframe=60".to_string(),
+            "btc@candles@okx@mmt:timeframe=60".to_string(),
         ])
         .expect("parse source configs")
     }
@@ -1747,7 +1752,46 @@ mod tests {
             .expect("route update")
             .expect("matching source config");
 
-        assert_eq!(config.selector, "candles@okx@mmt");
+        assert_eq!(config.selector, "btc@candles@okx@mmt");
+    }
+
+    #[test]
+    fn mmt_updates_route_to_the_symbol_qualified_selector() {
+        let configs = parse_source_configs(&[
+            "btc@candles@binancef@mmt:timeframe=60".to_string(),
+            "aave@candles@binancef@mmt:timeframe=60".to_string(),
+        ])
+        .expect("parse multi-symbol configs");
+        let provider_symbol =
+            normalize_symbol_for_mmt("binancef", "AAVE/USDT").expect("resolve provider symbol");
+        let update = json!({
+            "type": "data",
+            "channel": "trades",
+            "exchange": "binancef",
+            "symbol": provider_symbol,
+            "data": {}
+        });
+
+        let config = mmt_update_config(&update, &configs, &ScriptSource::Candles)
+            .expect("route update")
+            .expect("matching source config");
+
+        assert_eq!(config.selector, "aave@candles@binancef@mmt");
+    }
+
+    #[test]
+    fn direct_source_streams_are_grouped_by_symbol() {
+        let configs = parse_source_configs(&[
+            "btc@trades@bulkf".to_string(),
+            "zec@trades@bulkf".to_string(),
+        ])
+        .expect("parse direct multi-symbol configs");
+
+        let grouped = configs_grouped_by_symbol(&configs, ProviderKind::Bulk);
+
+        assert_eq!(grouped.len(), 2);
+        assert!(grouped["btc"].contains_key("btc@trades@bulkf"));
+        assert!(grouped["zec"].contains_key("zec@trades@bulkf"));
     }
 
     #[test]
@@ -1770,18 +1814,20 @@ mod tests {
     #[test]
     fn mmt_trade_updates_feed_trades_and_trade_derived_candles() {
         let configs = parse_source_configs(&[
-            "trades@binancef@mmt".to_string(),
-            "candles@binancef@mmt:timeframe=60".to_string(),
+            "btc@trades@binancef@mmt".to_string(),
+            "btc@candles@binancef@mmt:timeframe=60".to_string(),
         ])
         .expect("parse trade source configs");
         let mut aggregators =
             trade_candle_aggregators(&configs, 60_000).expect("create aggregators");
+        let provider_symbol =
+            normalize_symbol_for_mmt("binancef", "BTC/USDT").expect("resolve provider symbol");
 
         let first = json!({
             "type": "data",
             "channel": "trades",
             "exchange": "binancef",
-            "symbol": "btc/usdt",
+            "symbol": provider_symbol,
             "data": {
                 "id": "1",
                 "t": 60_000,
@@ -1799,7 +1845,7 @@ mod tests {
             "type": "data",
             "channel": "trades",
             "exchange": "binancef",
-            "symbol": "btc/usdt",
+            "symbol": provider_symbol,
             "data": {
                 "id": "2",
                 "t": 120_000,
@@ -1822,9 +1868,9 @@ mod tests {
     #[test]
     fn trades_live_payload_contains_only_price_and_size() {
         let configs =
-            parse_source_configs(&["trades@bulkf".to_string()]).expect("parse trades config");
+            parse_source_configs(&["btc@trades@bulkf".to_string()]).expect("parse trades config");
         let update = LiveUpdate::new(
-            &configs["trades@bulkf"],
+            &configs["btc@trades@bulkf"],
             LiveRecord::Trades(LiveTrade {
                 timestamp_ms: 1_700_000_000_000,
                 record: ScriptTrade {
@@ -1834,10 +1880,10 @@ mod tests {
             }),
         );
 
-        let payload =
-            live_stream_payload(&update, &configs, "BTC/USDT", &[]).expect("build payload");
+        let payload = live_stream_payload(&update, &configs, &[]).expect("build payload");
 
         assert_eq!(payload["source_type"], "trades");
+        assert_eq!(payload["symbol"], "btc");
         assert_eq!(
             payload["data"]["record"],
             json!({ "price": 42_000.0, "size": 0.25 })
@@ -1848,23 +1894,23 @@ mod tests {
     fn live_payload_contains_current_internal_record_and_source_metadata() {
         let configs = cross_exchange_configs();
         let okx = LiveUpdate::new(
-            &configs["candles@okx@mmt"],
+            &configs["btc@candles@okx@mmt"],
             LiveRecord::Candles(candle(20.0)),
         );
 
-        let payload =
-            live_stream_payload(&okx, &configs, "BTC/USDT", &[]).expect("build live payload");
+        let payload = live_stream_payload(&okx, &configs, &[]).expect("build live payload");
 
-        assert_eq!(payload["source"], "candles@okx@mmt");
+        assert_eq!(payload["source"], "btc@candles@okx@mmt");
+        assert_eq!(payload["symbol"], "btc");
         assert_eq!(payload["source_type"], "candles");
         assert_eq!(payload["exchange"], "okx");
         assert_eq!(payload["data"]["candle"]["c"], 20.0);
         assert_eq!(
-            payload["source_configs"]["candles@binancef@mmt"]["exchange"],
+            payload["source_configs"]["btc@candles@binancef@mmt"]["exchange"],
             "binancef"
         );
         assert_eq!(
-            payload["source_configs"]["candles@okx@mmt"]["exchange"],
+            payload["source_configs"]["btc@candles@okx@mmt"]["exchange"],
             "okx"
         );
         assert!(payload.get("sources").is_none());

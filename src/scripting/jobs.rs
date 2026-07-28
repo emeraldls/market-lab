@@ -17,7 +17,6 @@ pub struct ScriptJobSubmission {
     pub source: String,
     pub providers: Vec<String>,
     pub exchanges: Vec<String>,
-    pub symbol: String,
     #[serde(default)]
     pub sources: Vec<String>,
     #[serde(default)]
@@ -46,9 +45,6 @@ impl ScriptJobSubmission {
         if self.source.len() > MAX_SCRIPT_SOURCE_BYTES {
             bail!("script source exceeds the 1 MiB job limit");
         }
-        if self.symbol.trim().is_empty() {
-            bail!("script job symbol is required");
-        }
         if self.duration_seconds == Some(0) {
             bail!("script job duration must be at least 1 second");
         }
@@ -64,7 +60,6 @@ pub struct ScriptJobDefinition {
     pub snapshot_path: PathBuf,
     pub providers: Vec<String>,
     pub exchanges: Vec<String>,
-    pub symbol: String,
     pub sources: Vec<String>,
     pub params: Vec<String>,
     pub venue: Option<ExecutionVenue>,
@@ -126,6 +121,8 @@ pub struct ScriptExecutionEvent {
     pub order_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub venue: Option<ExecutionVenue>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,8 +146,7 @@ mod tests {
             "snapshotPath": "/tmp/maker.js",
             "providers": ["bulkf"],
             "exchanges": ["bulkf"],
-            "symbol": "BTC/USDT",
-            "sources": ["orderbook@bulkf:depth=20"],
+            "sources": ["btc@orderbook@bulkf:depth=20"],
             "params": [],
             "venue": "bulkf",
             "verbose": false

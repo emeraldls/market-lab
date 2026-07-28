@@ -11,6 +11,7 @@ use super::manifest::{InputType, ScriptManifest, ScriptParamSchema, ScriptSource
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceConfig {
     pub selector: String,
+    pub symbol: String,
     pub source: ScriptSource,
     pub provider: ProviderKind,
     pub exchange: String,
@@ -23,6 +24,7 @@ pub struct SourceConfig {
 impl SourceConfig {
     fn new(
         selector: String,
+        symbol: String,
         source: ScriptSource,
         provider: ProviderKind,
         exchange: String,
@@ -30,6 +32,7 @@ impl SourceConfig {
     ) -> Self {
         Self {
             selector,
+            symbol,
             source,
             provider,
             exchange,
@@ -38,6 +41,10 @@ impl SourceConfig {
             depth: None,
             bucket: None,
         }
+    }
+
+    pub fn market_symbol(&self) -> String {
+        script_symbol_to_market(&self.symbol)
     }
 
     pub fn require_timeframe(&self, source: &ScriptSource) -> Result<u32> {
@@ -72,10 +79,11 @@ pub fn parse_source_configs(values: &[String]) -> Result<SourceConfigs> {
             .map_or((value.as_str(), ""), |(binding, options)| {
                 (binding, options)
             });
-        let (selector, source, provider, exchange) = parse_source_selector(binding)?;
+        let (selector, symbol, source, provider, exchange) = parse_source_selector(binding)?;
         let config = configs.entry(selector.clone()).or_insert_with(|| {
             SourceConfig::new(
                 selector.clone(),
+                symbol.clone(),
                 source.clone(),
                 provider,
                 exchange.clone(),
@@ -199,6 +207,8 @@ pub fn source_configs_payload(configs: &SourceConfigs) -> Value {
         payload.insert(
             config.selector.clone(),
             json!({
+                "symbol": config.symbol,
+                "market_symbol": config.market_symbol(),
                 "type": config.source.as_str(),
                 "provider": source_provider_name(config.provider),
                 "exchange": config.exchange,
@@ -414,43 +424,69 @@ fn parse_source(source: &str) -> Result<ScriptSource> {
     }
 }
 
-fn parse_source_selector(raw: &str) -> Result<(String, ScriptSource, ProviderKind, String)> {
+fn parse_source_selector(
+    raw: &str,
+) -> Result<(String, String, ScriptSource, ProviderKind, String)> {
     let parts = raw.split('@').collect::<Vec<_>>();
-    let (source_raw, exchange, provider) = match parts.as_slice() {
-        [source, provider] => {
+    let (symbol_raw, source_raw, exchange, provider) = match parts.as_slice() {
+        [symbol, source, provider] => {
             let provider = parse_source_provider(provider)?;
             if provider == ProviderKind::Mmt {
                 bail!(
-                    "MMT sources require source@exchange@mmt, for example `{source}@binancef@mmt`"
+                    "MMT sources require symbol@source@exchange@mmt, for example `{symbol}@{source}@binancef@mmt`"
                 );
             }
-            (*source, provider_name_for_exchange(provider), provider)
+            (
+                *symbol,
+                *source,
+                provider_name_for_exchange(provider),
+                provider,
+            )
         }
-        [source, exchange, provider] => {
+        [symbol, source, exchange, provider] => {
             let provider = parse_source_provider(provider)?;
             if provider != ProviderKind::Mmt {
                 bail!(
-                    "{} sources must use `source@{}`",
+                    "{} sources must use `symbol@source@{}`",
                     source_provider_name(provider),
                     source_provider_name(provider)
                 );
             }
-            (*source, *exchange, provider)
+            (*symbol, *source, *exchange, provider)
         }
-        _ => bail!("--source `{raw}` must use source@provider or source@exchange@provider"),
+        _ => bail!(
+            "--source `{raw}` must use symbol@source@provider or symbol@source@exchange@provider"
+        ),
     };
+    let symbol = normalize_script_symbol(symbol_raw)?;
     let source = parse_source(source_raw)?;
     let exchange = exchange.trim().to_ascii_lowercase();
     validate_exchange_name(&exchange)?;
     let selector = match provider {
-        ProviderKind::Mmt => format!("{}@{exchange}@mmt", source.as_str()),
-        ProviderKind::Bulk => format!("{}@bulkf", source.as_str()),
-        ProviderKind::Hyperliquid => format!("{}@hyperliquidf", source.as_str()),
-        ProviderKind::Binance => format!("{}@binance", source.as_str()),
-        ProviderKind::BinanceFutures => format!("{}@binancef", source.as_str()),
+        ProviderKind::Mmt => format!("{symbol}@{}@{exchange}@mmt", source.as_str()),
+        ProviderKind::Bulk => format!("{symbol}@{}@bulkf", source.as_str()),
+        ProviderKind::Hyperliquid => format!("{symbol}@{}@hyperliquidf", source.as_str()),
+        ProviderKind::Binance => format!("{symbol}@{}@binance", source.as_str()),
+        ProviderKind::BinanceFutures => format!("{symbol}@{}@binancef", source.as_str()),
         ProviderKind::MarketLab => unreachable!(),
     };
-    Ok((selector, source, provider, exchange))
+    Ok((selector, symbol, source, provider, exchange))
+}
+
+pub fn normalize_script_symbol(raw: &str) -> Result<String> {
+    let symbol = raw.trim().to_ascii_lowercase();
+    if symbol.is_empty()
+        || !symbol
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        bail!("script symbol `{raw}` must use letters, numbers, `-`, or `_`, for example `btc`");
+    }
+    Ok(symbol)
+}
+
+pub fn script_symbol_to_market(symbol: &str) -> String {
+    format!("{}/USDT", symbol.trim().to_ascii_uppercase())
 }
 
 fn parse_source_provider(raw: &str) -> Result<ProviderKind> {
@@ -504,6 +540,7 @@ fn reject_duplicate_resolved_sources(configs: &SourceConfigs) -> Result<()> {
     for (idx, left) in values.iter().enumerate() {
         for right in values.iter().skip(idx + 1) {
             if left.source == right.source
+                && left.symbol == right.symbol
                 && left.provider == right.provider
                 && left.exchange == right.exchange
             {
@@ -631,44 +668,66 @@ mod tests {
     #[test]
     fn parses_exchange_qualified_source_configs() {
         let configs = parse_source_configs(&[
-            "candles@okx@mmt:timeframe=60".to_string(),
-            "orderbook@binancef@mmt:timeframe=60,depth=50".to_string(),
-            "trades@hyperliquidf@mmt".to_string(),
-            "vd@hyperliquidf@mmt:timeframe=60,bucket=1".to_string(),
-            "oi@binancef@mmt:timeframe=60".to_string(),
-            "volumes@okx@mmt:timeframe=60".to_string(),
+            "btc@candles@okx@mmt:timeframe=60".to_string(),
+            "btc@orderbook@binancef@mmt:timeframe=60,depth=50".to_string(),
+            "btc@trades@hyperliquidf@mmt".to_string(),
+            "btc@vd@hyperliquidf@mmt:timeframe=60,bucket=1".to_string(),
+            "btc@oi@binancef@mmt:timeframe=60".to_string(),
+            "btc@volumes@okx@mmt:timeframe=60".to_string(),
         ])
         .unwrap();
-        assert_eq!(configs["candles@okx@mmt"].exchange, "okx");
-        assert_eq!(configs["candles@okx@mmt"].provider, ProviderKind::Mmt);
-        assert_eq!(configs["orderbook@binancef@mmt"].depth, Some(50));
-        assert_eq!(configs["trades@hyperliquidf@mmt"].timeframe, None);
-        assert_eq!(configs["vd@hyperliquidf@mmt"].bucket, Some(1));
-        assert_eq!(configs["oi@binancef@mmt"].timeframe, Some(60));
-        assert_eq!(configs["volumes@okx@mmt"].timeframe, Some(60));
+        assert_eq!(configs["btc@candles@okx@mmt"].exchange, "okx");
+        assert_eq!(configs["btc@candles@okx@mmt"].symbol, "btc");
+        assert_eq!(configs["btc@candles@okx@mmt"].provider, ProviderKind::Mmt);
+        assert_eq!(configs["btc@orderbook@binancef@mmt"].depth, Some(50));
+        assert_eq!(configs["btc@trades@hyperliquidf@mmt"].timeframe, None);
+        assert_eq!(configs["btc@vd@hyperliquidf@mmt"].bucket, Some(1));
+        assert_eq!(configs["btc@oi@binancef@mmt"].timeframe, Some(60));
+        assert_eq!(configs["btc@volumes@okx@mmt"].timeframe, Some(60));
     }
 
     #[test]
     fn validates_two_candle_exchanges() {
         let manifest = manifest(vec![ScriptSource::Candles]);
         let configs = parse_source_configs(&[
-            "candles@binancef@mmt:timeframe=60".to_string(),
-            "candles@okx@mmt:timeframe=300".to_string(),
+            "btc@candles@binancef@mmt:timeframe=60".to_string(),
+            "btc@candles@okx@mmt:timeframe=300".to_string(),
         ])
         .expect("qualified bindings should parse");
 
         validate_source_configs(&manifest, &configs).expect("backtest configs should validate");
         validate_source_configs_for_run(&manifest, &configs).expect("live configs should validate");
         assert_eq!(source_exchange_label(&configs), "binancef,okx");
-        assert_eq!(configs["candles@okx@mmt"].timeframe, Some(300));
+        assert_eq!(configs["btc@candles@okx@mmt"].timeframe, Some(300));
+    }
+
+    #[test]
+    fn keeps_the_same_feed_for_different_symbols_distinct() {
+        let manifest = manifest(vec![ScriptSource::Candles]);
+        let configs = parse_source_configs(&[
+            "btc@candles@binancef@mmt:timeframe=60".to_string(),
+            "zec@candles@binancef@mmt:timeframe=60".to_string(),
+        ])
+        .expect("multi-symbol bindings should parse");
+
+        validate_source_configs(&manifest, &configs).expect("multi-symbol configs should validate");
+        assert_eq!(configs.len(), 2);
+        assert_eq!(
+            configs["btc@candles@binancef@mmt"].market_symbol(),
+            "BTC/USDT"
+        );
+        assert_eq!(
+            configs["zec@candles@binancef@mmt"].market_symbol(),
+            "ZEC/USDT"
+        );
     }
 
     #[test]
     fn live_candles_accept_custom_second_timeframes() {
         let manifest = manifest(vec![ScriptSource::Candles]);
         for selector in [
-            "candles@binancef@mmt:timeframe=1",
-            "candles@bulkf:timeframe=1",
+            "btc@candles@binancef@mmt:timeframe=1",
+            "btc@candles@bulkf:timeframe=1",
         ] {
             let configs = parse_source_configs(&[selector.to_string()]).unwrap();
             validate_source_configs_for_run(&manifest, &configs)
@@ -682,7 +741,7 @@ mod tests {
     fn rejects_source_without_exchange() {
         let error = parse_source_configs(&["candles:timeframe=60".to_string()])
             .expect_err("unqualified source must fail");
-        assert!(error.to_string().contains("source@provider"));
+        assert!(error.to_string().contains("symbol@source@provider"));
     }
 
     #[test]
@@ -695,24 +754,24 @@ mod tests {
             ScriptSource::Oi,
         ]);
         let configs = parse_source_configs(&[
-            "candles@bulkf:timeframe=60".to_string(),
-            "orderbook@bulkf:depth=50".to_string(),
-            "trades@bulkf".to_string(),
-            "vd@bulkf".to_string(),
-            "oi@bulkf".to_string(),
+            "btc@candles@bulkf:timeframe=60".to_string(),
+            "btc@orderbook@bulkf:depth=50".to_string(),
+            "btc@trades@bulkf".to_string(),
+            "btc@vd@bulkf".to_string(),
+            "btc@oi@bulkf".to_string(),
         ])
         .unwrap();
 
         validate_source_configs_for_run(&live_manifest, &configs)
             .expect("BULK live configs should validate");
-        assert!(configs.contains_key("vd@bulkf"));
-        assert!(configs.contains_key("oi@bulkf"));
-        assert!(configs.contains_key("trades@bulkf"));
+        assert!(configs.contains_key("btc@vd@bulkf"));
+        assert!(configs.contains_key("btc@oi@bulkf"));
+        assert!(configs.contains_key("btc@trades@bulkf"));
     }
 
     #[test]
     fn rejects_bare_bulk_source_bindings() {
-        let error = parse_source_configs(&["orderbook@bulk:depth=50".to_string()])
+        let error = parse_source_configs(&["btc@orderbook@bulk:depth=50".to_string()])
             .expect_err("bare bulk must not be accepted as a script source");
         assert!(
             error
@@ -732,28 +791,28 @@ mod tests {
             ScriptSource::Volumes,
         ]);
         let configs = parse_source_configs(&[
-            "candles@hyperliquidf:timeframe=60".to_string(),
-            "orderbook@hyperliquidf:depth=20".to_string(),
-            "trades@hyperliquidf".to_string(),
-            "vd@hyperliquidf".to_string(),
-            "oi@hyperliquidf".to_string(),
-            "volumes@hyperliquidf:timeframe=60".to_string(),
+            "btc@candles@hyperliquidf:timeframe=60".to_string(),
+            "btc@orderbook@hyperliquidf:depth=20".to_string(),
+            "btc@trades@hyperliquidf".to_string(),
+            "btc@vd@hyperliquidf".to_string(),
+            "btc@oi@hyperliquidf".to_string(),
+            "btc@volumes@hyperliquidf:timeframe=60".to_string(),
         ])
         .expect("standalone Hyperliquid selectors should parse");
 
         validate_source_configs_for_run(&live_manifest, &configs)
             .expect("standalone Hyperliquid live configs should validate");
         assert_eq!(
-            configs["candles@hyperliquidf"].provider,
+            configs["btc@candles@hyperliquidf"].provider,
             ProviderKind::Hyperliquid
         );
-        assert_eq!(configs["orderbook@hyperliquidf"].depth, Some(20));
-        assert_eq!(configs["trades@hyperliquidf"].timeframe, None);
+        assert_eq!(configs["btc@orderbook@hyperliquidf"].depth, Some(20));
+        assert_eq!(configs["btc@trades@hyperliquidf"].timeframe, None);
 
         let historical_manifest = manifest(vec![ScriptSource::Candles, ScriptSource::Volumes]);
         let historical_configs = parse_source_configs(&[
-            "candles@hyperliquidf:timeframe=60".to_string(),
-            "volumes@hyperliquidf:timeframe=60".to_string(),
+            "btc@candles@hyperliquidf:timeframe=60".to_string(),
+            "btc@volumes@hyperliquidf:timeframe=60".to_string(),
         ])
         .expect("historical Hyperliquid selectors should parse");
         validate_source_configs(&historical_manifest, &historical_configs)
@@ -764,16 +823,19 @@ mod tests {
     fn validates_historical_binance_spot_and_futures_bindings() {
         let manifest = manifest(vec![ScriptSource::Candles, ScriptSource::Volumes]);
         let configs = parse_source_configs(&[
-            "candles@binance:timeframe=60".to_string(),
-            "volumes@binancef:timeframe=300".to_string(),
+            "btc@candles@binance:timeframe=60".to_string(),
+            "btc@volumes@binancef:timeframe=300".to_string(),
         ])
         .expect("standalone Binance selectors should parse");
 
         validate_source_configs(&manifest, &configs)
             .expect("historical Binance configs should validate");
-        assert_eq!(configs["candles@binance"].provider, ProviderKind::Binance);
         assert_eq!(
-            configs["volumes@binancef"].provider,
+            configs["btc@candles@binance"].provider,
+            ProviderKind::Binance
+        );
+        assert_eq!(
+            configs["btc@volumes@binancef"].provider,
             ProviderKind::BinanceFutures
         );
         validate_source_configs_for_run(&manifest, &configs)
@@ -783,7 +845,7 @@ mod tests {
     #[test]
     fn rejects_open_interest_on_a_spot_exchange() {
         let manifest = manifest(vec![ScriptSource::Oi]);
-        let configs = parse_source_configs(&["oi@binance@mmt:timeframe=60".to_string()])
+        let configs = parse_source_configs(&["btc@oi@binance@mmt:timeframe=60".to_string()])
             .expect("spot OI binding parses before capability validation");
 
         let error = validate_source_configs_for_run(&manifest, &configs)
@@ -794,7 +856,7 @@ mod tests {
     #[test]
     fn rejects_bulk_historical_sources_that_do_not_exist() {
         let manifest = manifest(vec![ScriptSource::Orderbook]);
-        let configs = parse_source_configs(&["orderbook@bulkf:depth=50".to_string()])
+        let configs = parse_source_configs(&["btc@orderbook@bulkf:depth=50".to_string()])
             .expect("parse book binding");
 
         let error = validate_source_configs(&manifest, &configs)
@@ -804,7 +866,11 @@ mod tests {
 
     #[test]
     fn rejects_raw_trades_for_backtests() {
-        for selector in ["trades@binancef@mmt", "trades@bulkf", "trades@hyperliquidf"] {
+        for selector in [
+            "btc@trades@binancef@mmt",
+            "btc@trades@bulkf",
+            "btc@trades@hyperliquidf",
+        ] {
             let manifest = manifest(vec![ScriptSource::Trades]);
             let configs = parse_source_configs(&[selector.to_string()]).expect("parse trades");
             let error = validate_source_configs(&manifest, &configs)

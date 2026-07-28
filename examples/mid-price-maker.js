@@ -18,6 +18,7 @@ const quotes = { buy: null, sell: null }
 function place(ctx, side, price) {
   const ref = ctx.order({
     key: `mm-${side}-${latest.timestamp}-${++sequence}`,
+    symbol: "btc",
     side,
     margin: ctx.params.margin,
     leverage: ctx.params.leverage,
@@ -27,9 +28,9 @@ function place(ctx, side, price) {
 }
 
 export function onData(ctx, input, history) {
-  if (input.source !== "orderbook@bulkf") return
+  if (input.source !== "btc@orderbook@bulkf") return
 
-  const book = history.source("orderbook@bulkf", 0)
+  const book = history.source("btc@orderbook@bulkf", 0)
   const bestBid = book?.bids?.[0]?.price
   const bestAsk = book?.asks?.[0]?.price
   if (!bestBid || !bestAsk || bestBid >= bestAsk) return

@@ -5,6 +5,7 @@ use chrono::{Local, Utc};
 
 use crate::cli::{OutputFormat, ScriptJobArgs, ScriptJobsArgs, ScriptLogsArgs};
 use crate::runtime;
+use crate::scripting::inputs::parse_source_configs;
 use crate::scripting::jobs::{ScriptJob, ScriptJobStatus};
 
 pub async fn handle_list(args: ScriptJobsArgs) -> Result<()> {
@@ -82,7 +83,7 @@ fn render_jobs(jobs: &[ScriptJob], output: OutputFormat) -> Result<()> {
                     truncate(&job.definition.script_name, 22),
                     job.definition.venue.map_or("-", venue_name),
                     job.definition.providers.join(","),
-                    job.definition.symbol,
+                    job_symbols(job)?,
                 );
             }
         }
@@ -117,7 +118,7 @@ fn render_job(job: &ScriptJob, output: OutputFormat) -> Result<()> {
             );
             println!("  providers:        {}", job.definition.providers.join(","));
             println!("  exchanges:        {}", job.definition.exchanges.join(","));
-            println!("  symbol:           {}", job.definition.symbol);
+            println!("  symbols:          {}", job_symbols(job)?);
             println!(
                 "  venue:            {}",
                 job.definition.venue.map_or_else(
@@ -149,6 +150,17 @@ fn render_job(job: &ScriptJob, output: OutputFormat) -> Result<()> {
         OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
     }
     Ok(())
+}
+
+fn job_symbols(job: &ScriptJob) -> Result<String> {
+    let configs = parse_source_configs(&job.definition.sources)?;
+    let mut symbols = configs
+        .values()
+        .map(|config| config.symbol.as_str())
+        .collect::<Vec<_>>();
+    symbols.sort_unstable();
+    symbols.dedup();
+    Ok(symbols.join(","))
 }
 
 fn render_log_values(

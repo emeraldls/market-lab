@@ -43,7 +43,7 @@ where
     version: &'static str,
     provider: String,
     exchange: String,
-    symbol: String,
+    symbols: Vec<String>,
     ts_ms: u64,
     script: ScriptDescriptor,
     window: ScriptWindow,
@@ -66,7 +66,7 @@ where
     version: &'static str,
     provider: &'a str,
     exchange: &'a str,
-    symbol: &'a str,
+    symbols: &'a [String],
     ts_ms: u64,
     script: &'a ScriptDescriptor,
     summary: &'a ScriptBacktestSummary,
@@ -118,6 +118,7 @@ struct ScriptBacktestTrade {
     position_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     order_id: Option<String>,
+    symbol: String,
     side: TradeSide,
     entry: ScriptBacktestTradeLeg,
     exit: ScriptBacktestTradeLeg,
@@ -145,6 +146,7 @@ struct ScriptBacktestOpenPosition {
     id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     order_id: Option<String>,
+    symbol: String,
     side: TradeSide,
     entry_ts_ms: u64,
     entry_price: f64,
@@ -174,6 +176,7 @@ enum TradeSide {
 struct OpenTrade {
     id: String,
     order_id: Option<String>,
+    symbol: String,
     side: TradeSide,
     entry_idx: usize,
     entry_ts_ms: u64,
@@ -239,6 +242,7 @@ struct TradeEvent {
 }
 
 struct TradeEntry {
+    symbol: String,
     side: TradeSide,
     idx: usize,
     ts_ms: u64,
@@ -286,13 +290,7 @@ pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
     }
 
     let script = Script::load(&args.script)?;
-    let mut report = report_builder(
-        "script.backtest",
-        &script,
-        None,
-        None,
-        Some(args.symbol.clone()),
-    );
+    let mut report = report_builder("script.backtest", &script, None, None, None);
     let source_configs = match parse_source_configs(&args.source) {
         Ok(configs) => configs,
         Err(err) => {
@@ -349,8 +347,7 @@ async fn backtest_events(
     if events.is_empty() {
         bail!("script backtest received no source events in the requested range");
     }
-    let reference_source = resolve_reference_source(&data, &source_configs)?;
-    let reference_selector = reference_source.selector.clone();
+    let reference_sources = resolve_reference_sources(&data, &source_configs)?;
 
     let mut returns = Vec::new();
     let mut orders = 0_usize;
@@ -374,23 +371,48 @@ async fn backtest_events(
     let lookback = script.history_capacity(&resolved_params);
     let provider_label = source_provider_label(&source_configs);
     let exchange_label = source_exchange_label(&source_configs);
-    let mut latest_reference_price = None;
-    let mut latest_reference_ts = args.from;
+    let mut latest_marks = BTreeMap::<String, (u64, f64)>::new();
     eprintln!(
-        "running script={} sources={} events={} reference={} lookback={}",
+        "running script={} sources={} events={} references={} lookback={}",
         script.manifest.name,
         script.manifest.source_names(),
         events.len(),
-        reference_selector,
+        reference_sources
+            .values()
+            .map(|config| config.selector.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
         lookback
     );
     report.set_progress("executing_hooks", 0, events.len() as u64);
     write_running_report_best_effort(report);
 
+    let mut prepared_ts_ms = None;
     for (idx, event) in events.iter().enumerate() {
         if session.is_cancelled() {
             report.set_progress("cancelled", idx as u64, events.len() as u64);
             return Err(ScriptCancelled.into());
+        }
+
+        if prepared_ts_ms != Some(event.ts_ms) {
+            for (symbol, (ts_ms, price)) in reference_marks_at_timestamp(
+                &events,
+                idx,
+                &data,
+                &source_configs,
+                &reference_sources,
+            )? {
+                if let Some((_, previous_price)) = latest_marks.get(&symbol).copied() {
+                    returns.push(position_return(
+                        &simulation.open_trades,
+                        &symbol,
+                        previous_price,
+                        price,
+                    ));
+                }
+                latest_marks.insert(symbol, (ts_ms, price));
+            }
+            prepared_ts_ms = Some(event.ts_ms);
         }
 
         let config = source_configs
@@ -400,18 +422,10 @@ async fn backtest_events(
             .series
             .get(&event.selector)
             .with_context(|| format!("{} data not loaded", event.selector))?;
-        if event.selector == reference_selector
-            && let Some(price) = backtest_series_reference_price(series, event.record_idx)?
+        if reference_sources
+            .get(&config.symbol)
+            .is_some_and(|reference| reference.selector == event.selector)
         {
-            if let Some(previous_price) = latest_reference_price {
-                returns.push(position_return(
-                    &simulation.open_trades,
-                    previous_price,
-                    price,
-                ));
-            }
-            latest_reference_price = Some(price);
-            latest_reference_ts = event.ts_ms;
             apply_protective_triggers(
                 config,
                 &data,
@@ -425,7 +439,7 @@ async fn backtest_events(
                 &session,
                 idx,
                 event.ts_ms,
-                latest_reference_price,
+                &latest_marks,
                 &mut simulation,
                 report,
                 &mut latest_output,
@@ -434,13 +448,11 @@ async fn backtest_events(
         }
         let payload = build_event_payload(EventPayloadContext {
             source_configs: &source_configs,
-            symbol: &args.symbol,
             config,
             series,
             record_idx: event.record_idx,
             event_idx: idx,
-            mark_ts_ms: latest_reference_ts,
-            mark_price: latest_reference_price.unwrap_or_default(),
+            latest_marks: &latest_marks,
             open_trades: &simulation.open_trades,
         })?;
         let execution = match session.run_event(payload) {
@@ -462,7 +474,7 @@ async fn backtest_events(
             commands,
             idx,
             event.ts_ms,
-            latest_reference_price,
+            &latest_marks,
             &mut simulation,
         )?;
         peak_margin = peak_margin.max(open_position_margin(&simulation.open_trades));
@@ -480,7 +492,7 @@ async fn backtest_events(
             &session,
             idx,
             event.ts_ms,
-            latest_reference_price,
+            &latest_marks,
             &mut simulation,
             report,
             &mut latest_output,
@@ -494,12 +506,13 @@ async fn backtest_events(
         }
     }
 
-    let mark_price = latest_reference_price.context("backtest produced no reference price")?;
+    if latest_marks.is_empty() {
+        bail!("backtest produced no reference price");
+    }
     let open_positions = open_trades_to_positions(
         &simulation.open_trades,
         events.len().saturating_sub(1),
-        latest_reference_ts,
-        mark_price,
+        &latest_marks,
     );
     let summary = backtest_summary(
         orders,
@@ -513,13 +526,19 @@ async fn backtest_events(
         &open_positions,
         peak_margin,
     );
+    let symbols = source_symbols(&source_configs);
+    let latest_ts_ms = latest_marks
+        .values()
+        .map(|(ts_ms, _)| *ts_ms)
+        .max()
+        .unwrap_or(args.to);
     let result = ScriptBacktestResult {
         r#type: "script.backtest.result",
         version: "1",
         provider: provider_label,
         exchange: exchange_label,
-        symbol: args.symbol.clone(),
-        ts_ms: latest_reference_ts,
+        symbols,
+        ts_ms: latest_ts_ms,
         script: ScriptDescriptor {
             name: script.manifest.name.clone(),
             sources: script
@@ -543,7 +562,10 @@ async fn backtest_events(
         latest_output,
         meta: json!({
             "events": events.len(),
-            "reference_source": reference_selector,
+            "reference_sources": reference_sources
+                .iter()
+                .map(|(symbol, config)| (symbol.clone(), Value::String(config.selector.clone())))
+                .collect::<Map<_, _>>(),
             "source_data": {
                 "orderbook": "flat_heatmap_hd"
             }
@@ -619,6 +641,7 @@ async fn fetch_mmt_sources(
     for config in configs {
         let source = &config.source;
         let exchange = config.exchange.as_str();
+        let market_symbol = config.market_symbol();
         match source {
             ScriptSource::Trades => {
                 bail!("MMT raw trades are live-only and cannot be backtested");
@@ -631,9 +654,9 @@ async fn fetch_mmt_sources(
                 write_running_report_best_effort(report);
                 eprintln!(
                     "fetching candles exchange={} symbol={} tf={} from={} to={}",
-                    exchange, args.symbol, timeframe, args.from, args.to
+                    exchange, market_symbol, timeframe, args.from, args.to
                 );
-                let future = MmtProvider::candles(exchange, &args.symbol, tf, args.from, args.to);
+                let future = MmtProvider::candles(exchange, &market_symbol, tf, args.from, args.to);
                 let series = tokio::select! {
                     result = future => result?,
                     _ = &mut cancel => {
@@ -672,11 +695,11 @@ async fn fetch_mmt_sources(
                 write_running_report_best_effort(report);
                 eprintln!(
                     "fetching orderbooks exchange={} symbol={} tf={} from={} to={} depth={}",
-                    exchange, args.symbol, timeframe, args.from, args.to, depth
+                    exchange, market_symbol, timeframe, args.from, args.to, depth
                 );
                 let future = MmtProvider::historical_orderbooks(
                     exchange,
-                    &args.symbol,
+                    &market_symbol,
                     tf,
                     args.from,
                     args.to,
@@ -712,10 +735,10 @@ async fn fetch_mmt_sources(
                 write_running_report_best_effort(report);
                 eprintln!(
                     "fetching vd exchange={} symbol={} tf={} from={} to={} bucket={}",
-                    exchange, args.symbol, timeframe, args.from, args.to, bucket
+                    exchange, market_symbol, timeframe, args.from, args.to, bucket
                 );
                 let future =
-                    MmtProvider::vd(exchange, &args.symbol, tf, args.from, args.to, bucket);
+                    MmtProvider::vd(exchange, &market_symbol, tf, args.from, args.to, bucket);
                 let series = tokio::select! {
                     result = future => result?,
                     _ = &mut cancel => {
@@ -753,9 +776,9 @@ async fn fetch_mmt_sources(
                 write_running_report_best_effort(report);
                 eprintln!(
                     "fetching oi exchange={} symbol={} tf={} from={} to={}",
-                    exchange, args.symbol, timeframe, args.from, args.to
+                    exchange, market_symbol, timeframe, args.from, args.to
                 );
-                let future = MmtProvider::oi(exchange, &args.symbol, tf, args.from, args.to);
+                let future = MmtProvider::oi(exchange, &market_symbol, tf, args.from, args.to);
                 let series = tokio::select! {
                     result = future => result?,
                     _ = &mut cancel => {
@@ -793,9 +816,9 @@ async fn fetch_mmt_sources(
                 write_running_report_best_effort(report);
                 eprintln!(
                     "fetching volumes exchange={} symbol={} tf={} from={} to={}",
-                    exchange, args.symbol, timeframe, args.from, args.to
+                    exchange, market_symbol, timeframe, args.from, args.to
                 );
-                let future = MmtProvider::volumes(exchange, &args.symbol, tf, args.from, args.to);
+                let future = MmtProvider::volumes(exchange, &market_symbol, tf, args.from, args.to);
                 let series = tokio::select! {
                     result = future => result?,
                     _ = &mut cancel => {
@@ -845,6 +868,7 @@ async fn fetch_direct_sources(
     configs.sort_by_key(|config| config.position);
     for config in configs {
         let source = &config.source;
+        let market_symbol = config.market_symbol();
         let timeframe = config.require_timeframe(source)?;
         let provider_name = match provider {
             ProviderKind::Bulk => "BULK",
@@ -886,7 +910,7 @@ async fn fetch_direct_sources(
             "fetching {} {} symbol={} tf={} from={} to={}",
             provider_name,
             source.as_str(),
-            args.symbol,
+            market_symbol,
             timeframe,
             args.from,
             args.to
@@ -894,15 +918,15 @@ async fn fetch_direct_sources(
         let future = async {
             match provider {
                 ProviderKind::Bulk => {
-                    BulkProvider::candles(&args.symbol, interval, args.from, args.to).await
+                    BulkProvider::candles(&market_symbol, interval, args.from, args.to).await
                 }
                 ProviderKind::Hyperliquid => {
-                    HyperliquidProvider::candles(&args.symbol, interval, args.from, args.to).await
+                    HyperliquidProvider::candles(&market_symbol, interval, args.from, args.to).await
                 }
                 ProviderKind::Binance => {
                     BinanceProvider::candles_paginated(
                         BinanceMarket::Spot,
-                        &args.symbol,
+                        &market_symbol,
                         interval,
                         args.from,
                         args.to,
@@ -912,7 +936,7 @@ async fn fetch_direct_sources(
                 ProviderKind::BinanceFutures => {
                     BinanceProvider::candles_paginated(
                         BinanceMarket::Futures,
-                        &args.symbol,
+                        &market_symbol,
                         interval,
                         args.from,
                         args.to,
@@ -979,13 +1003,11 @@ async fn fetch_direct_sources(
 
 struct EventPayloadContext<'a> {
     source_configs: &'a SourceConfigs,
-    symbol: &'a str,
     config: &'a SourceConfig,
     series: &'a BacktestSeries,
     record_idx: usize,
     event_idx: usize,
-    mark_ts_ms: u64,
-    mark_price: f64,
+    latest_marks: &'a BTreeMap<String, (u64, f64)>,
     open_trades: &'a [OpenTrade],
 }
 
@@ -999,7 +1021,10 @@ fn build_event_payload(ctx: EventPayloadContext<'_>) -> Result<Value> {
         "exchange".to_string(),
         Value::String(ctx.config.exchange.clone()),
     );
-    root.insert("symbol".to_string(), Value::String(ctx.symbol.to_string()));
+    root.insert(
+        "symbol".to_string(),
+        Value::String(ctx.config.symbol.clone()),
+    );
     root.insert(
         "source".to_string(),
         Value::String(ctx.config.selector.clone()),
@@ -1016,12 +1041,7 @@ fn build_event_payload(ctx: EventPayloadContext<'_>) -> Result<Value> {
         "source_configs".to_string(),
         source_configs_payload(ctx.source_configs),
     );
-    let open_positions = open_trades_to_positions(
-        ctx.open_trades,
-        ctx.event_idx,
-        ctx.mark_ts_ms,
-        ctx.mark_price,
-    );
+    let open_positions = open_trades_to_positions(ctx.open_trades, ctx.event_idx, ctx.latest_marks);
     root.insert("positions".to_string(), json!({ "open": open_positions }));
 
     Ok(Value::Object(root))
@@ -1050,24 +1070,80 @@ fn build_event_timeline(
     Ok(events)
 }
 
-fn resolve_reference_source<'a>(
+fn resolve_reference_sources<'a>(
     data: &BacktestData,
     source_configs: &'a SourceConfigs,
-) -> Result<&'a SourceConfig> {
+) -> Result<BTreeMap<String, &'a SourceConfig>> {
     let mut configs = source_configs.values().collect::<Vec<_>>();
     configs.sort_by_key(|config| config.position);
+    let mut references = BTreeMap::new();
     for config in configs {
+        if references.contains_key(&config.symbol) {
+            continue;
+        }
         let series = data
             .series
             .get(&config.selector)
             .with_context(|| format!("{} data not loaded", config.selector))?;
         for idx in 0..backtest_series_len(series) {
             if backtest_series_reference_price(series, idx)?.is_some() {
-                return Ok(config);
+                references.insert(config.symbol.clone(), config);
+                break;
             }
         }
     }
-    bail!("script backtest requires a price-bearing source such as candles, orderbook, or volumes")
+    if references.is_empty() {
+        bail!(
+            "script backtest requires a price-bearing source such as candles, orderbook, or volumes"
+        );
+    }
+    Ok(references)
+}
+
+fn reference_marks_at_timestamp(
+    events: &[BacktestEvent],
+    start_idx: usize,
+    data: &BacktestData,
+    source_configs: &SourceConfigs,
+    reference_sources: &BTreeMap<String, &SourceConfig>,
+) -> Result<BTreeMap<String, (u64, f64)>> {
+    let event = events
+        .get(start_idx)
+        .context("reference mark start event is out of range")?;
+    let ts_ms = event.ts_ms;
+    let mut marks = BTreeMap::new();
+    for candidate in events[start_idx..]
+        .iter()
+        .take_while(|candidate| candidate.ts_ms == ts_ms)
+    {
+        let config = source_configs
+            .get(&candidate.selector)
+            .with_context(|| format!("missing source config for {}", candidate.selector))?;
+        if reference_sources
+            .get(&config.symbol)
+            .is_none_or(|reference| reference.selector != candidate.selector)
+        {
+            continue;
+        }
+        let series = data
+            .series
+            .get(&candidate.selector)
+            .with_context(|| format!("{} data not loaded", candidate.selector))?;
+        if let Some(price) = backtest_series_reference_price(series, candidate.record_idx)? {
+            marks.insert(config.symbol.clone(), (candidate.ts_ms, price));
+        }
+    }
+    Ok(marks)
+}
+
+fn source_symbols(source_configs: &SourceConfigs) -> Vec<String> {
+    let mut symbols = source_configs
+        .values()
+        .map(|config| config.symbol.clone())
+        .collect::<Vec<_>>();
+    symbols.sort();
+    symbols.dedup();
+    symbols
 }
 
 fn backtest_series_len(series: &BacktestSeries) -> usize {
@@ -1241,7 +1317,7 @@ fn apply_script_execution_commands(
     commands: Vec<ScriptExecutionCommand>,
     idx: usize,
     ts_ms: u64,
-    current_price: Option<f64>,
+    latest_marks: &BTreeMap<String, (u64, f64)>,
     simulation: &mut ScriptSimulationState,
 ) -> Result<usize> {
     let mut submitted = 0;
@@ -1250,9 +1326,14 @@ fn apply_script_execution_commands(
             ScriptExecutionCommand::Trade { order, request } => {
                 request.validate()?;
                 validate_position_transition(&request, &simulation.open_trades)?;
-                let reference_price = request.order.price.or(current_price).context(
-                    "ctx.trade requires a price-bearing source before submitting this order",
-                )?;
+                let current_price =
+                    latest_price(latest_marks, &request.symbol).with_context(|| {
+                        format!(
+                            "ctx.trade symbol `{}` requires its own price-bearing source before submitting this order",
+                            request.symbol
+                        )
+                    })?;
+                let reference_price = request.order.price.unwrap_or(current_price);
                 validate_script_protection(&request, reference_price)?;
                 submitted += usize::from(submit_simulated_script_order(
                     order,
@@ -1260,19 +1341,26 @@ fn apply_script_execution_commands(
                     "ctx.trade",
                     idx,
                     ts_ms,
-                    current_price,
+                    Some(current_price),
                     simulation,
                 )?);
             }
             ScriptExecutionCommand::Order { order, request } => {
                 request.validate()?;
+                let current_price =
+                    latest_price(latest_marks, &request.symbol).with_context(|| {
+                        format!(
+                            "ctx.order symbol `{}` requires its own price-bearing source before submitting this order",
+                            request.symbol
+                        )
+                    })?;
                 submitted += usize::from(submit_simulated_script_order(
                     order,
                     ScriptManagedRequest::Order(request),
                     "ctx.order",
                     idx,
                     ts_ms,
-                    current_price,
+                    Some(current_price),
                     simulation,
                 )?);
             }
@@ -1288,7 +1376,7 @@ fn dispatch_simulated_execution_events(
     session: &crate::scripting::engine::ScriptSession,
     idx: usize,
     ts_ms: u64,
-    current_price: Option<f64>,
+    latest_marks: &BTreeMap<String, (u64, f64)>,
     simulation: &mut ScriptSimulationState,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
     latest_output: &mut Option<ScriptBacktestLatestOutput>,
@@ -1315,7 +1403,7 @@ fn dispatch_simulated_execution_events(
             execution.commands,
             idx,
             ts_ms,
-            current_price,
+            latest_marks,
             simulation,
         )?;
         if !execution.output.is_empty() {
@@ -1326,6 +1414,12 @@ fn dispatch_simulated_execution_events(
         }
     }
     Ok(submitted)
+}
+
+fn latest_price(latest_marks: &BTreeMap<String, (u64, f64)>, symbol: &str) -> Option<f64> {
+    latest_marks
+        .get(&symbol.to_ascii_lowercase())
+        .map(|(_, price)| *price)
 }
 
 fn submit_simulated_script_order(
@@ -1448,6 +1542,7 @@ fn queue_simulated_order_event(
         "type": event_type,
         "orderId": order.order.id,
         "key": order.order.key,
+        "symbol": order.request.symbol(),
         "venue": "bulkf",
         "status": status,
         "terminal": terminal,
@@ -1472,6 +1567,7 @@ fn fill_pending_script_orders(
         order.status == SimulatedOrderStatus::Pending
             && order.submitted_idx < event_idx
             && order.request.order().kind == ScriptOrderKind::Limit
+            && order.request.symbol().eq_ignore_ascii_case(&config.symbol)
     }) {
         let price = order
             .request
@@ -1617,6 +1713,7 @@ fn fill_simulated_trade(
         let opened = open_trade_from_entry(
             &mut simulation.next_position_id,
             TradeEntry {
+                symbol: request.symbol.to_ascii_lowercase(),
                 side,
                 idx,
                 ts_ms,
@@ -1631,7 +1728,11 @@ fn fill_simulated_trade(
             },
         );
         let filled_qty = opened.qty;
-        if let Some(existing) = simulation.open_trades.first_mut() {
+        if let Some(existing) = simulation
+            .open_trades
+            .iter_mut()
+            .find(|open| open.symbol.eq_ignore_ascii_case(&request.symbol))
+        {
             add_to_open_position(existing, opened);
         } else {
             simulation.open_trades.push(opened);
@@ -1642,7 +1743,7 @@ fn fill_simulated_trade(
         let open_index = simulation
             .open_trades
             .iter()
-            .position(|open| open.side == side)
+            .position(|open| open.side == side && open.symbol.eq_ignore_ascii_case(&request.symbol))
             .context("matching simulated position disappeared before the close filled")?;
         let close_qty = request
             .size
@@ -1679,7 +1780,11 @@ fn fill_simulated_raw_order(
         .or_else(|| request.size.map(|size| size * price))
         .context("ctx.order simulation could not determine order notional")?;
     let quantity = notional / price;
-    let existing = simulation.open_trades.first().map(|open| open.side);
+    let existing_index = simulation
+        .open_trades
+        .iter()
+        .position(|open| open.symbol.eq_ignore_ascii_case(&request.symbol));
+    let existing = existing_index.map(|index| simulation.open_trades[index].side);
 
     if (existing.is_none() || existing == Some(side)) && request.reduce_only {
         return Ok(SimulatedFillOutcome::Cancelled);
@@ -1693,9 +1798,10 @@ fn fill_simulated_raw_order(
     };
     let mut remaining = quantity;
     if existing.is_some_and(|existing_side| existing_side != side) {
-        let closing = remaining.min(simulation.open_trades[0].qty);
+        let open_index = existing_index.expect("matching open position index");
+        let closing = remaining.min(simulation.open_trades[open_index].qty);
         close_position_quantity(
-            0,
+            open_index,
             closing,
             &mut simulation.open_trades,
             &mut simulation.closed_trades,
@@ -1711,6 +1817,7 @@ fn fill_simulated_raw_order(
         let opened = open_trade_from_entry(
             &mut simulation.next_position_id,
             TradeEntry {
+                symbol: request.symbol.to_ascii_lowercase(),
                 side,
                 idx,
                 ts_ms,
@@ -1724,7 +1831,11 @@ fn fill_simulated_raw_order(
                 take_profit_price: None,
             },
         );
-        if let Some(existing) = simulation.open_trades.first_mut() {
+        if let Some(existing) = simulation
+            .open_trades
+            .iter_mut()
+            .find(|open| open.symbol.eq_ignore_ascii_case(&request.symbol))
+        {
             add_to_open_position(existing, opened);
         } else {
             simulation.open_trades.push(opened);
@@ -1738,7 +1849,10 @@ fn validate_position_transition(
     open_trades: &[OpenTrade],
 ) -> Result<()> {
     let target = trade_side(request.position.position_direction());
-    let Some(open) = open_trades.first() else {
+    let Some(open) = open_trades
+        .iter()
+        .find(|open| open.symbol.eq_ignore_ascii_case(&request.symbol))
+    else {
         if request.position.is_close() {
             bail!(
                 "ctx.trade {} requires an open {} position",
@@ -1779,6 +1893,7 @@ fn trade_side(direction: crate::domain::execution::PositionDirection) -> TradeSi
 
 fn add_to_open_position(existing: &mut OpenTrade, added: OpenTrade) {
     debug_assert_eq!(existing.side, added.side);
+    debug_assert_eq!(existing.symbol, added.symbol);
     let qty = existing.qty + added.qty;
     if qty > f64::EPSILON {
         existing.entry_price =
@@ -1868,6 +1983,13 @@ fn apply_protective_triggers(
     let ts_ms = backtest_series_event_ts_ms(series, record_idx, config)?;
     let mut open_index = 0;
     while open_index < open_trades.len() {
+        if !open_trades[open_index]
+            .symbol
+            .eq_ignore_ascii_case(&config.symbol)
+        {
+            open_index += 1;
+            continue;
+        }
         let trigger = protective_trigger(
             config,
             data,
@@ -1950,6 +2072,7 @@ fn open_trade_from_entry(next_position_id: &mut usize, entry: TradeEntry) -> Ope
     OpenTrade {
         id,
         order_id: entry.order_id,
+        symbol: entry.symbol,
         side: entry.side,
         entry_idx: entry.idx,
         entry_ts_ms: entry.ts_ms,
@@ -1984,6 +2107,7 @@ fn close_open_trade(
         id: format_trade_id(closed_trades.len() + 1),
         position_id: open.id,
         order_id: open.order_id,
+        symbol: open.symbol,
         side: open.side,
         entry: ScriptBacktestTradeLeg {
             ts_ms: open.entry_ts_ms,
@@ -2015,15 +2139,20 @@ fn trade_pnl(side: TradeSide, entry_price: f64, exit_price: f64, qty: f64) -> f6
     }
 }
 
-fn position_return(open_trades: &[OpenTrade], curr: f64, next: f64) -> f64 {
+fn position_return(open_trades: &[OpenTrade], symbol: &str, curr: f64, next: f64) -> f64 {
     if open_trades.is_empty() {
         return 0.0;
     }
     let pnl = open_trades
         .iter()
+        .filter(|open| open.symbol.eq_ignore_ascii_case(symbol))
         .map(|open| trade_pnl(open.side, curr, next, open.qty))
         .sum::<f64>();
-    let margin = open_trades.iter().map(|open| open.margin).sum::<f64>();
+    let margin = open_trades
+        .iter()
+        .filter(|open| open.symbol.eq_ignore_ascii_case(symbol))
+        .map(|open| open.margin)
+        .sum::<f64>();
     if margin.abs() > f64::EPSILON {
         pnl / margin
     } else {
@@ -2034,28 +2163,31 @@ fn position_return(open_trades: &[OpenTrade], curr: f64, next: f64) -> f64 {
 fn open_trades_to_positions(
     open_trades: &[OpenTrade],
     mark_idx: usize,
-    mark_ts_ms: u64,
-    mark_price: f64,
+    latest_marks: &BTreeMap<String, (u64, f64)>,
 ) -> Vec<ScriptBacktestOpenPosition> {
     open_trades
         .iter()
-        .map(|open| ScriptBacktestOpenPosition {
-            id: open.id.clone(),
-            order_id: open.order_id.clone(),
-            side: open.side,
-            entry_ts_ms: open.entry_ts_ms,
-            entry_price: open.entry_price,
-            mark_ts_ms,
-            mark_price,
-            notional: open.notional,
-            margin: open.margin,
-            leverage: open.leverage,
-            qty: open.qty,
-            stop_loss_price: open.stop_loss_price,
-            take_profit_price: open.take_profit_price,
-            unrealized_pnl: trade_pnl(open.side, open.entry_price, mark_price, open.qty),
-            events_held: mark_idx.saturating_sub(open.entry_idx),
-            reason: "backtest ended before exit signal".to_string(),
+        .filter_map(|open| {
+            let (mark_ts_ms, mark_price) = latest_marks.get(&open.symbol).copied()?;
+            Some(ScriptBacktestOpenPosition {
+                id: open.id.clone(),
+                order_id: open.order_id.clone(),
+                symbol: open.symbol.clone(),
+                side: open.side,
+                entry_ts_ms: open.entry_ts_ms,
+                entry_price: open.entry_price,
+                mark_ts_ms,
+                mark_price,
+                notional: open.notional,
+                margin: open.margin,
+                leverage: open.leverage,
+                qty: open.qty,
+                stop_loss_price: open.stop_loss_price,
+                take_profit_price: open.take_profit_price,
+                unrealized_pnl: trade_pnl(open.side, open.entry_price, mark_price, open.qty),
+                events_held: mark_idx.saturating_sub(open.entry_idx),
+                reason: "backtest ended before exit signal".to_string(),
+            })
         })
         .collect()
 }
@@ -2184,8 +2316,11 @@ fn render_backtest(
             println!("script backtest");
             println!("---------------");
             println!(
-                "market: {}:{} [{}-{}]",
-                result.exchange, result.symbol, result.window.from, result.window.to
+                "markets: {}:{} [{}-{}]",
+                result.exchange,
+                result.symbols.join(","),
+                result.window.from,
+                result.window.to
             );
             println!("script: {}", result.script.name);
             println!();
@@ -2228,8 +2363,9 @@ fn render_backtest(
                 };
                 for trade in result.closed_trades.iter().take(shown) {
                     println!(
-                        "  {} pos={} {} entry={} exit={} notional={} margin={} pnl={} events={} reason={}",
+                        "  {} {} pos={} {} entry={} exit={} notional={} margin={} pnl={} events={} reason={}",
                         trade.id,
+                        trade.symbol,
                         trade.position_id,
                         format_side(trade.side),
                         format_price(trade.entry.price),
@@ -2253,8 +2389,9 @@ fn render_backtest(
                 println!("open positions");
                 for open in &result.open_positions {
                     println!(
-                        "  {} {} entry={} mark={} notional={} margin={} unrealized={} events={}",
+                        "  {} {} {} entry={} mark={} notional={} margin={} unrealized={} events={}",
                         open.id,
+                        open.symbol,
                         format_side(open.side),
                         format_price(open.entry_price),
                         format_price(open.mark_price),
@@ -2299,7 +2436,7 @@ where
             version: result.version,
             provider: &result.provider,
             exchange: &result.exchange,
-            symbol: &result.symbol,
+            symbols: &result.symbols,
             ts_ms: result.ts_ms,
             script: &result.script,
             summary: &result.summary,
@@ -2405,7 +2542,8 @@ mod tests {
 
     fn candle_source() -> SourceConfig {
         SourceConfig {
-            selector: "candles@binancef@mmt".to_string(),
+            selector: "btc@candles@binancef@mmt".to_string(),
+            symbol: "btc".to_string(),
             source: ScriptSource::Candles,
             provider: ProviderKind::Mmt,
             exchange: "binancef".to_string(),
@@ -2419,7 +2557,7 @@ mod tests {
     fn candle_data(candles: Vec<ScriptCandle>) -> BacktestData {
         BacktestData {
             series: BTreeMap::from([(
-                "candles@binancef@mmt".to_string(),
+                "btc@candles@binancef@mmt".to_string(),
                 BacktestSeries::Candles(candles),
             )]),
         }
@@ -2442,7 +2580,12 @@ mod tests {
         }
     }
 
-    fn script_trade(value: Value) -> ScriptExecutionCommand {
+    fn script_trade(mut value: Value) -> ScriptExecutionCommand {
+        value
+            .as_object_mut()
+            .expect("script trade request object")
+            .entry("symbol")
+            .or_insert_with(|| Value::String("btc".to_string()));
         let request: ScriptTradeRequest =
             serde_json::from_value(value).expect("valid script trade request");
         let order = ScriptOrderRef {
@@ -2452,7 +2595,12 @@ mod tests {
         ScriptExecutionCommand::Trade { order, request }
     }
 
-    fn script_order(value: Value) -> ScriptExecutionCommand {
+    fn script_order(mut value: Value) -> ScriptExecutionCommand {
+        value
+            .as_object_mut()
+            .expect("raw script order request object")
+            .entry("symbol")
+            .or_insert_with(|| Value::String("btc".to_string()));
         let request: ScriptRawOrderRequest =
             serde_json::from_value(value).expect("valid raw script order request");
         let order = ScriptOrderRef {
@@ -2462,52 +2610,56 @@ mod tests {
         ScriptExecutionCommand::Order { order, request }
     }
 
+    fn marks(price: f64) -> BTreeMap<String, (u64, f64)> {
+        BTreeMap::from([("btc".to_string(), (1_780_000_000_000, price))])
+    }
+
     #[test]
     fn event_payload_matches_live_source_metadata() {
         let configs = parse_source_configs(&[
-            "candles@binancef@mmt:timeframe=60".to_string(),
-            "candles@okx@mmt:timeframe=60".to_string(),
+            "btc@candles@binancef@mmt:timeframe=60".to_string(),
+            "btc@candles@okx@mmt:timeframe=60".to_string(),
         ])
         .expect("parse source configs");
-        let config = &configs["candles@binancef@mmt"];
+        let config = &configs["btc@candles@binancef@mmt"];
         let data = BacktestData {
             series: BTreeMap::from([
                 (
-                    "candles@binancef@mmt".to_string(),
+                    "btc@candles@binancef@mmt".to_string(),
                     BacktestSeries::Candles(vec![candle(0, 10.0, 10.0, 10.0, 10.0)]),
                 ),
                 (
-                    "candles@okx@mmt".to_string(),
+                    "btc@candles@okx@mmt".to_string(),
                     BacktestSeries::Candles(vec![candle(0, 20.0, 20.0, 20.0, 20.0)]),
                 ),
             ]),
         };
 
-        let series = &data.series["candles@binancef@mmt"];
+        let series = &data.series["btc@candles@binancef@mmt"];
+        let latest_marks = marks(10.0);
         let payload = build_event_payload(EventPayloadContext {
             source_configs: &configs,
-            symbol: "BTC/USDT",
             config,
             series,
             record_idx: 0,
             event_idx: 0,
-            mark_ts_ms: backtest_series_event_ts_ms(series, 0, config).unwrap(),
-            mark_price: backtest_series_reference_price(series, 0).unwrap().unwrap(),
+            latest_marks: &latest_marks,
             open_trades: &[],
         })
         .expect("build event payload");
 
-        assert_eq!(payload["source"], "candles@binancef@mmt");
+        assert_eq!(payload["symbol"], "btc");
+        assert_eq!(payload["source"], "btc@candles@binancef@mmt");
         assert_eq!(payload["source_type"], "candles");
         assert_eq!(payload["exchange"], "binancef");
         assert_eq!(payload["provider"], "mmt");
         assert_eq!(payload["data"]["candle"]["c"], 10.0);
         assert_eq!(
-            payload["source_configs"]["candles@binancef@mmt"]["exchange"],
+            payload["source_configs"]["btc@candles@binancef@mmt"]["exchange"],
             "binancef"
         );
         assert_eq!(
-            payload["source_configs"]["candles@okx@mmt"]["exchange"],
+            payload["source_configs"]["btc@candles@okx@mmt"]["exchange"],
             "okx"
         );
         assert!(payload.get("sources").is_none());
@@ -2517,14 +2669,14 @@ mod tests {
     #[test]
     fn reference_source_skips_non_price_series() {
         let configs = parse_source_configs(&[
-            "oi@binancef@mmt:timeframe=60".to_string(),
-            "candles@binancef@mmt:timeframe=60".to_string(),
+            "btc@oi@binancef@mmt:timeframe=60".to_string(),
+            "btc@candles@binancef@mmt:timeframe=60".to_string(),
         ])
         .expect("parse source configs");
         let data = BacktestData {
             series: BTreeMap::from([
                 (
-                    "oi@binancef@mmt".to_string(),
+                    "btc@oi@binancef@mmt".to_string(),
                     BacktestSeries::Oi(vec![ScriptOpenInterest {
                         t: candle(0, 0.0, 0.0, 0.0, 0.0).t,
                         value: 1_000.0,
@@ -2538,18 +2690,49 @@ mod tests {
                     }]),
                 ),
                 (
-                    "candles@binancef@mmt".to_string(),
+                    "btc@candles@binancef@mmt".to_string(),
                     BacktestSeries::Candles(vec![candle(0, 10.0, 10.0, 10.0, 10.0)]),
                 ),
             ]),
         };
 
         assert_eq!(
-            resolve_reference_source(&data, &configs)
-                .expect("resolve reference source")
+            resolve_reference_sources(&data, &configs).expect("resolve reference sources")["btc"]
                 .selector,
-            "candles@binancef@mmt"
+            "btc@candles@binancef@mmt"
         );
+    }
+
+    #[test]
+    fn timestamp_marks_include_every_symbol_before_the_first_hook_runs() {
+        let configs = parse_source_configs(&[
+            "btc@candles@binancef@mmt:timeframe=60".to_string(),
+            "zec@candles@binancef@mmt:timeframe=60".to_string(),
+        ])
+        .expect("parse multi-symbol configs");
+        let data = BacktestData {
+            series: BTreeMap::from([
+                (
+                    "btc@candles@binancef@mmt".to_string(),
+                    BacktestSeries::Candles(vec![candle(0, 100.0, 101.0, 99.0, 100.0)]),
+                ),
+                (
+                    "zec@candles@binancef@mmt".to_string(),
+                    BacktestSeries::Candles(vec![candle(0, 50.0, 51.0, 49.0, 50.0)]),
+                ),
+            ]),
+        };
+        let events = build_event_timeline(&data, &configs).expect("build timeline");
+        let references =
+            resolve_reference_sources(&data, &configs).expect("resolve reference sources");
+
+        let timestamp_marks =
+            reference_marks_at_timestamp(&events, 0, &data, &configs, &references)
+                .expect("prepare timestamp marks");
+
+        assert_eq!(events[0].selector, "btc@candles@binancef@mmt");
+        assert_eq!(timestamp_marks["btc"].1, 100.0);
+        assert_eq!(timestamp_marks["zec"].1, 50.0);
     }
 
     #[test]
@@ -2568,14 +2751,14 @@ export const script = {
 };
 
 export function onData(ctx, input, history) {
-  const binance = history.source("candles@binancef@mmt");
-  const okx = history.source("candles@okx@mmt");
+  const binance = history.source("btc@candles@binancef@mmt");
+  const okx = history.source("btc@candles@okx@mmt");
   return {
     metrics: {
       binance: binance.map((candle) => candle.c),
       okx: okx.map((candle) => candle.c),
-      current: history.source("candles@binancef@mmt", 0)?.c ?? null,
-      previous: history.source("candles@binancef@mmt", 1)?.c ?? null,
+      current: history.source("btc@candles@binancef@mmt", 0)?.c ?? null,
+      previous: history.source("btc@candles@binancef@mmt", 1)?.c ?? null,
       trigger: input.source,
       has_legacy_input: input.candles !== undefined || input.sources !== undefined
     }
@@ -2587,21 +2770,21 @@ export function onData(ctx, input, history) {
 
         let script = Script::load(&path).expect("load history script");
         let configs = parse_source_configs(&[
-            "candles@binancef@mmt:timeframe=60".to_string(),
-            "candles@okx@mmt:timeframe=60".to_string(),
+            "btc@candles@binancef@mmt:timeframe=60".to_string(),
+            "btc@candles@okx@mmt:timeframe=60".to_string(),
         ])
         .expect("parse source configs");
         let data = BacktestData {
             series: BTreeMap::from([
                 (
-                    "candles@binancef@mmt".to_string(),
+                    "btc@candles@binancef@mmt".to_string(),
                     BacktestSeries::Candles(vec![
                         candle(0, 10.0, 10.0, 10.0, 10.0),
                         candle(1, 11.0, 11.0, 11.0, 11.0),
                     ]),
                 ),
                 (
-                    "candles@okx@mmt".to_string(),
+                    "btc@candles@okx@mmt".to_string(),
                     BacktestSeries::Candles(vec![
                         candle(0, 20.0, 20.0, 20.0, 20.0),
                         candle(1, 21.0, 21.0, 21.0, 21.0),
@@ -2617,28 +2800,29 @@ export function onData(ctx, input, history) {
                 .map(|event| event.selector.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "candles@binancef@mmt",
-                "candles@okx@mmt",
-                "candles@binancef@mmt",
-                "candles@okx@mmt",
+                "btc@candles@binancef@mmt",
+                "btc@candles@okx@mmt",
+                "btc@candles@binancef@mmt",
+                "btc@candles@okx@mmt",
             ]
         );
         assert_eq!(events[0].ts_ms, candle(0, 0.0, 0.0, 0.0, 0.0).t + 60_000);
         let mut outputs = Vec::new();
+        let mut latest_marks = BTreeMap::new();
         for (event_idx, event) in events.iter().enumerate() {
             let config = &configs[&event.selector];
             let series = &data.series[&event.selector];
+            if let Some(price) = backtest_series_reference_price(series, event.record_idx).unwrap()
+            {
+                latest_marks.insert(config.symbol.clone(), (event.ts_ms, price));
+            }
             let payload = build_event_payload(EventPayloadContext {
                 source_configs: &configs,
-                symbol: "BTC/USDT",
                 config,
                 series,
                 record_idx: event.record_idx,
                 event_idx,
-                mark_ts_ms: event.ts_ms,
-                mark_price: backtest_series_reference_price(series, event.record_idx)
-                    .unwrap()
-                    .unwrap(),
+                latest_marks: &latest_marks,
                 open_trades: &[],
             })
             .expect("build event payload");
@@ -2655,12 +2839,12 @@ export function onData(ctx, input, history) {
         assert_eq!(first["binance"], json!([10]));
         assert_eq!(first["okx"], json!([]));
         assert!(first["previous"].is_null());
-        assert_eq!(first["trigger"], "candles@binancef@mmt");
+        assert_eq!(first["trigger"], "btc@candles@binancef@mmt");
 
         let second = &outputs[1];
         assert_eq!(second["binance"], json!([10]));
         assert_eq!(second["okx"], json!([20]));
-        assert_eq!(second["trigger"], "candles@okx@mmt");
+        assert_eq!(second["trigger"], "btc@candles@okx@mmt");
 
         let last = outputs.last().unwrap();
         assert_eq!(last["binance"], json!([10, 11]));
@@ -2690,7 +2874,7 @@ export function onData(ctx, input, history) {
             }))],
             0,
             candle_ts_ms(&candle(0, 100.0, 105.0, 85.0, 100.0)),
-            Some(100.0),
+            &marks(100.0),
             &mut simulation,
         )
         .expect("queue limit order");
@@ -2728,7 +2912,7 @@ export function onData(ctx, input, history) {
             }))],
             0,
             candle_ts_ms(&candle(0, 100.0, 105.0, 95.0, 100.0)),
-            Some(100.0),
+            &marks(100.0),
             &mut simulation,
         )
         .expect("fill market order");
@@ -2764,7 +2948,7 @@ export function onData(ctx, input, history) {
             }))],
             0,
             1_000,
-            Some(100.0),
+            &marks(100.0),
             &mut simulation,
         )
         .expect("open long");
@@ -2777,7 +2961,7 @@ export function onData(ctx, input, history) {
             }))],
             1,
             2_000,
-            Some(110.0),
+            &marks(110.0),
             &mut simulation,
         )
         .expect("close long");
@@ -2786,6 +2970,106 @@ export function onData(ctx, input, history) {
         assert_eq!(simulation.closed_trades.len(), 1);
         assert_eq!(simulation.closed_trades[0].qty, 2.0);
         assert_eq!(simulation.closed_trades[0].net_pnl, 20.0);
+    }
+
+    #[test]
+    fn multi_symbol_orders_use_only_their_own_marks_and_positions() {
+        let mut simulation = ScriptSimulationState::default();
+        let initial_marks = BTreeMap::from([
+            ("btc".to_string(), (1_000, 100.0)),
+            ("zec".to_string(), (1_000, 50.0)),
+        ]);
+
+        apply_script_execution_commands(
+            vec![script_trade(json!({
+                "key": "open-zec",
+                "symbol": "zec",
+                "position": "open-long",
+                "size": 2
+            }))],
+            0,
+            1_000,
+            &initial_marks,
+            &mut simulation,
+        )
+        .expect("open ZEC using the ZEC mark");
+        apply_script_execution_commands(
+            vec![script_trade(json!({
+                "key": "open-btc",
+                "symbol": "btc",
+                "position": "open-long",
+                "size": 1
+            }))],
+            1,
+            1_000,
+            &initial_marks,
+            &mut simulation,
+        )
+        .expect("open BTC using the BTC mark");
+
+        assert_eq!(simulation.open_trades.len(), 2);
+        let zec = simulation
+            .open_trades
+            .iter()
+            .find(|position| position.symbol == "zec")
+            .expect("ZEC position");
+        let btc = simulation
+            .open_trades
+            .iter()
+            .find(|position| position.symbol == "btc")
+            .expect("BTC position");
+        assert_eq!(zec.entry_price, 50.0);
+        assert_eq!(btc.entry_price, 100.0);
+
+        let exit_marks = BTreeMap::from([
+            ("btc".to_string(), (2_000, 200.0)),
+            ("zec".to_string(), (2_000, 55.0)),
+        ]);
+        apply_script_execution_commands(
+            vec![script_trade(json!({
+                "key": "close-zec",
+                "symbol": "zec",
+                "position": "close-long"
+            }))],
+            2,
+            2_000,
+            &exit_marks,
+            &mut simulation,
+        )
+        .expect("close only ZEC using the ZEC mark");
+
+        assert_eq!(simulation.open_trades.len(), 1);
+        assert_eq!(simulation.open_trades[0].symbol, "btc");
+        assert_eq!(simulation.closed_trades.len(), 1);
+        assert_eq!(simulation.closed_trades[0].symbol, "zec");
+        assert_eq!(simulation.closed_trades[0].exit.price, 55.0);
+        assert_eq!(simulation.closed_trades[0].net_pnl, 10.0);
+    }
+
+    #[test]
+    fn backtest_rejects_an_order_without_its_own_price_source() {
+        let mut simulation = ScriptSimulationState::default();
+
+        let error = apply_script_execution_commands(
+            vec![script_order(json!({
+                "key": "unknown-zec",
+                "symbol": "zec",
+                "side": "buy",
+                "size": 1,
+                "order": { "type": "limit", "price": 50 }
+            }))],
+            0,
+            1_000,
+            &marks(100.0),
+            &mut simulation,
+        )
+        .expect_err("explicit limit prices must not bypass symbol routing");
+
+        assert!(
+            error
+                .to_string()
+                .contains("symbol `zec` requires its own price-bearing source")
+        );
     }
 
     #[test]
@@ -2800,7 +3084,7 @@ export function onData(ctx, input, history) {
             }))],
             0,
             1_000,
-            Some(100.0),
+            &marks(100.0),
             &mut simulation,
         )
         .expect("open long");
@@ -2813,7 +3097,7 @@ export function onData(ctx, input, history) {
             }))],
             1,
             2_000,
-            Some(99.0),
+            &marks(99.0),
             &mut simulation,
         )
         .expect_err("opposite open must fail");
@@ -2833,7 +3117,7 @@ export function onData(ctx, input, history) {
             }))],
             0,
             1_000,
-            Some(100.0),
+            &marks(100.0),
             &mut simulation,
         )
         .expect("raw buy fills");
@@ -2849,7 +3133,7 @@ export function onData(ctx, input, history) {
             }))],
             1,
             2_000,
-            Some(110.0),
+            &marks(110.0),
             &mut simulation,
         )
         .expect("raw sell closes and flips");
@@ -2874,7 +3158,7 @@ export function onData(ctx, input, history) {
             }))],
             0,
             1_000,
-            Some(100.0),
+            &marks(100.0),
             &mut simulation,
         )
         .expect("raw buy fills");
@@ -2888,7 +3172,7 @@ export function onData(ctx, input, history) {
             }))],
             1,
             2_000,
-            Some(110.0),
+            &marks(110.0),
             &mut simulation,
         )
         .expect("reduce-only sell fills only the open long");
@@ -2919,7 +3203,7 @@ export function onData() {}
 
 export function onExecution(ctx, event) {
   if (event.type === "order.filled" && event.key === "raw-buy") {
-    ctx.order({ key: "raw-sell", side: "sell", size: 1 });
+    ctx.order({ key: "raw-sell", symbol: "btc", side: "sell", size: 1 });
   }
   return { metrics: { last_event: event.type } };
 }
@@ -2945,7 +3229,7 @@ export function onExecution(ctx, event) {
             }))],
             0,
             1_000,
-            Some(100.0),
+            &marks(100.0),
             &mut simulation,
         )
         .expect("initial raw order fills");
@@ -2966,7 +3250,7 @@ export function onExecution(ctx, event) {
             &session,
             0,
             1_000,
-            Some(100.0),
+            &marks(100.0),
             &mut simulation,
             &mut report,
             &mut latest_output,

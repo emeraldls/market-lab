@@ -227,7 +227,7 @@ impl ScriptSession {
             .context("test candle window must be an array")?;
         for candle in candles {
             self.record_source(
-                "candles@binancef@mmt",
+                "btc@candles@binancef@mmt",
                 candle.clone(),
                 candle.get("t").and_then(JsonValue::as_u64),
             )?;
@@ -241,28 +241,13 @@ impl ScriptSession {
             .as_array()
             .context("test orderbook window must be an array")?;
         for book in books {
-            self.record_source("orderbook@binancef@mmt", book.clone(), None)?;
+            self.record_source("btc@orderbook@binancef@mmt", book.clone(), None)?;
         }
         self.run_on_data(serde_json::json!({}))
     }
 
     pub fn run_event(&self, mut payload: JsonValue) -> Result<ScriptExecution> {
-        let source_type = payload
-            .get("source_type")
-            .and_then(JsonValue::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                payload
-                    .get("source")
-                    .and_then(JsonValue::as_str)
-                    .and_then(|selector| selector.split_once('@').map(|(source, _)| source))
-                    .unwrap_or_default()
-                    .to_string()
-            });
         let (source, record, identity) = event_history_entry(&payload)?;
-        if source_type == "trades" && source != "trades" {
-            self.record_source("trades", record.clone(), identity)?;
-        }
         self.record_source(&source, record, identity)?;
         strip_source_data(&mut payload);
         self.run_on_data(payload)
@@ -486,11 +471,7 @@ fn event_history_entry(input: &JsonValue) -> Result<(String, JsonValue, Option<u
     let source = input
         .get("source_type")
         .and_then(JsonValue::as_str)
-        .unwrap_or_else(|| {
-            selector
-                .split_once('@')
-                .map_or(selector, |(source, _)| source)
-        });
+        .unwrap_or_else(|| selector.split('@').nth(1).unwrap_or(selector));
     let current = input.get("data");
     let record = match source {
         "candles" => current.and_then(|value| value.get("candle")),
@@ -621,7 +602,7 @@ export const script = {
 };
 
 export function onData(ctx, input, history) {
-  return { metrics: { count: history.source("candles@binancef@mmt").length, threshold: ctx.params.min_vbuy } };
+  return { metrics: { count: history.source("btc@candles@binancef@mmt").length, threshold: ctx.params.min_vbuy } };
 }
 "#,
             "manifest",
@@ -644,7 +625,7 @@ export const study = {
 };
 
 export function onData(ctx, input, history) {
-  return { metrics: { candles: history.source("candles@binancef@mmt").length } };
+  return { metrics: { candles: history.source("btc@candles@binancef@mmt").length } };
 }
 "#,
             "legacy-study",
@@ -675,7 +656,7 @@ export const script = {
 };
 
 export function onData(ctx, input, history) {
-  const candles = history.source("candles@binancef@mmt");
+  const candles = history.source("btc@candles@binancef@mmt");
   const filtered = candles.filter((c) => c.vb >= ctx.params.min_vbuy);
   return {
     metrics: {
@@ -715,7 +696,7 @@ export const script = {
 };
 
 export function onData(ctx, input, history) {
-  const candles = history.source("candles@binancef@mmt");
+  const candles = history.source("btc@candles@binancef@mmt");
   const sma = ctx.study.sma(candles, { field: "c", window: 3 });
   const ema = ctx.study.ema(candles, { field: "c", window: 3 });
   return {
@@ -758,8 +739,8 @@ export const script = {
 };
 
 export function onData(ctx, input, history) {
-  const candles = history.source("vd@hyperliquidf@mmt");
-  const bucket = input.source_configs["vd@hyperliquidf@mmt"].bucket;
+  const candles = history.source("btc@vd@hyperliquidf@mmt");
+  const bucket = input.source_configs["btc@vd@hyperliquidf@mmt"].bucket;
   const cvd = ctx.study.cvd(candles, { bucket });
   const single = ctx.study.cvd(candles[candles.length - 1], { bucket });
   return {
@@ -787,7 +768,7 @@ export function onData(ctx, input, history) {
         for candle in vd.as_array().unwrap() {
             session
                 .record_source(
-                    "vd@hyperliquidf@mmt",
+                    "btc@vd@hyperliquidf@mmt",
                     candle.clone(),
                     candle.get("t").and_then(serde_json::Value::as_u64),
                 )
@@ -796,7 +777,7 @@ export function onData(ctx, input, history) {
         let execution = session
             .run_on_data(json!({
                 "source_configs": {
-                    "vd@hyperliquidf@mmt": {
+                    "btc@vd@hyperliquidf@mmt": {
                         "type": "vd",
                         "exchange": "hyperliquidf",
                         "bucket": 7,
@@ -828,7 +809,7 @@ export const script = {
 
 export function onData(ctx, input, history) {
   return {
-    metrics: ctx.study.cvd(history.source("candles@binancef@mmt"), { bucket: 1 })
+    metrics: ctx.study.cvd(history.source("btc@candles@binancef@mmt"), { bucket: 1 })
   };
 }
 "#,
@@ -859,7 +840,7 @@ export const script = {
 };
 
 export function onData(ctx, input, history) {
-  return { metrics: ctx.study.sma(history.source("candles@binancef@mmt"), { field: "missing", window: 2 }) };
+  return { metrics: ctx.study.sma(history.source("btc@candles@binancef@mmt"), { field: "missing", window: 2 }) };
 }
 "#,
             "bad-helper",
@@ -889,7 +870,7 @@ export const script = {
 };
 
 export function onData(ctx, input, history) {
-  const book = history.source("orderbook@binancef@mmt", 0);
+  const book = history.source("btc@orderbook@binancef@mmt", 0);
   const spread = ctx.study.spread(book);
   const depth = ctx.study.depth(book, { levels: 2 });
   const imbalance = ctx.study.imbalance(book, { depth: 2 });
@@ -958,8 +939,8 @@ export const script = {
 };
 
 export function onData(ctx, input, history) {
-  const books = history.source("orderbook@binancef@mmt");
-  const latest = history.source("orderbook@binancef@mmt", 0);
+  const books = history.source("btc@orderbook@binancef@mmt");
+  const latest = history.source("btc@orderbook@binancef@mmt", 0);
   const spread = ctx.study.spread(latest);
   return {
     metrics: {
@@ -1015,8 +996,8 @@ export const script = {
 };
 
 export function onData(ctx, input, history) {
-  const candles = history.source("vd@hyperliquidf@mmt");
-  const latest = history.source("vd@hyperliquidf@mmt", 0);
+  const candles = history.source("btc@vd@hyperliquidf@mmt");
+  const latest = history.source("btc@vd@hyperliquidf@mmt", 0);
   return {
     metrics: {
       candles: candles.length,
@@ -1038,7 +1019,7 @@ export function onData(ctx, input, history) {
         for candle in candles.as_array().unwrap() {
             session
                 .record_source(
-                    "vd@hyperliquidf@mmt",
+                    "btc@vd@hyperliquidf@mmt",
                     candle.clone(),
                     candle.get("t").and_then(serde_json::Value::as_u64),
                 )
@@ -1070,7 +1051,7 @@ export function onData(ctx, input, history) {
   return {
     metrics: {
       calls,
-      candles: history.source("candles@binancef@mmt").length
+      candles: history.source("btc@candles@binancef@mmt").length
     }
   };
 }
@@ -1111,7 +1092,7 @@ export function onData(ctx, input, history) {
   return {
     metrics: {
       calls,
-      close: history.source("candles@binancef@mmt", 0).c,
+      close: history.source("btc@candles@binancef@mmt", 0).c,
       source_data_removed: input.data === undefined && input.candles === undefined
     }
   };
@@ -1124,7 +1105,7 @@ export function onData(ctx, input, history) {
         let session = script.start_session(&json!({})).expect("start session");
         let first = session
             .run_event(json!({
-                "source": "candles@binancef@mmt",
+                "source": "btc@candles@binancef@mmt",
                 "source_type": "candles",
                 "data": {
                     "candle": { "t": 1, "o": 1.0, "h": 1.0, "l": 1.0, "c": 10.0, "vb": 1.0, "vs": 1.0, "tb": 1, "ts": 1 }
@@ -1133,7 +1114,7 @@ export function onData(ctx, input, history) {
             .expect("first stream run");
         let second = session
             .run_event(json!({
-                "source": "candles@binancef@mmt",
+                "source": "btc@candles@binancef@mmt",
                 "source_type": "candles",
                 "data": {
                     "candle": { "t": 2, "o": 1.0, "h": 1.0, "l": 1.0, "c": 11.0, "vb": 1.0, "vs": 1.0, "tb": 1, "ts": 1 }
@@ -1162,18 +1143,18 @@ export const script = {
 };
 
 export function onData(ctx, input, history) {
-  const current = history.source("candles@binancef@mmt", 0);
-  const previous = history.source("candles@binancef@mmt", 1);
-  const candles = history.source("candles@binancef@mmt");
+  const current = history.source("btc@candles@binancef@mmt", 0);
+  const previous = history.source("btc@candles@binancef@mmt", 1);
+  const candles = history.source("btc@candles@binancef@mmt");
   return {
     metrics: {
       current: current.c,
       previous: previous?.c ?? null,
-      out_of_range: history.source("candles@binancef@mmt", 2) === undefined,
+      out_of_range: history.source("btc@candles@binancef@mmt", 2) === undefined,
       list_length: candles.length,
       first: candles[0].c,
       latest: candles[candles.length - 1].c,
-      missing_list: history.source("candles@missing@mmt").length,
+      missing_list: history.source("btc@candles@missing@mmt").length,
       frozen: Object.isFrozen(current) && Object.isFrozen(candles) && Object.isFrozen(candles[0])
     }
   };
@@ -1186,21 +1167,21 @@ export function onData(ctx, input, history) {
         let session = script.start_session(&json!({})).expect("start session");
         let first = session
             .run_event(json!({
-                "source": "candles@binancef@mmt",
+                "source": "btc@candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 1, "c": 10.0 } }
             }))
             .expect("first stream run");
         let second = session
             .run_event(json!({
-                "source": "candles@binancef@mmt",
+                "source": "btc@candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 2, "c": 11.0 } }
             }))
             .expect("second stream run");
         let third = session
             .run_event(json!({
-                "source": "candles@binancef@mmt",
+                "source": "btc@candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 3, "c": 12.0 } }
             }))
@@ -1234,13 +1215,13 @@ export const script = {
 };
 
 export function onData(ctx, input, history) {
-  const trades = history.source("trades");
+  const trades = history.source("btc@trades@bulkf");
   return {
     metrics: {
       count: trades.length,
       first: trades[0].price,
-      latest: history.source("trades", 0).price,
-      exact_latest: history.source("trades@bulkf", 0).price
+      latest: history.source("btc@trades@bulkf", 0).price,
+      exact_latest: history.source("btc@trades@bulkf", 0).price
     }
   };
 }
@@ -1252,14 +1233,14 @@ export function onData(ctx, input, history) {
         let session = script.start_session(&json!({})).expect("start session");
         session
             .run_event(json!({
-                "source": "trades@bulkf",
+                "source": "btc@trades@bulkf",
                 "source_type": "trades",
                 "data": { "record": { "price": 100.0, "size": 0.5 } }
             }))
             .expect("first trade");
         let second = session
             .run_event(json!({
-                "source": "trades@bulkf",
+                "source": "btc@trades@bulkf",
                 "source_type": "trades",
                 "data": { "record": { "price": 101.0, "size": 0.25 } }
             }))
@@ -1286,8 +1267,8 @@ export const script = {
 export function onData(ctx, input, history) {
   return {
     metrics: {
-      current: history.source("candles@binancef@mmt", 0).c,
-      previous: history.source("candles@binancef@mmt", 1)?.c ?? null
+      current: history.source("btc@candles@binancef@mmt", 0).c,
+      previous: history.source("btc@candles@binancef@mmt", 1)?.c ?? null
     }
   };
 }
@@ -1299,21 +1280,21 @@ export function onData(ctx, input, history) {
         let session = script.start_session(&json!({})).expect("start session");
         session
             .run_event(json!({
-                "source": "candles@binancef@mmt",
+                "source": "btc@candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 1, "c": 10.0 } }
             }))
             .expect("first stream run");
         let replacement = session
             .run_event(json!({
-                "source": "candles@binancef@mmt",
+                "source": "btc@candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 1, "c": 10.5 } }
             }))
             .expect("replacement stream run");
         let next = session
             .run_event(json!({
-                "source": "candles@binancef@mmt",
+                "source": "btc@candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 2, "c": 11.0 } }
             }))
@@ -1340,9 +1321,9 @@ export const script = {
 export function onData(ctx, input, history) {
   return {
     metrics: {
-      candle: history.source("candles@binancef@mmt", 0)?.c ?? null,
-      previous_candle: history.source("candles@binancef@mmt", 1)?.c ?? null,
-      book_ts: history.source("orderbook@bulkf", 0)?.timestamp_ms ?? null
+      candle: history.source("btc@candles@binancef@mmt", 0)?.c ?? null,
+      previous_candle: history.source("btc@candles@binancef@mmt", 1)?.c ?? null,
+      book_ts: history.source("btc@orderbook@bulkf", 0)?.timestamp_ms ?? null
     }
   };
 }
@@ -1354,14 +1335,14 @@ export function onData(ctx, input, history) {
         let session = script.start_session(&json!({})).expect("start session");
         session
             .run_event(json!({
-                "source": "candles@binancef@mmt",
+                "source": "btc@candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 1, "c": 10.0 } }
             }))
             .expect("candle stream run");
         let book = session
             .run_event(json!({
-                "source": "orderbook@bulkf",
+                "source": "btc@orderbook@bulkf",
                 "source_type": "orderbook",
                 "data": {
                     "snapshot": { "timestamp_ms": 2, "bids": [], "asks": [] }
@@ -1370,7 +1351,7 @@ export function onData(ctx, input, history) {
             .expect("orderbook stream run");
         let candle = session
             .run_event(json!({
-                "source": "candles@binancef@mmt",
+                "source": "btc@candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 3, "c": 11.0 } }
             }))
@@ -1398,9 +1379,9 @@ export const script = {
 export function onData(ctx, input, history) {
   return {
     metrics: {
-      binance: history.source("candles@binancef@mmt", 0)?.c ?? null,
-      previous_binance: history.source("candles@binancef@mmt", 1)?.c ?? null,
-      okx: history.source("candles@okx@mmt", 0)?.c ?? null
+      binance: history.source("btc@candles@binancef@mmt", 0)?.c ?? null,
+      previous_binance: history.source("btc@candles@binancef@mmt", 1)?.c ?? null,
+      okx: history.source("btc@candles@okx@mmt", 0)?.c ?? null
     }
   };
 }
@@ -1412,21 +1393,21 @@ export function onData(ctx, input, history) {
         let session = script.start_session(&json!({})).expect("start session");
         session
             .run_event(json!({
-                "source": "candles@binancef@mmt",
+                "source": "btc@candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 1, "c": 10.0 } }
             }))
             .expect("first binance stream run");
         let okx = session
             .run_event(json!({
-                "source": "candles@okx@mmt",
+                "source": "btc@candles@okx@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 1, "c": 20.0 } }
             }))
             .expect("okx stream run");
         let binance = session
             .run_event(json!({
-                "source": "candles@binancef@mmt",
+                "source": "btc@candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 2, "c": 11.0 } }
             }))
@@ -1482,7 +1463,7 @@ export const script = {
 };
 
 export function onData(ctx, input, history) {
-  return { metrics: { candles: history.source("candles@binancef@mmt").length } };
+  return { metrics: { candles: history.source("btc@candles@binancef@mmt").length } };
 }
 "#,
             "cancel",
@@ -1537,6 +1518,7 @@ export const script = {
 export function onData(ctx, input, history) {
   ctx.trade({
     key: "entry-1",
+    symbol: "btc",
     position: "open-long",
     margin: 100,
     leverage: 5,
@@ -1546,6 +1528,7 @@ export function onData(ctx, input, history) {
   });
   ctx.order({
     key: "maker-ask-1",
+    symbol: "btc",
     side: "short",
     size: 0.01,
     leverage: 5,
@@ -1574,7 +1557,7 @@ export function onExecution(ctx, event) {
             .expect("start execution session");
         let execution = session
             .run_event(json!({
-                "source": "candles@binancef@mmt",
+                "source": "btc@candles@binancef@mmt",
                 "source_type": "candles",
                 "data": { "candle": { "t": 1, "c": 1.0 } }
             }))
@@ -1630,7 +1613,7 @@ export const script = {
 };
 
 export function onData(ctx, input, history) {
-  const candles = history.source("candles@binancef@mmt");
+  const candles = history.source("btc@candles@binancef@mmt");
   let total = 0;
   for (const candle of candles) {
     total += candle.c;

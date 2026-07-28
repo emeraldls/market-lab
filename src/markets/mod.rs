@@ -1348,6 +1348,21 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
         size_increment: Some(0.001),
         execution: None,
     };
+    let mmt_aave_market = Market {
+        symbol: "AAVE/USDT".to_string(),
+        provider_symbol: "aave/usd".to_string(),
+        venue_symbol: "aave/usd".to_string(),
+        venue_id: None,
+        aliases: vec!["AAVE/USDT".to_string()],
+        base_asset: "AAVE".to_string(),
+        quote_asset: "USDT".to_string(),
+        venue_base_asset: "AAVE".to_string(),
+        venue_quote_asset: "USDT".to_string(),
+        status: "AVAILABLE".to_string(),
+        price_increment: Some(0.01),
+        size_increment: Some(0.001),
+        execution: None,
+    };
     let hyperliquid_market = Market {
         symbol: "BTC/USDT".to_string(),
         provider_symbol: "BTC".to_string(),
@@ -1458,7 +1473,7 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
                     provider_exchange: Some("binancef".to_string()),
                     name: "binancef".to_string(),
                     market_type: MarketType::Futures,
-                    markets: vec![mmt_market.clone()],
+                    markets: vec![mmt_market.clone(), mmt_aave_market],
                 },
                 ExchangeMarkets {
                     exchange: "binance".to_string(),
