@@ -298,18 +298,21 @@ impl BulkExecutionAdapter {
         account: &Pubkey,
         plan: &TradePlan,
     ) -> Result<()> {
+        let leverage = plan
+            .leverage
+            .context("BULK trade plan is missing leverage")?;
         let key = (plan.account.clone(), plan.venue_symbol.clone());
         let mut settings = self.leverage_settings.lock().await;
         if settings
             .get(&key)
-            .is_some_and(|leverage| (*leverage - plan.leverage).abs() <= f64::EPSILON)
+            .is_some_and(|current| (*current - leverage).abs() <= f64::EPSILON)
         {
             return Ok(());
         }
 
         let action = Action::UpdateUserSettings(bulk_keychain::UserSettings::set_leverage(
             plan.venue_symbol.clone(),
-            plan.leverage,
+            leverage,
         ));
         let transaction = signer
             .sign_action(&action, next_nonce()?, account)
@@ -318,7 +321,7 @@ impl BulkExecutionAdapter {
         if !is_trading_acknowledgement(&response) {
             validate_transaction_response(&response, "leverage update")?;
         }
-        settings.insert(key, plan.leverage);
+        settings.insert(key, leverage);
         Ok(())
     }
 
@@ -494,6 +497,9 @@ fn reconciled_history_receipt(account: &str, order: OrderRecord) -> Result<Execu
             "source": "orderHistory",
             "order": order,
         }),
+        requested_size: None,
+        filled_size: None,
+        average_fill_price: None,
     })
 }
 
@@ -510,6 +516,9 @@ fn reconciled_open_order_receipt(account: &str, order: OpenOrder) -> ExecutionRe
             "source": "openOrders",
             "order": order,
         }),
+        requested_size: None,
+        filled_size: None,
+        average_fill_price: None,
     }
 }
 
@@ -532,6 +541,9 @@ fn reconciled_fill_receipt(
             "source": "fills",
             "fill": fill,
         }),
+        requested_size: None,
+        filled_size: None,
+        average_fill_price: None,
     }
 }
 
@@ -654,10 +666,10 @@ fn validate_trade_plan(plan: &TradePlan) -> Result<()> {
             market.symbol
         );
     }
-    if !plan.leverage.is_finite()
-        || plan.leverage < 1.0
-        || plan.leverage > f64::from(rules.max_leverage)
-    {
+    let leverage = plan
+        .leverage
+        .context("BULK trade plan is missing leverage")?;
+    if !leverage.is_finite() || leverage < 1.0 || leverage > f64::from(rules.max_leverage) {
         bail!(
             "trade plan leverage must be between 1 and {} for {}",
             rules.max_leverage,
@@ -866,6 +878,9 @@ fn receipt_from_status(
         terminal,
         submitted_at_ms: now_ms()?,
         raw_status: status.clone(),
+        requested_size: None,
+        filled_size: None,
+        average_fill_price: None,
     })
 }
 
@@ -930,6 +945,9 @@ fn acknowledged_receipt(
         terminal: false,
         submitted_at_ms: now_ms()?,
         raw_status: response,
+        requested_size: None,
+        filled_size: None,
+        average_fill_price: None,
     })
 }
 
@@ -1578,7 +1596,7 @@ mod tests {
             estimated_margin: 13.0,
             estimated_exposure: 65.0,
             projected_liquidation_price: None,
-            leverage: 5.0,
+            leverage: Some(5.0),
             reduce_only: false,
             stop_loss_price: None,
             take_profit_price: None,

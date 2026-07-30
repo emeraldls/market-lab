@@ -118,9 +118,9 @@ pub struct TradeArgs {
     pub price: Option<f64>,
     #[arg(long, value_enum, default_value_t = TradeTimeInForce::Gtc)]
     pub tif: TradeTimeInForce,
-    /// Exposure multiplier for margin sizing and the leverage setting sent to BULK.
-    #[arg(long, default_value_t = 1.0)]
-    pub leverage: f64,
+    /// Exposure multiplier for perpetual markets. Not accepted for spot execution.
+    #[arg(long)]
+    pub leverage: Option<f64>,
     #[arg(long, default_value_t = false)]
     pub reduce_only: bool,
     /// Native stop-loss trigger price attached after the entry first fills.
@@ -157,12 +157,14 @@ impl TradeArgs {
             (None, None) => bail!("one of --size or --margin is required"),
             _ => {}
         }
-        if !self.leverage.is_finite() || self.leverage < 1.0 {
+        if let Some(leverage) = self.leverage
+            && (!leverage.is_finite() || leverage < 1.0)
+        {
             bail!("--leverage must be at least 1");
         }
         if self
             .margin
-            .is_some_and(|margin| !(margin * self.leverage).is_finite())
+            .is_some_and(|margin| !(margin * self.leverage.unwrap_or(1.0)).is_finite())
         {
             bail!("--margin multiplied by --leverage is too large");
         }
@@ -2721,10 +2723,36 @@ mod tests {
                 assert_eq!(args.size, Some(0.001));
                 assert!(matches!(args.order_kind, TradeOrderKind::Limit));
                 assert!(matches!(args.tif, TradeTimeInForce::Alo));
-                assert_eq!(args.leverage, 5.0);
+                assert_eq!(args.leverage, Some(5.0));
                 assert_eq!(args.sl, Some(64_000.0));
                 assert_eq!(args.tp, Some(67_000.0));
                 assert!(args.dry_run);
+            }
+            _ => panic!("expected trade long command"),
+        }
+    }
+
+    #[test]
+    fn spot_trade_does_not_collect_leverage() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "long",
+            "HYPE/USDT",
+            "--venue",
+            "hyperliquid",
+            "--margin",
+            "100",
+            "--dry-run",
+        ])
+        .expect("spot trade should parse without leverage");
+
+        match cli.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => {
+                args.validate_shape().expect("spot trade shape is valid");
+                assert_eq!(args.leverage, None);
             }
             _ => panic!("expected trade long command"),
         }

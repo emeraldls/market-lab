@@ -14,6 +14,7 @@ pub const MAINNET_HTTP_URL: &str = "https://api.hyperliquid.xyz";
 pub const MAINNET_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 pub const TESTNET_HTTP_URL: &str = "https://api.hyperliquid-testnet.xyz";
 pub const TESTNET_WS_URL: &str = "wss://api.hyperliquid-testnet.xyz/ws";
+pub(crate) const MARKET_ORDER_SLIPPAGE: f64 = 0.005;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

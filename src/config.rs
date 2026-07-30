@@ -597,7 +597,7 @@ format = "json"
             } => {
                 assert_eq!(args.symbol, "BTC/USDT");
                 assert_eq!(args.margin, Some(250.0));
-                assert_eq!(args.leverage, 5.0);
+                assert_eq!(args.leverage, Some(5.0));
                 assert!(args.dry_run);
                 assert!(matches!(args.output, crate::cli::OutputFormat::Json));
             }

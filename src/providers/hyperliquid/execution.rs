@@ -19,9 +19,7 @@ use super::exchange::{
     OrderGrouping, OrderRequest, WireOrder, raw_response, wire_number,
 };
 use super::markets;
-use super::{HyperliquidNetwork, HyperliquidProduct};
-
-const MARKET_SLIPPAGE: f64 = 0.005;
+use super::{HyperliquidNetwork, HyperliquidProduct, MARKET_ORDER_SLIPPAGE};
 
 type LeverageKey = (HyperliquidNetwork, String, u32);
 type LeverageValue = (u32, bool);
@@ -228,16 +226,21 @@ impl HyperliquidExecutionAdapter {
         let resolved = self.resolve_market(&plan.internal_symbol).await?;
         validate_resolved_trade_plan(plan, &resolved)?;
         if self.product == HyperliquidProduct::Perpetual && !plan.reduce_only {
-            self.ensure_leverage(resolved.asset, plan.leverage, resolved.cross_margin)
-                .await?;
+            self.ensure_leverage(
+                resolved.asset,
+                plan.leverage
+                    .context("Hyperliquid perpetual trade plan is missing leverage")?,
+                resolved.cross_margin,
+            )
+            .await?;
         }
 
         let entry_price = match plan.order_kind {
             OrderKind::Market => {
                 let guarded = if plan.side == OrderSide::Buy {
-                    plan.reference_price * (1.0 + MARKET_SLIPPAGE)
+                    plan.reference_price * (1.0 + MARKET_ORDER_SLIPPAGE)
                 } else {
-                    plan.reference_price * (1.0 - MARKET_SLIPPAGE)
+                    plan.reference_price * (1.0 - MARKET_ORDER_SLIPPAGE)
                 };
                 normalize_price_for(
                     guarded,
@@ -298,7 +301,13 @@ impl HyperliquidExecutionAdapter {
                     self.network.label()
                 )
             })?;
-        receipt_from_response(self.venue(), &plan.account, response, "order")
+        receipt_from_response(
+            self.venue(),
+            &plan.account,
+            response,
+            "order",
+            Some(plan.size),
+        )
     }
 
     pub async fn submit_trades(&self, plans: &[TradePlan]) -> Result<Vec<ExecutionOutcome>> {
@@ -318,15 +327,20 @@ impl HyperliquidExecutionAdapter {
             let resolved = self.resolve_market(&plan.internal_symbol).await?;
             validate_resolved_trade_plan(plan, &resolved)?;
             if self.product == HyperliquidProduct::Perpetual && !plan.reduce_only {
-                self.ensure_leverage(resolved.asset, plan.leverage, resolved.cross_margin)
-                    .await?;
+                self.ensure_leverage(
+                    resolved.asset,
+                    plan.leverage
+                        .context("Hyperliquid perpetual trade plan is missing leverage")?,
+                    resolved.cross_margin,
+                )
+                .await?;
             }
             let entry_price = match plan.order_kind {
                 OrderKind::Market => {
                     let guarded = if plan.side == OrderSide::Buy {
-                        plan.reference_price * (1.0 + MARKET_SLIPPAGE)
+                        plan.reference_price * (1.0 + MARKET_ORDER_SLIPPAGE)
                     } else {
-                        plan.reference_price * (1.0 - MARKET_SLIPPAGE)
+                        plan.reference_price * (1.0 - MARKET_ORDER_SLIPPAGE)
                     };
                     normalize_price_for(
                         guarded,
@@ -367,10 +381,8 @@ impl HyperliquidExecutionAdapter {
 
     pub async fn configure_leverage(&self, internal_symbol: &str, leverage: f64) -> Result<()> {
         if self.product == HyperliquidProduct::Spot {
-            if (leverage - 1.0).abs() <= f64::EPSILON {
-                return Ok(());
-            }
-            bail!("Hyperliquid spot has fixed 1x leverage");
+            let _ = (internal_symbol, leverage);
+            bail!("Hyperliquid spot does not support leverage configuration");
         }
         let market = markets::market(internal_symbol)?;
         let resolved = self.resolve_market(&market.symbol).await?;
@@ -455,7 +467,7 @@ impl HyperliquidExecutionAdapter {
             )
         })?;
         let mut receipt =
-            receipt_from_response(self.venue(), &self.account, response, "cancellation")?;
+            receipt_from_response(self.venue(), &self.account, response, "cancellation", None)?;
         receipt.order_id = Some(order_id.to_string());
         Ok(receipt)
     }
@@ -541,8 +553,8 @@ fn validate_trade_plan(
         );
     }
     if product == HyperliquidProduct::Spot {
-        if (plan.leverage - 1.0).abs() > f64::EPSILON {
-            bail!("Hyperliquid spot has fixed 1x leverage");
+        if plan.leverage.is_some() {
+            bail!("Hyperliquid spot trade plans must omit leverage");
         }
         if plan.reduce_only {
             bail!("Hyperliquid spot orders do not support reduce-only");
@@ -558,16 +570,21 @@ fn validate_trade_plan(
             market.symbol
         );
     }
-    if !plan.leverage.is_finite()
-        || plan.leverage < 1.0
-        || plan.leverage > f64::from(rules.max_leverage)
-        || plan.leverage.fract().abs() > f64::EPSILON
-    {
-        bail!(
-            "Hyperliquid leverage must be a whole number between 1 and {} for {}",
-            rules.max_leverage,
-            market.symbol
-        );
+    if product == HyperliquidProduct::Perpetual {
+        let leverage = plan
+            .leverage
+            .context("Hyperliquid perpetual trade plan is missing leverage")?;
+        if !leverage.is_finite()
+            || leverage < 1.0
+            || leverage > f64::from(rules.max_leverage)
+            || leverage.fract().abs() > f64::EPSILON
+        {
+            bail!(
+                "Hyperliquid leverage must be a whole number between 1 and {} for {}",
+                rules.max_leverage,
+                market.symbol
+            );
+        }
     }
     if plan.size * plan.reference_price < rules.min_notional {
         bail!(
@@ -596,7 +613,10 @@ fn validate_resolved_trade_plan(plan: &TradePlan, market: &ResolvedMarket) -> Re
             market.lot_size
         );
     }
-    if plan.leverage > f64::from(market.max_leverage) {
+    if plan
+        .leverage
+        .is_some_and(|leverage| leverage > f64::from(market.max_leverage))
+    {
         bail!(
             "Hyperliquid {} leverage exceeds the market maximum of {}",
             if plan.testnet { "testnet" } else { "mainnet" },
@@ -759,6 +779,7 @@ fn receipt_from_response(
     account: &str,
     response: ExchangeResponseStatus,
     operation: &str,
+    requested_size: Option<f64>,
 ) -> Result<ExecutionReceipt> {
     let response = match response {
         ExchangeResponseStatus::Ok(response) => response,
@@ -780,12 +801,32 @@ fn receipt_from_response(
         }
     }
     let first = &statuses[0];
-    let (order_id, status, terminal) = match first {
-        ExchangeDataStatus::Filled(order) => (Some(order.oid.to_string()), "filled", true),
-        ExchangeDataStatus::Resting(order) => (Some(order.oid.to_string()), "resting", false),
-        ExchangeDataStatus::Success => (None, "cancelled", true),
-        ExchangeDataStatus::WaitingForFill => (None, "waitingForFill", false),
-        ExchangeDataStatus::WaitingForTrigger => (None, "waitingForTrigger", false),
+    let (order_id, status, terminal, filled_size, average_fill_price) = match first {
+        ExchangeDataStatus::Filled(order) => {
+            let filled_size = parse(&order.total_sz, "filled order size")?;
+            let average_fill_price = parse(&order.avg_px, "average fill price")?;
+            let partially_filled = requested_size.is_some_and(|requested| {
+                let tolerance = 1e-12_f64.max(requested.abs() * 1e-9);
+                filled_size + tolerance < requested
+            });
+            (
+                Some(order.oid.to_string()),
+                if partially_filled {
+                    "partiallyFilled"
+                } else {
+                    "filled"
+                },
+                true,
+                Some(filled_size),
+                Some(average_fill_price),
+            )
+        }
+        ExchangeDataStatus::Resting(order) => {
+            (Some(order.oid.to_string()), "resting", false, None, None)
+        }
+        ExchangeDataStatus::Success => (None, "cancelled", true, None, None),
+        ExchangeDataStatus::WaitingForFill => (None, "waitingForFill", false, None, None),
+        ExchangeDataStatus::WaitingForTrigger => (None, "waitingForTrigger", false, None, None),
         ExchangeDataStatus::Error(_) => unreachable!("errors handled above"),
     };
     Ok(ExecutionReceipt {
@@ -796,6 +837,9 @@ fn receipt_from_response(
         terminal,
         submitted_at_ms: now_ms()?,
         raw_status,
+        requested_size,
+        filled_size,
+        average_fill_price,
     })
 }
 
@@ -866,6 +910,9 @@ fn batch_outcomes_from_response(
                     terminal,
                     submitted_at_ms,
                     raw_status,
+                    requested_size: None,
+                    filled_size: None,
+                    average_fill_price: None,
                 }),
                 Err(error) => ExecutionOutcome::failure(format!("{error:#}")),
             }
@@ -1412,5 +1459,40 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("invalid nonce"))
         }));
+    }
+
+    #[test]
+    fn ioc_receipt_reports_partial_fill_size() {
+        let response: ExchangeResponseStatus = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [{
+                        "filled": {
+                            "totalSz": "19.38",
+                            "avgPx": "44.0",
+                            "oid": 57_224_477_892_u64
+                        }
+                    }]
+                }
+            }
+        }))
+        .expect("valid partial-fill response");
+
+        let receipt = receipt_from_response(
+            ExecutionVenue::HyperliquidSpot,
+            "0xabc",
+            response,
+            "order",
+            Some(22.72),
+        )
+        .expect("partial fill receipt");
+
+        assert_eq!(receipt.status, "partiallyFilled");
+        assert_eq!(receipt.requested_size, Some(22.72));
+        assert_eq!(receipt.filled_size, Some(19.38));
+        assert_eq!(receipt.average_fill_price, Some(44.0));
+        assert!(receipt.terminal);
     }
 }

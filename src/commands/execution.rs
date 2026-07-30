@@ -15,8 +15,8 @@ use crate::domain::execution::{
 use crate::markets::Market;
 use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::execution::ExecutionAdapter;
-use crate::providers::hyperliquid::HyperliquidNetwork;
 use crate::providers::hyperliquid::market_data::HyperliquidProvider;
+use crate::providers::hyperliquid::{HyperliquidNetwork, MARKET_ORDER_SLIPPAGE};
 
 pub async fn handle_trade(args: TradeArgs, direction: PositionDirection) -> Result<()> {
     args.validate_shape()?;
@@ -237,7 +237,7 @@ pub async fn handle_close(args: ClosePositionArgs) -> Result<()> {
             order_kind: TradeOrderKind::Market,
             price: None,
             tif: TradeTimeInForce::Gtc,
-            leverage: position.leverage.max(1.0),
+            leverage: Some(position.leverage.max(1.0)),
             reduce_only: true,
             sl: None,
             tp: None,
@@ -312,6 +312,11 @@ pub(crate) async fn build_trade_plan(
     let venue = ExecutionVenue::from(args.venue);
     let market = execution_market(venue, &args.symbol)?;
     validate_market_rules(venue, &market, args)?;
+    let leverage = match venue {
+        ExecutionVenue::HyperliquidSpot => None,
+        ExecutionVenue::Bulk | ExecutionVenue::Hyperliquid => Some(args.leverage.unwrap_or(1.0)),
+    };
+    let sizing_leverage = leverage.unwrap_or(1.0);
     let rules = execution_rules(venue, args.testnet, &market)?;
     let account = ExecutionAdapter::configured_account(venue)?;
     let reference_price = match args.order_kind {
@@ -362,10 +367,26 @@ pub(crate) async fn build_trade_plan(
         let margin = args
             .margin
             .context("one of --size or --margin is required")?;
-        let raw_size = exposure_from_margin(margin, args.leverage)? / reference_price;
+        let sizing_price = if venue == ExecutionVenue::HyperliquidSpot
+            && direction == PositionDirection::Long
+            && matches!(args.order_kind, TradeOrderKind::Market)
+        {
+            reference_price * (1.0 + MARKET_ORDER_SLIPPAGE)
+        } else {
+            reference_price
+        };
+        let raw_size = exposure_from_margin(margin, sizing_leverage)? / sizing_price;
         floor_to_step(raw_size, rules.lot_size, rules.size_precision)
     };
     if size <= 0.0 {
+        if venue == ExecutionVenue::HyperliquidSpot {
+            bail!(
+                "requested amount produces a size below {} spot lot size {} on {}",
+                venue_label(venue),
+                rules.lot_size,
+                market.symbol
+            );
+        }
         bail!(
             "requested margin and leverage produce a size below {} lot size {} on {}",
             venue_label(venue),
@@ -374,7 +395,7 @@ pub(crate) async fn build_trade_plan(
         );
     }
     let estimated_exposure = size * reference_price;
-    let estimated_margin = estimated_exposure / args.leverage;
+    let estimated_margin = estimated_exposure / sizing_leverage;
     if estimated_exposure + f64::EPSILON < rules.min_notional {
         bail!(
             "estimated exposure {estimated_exposure:.8} is below {} minimum notional {} for {}",
@@ -382,6 +403,22 @@ pub(crate) async fn build_trade_plan(
             rules.min_notional,
             market.symbol
         );
+    }
+    if venue == ExecutionVenue::HyperliquidSpot {
+        validate_spot_funds(
+            args.testnet,
+            &account,
+            &market,
+            direction,
+            size,
+            match args.order_kind {
+                TradeOrderKind::Market if direction == PositionDirection::Long => {
+                    reference_price * (1.0 + MARKET_ORDER_SLIPPAGE)
+                }
+                TradeOrderKind::Market | TradeOrderKind::Limit => reference_price,
+            },
+        )
+        .await?;
     }
 
     Ok(TradePlan {
@@ -404,11 +441,42 @@ pub(crate) async fn build_trade_plan(
         estimated_margin,
         estimated_exposure,
         projected_liquidation_price: None,
-        leverage: args.leverage,
+        leverage,
         reduce_only: args.reduce_only,
         stop_loss_price: args.sl,
         take_profit_price: args.tp,
     })
+}
+
+async fn validate_spot_funds(
+    testnet: bool,
+    account: &str,
+    market: &Market,
+    direction: PositionDirection,
+    size: f64,
+    execution_price: f64,
+) -> Result<()> {
+    let snapshot = ExecutionAdapter::new(ExecutionVenue::HyperliquidSpot, testnet)
+        .await?
+        .account_snapshot(account)
+        .await?;
+    let (asset, required, unit) = match direction {
+        PositionDirection::Long => (market.quote_asset.as_str(), size * execution_price, "quote"),
+        PositionDirection::Short => (market.base_asset.as_str(), size, "base"),
+    };
+    let balance = snapshot
+        .spot_balances
+        .iter()
+        .find(|balance| balance.asset == asset);
+    let available = balance.map_or(0.0, |balance| balance.available);
+    let venue_asset = balance.map_or(asset, |balance| balance.venue_asset.as_str());
+    let tolerance = 1e-12_f64.max(required.abs() * 1e-12);
+    if available + tolerance < required {
+        bail!(
+            "insufficient Hyperliquid spot {venue_asset} balance: {available:.8} available, {required:.8} {unit} amount required"
+        );
+    }
+    Ok(())
 }
 
 fn validate_protection_prices(
@@ -478,22 +546,23 @@ fn validate_market_rules(venue: ExecutionVenue, market: &Market, args: &TradeArg
             market.venue_symbol
         );
     }
-    if args.leverage > f64::from(rules.max_leverage) {
+    if venue == ExecutionVenue::HyperliquidSpot && args.leverage.is_some() {
+        bail!("--leverage is not supported for Hyperliquid spot");
+    }
+    let leverage = args.leverage.unwrap_or(1.0);
+    if leverage > f64::from(rules.max_leverage) {
         bail!(
             "--leverage {} exceeds {} maximum {}x for {}",
-            args.leverage,
+            leverage,
             venue_label(venue),
             rules.max_leverage,
             market.symbol
         );
     }
-    if venue == ExecutionVenue::Hyperliquid && args.leverage.fract().abs() > f64::EPSILON {
+    if venue == ExecutionVenue::Hyperliquid && leverage.fract().abs() > f64::EPSILON {
         bail!("Hyperliquid leverage must be a whole number");
     }
     if venue == ExecutionVenue::HyperliquidSpot {
-        if (args.leverage - 1.0).abs() > f64::EPSILON {
-            bail!("Hyperliquid spot uses fixed 1x leverage");
-        }
         if args.reduce_only {
             bail!("Hyperliquid spot orders do not support --reduce-only");
         }
@@ -690,7 +759,9 @@ fn render_trade_plan(plan: &TradePlan, dry_run: bool, output: OutputFormat) -> R
             }
             println!("  est. margin:       {:.8}", plan.estimated_margin);
             println!("  est. exposure:     {:.8}", plan.estimated_exposure);
-            println!("  leverage:          {}x", plan.leverage);
+            if let Some(leverage) = plan.leverage {
+                println!("  leverage:          {leverage}x");
+            }
             if plan.venue != ExecutionVenue::HyperliquidSpot {
                 println!(
                     "  liquidation price: determined by {} after fill",
@@ -819,6 +890,15 @@ fn render_terminal_receipt(receipt: &ExecutionReceipt) {
     println!("{}: order {}", venue_key(receipt.venue), receipt.status);
     if let Some(order_id) = &receipt.order_id {
         println!("  order id: {order_id}");
+    }
+    if let Some(requested_size) = receipt.requested_size {
+        println!("  requested size: {requested_size}");
+    }
+    if let Some(filled_size) = receipt.filled_size {
+        println!("  filled size:    {filled_size}");
+    }
+    if let Some(average_fill_price) = receipt.average_fill_price {
+        println!("  average price:  {average_fill_price}");
     }
     println!("  terminal: {}", receipt.terminal);
 }

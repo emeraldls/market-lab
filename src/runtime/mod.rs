@@ -36,7 +36,7 @@ use crate::strategies::jobs::{
 };
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-const RUNTIME_VERSION: u8 = 31;
+const RUNTIME_VERSION: u8 = 32;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -2497,7 +2497,7 @@ async fn execute_script_order(
                     order_kind,
                     price: order_spec.price,
                     tif,
-                    leverage,
+                    leverage: Some(leverage),
                     reduce_only: request.position.reduce_only(),
                     sl: request.sl,
                     tp: request.tp,
@@ -2519,7 +2519,7 @@ async fn execute_script_order(
                 order_kind,
                 price: order_spec.price,
                 tif,
-                leverage: request.leverage_or_default(),
+                leverage: Some(request.leverage_or_default()),
                 reduce_only: request.reduce_only,
                 sl: None,
                 tp: None,
@@ -2825,7 +2825,9 @@ fn validate_strategy_trade(
         || plan.internal_symbol != symbol
         || plan.direction != expected_direction
         || plan.reduce_only != reduce_only
-        || (plan.leverage - leverage).abs() > f64::EPSILON
+        || plan
+            .leverage
+            .is_none_or(|plan_leverage| (plan_leverage - leverage).abs() > f64::EPSILON)
         || plan.stop_loss_price.is_some()
         || plan.take_profit_price.is_some()
         || plan.size > total_size + 1e-12_f64.max(total_size.abs() * 1e-12)
@@ -2972,7 +2974,9 @@ fn validate_bot_trade(definition: &BotJobDefinition, plan: &TradePlan) -> Result
     };
     if plan.venue != venue
         || plan.internal_symbol != symbol
-        || (plan.leverage - leverage).abs() > f64::EPSILON
+        || plan
+            .leverage
+            .is_none_or(|plan_leverage| (plan_leverage - leverage).abs() > f64::EPSILON)
         || plan.stop_loss_price.is_some()
         || plan.take_profit_price.is_some()
         || plan.size > max_inventory_size + 1e-12_f64.max(max_inventory_size.abs() * 1e-12)
@@ -5156,7 +5160,7 @@ mod tests {
 
     #[test]
     fn runtime_protocol_v29_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 31);
+        assert_eq!(RUNTIME_VERSION, 32);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",

@@ -1649,7 +1649,10 @@ fn plan_view(input: PlanInput<'_>) -> VwapPlanView<'_> {
         feasible: feasibility.feasible(),
         execution_policy: "maker_first_taker_catch_up",
         max_taker_slippage_bps: MAX_TAKER_SLIPPAGE_BPS,
-        leverage: input.parent.leverage,
+        leverage: input
+            .parent
+            .leverage
+            .expect("VWAP parent plan must include leverage"),
         reduce_only: input.reduce_only,
         dry_run: input.dry_run,
     }
@@ -1740,7 +1743,7 @@ fn trade_args(args: &RunVwapArgs, size: Option<f64>, margin: Option<f64>) -> Tra
         order_kind: TradeOrderKind::Market,
         price: None,
         tif: TradeTimeInForce::Gtc,
-        leverage: args.leverage,
+        leverage: Some(args.leverage),
         reduce_only: args.reduce_only,
         sl: None,
         tp: None,
@@ -1777,7 +1780,7 @@ pub(super) fn worker_trade_args(
         } else {
             TradeTimeInForce::Gtc
         },
-        leverage: definition.leverage,
+        leverage: Some(definition.leverage),
         reduce_only: definition.reduce_only,
         sl: None,
         tp: None,

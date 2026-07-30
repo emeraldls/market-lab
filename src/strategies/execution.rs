@@ -272,7 +272,7 @@ mod tests {
             estimated_margin: 100.0,
             estimated_exposure: 100.0,
             projected_liquidation_price: None,
-            leverage: 1.0,
+            leverage: Some(1.0),
             reduce_only: false,
             stop_loss_price: None,
             take_profit_price: None,

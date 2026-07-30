@@ -461,7 +461,10 @@ fn plan_view(input: PlanInput<'_>) -> OiwapPlanView<'_> {
         feasible: feasibility.feasible(),
         execution_policy: "maker_first_taker_catch_up",
         max_taker_slippage_bps: MAX_TAKER_SLIPPAGE_BPS,
-        leverage: input.parent.leverage,
+        leverage: input
+            .parent
+            .leverage
+            .expect("OI-WAP parent plan must include leverage"),
         reduce_only: input.reduce_only,
         dry_run: input.dry_run,
     }
@@ -629,7 +632,7 @@ fn trade_args(args: &RunOiwapArgs, size: Option<f64>, margin: Option<f64>) -> Tr
         order_kind: TradeOrderKind::Market,
         price: None,
         tif: TradeTimeInForce::Gtc,
-        leverage: args.leverage,
+        leverage: Some(args.leverage),
         reduce_only: args.reduce_only,
         sl: None,
         tp: None,

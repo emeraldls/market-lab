@@ -272,7 +272,7 @@ fn trade_args(args: &RunMidPriceArgs, size: Option<f64>, margin: Option<f64>) ->
         order_kind: TradeOrderKind::Market,
         price: None,
         tif: TradeTimeInForce::Gtc,
-        leverage: args.leverage,
+        leverage: Some(args.leverage),
         reduce_only: false,
         sl: None,
         tp: None,
@@ -297,7 +297,7 @@ fn worker_trade_args(definition: &MidPriceJobDefinition) -> TradeArgs {
         order_kind: TradeOrderKind::Market,
         price: None,
         tif: TradeTimeInForce::Gtc,
-        leverage: definition.leverage,
+        leverage: Some(definition.leverage),
         reduce_only: false,
         sl: None,
         tp: None,
@@ -342,7 +342,7 @@ fn plan_view<'a>(
         directional_bias_percent: definition.directional_bias_percent,
         sizing: "continuous, inventory-skewed",
         duration_secs: definition.duration_seconds,
-        leverage: parent.leverage,
+        leverage: definition.leverage,
         execution: "maker-only post-only ALO quotes",
         shutdown: "cancel owned quotes, then unwind bot-owned inventory",
         dry_run,
@@ -1847,7 +1847,10 @@ pub(super) fn quote_plan(
         price: Some(price),
         reference_price: price,
         requested_margin: None,
-        estimated_margin: exposure / parent.leverage,
+        estimated_margin: exposure
+            / parent
+                .leverage
+                .context("mid-price parent plan is missing leverage")?,
         estimated_exposure: exposure,
         projected_liquidation_price: None,
         leverage: parent.leverage,
@@ -1880,7 +1883,10 @@ pub(super) fn inventory_unwind_plan(
         price: None,
         reference_price: price,
         requested_margin: None,
-        estimated_margin: exposure / parent.leverage,
+        estimated_margin: exposure
+            / parent
+                .leverage
+                .context("mid-price parent plan is missing leverage")?,
         estimated_exposure: exposure,
         projected_liquidation_price: None,
         leverage: parent.leverage,
@@ -2810,7 +2816,7 @@ mod tests {
             estimated_margin: 10.0,
             estimated_exposure: 100.0,
             projected_liquidation_price: None,
-            leverage: 10.0,
+            leverage: Some(10.0),
             reduce_only: false,
             stop_loss_price: None,
             take_profit_price: None,

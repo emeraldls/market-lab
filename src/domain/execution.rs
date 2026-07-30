@@ -85,7 +85,9 @@ pub struct TradePlan {
     pub estimated_exposure: f64,
     /// BULK does not expose a pre-trade portfolio-liquidation simulation.
     pub projected_liquidation_price: Option<f64>,
-    pub leverage: f64,
+    /// Perpetual leverage. Spot plans omit this field entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leverage: Option<f64>,
     pub reduce_only: bool,
     #[serde(default)]
     pub stop_loss_price: Option<f64>,
@@ -230,6 +232,12 @@ pub struct ExecutionReceipt {
     pub terminal: bool,
     pub submitted_at_ms: u64,
     pub raw_status: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_size: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filled_size: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_fill_price: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -305,5 +313,36 @@ mod tests {
 
         let spot = serde_json::to_value(ExecutionVenue::HyperliquidSpot).expect("venue serializes");
         assert_eq!(spot, serde_json::json!("hyperliquid"));
+    }
+
+    #[test]
+    fn spot_trade_plans_omit_leverage() {
+        let plan = TradePlan {
+            created_at_ms: 1,
+            venue: ExecutionVenue::HyperliquidSpot,
+            testnet: true,
+            account: "0xabc".to_string(),
+            internal_symbol: "HYPE/USDT".to_string(),
+            venue_symbol: "@1035".to_string(),
+            direction: PositionDirection::Long,
+            side: OrderSide::Buy,
+            order_kind: OrderKind::Market,
+            time_in_force: None,
+            requested_size: None,
+            size: 1.0,
+            price: None,
+            reference_price: 44.0,
+            requested_margin: Some(44.0),
+            estimated_margin: 44.0,
+            estimated_exposure: 44.0,
+            projected_liquidation_price: None,
+            leverage: None,
+            reduce_only: false,
+            stop_loss_price: None,
+            take_profit_price: None,
+        };
+
+        let encoded = serde_json::to_value(plan).expect("spot plan serializes");
+        assert!(encoded.get("leverage").is_none());
     }
 }
