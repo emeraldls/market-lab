@@ -302,6 +302,7 @@ mod tests {
             order_id: Some("owned".to_string()),
             maker: true,
             fee: None,
+            fee_asset: None,
             slot: 7,
             ts_ms: 1_000,
         };

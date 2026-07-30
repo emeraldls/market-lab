@@ -9,6 +9,7 @@ pub mod ws;
 use serde::{Deserialize, Serialize};
 
 pub const EXCHANGE: &str = "hyperliquidf";
+pub const SPOT_EXCHANGE: &str = "hyperliquid";
 pub const MAINNET_HTTP_URL: &str = "https://api.hyperliquid.xyz";
 pub const MAINNET_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 pub const TESTNET_HTTP_URL: &str = "https://api.hyperliquid-testnet.xyz";
@@ -20,6 +21,38 @@ pub enum HyperliquidNetwork {
     #[default]
     Mainnet,
     Testnet,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum HyperliquidProduct {
+    Spot,
+    Perpetual,
+}
+
+impl HyperliquidProduct {
+    pub fn from_exchange(exchange: &str) -> anyhow::Result<Self> {
+        match exchange.trim().to_ascii_lowercase().as_str() {
+            SPOT_EXCHANGE => Ok(Self::Spot),
+            EXCHANGE => Ok(Self::Perpetual),
+            _ => anyhow::bail!(
+                "Hyperliquid exchange must be `hyperliquid` (spot) or `hyperliquidf` (perpetuals)"
+            ),
+        }
+    }
+
+    pub const fn exchange(self) -> &'static str {
+        match self {
+            Self::Spot => SPOT_EXCHANGE,
+            Self::Perpetual => EXCHANGE,
+        }
+    }
+
+    pub const fn max_price_decimals(self) -> u8 {
+        match self {
+            Self::Spot => 8,
+            Self::Perpetual => 6,
+        }
+    }
 }
 
 impl HyperliquidNetwork {

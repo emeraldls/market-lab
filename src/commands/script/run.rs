@@ -26,12 +26,12 @@ use crate::providers::bulk::markets as bulk_markets;
 use crate::providers::bulk::ws::{
     BulkCandleStream, BulkOrderBookStream, BulkTickerStream, BulkTradesStream,
 };
-use crate::providers::hyperliquid::HyperliquidNetwork;
 use crate::providers::hyperliquid::markets as hyperliquid_markets;
 use crate::providers::hyperliquid::ws::{
     HyperliquidAssetContextStream, HyperliquidCandleStream, HyperliquidOrderBookStream,
     HyperliquidTradesStream,
 };
+use crate::providers::hyperliquid::{HyperliquidNetwork, HyperliquidProduct};
 use crate::providers::mmt::utils::{
     normalize_exchange_for_mmt, normalize_symbol_for_mmt, normalize_to_ms, parse_levels,
 };
@@ -223,6 +223,9 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
     let venue = job.definition.venue.map(|venue| match venue {
         crate::domain::execution::ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
         crate::domain::execution::ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
+        crate::domain::execution::ExecutionVenue::HyperliquidSpot => {
+            ExecutionVenueArg::HyperliquidSpot
+        }
     });
     let args = ScriptRunArgs {
         script: job.definition.snapshot_path.display().to_string(),
@@ -595,9 +598,12 @@ impl ScriptLiveStreams {
                 let requested = config.market_symbol();
                 let venue_symbol = match provider {
                     ProviderKind::Bulk => bulk_markets::market(&requested)?.symbol.clone(),
-                    ProviderKind::Hyperliquid => {
-                        hyperliquid_markets::market(&requested)?.symbol.clone()
-                    }
+                    ProviderKind::Hyperliquid => hyperliquid_markets::market_for(
+                        HyperliquidProduct::from_exchange(&config.exchange)?,
+                        &requested,
+                    )?
+                    .symbol
+                    .clone(),
                     _ => unreachable!(),
                 };
                 direct.push(Box::new(
@@ -637,7 +643,9 @@ impl ScriptLiveStreams {
     fn carry_runtime_state_from(&mut self, previous: &Self) {
         for current in &mut self.direct {
             if let Some(previous) = previous.direct.iter().find(|previous| {
-                previous.provider == current.provider && previous.symbol == current.symbol
+                previous.provider == current.provider
+                    && previous.exchange == current.exchange
+                    && previous.symbol == current.symbol
             }) {
                 current.cumulative_delta = previous.cumulative_delta;
             }
@@ -765,7 +773,7 @@ fn configs_grouped_by_symbol(
         .filter(|(_, config)| config.provider == provider)
     {
         grouped
-            .entry(config.symbol.clone())
+            .entry(format!("{}:{}", config.exchange, config.symbol))
             .or_default()
             .insert(selector.clone(), config.clone());
     }
@@ -795,11 +803,17 @@ enum DirectTradesStream {
 }
 
 impl DirectTradesStream {
-    async fn connect(provider: ProviderKind, symbol: &str, testnet: bool) -> Result<Self> {
+    async fn connect(
+        provider: ProviderKind,
+        exchange: &str,
+        symbol: &str,
+        testnet: bool,
+    ) -> Result<Self> {
         match provider {
             ProviderKind::Bulk => Ok(Self::Bulk(BulkTradesStream::connect(symbol).await?)),
             ProviderKind::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidTradesStream::connect_on(
+                HyperliquidTradesStream::connect_for(
+                    HyperliquidProduct::from_exchange(exchange)?,
                     symbol,
                     HyperliquidNetwork::from_testnet(testnet),
                 )
@@ -830,6 +844,7 @@ enum DirectOrderBookStream {
 impl DirectOrderBookStream {
     async fn connect(
         provider: ProviderKind,
+        exchange: &str,
         symbol: &str,
         depth: u16,
         testnet: bool,
@@ -839,7 +854,8 @@ impl DirectOrderBookStream {
                 BulkOrderBookStream::connect(symbol, depth).await?,
             )),
             ProviderKind::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidOrderBookStream::connect_on(
+                HyperliquidOrderBookStream::connect_for(
+                    HyperliquidProduct::from_exchange(exchange)?,
                     symbol,
                     depth,
                     HyperliquidNetwork::from_testnet(testnet),
@@ -869,11 +885,17 @@ enum DirectTickerStream {
 }
 
 impl DirectTickerStream {
-    async fn connect(provider: ProviderKind, symbol: &str, testnet: bool) -> Result<Self> {
+    async fn connect(
+        provider: ProviderKind,
+        exchange: &str,
+        symbol: &str,
+        testnet: bool,
+    ) -> Result<Self> {
         match provider {
             ProviderKind::Bulk => Ok(Self::Bulk(BulkTickerStream::connect(symbol).await?)),
             ProviderKind::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidAssetContextStream::connect_on(
+                HyperliquidAssetContextStream::connect_for(
+                    HyperliquidProduct::from_exchange(exchange)?,
                     symbol,
                     HyperliquidNetwork::from_testnet(testnet),
                 )
@@ -904,6 +926,7 @@ enum DirectCandleStream {
 impl DirectCandleStream {
     async fn connect(
         provider: ProviderKind,
+        exchange: &str,
         symbol: &str,
         interval: &str,
         testnet: bool,
@@ -913,7 +936,8 @@ impl DirectCandleStream {
                 BulkCandleStream::connect(symbol, interval).await?,
             )),
             ProviderKind::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidCandleStream::connect_on(
+                HyperliquidCandleStream::connect_for(
+                    HyperliquidProduct::from_exchange(exchange)?,
                     symbol,
                     interval,
                     HyperliquidNetwork::from_testnet(testnet),
@@ -937,10 +961,10 @@ impl DirectCandleStream {
     }
 }
 
-fn direct_provider_name(provider: ProviderKind) -> &'static str {
+fn direct_provider_name(provider: ProviderKind, exchange: &str) -> &str {
     match provider {
         ProviderKind::Bulk => "bulkf",
-        ProviderKind::Hyperliquid => "hyperliquidf",
+        ProviderKind::Hyperliquid => exchange,
         ProviderKind::Binance => "binance",
         ProviderKind::BinanceFutures => "binancef",
         ProviderKind::Mmt => "mmt",
@@ -965,6 +989,7 @@ fn direct_timeframe(provider: ProviderKind, seconds: u32) -> Result<&'static str
 
 struct DirectScriptStreams {
     provider: ProviderKind,
+    exchange: String,
     symbol: String,
     source_configs: SourceConfigs,
     trades: Option<DirectTradesStream>,
@@ -983,6 +1008,12 @@ impl DirectScriptStreams {
         symbol: &str,
         testnet: bool,
     ) -> Result<Self> {
+        let exchange = source_configs
+            .values()
+            .next()
+            .context("direct source group is empty")?
+            .exchange
+            .clone();
         let candle_timeframe = if source_configs
             .values()
             .any(|config| config.source == ScriptSource::Candles)
@@ -999,7 +1030,7 @@ impl DirectScriptStreams {
                 .values()
                 .any(|config| matches!(config.source, ScriptSource::Trades | ScriptSource::Vd))
         {
-            Some(DirectTradesStream::connect(provider, symbol, testnet).await?)
+            Some(DirectTradesStream::connect(provider, &exchange, symbol, testnet).await?)
         } else {
             None
         };
@@ -1010,7 +1041,7 @@ impl DirectScriptStreams {
             .any(|config| config.source == ScriptSource::Orderbook)
         {
             let depth = source_config(source_configs, &ScriptSource::Orderbook)?.depth_or_default();
-            Some(DirectOrderBookStream::connect(provider, symbol, depth, testnet).await?)
+            Some(DirectOrderBookStream::connect(provider, &exchange, symbol, depth, testnet).await?)
         } else {
             None
         };
@@ -1018,7 +1049,7 @@ impl DirectScriptStreams {
             .values()
             .any(|config| config.source == ScriptSource::Oi)
         {
-            Some(DirectTickerStream::connect(provider, symbol, testnet).await?)
+            Some(DirectTickerStream::connect(provider, &exchange, symbol, testnet).await?)
         } else {
             None
         };
@@ -1029,12 +1060,13 @@ impl DirectScriptStreams {
             let seconds = source_config(source_configs, &ScriptSource::Volumes)?
                 .require_timeframe(&ScriptSource::Volumes)?;
             let interval = direct_timeframe(provider, seconds)?;
-            Some(DirectCandleStream::connect(provider, symbol, interval, testnet).await?)
+            Some(DirectCandleStream::connect(provider, &exchange, symbol, interval, testnet).await?)
         } else {
             None
         };
         Ok(Self {
             provider,
+            exchange,
             symbol: source_configs
                 .values()
                 .next()
@@ -1114,7 +1146,12 @@ impl DirectScriptStreams {
                         );
                     }
                     if let Some(config) = vd_config.as_ref()
-                        && let Some(update) = direct_vd_update(self.provider, &batch, cumulative_delta)
+                        && let Some(update) = direct_vd_update(
+                            self.provider,
+                            &self.exchange,
+                            &batch,
+                            cumulative_delta,
+                        )
                     {
                         pending.push_back(LiveUpdate::new(config, LiveRecord::Vd(update)));
                     }
@@ -1136,7 +1173,10 @@ impl DirectScriptStreams {
                 candle = async { volumes.as_mut().expect("guarded volume stream").next_candle().await }, if has_volumes => {
                     return Ok(LiveUpdate::new(volumes_config.as_ref().expect("configured volumes source"), LiveRecord::Volumes(ScriptVolume::from_bulk_candle(candle?))));
                 }
-                else => bail!("{} script has no live source streams", direct_provider_name(self.provider)),
+                else => bail!(
+                    "{} script has no live source streams",
+                    direct_provider_name(self.provider, &self.exchange)
+                ),
             }
         }
     }
@@ -1144,6 +1184,7 @@ impl DirectScriptStreams {
 
 fn direct_vd_update(
     provider: ProviderKind,
+    exchange: &str,
     trades: &[crate::domain::types::TradeTick],
     cumulative_delta: &mut f64,
 ) -> Option<ScriptVolumeDelta> {
@@ -1162,7 +1203,7 @@ fn direct_vd_update(
         .sum::<f64>();
     *cumulative_delta += delta;
     Some(ScriptVolumeDelta::from_bulk(VolumeDeltaTick {
-        exchange: direct_provider_name(provider).to_string(),
+        exchange: direct_provider_name(provider, exchange).to_string(),
         symbol: trades[0].symbol.clone(),
         timestamp_ms: trades
             .iter()
@@ -1790,8 +1831,8 @@ mod tests {
         let grouped = configs_grouped_by_symbol(&configs, ProviderKind::Bulk);
 
         assert_eq!(grouped.len(), 2);
-        assert!(grouped["btc"].contains_key("btc@trades@bulkf"));
-        assert!(grouped["zec"].contains_key("zec@trades@bulkf"));
+        assert!(grouped["bulkf:btc"].contains_key("btc@trades@bulkf"));
+        assert!(grouped["bulkf:zec"].contains_key("zec@trades@bulkf"));
     }
 
     #[test]

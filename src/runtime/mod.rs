@@ -1404,12 +1404,14 @@ fn create_script_job(
     submission: ScriptJobSubmission,
 ) -> Result<ScriptJob> {
     submission.validate()?;
-    if submission.venue == Some(ExecutionVenue::Bulk) {
-        credentials::bulk_account()
-            .context("BULK authentication is required when a script uses --venue bulkf")?;
-    } else if submission.venue == Some(ExecutionVenue::Hyperliquid) {
-        credentials::hyperliquid_account().context(
-            "Hyperliquid authentication is required when a script uses --venue hyperliquidf",
+    if let Some(venue) = submission.venue {
+        crate::providers::execution::ExecutionAdapter::configured_account(venue).with_context(
+            || {
+                format!(
+                    "{} authentication is required when a script enables execution",
+                    execution_exchange(venue)
+                )
+            },
         )?;
     }
 
@@ -2423,6 +2425,7 @@ async fn execute_script_order(
     let venue_arg = match venue {
         ExecutionVenue::Bulk => crate::cli::ExecutionVenueArg::Bulk,
         ExecutionVenue::Hyperliquid => crate::cli::ExecutionVenueArg::Hyperliquid,
+        ExecutionVenue::HyperliquidSpot => crate::cli::ExecutionVenueArg::HyperliquidSpot,
     };
     let (args, direction) = match &request {
         ScriptManagedRequest::Trade(request) => {
@@ -3078,9 +3081,10 @@ async fn execute_bot_trades(
                     .submit_trades(credentials::active_bulk_credential()?, &pending_plans)
                     .await?
             }
-            ExecutionVenue::Hyperliquid => {
-                crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new(
-                    HyperliquidNetwork::from_testnet(pending_plans[0].testnet),
+            ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidSpot => {
+                crate::providers::execution::ExecutionAdapter::new(
+                    pending_plans[0].venue,
+                    pending_plans[0].testnet,
                 )
                 .await?
                 .submit_trades(&pending_plans)
@@ -3162,9 +3166,10 @@ async fn execute_bot_cancels(
                     .cancel_orders(credentials::active_bulk_credential()?, &pending_plans)
                     .await?
             }
-            ExecutionVenue::Hyperliquid => {
-                crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new(
-                    HyperliquidNetwork::from_testnet(pending_plans[0].testnet),
+            ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidSpot => {
+                crate::providers::execution::ExecutionAdapter::new(
+                    pending_plans[0].venue,
+                    pending_plans[0].testnet,
                 )
                 .await?
                 .cancel_orders_fast(&pending_plans)
@@ -3874,13 +3879,11 @@ async fn execute_trade(
                 .submit_trade(credentials::active_bulk_credential()?, plan)
                 .await?
         }
-        ExecutionVenue::Hyperliquid => {
-            crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new(
-                HyperliquidNetwork::from_testnet(plan.testnet),
-            )
-            .await?
-            .submit_trade(plan)
-            .await?
+        ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidSpot => {
+            crate::providers::execution::ExecutionAdapter::new(plan.venue, plan.testnet)
+                .await?
+                .submit_trade(plan)
+                .await?
         }
     };
     record_trade_receipt(paths, state, plan, script_order_id, &receipt)?;
@@ -3952,7 +3955,14 @@ async fn execute_cancel_with_priority(
 ) -> Result<ExecutionReceipt> {
     let market =
         crate::markets::exchange_market(execution_exchange(plan.venue), &plan.internal_symbol)?;
-    if market.venue_symbol != plan.venue_symbol {
+    let expected_venue_symbol = if plan.venue == ExecutionVenue::HyperliquidSpot {
+        market
+            .network_variant(HyperliquidNetwork::from_testnet(plan.testnet).label())?
+            .venue_symbol
+    } else {
+        market.venue_symbol.clone()
+    };
+    if expected_venue_symbol != plan.venue_symbol {
         bail!("cancel plan symbol mapping does not match the installed market snapshot");
     }
     let configured = crate::providers::execution::ExecutionAdapter::configured_account(plan.venue)?;
@@ -3969,20 +3979,14 @@ async fn execute_cancel_with_priority(
                 )
                 .await?
         }
-        ExecutionVenue::Hyperliquid => {
+        ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidSpot => {
             let adapter =
-                crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter::new(
-                    HyperliquidNetwork::from_testnet(plan.testnet),
-                )
-                .await?;
+                crate::providers::execution::ExecutionAdapter::new(plan.venue, plan.testnet)
+                    .await?;
             if fast {
-                adapter
-                    .cancel_order_fast(&plan.venue_symbol, &plan.order_id)
-                    .await?
+                adapter.cancel_order_fast(plan).await?
             } else {
-                adapter
-                    .cancel_order(&plan.venue_symbol, &plan.order_id)
-                    .await?
+                adapter.cancel_order(plan).await?
             }
         }
     };
@@ -4039,8 +4043,8 @@ fn ensure_account_supervisor(
 fn network_label(venue: ExecutionVenue, testnet: bool) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "testnet",
-        ExecutionVenue::Hyperliquid if testnet => "testnet",
-        ExecutionVenue::Hyperliquid => "mainnet",
+        ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidSpot if testnet => "testnet",
+        ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidSpot => "mainnet",
     }
 }
 
@@ -4064,6 +4068,7 @@ fn execution_exchange(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "bulkf",
         ExecutionVenue::Hyperliquid => "hyperliquidf",
+        ExecutionVenue::HyperliquidSpot => "hyperliquid",
     }
 }
 
@@ -4077,6 +4082,13 @@ impl VenueAccountStream {
         match venue {
             ExecutionVenue::Bulk => Ok(Self::Bulk(BulkAccountStream::connect(account).await?)),
             ExecutionVenue::Hyperliquid => Ok(Self::Hyperliquid(
+                HyperliquidAccountStream::connect_on(
+                    account,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
+            )),
+            ExecutionVenue::HyperliquidSpot => Ok(Self::Hyperliquid(
                 HyperliquidAccountStream::connect_on(
                     account,
                     HyperliquidNetwork::from_testnet(testnet),
@@ -4239,8 +4251,10 @@ async fn handle_account_connection_event(
                 &data,
                 received_at_ms,
             )?;
-            if venue == ExecutionVenue::Hyperliquid
-                && data.get("channel").and_then(serde_json::Value::as_str) == Some("user")
+            if matches!(
+                venue,
+                ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidSpot
+            ) && data.get("channel").and_then(serde_json::Value::as_str) == Some("user")
             {
                 refresh_account_positions(venue, testnet, adapter, state, &account, true).await?;
             }
@@ -4269,7 +4283,7 @@ async fn refresh_account_positions(
     }
     let snapshot = match venue {
         ExecutionVenue::Bulk => adapter.account_snapshot(account).await?,
-        ExecutionVenue::Hyperliquid => {
+        ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidSpot => {
             crate::providers::execution::ExecutionAdapter::new(venue, testnet)
                 .await?
                 .account_snapshot(account)
@@ -4343,8 +4357,16 @@ fn apply_account_event(
         ExecutionVenue::Bulk => {
             apply_bulk_account_event(paths, state, account, data, received_at_ms)
         }
-        ExecutionVenue::Hyperliquid => {
-            apply_hyperliquid_account_event(testnet, paths, state, account, data, received_at_ms)
+        ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidSpot => {
+            apply_hyperliquid_account_event(
+                venue,
+                testnet,
+                paths,
+                state,
+                account,
+                data,
+                received_at_ms,
+            )
         }
     }
 }
@@ -4430,6 +4452,7 @@ fn apply_bulk_account_event(
 }
 
 fn apply_hyperliquid_account_event(
+    venue: ExecutionVenue,
     testnet: bool,
     paths: &RuntimePaths,
     state: &mut RuntimeState,
@@ -4447,6 +4470,12 @@ fn apply_hyperliquid_account_event(
                 let order = update
                     .get("order")
                     .context("Hyperliquid order update omitted order")?;
+                let Some(coin) = order.get("coin").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                if !hyperliquid_event_matches_venue(venue, testnet, coin) {
+                    continue;
+                }
                 let order_id = value_identifier(
                     order
                         .get("oid")
@@ -4464,7 +4493,7 @@ fn apply_hyperliquid_account_event(
                 apply_tracked_order_status(
                     paths,
                     state,
-                    (ExecutionVenue::Hyperliquid, testnet),
+                    (venue, testnet),
                     account,
                     &order_id,
                     status,
@@ -4473,7 +4502,7 @@ fn apply_hyperliquid_account_event(
                 apply_script_order_status(
                     paths,
                     state,
-                    (ExecutionVenue::Hyperliquid, testnet),
+                    (venue, testnet),
                     &order_id,
                     status,
                     event_ms,
@@ -4487,14 +4516,29 @@ fn apply_hyperliquid_account_event(
                 .context("Hyperliquid user event omitted data")?;
             if let Some(fills) = event.get("fills").and_then(serde_json::Value::as_array) {
                 for fill in fills {
+                    let Some(coin) = fill.get("coin").and_then(serde_json::Value::as_str) else {
+                        continue;
+                    };
+                    if !hyperliquid_event_matches_venue(venue, testnet, coin) {
+                        continue;
+                    }
+                    let product = hyperliquid_product(venue);
+                    let symbol = crate::providers::hyperliquid::markets::market_for_wire(
+                        product,
+                        HyperliquidNetwork::from_testnet(testnet),
+                        coin,
+                    )
+                    .map(|market| market.symbol.clone())
+                    .unwrap_or_else(|_| coin.to_string());
                     let mut normalized = serde_json::json!({
                         "type": "fill",
-                        "venue": "hyperliquidf",
-                        "symbol": fill.get("coin").cloned().unwrap_or(serde_json::Value::Null),
+                        "venue": execution_exchange(venue),
+                        "symbol": symbol,
                         "price": fill.get("px").cloned().unwrap_or(serde_json::Value::Null),
                         "size": fill.get("sz").cloned().unwrap_or(serde_json::Value::Null),
                         "side": fill.get("side").cloned().unwrap_or(serde_json::Value::Null),
                         "fee": fill.get("fee").cloned().unwrap_or(serde_json::Value::Null),
+                        "feeAsset": fill.get("feeToken").cloned().unwrap_or(serde_json::Value::Null),
                         "timestamp": fill.get("time").cloned().unwrap_or(serde_json::Value::Null),
                         "raw": fill,
                     });
@@ -4504,19 +4548,30 @@ fn apply_hyperliquid_account_event(
                             serde_json::Value::String(value_identifier(oid)?),
                         );
                     }
-                    route_account_event_to_scripts(
-                        ExecutionVenue::Hyperliquid,
-                        testnet,
-                        paths,
-                        state,
-                        &normalized,
-                    )?;
+                    route_account_event_to_scripts(venue, testnet, paths, state, &normalized)?;
                 }
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+fn hyperliquid_product(venue: ExecutionVenue) -> crate::providers::hyperliquid::HyperliquidProduct {
+    match venue {
+        ExecutionVenue::Hyperliquid => crate::providers::hyperliquid::HyperliquidProduct::Perpetual,
+        ExecutionVenue::HyperliquidSpot => crate::providers::hyperliquid::HyperliquidProduct::Spot,
+        ExecutionVenue::Bulk => unreachable!("BULK is not a Hyperliquid product"),
+    }
+}
+
+fn hyperliquid_event_matches_venue(venue: ExecutionVenue, testnet: bool, coin: &str) -> bool {
+    crate::providers::hyperliquid::markets::market_for_wire(
+        hyperliquid_product(venue),
+        HyperliquidNetwork::from_testnet(testnet),
+        coin,
+    )
+    .is_ok()
 }
 
 fn value_identifier(value: &serde_json::Value) -> Result<String> {
@@ -4780,14 +4835,14 @@ async fn recover_account_gap(
                 )?;
             }
         }
-        ExecutionVenue::Hyperliquid => {
+        ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidSpot => {
             let execution =
                 crate::providers::execution::ExecutionAdapter::new(venue, testnet).await?;
             for order in execution.open_orders(account).await? {
                 apply_tracked_order_status(
                     paths,
                     state,
-                    (ExecutionVenue::Hyperliquid, testnet),
+                    (venue, testnet),
                     account,
                     &order.order_id,
                     "resting",
@@ -4796,7 +4851,7 @@ async fn recover_account_gap(
                 apply_script_order_status(
                     paths,
                     state,
-                    (ExecutionVenue::Hyperliquid, testnet),
+                    (venue, testnet),
                     &order.order_id,
                     "resting",
                     order.ts_ms,
@@ -4808,7 +4863,7 @@ async fn recover_account_gap(
 
     let fills = match venue {
         ExecutionVenue::Bulk => adapter.fills(account).await?,
-        ExecutionVenue::Hyperliquid => {
+        ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidSpot => {
             crate::providers::execution::ExecutionAdapter::new(venue, testnet)
                 .await?
                 .fills(account)

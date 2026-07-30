@@ -5,8 +5,10 @@ use serde::{Deserialize, Serialize};
 pub enum ExecutionVenue {
     #[serde(rename = "bulkf")]
     Bulk,
-    #[serde(rename = "hyperliquidf", alias = "hyperliquid")]
+    #[serde(rename = "hyperliquidf")]
     Hyperliquid,
+    #[serde(rename = "hyperliquid")]
+    HyperliquidSpot,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -98,8 +100,23 @@ pub struct AccountSnapshot {
     pub fetched_at_ms: u64,
     pub margin: MarginSummary,
     pub positions: Vec<Position>,
+    #[serde(default)]
+    pub spot_balances: Vec<SpotBalance>,
     pub open_orders: Vec<OpenOrder>,
     pub leverage_settings: Vec<LeverageSetting>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SpotBalance {
+    pub venue: ExecutionVenue,
+    pub asset: String,
+    pub venue_asset: String,
+    pub token_index: u32,
+    pub registry_supported: bool,
+    pub total: f64,
+    pub held: f64,
+    pub available: f64,
+    pub entry_notional: f64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -169,6 +186,8 @@ pub struct Fill {
     /// Signed venue fee: negative is a cost and positive is a rebate.
     #[serde(default)]
     pub fee: Option<f64>,
+    #[serde(default)]
+    pub fee_asset: Option<String>,
     pub slot: u64,
     pub ts_ms: u64,
 }
@@ -284,8 +303,7 @@ mod tests {
         let encoded = serde_json::to_value(ExecutionVenue::Hyperliquid).expect("venue serializes");
         assert_eq!(encoded, serde_json::json!("hyperliquidf"));
 
-        let legacy: ExecutionVenue = serde_json::from_value(serde_json::json!("hyperliquid"))
-            .expect("legacy venue deserializes");
-        assert_eq!(legacy, ExecutionVenue::Hyperliquid);
+        let spot = serde_json::to_value(ExecutionVenue::HyperliquidSpot).expect("venue serializes");
+        assert_eq!(spot, serde_json::json!("hyperliquid"));
     }
 }

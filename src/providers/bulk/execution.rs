@@ -87,6 +87,7 @@ impl BulkExecutionAdapter {
                 .filter(|position| position.size != 0.0)
                 .map(Position::try_from)
                 .collect::<Result<Vec<_>>>()?,
+            spot_balances: Vec::new(),
             open_orders: full
                 .open_orders
                 .into_iter()
@@ -1212,6 +1213,7 @@ impl BulkFill {
             }),
             maker: is_maker,
             fee: None,
+            fee_asset: None,
             slot: self.slot,
             ts_ms: normalize_timestamp_ms(self.timestamp),
         })
@@ -1392,6 +1394,7 @@ mod tests {
             order_id: Some("deterministic-id".to_string()),
             maker: false,
             fee: None,
+            fee_asset: None,
             slot: 42,
             ts_ms: 1_000,
         };

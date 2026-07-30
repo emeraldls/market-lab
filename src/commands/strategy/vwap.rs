@@ -73,6 +73,15 @@ impl WeightedOrderBookStream {
                 )
                 .await?,
             )),
+            ExecutionVenue::HyperliquidSpot => Ok(Self::Hyperliquid(
+                HyperliquidOrderBookStream::connect_for(
+                    crate::providers::hyperliquid::HyperliquidProduct::Spot,
+                    symbol,
+                    depth.min(20),
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
+            )),
         }
     }
 
@@ -1752,6 +1761,7 @@ pub(super) fn worker_trade_args(
         venue: match definition.venue {
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
             ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
+            ExecutionVenue::HyperliquidSpot => ExecutionVenueArg::HyperliquidSpot,
         },
         testnet: definition.testnet,
         size: Some(size),
@@ -1800,6 +1810,8 @@ pub(super) fn execution_venue_network_name(venue: ExecutionVenue, testnet: bool)
         (ExecutionVenue::Bulk, _) => "BULK testnet",
         (ExecutionVenue::Hyperliquid, true) => "Hyperliquid testnet",
         (ExecutionVenue::Hyperliquid, false) => "Hyperliquid mainnet",
+        (ExecutionVenue::HyperliquidSpot, true) => "Hyperliquid Spot testnet",
+        (ExecutionVenue::HyperliquidSpot, false) => "Hyperliquid Spot mainnet",
     }
 }
 
@@ -1807,6 +1819,7 @@ pub(super) fn execution_venue_name(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "bulkf",
         ExecutionVenue::Hyperliquid => "hyperliquidf",
+        ExecutionVenue::HyperliquidSpot => "hyperliquid",
     }
 }
 

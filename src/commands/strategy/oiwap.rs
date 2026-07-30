@@ -403,6 +403,17 @@ async fn fetch_directional_price_window(
         ExecutionVenue::Hyperliquid => {
             HyperliquidProvider::candles(symbol, "1m", from_ms, to_ms).await?
         }
+        ExecutionVenue::HyperliquidSpot => {
+            HyperliquidProvider::candles_for(
+                crate::providers::hyperliquid::HyperliquidProduct::Spot,
+                symbol,
+                "1m",
+                from_ms,
+                to_ms,
+                crate::providers::hyperliquid::HyperliquidNetwork::Mainnet,
+            )
+            .await?
+        }
     };
     let completed = series
         .data

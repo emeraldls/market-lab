@@ -14,8 +14,8 @@ use crate::domain::types::{
     MarketTicker, OhlcvCandle, OrderBookLevel, OrderBookSnapshot, TopOfBook, TradeTick,
 };
 
-use super::HyperliquidNetwork;
 use super::markets;
+use super::{HyperliquidNetwork, HyperliquidProduct};
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -305,27 +305,46 @@ pub struct HyperliquidOrderBookStream {
     client: HyperliquidWsClient,
     internal_symbol: String,
     venue_symbol: String,
+    exchange: &'static str,
     depth: u16,
     last_touch: Option<(f64, f64)>,
 }
 
 impl HyperliquidOrderBookStream {
     pub async fn connect(symbol: &str, depth: u16) -> Result<Self> {
-        Self::connect_on(symbol, depth, HyperliquidNetwork::Mainnet).await
+        Self::connect_for(
+            HyperliquidProduct::Perpetual,
+            symbol,
+            depth,
+            HyperliquidNetwork::Mainnet,
+        )
+        .await
     }
 
     pub async fn connect_on(symbol: &str, depth: u16, network: HyperliquidNetwork) -> Result<Self> {
+        Self::connect_for(HyperliquidProduct::Perpetual, symbol, depth, network).await
+    }
+
+    pub async fn connect_for(
+        product: HyperliquidProduct,
+        symbol: &str,
+        depth: u16,
+        network: HyperliquidNetwork,
+    ) -> Result<Self> {
         if depth == 0 || depth > 20 {
             bail!("Hyperliquid orderbook depth must be between 1 and 20");
         }
-        let market = markets::market(symbol)?;
-        let client =
-            HyperliquidWsClient::subscribe(network, [orderbook_subscription(&market.venue_symbol)])
-                .await?;
+        let (market, variant) = markets::network_market(product, network, symbol)?;
+        let client = HyperliquidWsClient::subscribe(
+            network,
+            [orderbook_subscription(&variant.venue_symbol)],
+        )
+        .await?;
         Ok(Self {
             client,
             internal_symbol: market.symbol.clone(),
-            venue_symbol: market.venue_symbol.clone(),
+            venue_symbol: variant.venue_symbol,
+            exchange: product.exchange(),
             depth,
             last_touch: None,
         })
@@ -345,7 +364,7 @@ impl HyperliquidOrderBookStream {
             )
             .context("invalid Hyperliquid book update")?;
             if book.coin != self.venue_symbol || book.levels.len() != 2 {
-                bail!("Hyperliquid book update did not match the subscribed native perpetual");
+                bail!("Hyperliquid book update did not match the subscribed market");
             }
             let mut sides = book.levels.into_iter();
             let parse = |levels: Vec<WsLevel>| {
@@ -356,7 +375,7 @@ impl HyperliquidOrderBookStream {
                     .collect::<Result<Vec<_>>>()
             };
             return Ok(OrderBookSnapshot {
-                exchange: "hyperliquidf".to_string(),
+                exchange: self.exchange.to_string(),
                 symbol: self.internal_symbol.clone(),
                 timestamp_ms: book.time,
                 bids: parse(sides.next().expect("book length checked"))?,
@@ -396,27 +415,42 @@ pub struct HyperliquidTradesStream {
     client: HyperliquidWsClient,
     internal_symbol: String,
     venue_symbol: String,
+    exchange: &'static str,
 }
 
 impl HyperliquidTradesStream {
     pub async fn connect(symbol: &str) -> Result<Self> {
-        Self::connect_on(symbol, HyperliquidNetwork::Mainnet).await
+        Self::connect_for(
+            HyperliquidProduct::Perpetual,
+            symbol,
+            HyperliquidNetwork::Mainnet,
+        )
+        .await
     }
 
     pub async fn connect_on(symbol: &str, network: HyperliquidNetwork) -> Result<Self> {
-        let market = markets::market(symbol)?;
+        Self::connect_for(HyperliquidProduct::Perpetual, symbol, network).await
+    }
+
+    pub async fn connect_for(
+        product: HyperliquidProduct,
+        symbol: &str,
+        network: HyperliquidNetwork,
+    ) -> Result<Self> {
+        let (market, variant) = markets::network_market(product, network, symbol)?;
         let client = HyperliquidWsClient::subscribe(
             network,
             [serde_json::json!({
                 "type": "trades",
-                "coin": market.venue_symbol,
+                "coin": variant.venue_symbol,
             })],
         )
         .await?;
         Ok(Self {
             client,
             internal_symbol: market.symbol.clone(),
-            venue_symbol: market.venue_symbol.clone(),
+            venue_symbol: variant.venue_symbol,
+            exchange: product.exchange(),
         })
     }
 
@@ -437,10 +471,10 @@ impl HyperliquidTradesStream {
                 .into_iter()
                 .map(|trade| {
                     if trade.coin != self.venue_symbol {
-                        bail!("Hyperliquid trade did not match the subscribed native perpetual");
+                        bail!("Hyperliquid trade did not match the subscribed market");
                     }
                     Ok(TradeTick {
-                        exchange: "hyperliquidf".to_string(),
+                        exchange: self.exchange.to_string(),
                         symbol: self.internal_symbol.clone(),
                         timestamp_ms: trade.time,
                         price: parse(&trade.px, "trade price")?,
@@ -460,7 +494,13 @@ pub struct HyperliquidCandleStream {
 
 impl HyperliquidCandleStream {
     pub async fn connect(symbol: &str, interval: &str) -> Result<Self> {
-        Self::connect_on(symbol, interval, HyperliquidNetwork::Mainnet).await
+        Self::connect_for(
+            HyperliquidProduct::Perpetual,
+            symbol,
+            interval,
+            HyperliquidNetwork::Mainnet,
+        )
+        .await
     }
 
     pub async fn connect_on(
@@ -468,19 +508,28 @@ impl HyperliquidCandleStream {
         interval: &str,
         network: HyperliquidNetwork,
     ) -> Result<Self> {
-        let market = markets::market(symbol)?;
+        Self::connect_for(HyperliquidProduct::Perpetual, symbol, interval, network).await
+    }
+
+    pub async fn connect_for(
+        product: HyperliquidProduct,
+        symbol: &str,
+        interval: &str,
+        network: HyperliquidNetwork,
+    ) -> Result<Self> {
+        let (_, variant) = markets::network_market(product, network, symbol)?;
         let client = HyperliquidWsClient::subscribe(
             network,
             [serde_json::json!({
                 "type": "candle",
-                "coin": market.venue_symbol,
+                "coin": variant.venue_symbol,
                 "interval": interval,
             })],
         )
         .await?;
         Ok(Self {
             client,
-            venue_symbol: market.venue_symbol.clone(),
+            venue_symbol: variant.venue_symbol,
         })
     }
 
@@ -498,7 +547,7 @@ impl HyperliquidCandleStream {
             )
             .context("invalid Hyperliquid candle update")?;
             if candle.symbol != self.venue_symbol {
-                bail!("Hyperliquid candle did not match the subscribed native perpetual");
+                bail!("Hyperliquid candle did not match the subscribed market");
             }
             return candle.into_candle();
         }
@@ -509,27 +558,42 @@ pub struct HyperliquidAssetContextStream {
     client: HyperliquidWsClient,
     internal_symbol: String,
     venue_symbol: String,
+    product: HyperliquidProduct,
 }
 
 impl HyperliquidAssetContextStream {
     pub async fn connect(symbol: &str) -> Result<Self> {
-        Self::connect_on(symbol, HyperliquidNetwork::Mainnet).await
+        Self::connect_for(
+            HyperliquidProduct::Perpetual,
+            symbol,
+            HyperliquidNetwork::Mainnet,
+        )
+        .await
     }
 
     pub async fn connect_on(symbol: &str, network: HyperliquidNetwork) -> Result<Self> {
-        let market = markets::market(symbol)?;
+        Self::connect_for(HyperliquidProduct::Perpetual, symbol, network).await
+    }
+
+    pub async fn connect_for(
+        product: HyperliquidProduct,
+        symbol: &str,
+        network: HyperliquidNetwork,
+    ) -> Result<Self> {
+        let (market, variant) = markets::network_market(product, network, symbol)?;
         let client = HyperliquidWsClient::subscribe(
             network,
             [serde_json::json!({
                 "type": "activeAssetCtx",
-                "coin": market.venue_symbol,
+                "coin": variant.venue_symbol,
             })],
         )
         .await?;
         Ok(Self {
             client,
             internal_symbol: market.symbol.clone(),
-            venue_symbol: market.venue_symbol.clone(),
+            venue_symbol: variant.venue_symbol,
+            product,
         })
     }
 
@@ -547,9 +611,9 @@ impl HyperliquidAssetContextStream {
             )
             .context("invalid Hyperliquid asset context")?;
             if update.coin != self.venue_symbol {
-                bail!("Hyperliquid asset context did not match the subscribed native perpetual");
+                bail!("Hyperliquid asset context did not match the subscribed market");
             }
-            return update.ctx.into_ticker(&self.internal_symbol);
+            return update.ctx.into_ticker(self.product, &self.internal_symbol);
         }
     }
 }
@@ -667,17 +731,22 @@ struct WsAssetContext {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WsContext {
-    funding: String,
-    open_interest: String,
+    #[serde(default)]
+    funding: Option<String>,
+    #[serde(default)]
+    open_interest: Option<String>,
     prev_day_px: String,
     day_ntl_vlm: String,
-    oracle_px: String,
+    #[serde(default)]
+    day_base_vlm: Option<String>,
+    #[serde(default)]
+    oracle_px: Option<String>,
     mark_px: String,
     mid_px: Option<String>,
 }
 
 impl WsContext {
-    fn into_ticker(self, symbol: &str) -> Result<MarketTicker> {
+    fn into_ticker(self, product: HyperliquidProduct, symbol: &str) -> Result<MarketTicker> {
         let mark = parse(&self.mark_px, "mark price")?;
         let previous = parse(&self.prev_day_px, "previous-day price")?;
         let last = self
@@ -686,7 +755,7 @@ impl WsContext {
             .map_or(Ok(mark), |value| parse(value, "mid price"))?;
         let quote_volume = parse(&self.day_ntl_vlm, "day notional volume")?;
         Ok(MarketTicker {
-            exchange: "hyperliquidf".to_string(),
+            exchange: product.exchange().to_string(),
             symbol: symbol.to_string(),
             timestamp_ms: now_ms(),
             price_change: last - previous,
@@ -698,16 +767,30 @@ impl WsContext {
             last_price: last,
             high_price: 0.0,
             low_price: 0.0,
-            volume: if mark == 0.0 {
-                0.0
-            } else {
-                quote_volume / mark
-            },
+            volume: self.day_base_vlm.as_deref().map_or_else(
+                || {
+                    if mark == 0.0 {
+                        Ok(0.0)
+                    } else {
+                        Ok(quote_volume / mark)
+                    }
+                },
+                |value| parse(value, "day base volume"),
+            )?,
             quote_volume,
             mark_price: mark,
-            oracle_price: parse(&self.oracle_px, "oracle price")?,
-            open_interest: parse(&self.open_interest, "open interest")?,
-            funding_rate: parse(&self.funding, "funding rate")?,
+            oracle_price: self
+                .oracle_px
+                .as_deref()
+                .map_or(Ok(0.0), |value| parse(value, "oracle price"))?,
+            open_interest: self
+                .open_interest
+                .as_deref()
+                .map_or(Ok(0.0), |value| parse(value, "open interest"))?,
+            funding_rate: self
+                .funding
+                .as_deref()
+                .map_or(Ok(0.0), |value| parse(value, "funding rate"))?,
             regime: 0,
             regime_dt: 0,
             regime_vol: 0.0,

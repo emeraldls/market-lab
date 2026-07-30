@@ -11,6 +11,7 @@ use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::bulk::ws::BulkCandleStream;
 use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 use crate::providers::hyperliquid::ws::HyperliquidCandleStream;
+use crate::providers::hyperliquid::{HyperliquidNetwork, HyperliquidProduct};
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::ws_candles::MmtCandlesStream;
 
@@ -108,20 +109,23 @@ async fn handle_bulk(args: SourceCandlesArgs) -> Result<()> {
 }
 
 async fn handle_hyperliquid(args: SourceCandlesArgs) -> Result<()> {
+    let product = HyperliquidProduct::from_exchange(args.exchange_name()?)?;
     if args.stream {
         ensure_stream_output(args.output)?;
-        return stream_hyperliquid_candles(args).await;
+        return stream_hyperliquid_candles(args, product).await;
     }
-    let series = HyperliquidProvider::candles(
+    let series = HyperliquidProvider::candles_for(
+        product,
         &args.symbol,
         args.timeframe_name()?,
         args.from
             .ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?,
         args.to
             .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?,
+        HyperliquidNetwork::Mainnet,
     )
     .await?;
-    render_direct_series(&series, &args, "hyperliquidf", "Hyperliquid")
+    render_direct_series(&series, &args, product.exchange(), "Hyperliquid")
 }
 
 async fn handle_binance(args: SourceCandlesArgs, market: BinanceMarket) -> Result<()> {
@@ -319,9 +323,18 @@ async fn stream_bulk_candles(args: SourceCandlesArgs) -> Result<()> {
     Ok(())
 }
 
-async fn stream_hyperliquid_candles(args: SourceCandlesArgs) -> Result<()> {
-    let market = crate::providers::hyperliquid::markets::market(&args.symbol)?;
-    let mut stream = HyperliquidCandleStream::connect(&args.symbol, args.timeframe_name()?).await?;
+async fn stream_hyperliquid_candles(
+    args: SourceCandlesArgs,
+    product: HyperliquidProduct,
+) -> Result<()> {
+    let market = crate::providers::hyperliquid::markets::market_for(product, &args.symbol)?;
+    let mut stream = HyperliquidCandleStream::connect_for(
+        product,
+        &args.symbol,
+        args.timeframe_name()?,
+        HyperliquidNetwork::Mainnet,
+    )
+    .await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest = None;
     let mut buf = VecDeque::with_capacity(args.buffer_size as usize);
@@ -337,8 +350,8 @@ async fn stream_hyperliquid_candles(args: SourceCandlesArgs) -> Result<()> {
                 let env = SourceEnvelope {
                     r#type: "source.candles.stream".to_string(),
                     version: "1",
-                    provider: "hyperliquidf",
-                    exchange: "hyperliquidf".to_string(),
+                    provider: product.exchange(),
+                    exchange: product.exchange().to_string(),
                     symbol: market.symbol.clone(),
                     ts_ms: candle.t,
                     stream: true,

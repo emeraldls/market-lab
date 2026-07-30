@@ -9,10 +9,9 @@ use crate::domain::types::{
     TopOfBook, VolumeBar, VolumeBarSeries,
 };
 
-use super::EXCHANGE;
-use super::HyperliquidNetwork;
 use super::client::HyperliquidClient;
 use super::markets;
+use super::{EXCHANGE, HyperliquidNetwork, HyperliquidProduct};
 
 pub struct HyperliquidProvider;
 
@@ -20,7 +19,7 @@ impl HyperliquidProvider {
     pub fn capabilities() -> serde_json::Value {
         serde_json::json!({
             "network": "mainnet",
-            "products": ["native_perpetuals"],
+            "products": ["spot", "native_perpetuals"],
             "authentication": {
                 "market_data_requires_api_key": false,
                 "execution_requires_agent_wallet": true
@@ -28,7 +27,7 @@ impl HyperliquidProvider {
             "historical": { "candles": true, "volume_bars": true },
             "snapshots": {
                 "orderbook": true, "ticker": true, "statistics": true,
-                "open_interest": true, "funding": true
+                "open_interest": "perpetuals_only", "funding": "perpetuals_only"
             },
             "streams": { "orderbook": true, "trades": true, "candles": true }
         })
@@ -51,18 +50,37 @@ impl HyperliquidProvider {
     }
 
     pub async fn candles(symbol: &str, interval: &str, from: u64, to: u64) -> Result<OhlcvSeries> {
-        let market = require_market(symbol)?;
+        Self::candles_for(
+            HyperliquidProduct::Perpetual,
+            symbol,
+            interval,
+            from,
+            to,
+            HyperliquidNetwork::Mainnet,
+        )
+        .await
+    }
+
+    pub async fn candles_for(
+        product: HyperliquidProduct,
+        symbol: &str,
+        interval: &str,
+        from: u64,
+        to: u64,
+        network: HyperliquidNetwork,
+    ) -> Result<OhlcvSeries> {
+        let (market, variant) = require_market(product, network, symbol)?;
         require_timestamp_ms(from, "candle start time")?;
         require_timestamp_ms(to, "candle end time")?;
         if from >= to {
             bail!("candle start time must be less than end time");
         }
         validate_interval(interval)?;
-        let raw: Vec<HyperliquidCandle> = HyperliquidClient::new()?
+        let raw: Vec<HyperliquidCandle> = HyperliquidClient::for_network(network)?
             .info(&serde_json::json!({
                 "type": "candleSnapshot",
                 "req": {
-                    "coin": market.provider_symbol,
+                    "coin": variant.provider_symbol,
                     "interval": interval,
                     "startTime": from,
                     "endTime": to
@@ -75,7 +93,7 @@ impl HyperliquidProvider {
             .collect::<Result<Vec<_>>>()?;
         data.sort_by_key(|candle| candle.t);
         Ok(OhlcvSeries {
-            exchange: EXCHANGE.to_string(),
+            exchange: product.exchange().to_string(),
             symbol: market.symbol.clone(),
             tf: interval.to_string(),
             from,
@@ -92,25 +110,19 @@ impl HyperliquidProvider {
         to: u64,
     ) -> Result<VolumeBarSeries> {
         let candles = Self::candles(symbol, interval, from, to).await?;
-        let data = candles
-            .data
-            .into_iter()
-            .map(|candle| VolumeBar {
-                t: candle.t,
-                close_time: candle.close_time,
-                volume: candle.volume,
-                trades: candle.trades,
-            })
-            .collect::<Vec<_>>();
-        Ok(VolumeBarSeries {
-            exchange: candles.exchange,
-            symbol: candles.symbol,
-            tf: candles.tf,
-            from: candles.from,
-            to: candles.to,
-            points: data.len(),
-            data,
-        })
+        Ok(volume_bars_from_candles(candles))
+    }
+
+    pub async fn volume_bars_for(
+        product: HyperliquidProduct,
+        symbol: &str,
+        interval: &str,
+        from: u64,
+        to: u64,
+        network: HyperliquidNetwork,
+    ) -> Result<VolumeBarSeries> {
+        let candles = Self::candles_for(product, symbol, interval, from, to, network).await?;
+        Ok(volume_bars_from_candles(candles))
     }
 
     pub async fn live_orderbook(
@@ -118,10 +130,44 @@ impl HyperliquidProvider {
         depth: u16,
         aggregation: Option<f64>,
     ) -> Result<OrderBookSnapshot> {
-        Self::live_orderbook_on(symbol, depth, aggregation, HyperliquidNetwork::Mainnet).await
+        Self::live_orderbook_for(
+            HyperliquidProduct::Perpetual,
+            symbol,
+            depth,
+            aggregation,
+            HyperliquidNetwork::Mainnet,
+        )
+        .await
+    }
+
+    pub async fn live_orderbook_for(
+        product: HyperliquidProduct,
+        symbol: &str,
+        depth: u16,
+        aggregation: Option<f64>,
+        network: HyperliquidNetwork,
+    ) -> Result<OrderBookSnapshot> {
+        Self::live_orderbook_on_product(product, symbol, depth, aggregation, network).await
     }
 
     pub async fn live_orderbook_on(
+        symbol: &str,
+        depth: u16,
+        aggregation: Option<f64>,
+        network: HyperliquidNetwork,
+    ) -> Result<OrderBookSnapshot> {
+        Self::live_orderbook_on_product(
+            HyperliquidProduct::Perpetual,
+            symbol,
+            depth,
+            aggregation,
+            network,
+        )
+        .await
+    }
+
+    async fn live_orderbook_on_product(
+        product: HyperliquidProduct,
         symbol: &str,
         depth: u16,
         _aggregation: Option<f64>,
@@ -130,32 +176,69 @@ impl HyperliquidProvider {
         if depth == 0 || depth > 20 {
             bail!("Hyperliquid orderbook depth must be between 1 and 20");
         }
-        let market = require_market(symbol)?;
+        let (market, variant) = require_market(product, network, symbol)?;
         let raw: HyperliquidBook = HyperliquidClient::for_network(network)?
             .info(&serde_json::json!({
                 "type": "l2Book",
-                "coin": market.provider_symbol
+                "coin": variant.provider_symbol
             }))
             .await?;
-        raw.into_snapshot(&market.symbol, &market.venue_symbol, depth)
+        raw.into_snapshot(
+            product.exchange(),
+            &market.symbol,
+            &variant.venue_symbol,
+            depth,
+        )
     }
 
     pub async fn ticker(symbol: &str) -> Result<MarketTicker> {
-        Self::ticker_on(symbol, HyperliquidNetwork::Mainnet).await
+        Self::ticker_for(
+            HyperliquidProduct::Perpetual,
+            symbol,
+            HyperliquidNetwork::Mainnet,
+        )
+        .await
+    }
+
+    pub async fn ticker_for(
+        product: HyperliquidProduct,
+        symbol: &str,
+        network: HyperliquidNetwork,
+    ) -> Result<MarketTicker> {
+        let (market, variant) = require_market(product, network, symbol)?;
+        match product {
+            HyperliquidProduct::Perpetual => {
+                let (meta, contexts) = meta_and_contexts(network).await?;
+                let index = meta
+                    .universe
+                    .iter()
+                    .position(|candidate| candidate.name == variant.provider_symbol)
+                    .with_context(|| {
+                        format!("Hyperliquid omitted {} context", variant.provider_symbol)
+                    })?;
+                let context = contexts
+                    .get(index)
+                    .context("Hyperliquid metadata and asset contexts are out of sync")?;
+                context.to_ticker(product.exchange(), &market.symbol)
+            }
+            HyperliquidProduct::Spot => {
+                let contexts = spot_contexts(network).await?;
+                let context = contexts
+                    .into_iter()
+                    .find(|context| context.coin == variant.provider_symbol)
+                    .with_context(|| {
+                        format!(
+                            "Hyperliquid spot omitted {} context",
+                            variant.provider_symbol
+                        )
+                    })?;
+                context.to_ticker(product.exchange(), &market.symbol)
+            }
+        }
     }
 
     pub async fn ticker_on(symbol: &str, network: HyperliquidNetwork) -> Result<MarketTicker> {
-        let market = require_market(symbol)?;
-        let (meta, contexts) = meta_and_contexts(network).await?;
-        let index = meta
-            .universe
-            .iter()
-            .position(|candidate| candidate.name == market.provider_symbol)
-            .with_context(|| format!("Hyperliquid omitted {} context", market.provider_symbol))?;
-        let context = contexts
-            .get(index)
-            .context("Hyperliquid metadata and asset contexts are out of sync")?;
-        context.to_ticker(&market.symbol)
+        Self::ticker_for(HyperliquidProduct::Perpetual, symbol, network).await
     }
 
     pub async fn open_interest(symbol: &str) -> Result<OpenInterestSnapshot> {
@@ -182,10 +265,24 @@ impl HyperliquidProvider {
     }
 
     pub async fn statistics(period: &str, symbol: Option<&str>) -> Result<ExchangeStatistics> {
+        Self::statistics_for(HyperliquidProduct::Perpetual, period, symbol).await
+    }
+
+    pub async fn statistics_for(
+        product: HyperliquidProduct,
+        period: &str,
+        symbol: Option<&str>,
+    ) -> Result<ExchangeStatistics> {
+        if product == HyperliquidProduct::Spot {
+            return spot_statistics(period, symbol).await;
+        }
         if !matches!(period.to_ascii_lowercase().as_str(), "1d" | "24h") {
             bail!("Hyperliquid statistics currently supports only period 1d");
         }
-        let selected = symbol.map(require_market).transpose()?;
+        let selected = symbol
+            .map(|symbol| require_market(product, HyperliquidNetwork::Mainnet, symbol))
+            .transpose()?
+            .map(|(market, _)| market);
         let (meta, contexts) = meta_and_contexts(HyperliquidNetwork::Mainnet).await?;
         let timestamp_ms = now_ms()?;
         let mut markets_out = Vec::new();
@@ -198,7 +295,7 @@ impl HyperliquidProvider {
             {
                 continue;
             }
-            let market = match markets::market(&asset.name) {
+            let market = match markets::market_for(product, &asset.name) {
                 Ok(market) => market,
                 Err(_) => continue,
             };
@@ -221,7 +318,7 @@ impl HyperliquidProvider {
                 mark_price: mark,
             });
             funding.push(FundingRateSnapshot {
-                exchange: EXCHANGE.to_string(),
+                exchange: product.exchange().to_string(),
                 symbol: market.symbol.clone(),
                 timestamp_ms,
                 current: rate,
@@ -229,7 +326,7 @@ impl HyperliquidProvider {
             });
         }
         Ok(ExchangeStatistics {
-            exchange: EXCHANGE.to_string(),
+            exchange: product.exchange().to_string(),
             timestamp_ms,
             period: "1d".to_string(),
             total_volume_usd: markets_out.iter().map(|market| market.quote_volume).sum(),
@@ -251,15 +348,44 @@ impl HyperliquidProvider {
     }
 }
 
-fn require_market(symbol: &str) -> Result<std::sync::Arc<markets::HyperliquidMarket>> {
-    let market = markets::market(symbol)?;
+fn volume_bars_from_candles(candles: OhlcvSeries) -> VolumeBarSeries {
+    let data = candles
+        .data
+        .into_iter()
+        .map(|candle| VolumeBar {
+            t: candle.t,
+            close_time: candle.close_time,
+            volume: candle.volume,
+            trades: candle.trades,
+        })
+        .collect::<Vec<_>>();
+    VolumeBarSeries {
+        exchange: candles.exchange,
+        symbol: candles.symbol,
+        tf: candles.tf,
+        from: candles.from,
+        to: candles.to,
+        points: data.len(),
+        data,
+    }
+}
+
+fn require_market(
+    product: HyperliquidProduct,
+    network: HyperliquidNetwork,
+    symbol: &str,
+) -> Result<(
+    std::sync::Arc<markets::HyperliquidMarket>,
+    markets::HyperliquidNetworkMarket,
+)> {
+    let (market, variant) = markets::network_market(product, network, symbol)?;
     if !market.is_available() {
         bail!(
             "Hyperliquid market `{}` is not trading",
             market.venue_symbol
         );
     }
-    Ok(market)
+    Ok((market, variant))
 }
 
 pub fn timeframe_from_seconds(seconds: u32) -> Result<&'static str> {
@@ -342,6 +468,72 @@ async fn meta_and_contexts(
     ))
 }
 
+async fn spot_contexts(network: HyperliquidNetwork) -> Result<Vec<HyperliquidSpotContext>> {
+    let value: serde_json::Value = HyperliquidClient::for_network(network)?
+        .info(&serde_json::json!({ "type": "spotMetaAndAssetCtxs" }))
+        .await?;
+    let entries = value
+        .as_array()
+        .context("Hyperliquid spotMetaAndAssetCtxs must be an array")?;
+    if entries.len() != 2 {
+        bail!("Hyperliquid spotMetaAndAssetCtxs must contain two entries");
+    }
+    serde_json::from_value(entries[1].clone()).context("invalid Hyperliquid spot asset contexts")
+}
+
+async fn spot_statistics(period: &str, symbol: Option<&str>) -> Result<ExchangeStatistics> {
+    if !matches!(period.to_ascii_lowercase().as_str(), "1d" | "24h") {
+        bail!("Hyperliquid spot statistics currently supports only period 1d");
+    }
+    let selected = symbol
+        .map(|symbol| {
+            require_market(
+                HyperliquidProduct::Spot,
+                HyperliquidNetwork::Mainnet,
+                symbol,
+            )
+        })
+        .transpose()?
+        .map(|(market, variant)| (market, variant.provider_symbol));
+    let timestamp_ms = now_ms()?;
+    let mut output = Vec::new();
+    for context in spot_contexts(HyperliquidNetwork::Mainnet).await? {
+        if selected
+            .as_ref()
+            .is_some_and(|(_, provider_symbol)| provider_symbol != &context.coin)
+        {
+            continue;
+        }
+        let market = match markets::market_for(HyperliquidProduct::Spot, &context.coin) {
+            Ok(market) => market,
+            Err(_) => continue,
+        };
+        let mark = parse(&context.mark_px, "spot mark price")?;
+        output.push(MarketStatistics {
+            symbol: market.symbol.clone(),
+            volume: parse(&context.day_base_vlm, "spot day base volume")?,
+            quote_volume: parse(&context.day_ntl_vlm, "spot day notional volume")?,
+            open_interest: 0.0,
+            funding_rate: 0.0,
+            funding_rate_annualized: 0.0,
+            last_price: context
+                .mid_px
+                .as_deref()
+                .map_or(Ok(mark), |value| parse(value, "spot mid price"))?,
+            mark_price: mark,
+        });
+    }
+    Ok(ExchangeStatistics {
+        exchange: HyperliquidProduct::Spot.exchange().to_string(),
+        timestamp_ms,
+        period: "1d".to_string(),
+        total_volume_usd: output.iter().map(|market| market.quote_volume).sum(),
+        total_open_interest_usd: 0.0,
+        markets: output,
+        funding: Vec::new(),
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct HyperliquidMeta {
     universe: Vec<HyperliquidAsset>,
@@ -369,7 +561,7 @@ struct HyperliquidContext {
 }
 
 impl HyperliquidContext {
-    fn to_ticker(&self, symbol: &str) -> Result<MarketTicker> {
+    fn to_ticker(&self, exchange: &str, symbol: &str) -> Result<MarketTicker> {
         let mark = parse(&self.mark_px, "mark price")?;
         let previous = parse(&self.prev_day_px, "previous-day price")?;
         let last = self
@@ -377,7 +569,7 @@ impl HyperliquidContext {
             .as_deref()
             .map_or(Ok(mark), |value| parse(value, "mid price"))?;
         Ok(MarketTicker {
-            exchange: EXCHANGE.to_string(),
+            exchange: exchange.to_string(),
             symbol: symbol.to_string(),
             timestamp_ms: now_ms()?,
             price_change: last - previous,
@@ -395,6 +587,55 @@ impl HyperliquidContext {
             oracle_price: parse(&self.oracle_px, "oracle price")?,
             open_interest: parse(&self.open_interest, "open interest")?,
             funding_rate: parse(&self.funding, "funding rate")?,
+            regime: 0,
+            regime_dt: 0,
+            regime_vol: 0.0,
+            regime_mv: 0.0,
+            fair_book_price: last,
+            fair_vol: 0.0,
+            fair_bias: 0.0,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HyperliquidSpotContext {
+    coin: String,
+    prev_day_px: String,
+    day_ntl_vlm: String,
+    day_base_vlm: String,
+    mark_px: String,
+    mid_px: Option<String>,
+}
+
+impl HyperliquidSpotContext {
+    fn to_ticker(&self, exchange: &str, symbol: &str) -> Result<MarketTicker> {
+        let mark = parse(&self.mark_px, "spot mark price")?;
+        let previous = parse(&self.prev_day_px, "spot previous-day price")?;
+        let last = self
+            .mid_px
+            .as_deref()
+            .map_or(Ok(mark), |value| parse(value, "spot mid price"))?;
+        Ok(MarketTicker {
+            exchange: exchange.to_string(),
+            symbol: symbol.to_string(),
+            timestamp_ms: now_ms()?,
+            price_change: last - previous,
+            price_change_percent: if previous == 0.0 {
+                0.0
+            } else {
+                (last - previous) / previous * 100.0
+            },
+            last_price: last,
+            high_price: 0.0,
+            low_price: 0.0,
+            volume: parse(&self.day_base_vlm, "spot day base volume")?,
+            quote_volume: parse(&self.day_ntl_vlm, "spot day notional volume")?,
+            mark_price: mark,
+            oracle_price: 0.0,
+            open_interest: 0.0,
+            funding_rate: 0.0,
             regime: 0,
             regime_dt: 0,
             regime_vol: 0.0,
@@ -457,6 +698,7 @@ struct HyperliquidLevel {
 impl HyperliquidBook {
     fn into_snapshot(
         self,
+        exchange: &str,
         symbol: &str,
         venue_symbol: &str,
         depth: u16,
@@ -478,7 +720,7 @@ impl HyperliquidBook {
                 .collect::<Result<Vec<_>>>()
         };
         Ok(OrderBookSnapshot {
-            exchange: EXCHANGE.to_string(),
+            exchange: exchange.to_string(),
             symbol: symbol.to_string(),
             timestamp_ms: self.time,
             bids: parse_side(sides.next().expect("book length checked"))?,

@@ -11,6 +11,7 @@ use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::bulk::ws::BulkOrderBookStream;
 use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 use crate::providers::hyperliquid::ws::HyperliquidOrderBookStream;
+use crate::providers::hyperliquid::{HyperliquidNetwork, HyperliquidProduct};
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::ws::MmtDepthStream;
 
@@ -70,14 +71,22 @@ async fn handle_bulk(args: SourceOrderbookArgs) -> Result<()> {
 }
 
 async fn handle_hyperliquid(args: SourceOrderbookArgs) -> Result<()> {
+    let product = HyperliquidProduct::from_exchange(args.exchange_name()?)?;
     if args.stream {
         if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("stream mode currently supports only --output terminal|json|jsonl");
         }
-        return stream_hyperliquid_orderbook(args).await;
+        return stream_hyperliquid_orderbook(args, product).await;
     }
-    let snapshot = HyperliquidProvider::live_orderbook(&args.symbol, args.depth, None).await?;
-    let envelope = build_orderbook_envelope(&snapshot, &args, "hyperliquidf", false)?;
+    let snapshot = HyperliquidProvider::live_orderbook_for(
+        product,
+        &args.symbol,
+        args.depth,
+        None,
+        HyperliquidNetwork::Mainnet,
+    )
+    .await?;
+    let envelope = build_orderbook_envelope(&snapshot, &args, product.exchange(), false)?;
     render_json_or_terminal(
         &envelope,
         &args.output,
@@ -161,8 +170,17 @@ async fn stream_bulk_orderbook(args: SourceOrderbookArgs) -> Result<()> {
     Ok(())
 }
 
-async fn stream_hyperliquid_orderbook(args: SourceOrderbookArgs) -> Result<()> {
-    let mut stream = HyperliquidOrderBookStream::connect(&args.symbol, args.depth).await?;
+async fn stream_hyperliquid_orderbook(
+    args: SourceOrderbookArgs,
+    product: HyperliquidProduct,
+) -> Result<()> {
+    let mut stream = HyperliquidOrderBookStream::connect_for(
+        product,
+        &args.symbol,
+        args.depth,
+        HyperliquidNetwork::Mainnet,
+    )
+    .await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest = None;
     let mut buf = VecDeque::with_capacity(args.buffer_size as usize);
@@ -175,7 +193,7 @@ async fn stream_hyperliquid_orderbook(args: SourceOrderbookArgs) -> Result<()> {
             snapshot = stream.next_snapshot() => latest = Some(snapshot?),
             _ = ticker.tick() => {
                 let Some(snapshot) = latest.as_ref() else { continue; };
-                let envelope = build_orderbook_envelope(snapshot, &args, "hyperliquidf", true)?;
+                let envelope = build_orderbook_envelope(snapshot, &args, product.exchange(), true)?;
                 match args.output {
                     OutputFormat::Json | OutputFormat::Jsonl => println!("{}", serde_json::to_string(&envelope)?),
                     OutputFormat::Terminal => {

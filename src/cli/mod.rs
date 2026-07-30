@@ -311,11 +311,18 @@ pub enum ExecutionVenueArg {
     Bulk,
     #[value(name = "hyperliquidf")]
     Hyperliquid,
+    #[value(name = "hyperliquid")]
+    HyperliquidSpot,
 }
 
 fn validate_execution_network(venue: ExecutionVenueArg, testnet: bool) -> Result<()> {
-    if testnet && venue != ExecutionVenueArg::Hyperliquid {
-        bail!("--testnet is only valid with --venue hyperliquidf");
+    if testnet
+        && !matches!(
+            venue,
+            ExecutionVenueArg::Hyperliquid | ExecutionVenueArg::HyperliquidSpot
+        )
+    {
+        bail!("--testnet is only valid with --venue hyperliquid or hyperliquidf");
     }
     Ok(())
 }
@@ -325,6 +332,7 @@ impl From<ExecutionVenueArg> for ExecutionVenue {
         match value {
             ExecutionVenueArg::Bulk => ExecutionVenue::Bulk,
             ExecutionVenueArg::Hyperliquid => ExecutionVenue::Hyperliquid,
+            ExecutionVenueArg::HyperliquidSpot => ExecutionVenue::HyperliquidSpot,
         }
     }
 }
@@ -595,8 +603,13 @@ impl ScriptRunArgs {
         if self.duration == Some(0) {
             bail!("--duration must be at least 1 second");
         }
-        if self.testnet && self.venue != Some(ExecutionVenueArg::Hyperliquid) {
-            bail!("--testnet requires --venue hyperliquidf");
+        if self.testnet
+            && !matches!(
+                self.venue,
+                Some(ExecutionVenueArg::Hyperliquid | ExecutionVenueArg::HyperliquidSpot)
+            )
+        {
+            bail!("--testnet requires --venue hyperliquid or hyperliquidf");
         }
         Ok(())
     }
@@ -1200,6 +1213,12 @@ impl SourceFundingArgs {
         resolve_source_provider(None, &self.exchange)?;
         if !is_valid_symbol(&self.symbol) {
             bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        }
+        if !crate::markets::is_futures_exchange(&self.exchange)? {
+            bail!(
+                "funding requires a futures exchange; `{}` is spot",
+                self.exchange
+            );
         }
         if self.stream && matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("stream mode currently supports only --output terminal|json|jsonl");
@@ -1866,6 +1885,9 @@ impl StrategyLogsArgs {
 
 impl RunTwapArgs {
     pub fn validate(&self) -> Result<()> {
+        if self.venue == ExecutionVenueArg::HyperliquidSpot {
+            bail!("TWAP does not support spot execution yet");
+        }
         if !is_valid_symbol(&self.symbol) {
             bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
@@ -1955,6 +1977,9 @@ impl RunVwapArgs {
         let execution_venue = match self.venue {
             ExecutionVenueArg::Bulk => "bulkf",
             ExecutionVenueArg::Hyperliquid => "hyperliquidf",
+            ExecutionVenueArg::HyperliquidSpot => {
+                bail!("VWAP does not support spot execution yet")
+            }
         };
         crate::strategies::vwap::VolumeSourceSelector::parse(
             &self.volume_sources,
@@ -1968,6 +1993,9 @@ impl RunVwapArgs {
 
 impl RunOiwapArgs {
     pub fn validate(&self) -> Result<()> {
+        if self.venue == ExecutionVenueArg::HyperliquidSpot {
+            bail!("OIWAP does not support spot execution yet");
+        }
         if !is_valid_symbol(&self.symbol) {
             bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
@@ -2017,6 +2045,9 @@ impl RunOiwapArgs {
 
 impl RunMidPriceArgs {
     pub fn validate(&self) -> Result<()> {
+        if self.venue == ExecutionVenueArg::HyperliquidSpot {
+            bail!("market-making bots do not support spot execution yet");
+        }
         if !is_valid_symbol(&self.symbol) {
             bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
@@ -2088,6 +2119,9 @@ impl RunVolumeMidArgs {
 
 impl RunGridArgs {
     pub fn validate(&self) -> Result<()> {
+        if self.venue == ExecutionVenueArg::HyperliquidSpot {
+            bail!("grid does not support spot execution yet");
+        }
         if !is_valid_symbol(&self.symbol) {
             bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
         }
@@ -2247,7 +2281,8 @@ fn resolve_source_provider(
     if exchange.eq_ignore_ascii_case("bulkf") {
         return Ok(CliProviderKind::Bulk);
     }
-    if exchange.eq_ignore_ascii_case("hyperliquidf") {
+    if exchange.eq_ignore_ascii_case("hyperliquidf") || exchange.eq_ignore_ascii_case("hyperliquid")
+    {
         return Ok(CliProviderKind::Hyperliquid);
     }
     if exchange.eq_ignore_ascii_case("binance") {
@@ -2279,6 +2314,9 @@ fn resolve_system_provider(
         (Some(_), _) => Ok(ProviderKind::Mmt),
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("bulkf") => Ok(ProviderKind::Bulk),
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquidf") => {
+            Ok(ProviderKind::Hyperliquid)
+        }
+        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquid") => {
             Ok(ProviderKind::Hyperliquid)
         }
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("binance") => {
@@ -2561,6 +2599,29 @@ mod tests {
             _ => panic!("expected trade long command"),
         }
 
+        let spot_trade = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "buy",
+            "BTC/USDT",
+            "--venue",
+            "hyperliquid",
+            "--size",
+            "0.001",
+            "--dry-run",
+        ])
+        .expect("Hyperliquid spot trade command should parse");
+        match spot_trade.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => {
+                args.validate_shape()
+                    .expect("Hyperliquid spot trade shape should validate");
+                assert!(matches!(args.venue, ExecutionVenueArg::HyperliquidSpot));
+            }
+            _ => panic!("expected trade buy command"),
+        }
+
         assert!(
             Cli::try_parse_from([
                 "mlab",
@@ -2572,8 +2633,8 @@ mod tests {
                 "--margin",
                 "100",
             ])
-            .is_err(),
-            "`hyperliquid` is reserved for spot and must not alias perpetual execution"
+            .is_ok(),
+            "`hyperliquid` must resolve deterministically to spot execution"
         );
     }
 

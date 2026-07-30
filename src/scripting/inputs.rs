@@ -181,18 +181,25 @@ pub fn source_exchange_label(configs: &SourceConfigs) -> String {
 pub fn source_provider_label(configs: &SourceConfigs) -> String {
     let mut providers = configs
         .values()
-        .map(|config| source_provider_name(config.provider))
+        .map(source_config_provider_name)
         .collect::<Vec<_>>();
     providers.sort_unstable();
     providers.dedup();
     providers.join(",")
 }
 
+fn source_config_provider_name(config: &SourceConfig) -> String {
+    match config.provider {
+        ProviderKind::Hyperliquid => config.exchange.clone(),
+        provider => source_provider_name(provider).to_string(),
+    }
+}
+
 pub fn source_provider_name(provider: ProviderKind) -> &'static str {
     match provider {
         ProviderKind::Mmt => "mmt",
         ProviderKind::Bulk => "bulkf",
-        ProviderKind::Hyperliquid => "hyperliquidf",
+        ProviderKind::Hyperliquid => "hyperliquid",
         ProviderKind::Binance => "binance",
         ProviderKind::BinanceFutures => "binancef",
         ProviderKind::MarketLab => "marketlab",
@@ -210,7 +217,7 @@ pub fn source_configs_payload(configs: &SourceConfigs) -> Value {
                 "symbol": config.symbol,
                 "market_symbol": config.market_symbol(),
                 "type": config.source.as_str(),
-                "provider": source_provider_name(config.provider),
+                "provider": source_config_provider_name(config),
                 "exchange": config.exchange,
                 "timeframe_sec": config.timeframe,
                 "depth": config.depth,
@@ -429,19 +436,14 @@ fn parse_source_selector(
 ) -> Result<(String, String, ScriptSource, ProviderKind, String)> {
     let parts = raw.split('@').collect::<Vec<_>>();
     let (symbol_raw, source_raw, exchange, provider) = match parts.as_slice() {
-        [symbol, source, provider] => {
-            let provider = parse_source_provider(provider)?;
+        [symbol, source, provider_name] => {
+            let provider = parse_source_provider(provider_name)?;
             if provider == ProviderKind::Mmt {
                 bail!(
                     "MMT sources require symbol@source@exchange@mmt, for example `{symbol}@{source}@binancef@mmt`"
                 );
             }
-            (
-                *symbol,
-                *source,
-                provider_name_for_exchange(provider),
-                provider,
-            )
+            (*symbol, *source, *provider_name, provider)
         }
         [symbol, source, exchange, provider] => {
             let provider = parse_source_provider(provider)?;
@@ -465,7 +467,7 @@ fn parse_source_selector(
     let selector = match provider {
         ProviderKind::Mmt => format!("{symbol}@{}@{exchange}@mmt", source.as_str()),
         ProviderKind::Bulk => format!("{symbol}@{}@bulkf", source.as_str()),
-        ProviderKind::Hyperliquid => format!("{symbol}@{}@hyperliquidf", source.as_str()),
+        ProviderKind::Hyperliquid => format!("{symbol}@{}@{exchange}", source.as_str()),
         ProviderKind::Binance => format!("{symbol}@{}@binance", source.as_str()),
         ProviderKind::BinanceFutures => format!("{symbol}@{}@binancef", source.as_str()),
         ProviderKind::MarketLab => unreachable!(),
@@ -493,21 +495,10 @@ fn parse_source_provider(raw: &str) -> Result<ProviderKind> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "mmt" => Ok(ProviderKind::Mmt),
         "bulkf" => Ok(ProviderKind::Bulk),
-        "hyperliquidf" => Ok(ProviderKind::Hyperliquid),
+        "hyperliquid" | "hyperliquidf" => Ok(ProviderKind::Hyperliquid),
         "binance" => Ok(ProviderKind::Binance),
         "binancef" => Ok(ProviderKind::BinanceFutures),
         other => bail!("unsupported script source provider `{other}`"),
-    }
-}
-
-fn provider_name_for_exchange(provider: ProviderKind) -> &'static str {
-    match provider {
-        ProviderKind::Bulk => "bulkf",
-        ProviderKind::Hyperliquid => "hyperliquidf",
-        ProviderKind::Binance => "binance",
-        ProviderKind::BinanceFutures => "binancef",
-        ProviderKind::Mmt => "mmt",
-        ProviderKind::MarketLab => "marketlab",
     }
 }
 
@@ -817,6 +808,40 @@ mod tests {
         .expect("historical Hyperliquid selectors should parse");
         validate_source_configs(&historical_manifest, &historical_configs)
             .expect("Hyperliquid candles and volume should support backtests");
+    }
+
+    #[test]
+    fn validates_standalone_hyperliquid_spot_bindings() {
+        let live_manifest = manifest(vec![
+            ScriptSource::Candles,
+            ScriptSource::Orderbook,
+            ScriptSource::Trades,
+            ScriptSource::Vd,
+            ScriptSource::Volumes,
+        ]);
+        let configs = parse_source_configs(&[
+            "btc@candles@hyperliquid:timeframe=60".to_string(),
+            "btc@orderbook@hyperliquid:depth=20".to_string(),
+            "btc@trades@hyperliquid".to_string(),
+            "btc@vd@hyperliquid".to_string(),
+            "btc@volumes@hyperliquid:timeframe=60".to_string(),
+        ])
+        .expect("standalone Hyperliquid spot selectors should parse");
+
+        validate_source_configs_for_run(&live_manifest, &configs)
+            .expect("standalone Hyperliquid spot live configs should validate");
+        assert_eq!(configs["btc@candles@hyperliquid"].exchange, "hyperliquid");
+        assert_eq!(
+            configs["btc@candles@hyperliquid"].provider,
+            ProviderKind::Hyperliquid
+        );
+
+        let oi_manifest = manifest(vec![ScriptSource::Oi]);
+        let oi = parse_source_configs(&["btc@oi@hyperliquid".to_string()])
+            .expect("spot OI selector parses before capability validation");
+        let error = validate_source_configs_for_run(&oi_manifest, &oi)
+            .expect_err("spot must not expose open interest");
+        assert!(error.to_string().contains("requires a futures exchange"));
     }
 
     #[test]

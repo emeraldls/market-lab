@@ -9,6 +9,7 @@ use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::bulk::ws::BulkTickerStream;
 use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 use crate::providers::hyperliquid::ws::HyperliquidAssetContextStream;
+use crate::providers::hyperliquid::{HyperliquidNetwork, HyperliquidProduct};
 
 use super::common::{SourceEnvelope, SourceMeta, render_terminal};
 
@@ -36,11 +37,13 @@ async fn handle_bulk(args: SourceStatsArgs) -> Result<()> {
 }
 
 async fn handle_hyperliquid(args: SourceStatsArgs) -> Result<()> {
+    let product = HyperliquidProduct::from_exchange(&args.exchange)?;
     if args.stream {
-        return stream_hyperliquid_stats(args).await;
+        return stream_hyperliquid_stats(args, product).await;
     }
-    let stats = HyperliquidProvider::statistics(&args.period, args.symbol.as_deref()).await?;
-    render_stats(stats, &args, "hyperliquidf")
+    let stats =
+        HyperliquidProvider::statistics_for(product, &args.period, args.symbol.as_deref()).await?;
+    render_stats(stats, &args, product.exchange())
 }
 
 fn render_stats(
@@ -158,12 +161,17 @@ async fn stream_bulk_stats(args: SourceStatsArgs) -> Result<()> {
     Ok(())
 }
 
-async fn stream_hyperliquid_stats(args: SourceStatsArgs) -> Result<()> {
+async fn stream_hyperliquid_stats(
+    args: SourceStatsArgs,
+    product: HyperliquidProduct,
+) -> Result<()> {
     let symbol = args
         .symbol
         .as_deref()
         .expect("validation requires a symbol when streaming");
-    let mut stream = HyperliquidAssetContextStream::connect(symbol).await?;
+    let mut stream =
+        HyperliquidAssetContextStream::connect_for(product, symbol, HyperliquidNetwork::Mainnet)
+            .await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest = None;
     let mut buf = VecDeque::with_capacity(args.buffer_size as usize);
@@ -178,7 +186,7 @@ async fn stream_hyperliquid_stats(args: SourceStatsArgs) -> Result<()> {
                 let Some(snapshot) = latest.as_ref() else { continue; };
                 let env = SourceEnvelope {
                     r#type: "source.stats.stream".to_string(), version: "1",
-                    provider: "hyperliquidf", exchange: snapshot.exchange.clone(),
+                    provider: product.exchange(), exchange: snapshot.exchange.clone(),
                     symbol: snapshot.symbol.clone(), ts_ms: snapshot.timestamp_ms,
                     stream: true, data: snapshot.clone(),
                     meta: SourceMeta { depth: None, min_size: None, max_size: None, price_group: None,

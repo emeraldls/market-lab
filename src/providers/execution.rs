@@ -6,8 +6,8 @@ use crate::domain::execution::{
     OpenOrder, TradePlan, VenueCapabilities,
 };
 use crate::providers::bulk::execution::BulkExecutionAdapter;
-use crate::providers::hyperliquid::HyperliquidNetwork;
 use crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter;
+use crate::providers::hyperliquid::{HyperliquidNetwork, HyperliquidProduct};
 
 pub enum ExecutionAdapter {
     Bulk(BulkExecutionAdapter),
@@ -19,7 +19,18 @@ impl ExecutionAdapter {
         match venue {
             ExecutionVenue::Bulk => Ok(Self::Bulk(BulkExecutionAdapter::new()?)),
             ExecutionVenue::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidExecutionAdapter::new(HyperliquidNetwork::from_testnet(testnet)).await?,
+                HyperliquidExecutionAdapter::new_for(
+                    HyperliquidProduct::Perpetual,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
+            )),
+            ExecutionVenue::HyperliquidSpot => Ok(Self::Hyperliquid(
+                HyperliquidExecutionAdapter::new_for(
+                    HyperliquidProduct::Spot,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
             )),
         }
     }
@@ -28,6 +39,9 @@ impl ExecutionAdapter {
         match venue {
             ExecutionVenue::Bulk => BulkExecutionAdapter::capabilities(),
             ExecutionVenue::Hyperliquid => HyperliquidExecutionAdapter::capabilities(),
+            ExecutionVenue::HyperliquidSpot => {
+                HyperliquidExecutionAdapter::capabilities_for(HyperliquidProduct::Spot)
+            }
         }
     }
 
@@ -35,6 +49,7 @@ impl ExecutionAdapter {
         match venue {
             ExecutionVenue::Bulk => credentials::bulk_account(),
             ExecutionVenue::Hyperliquid => credentials::hyperliquid_account(),
+            ExecutionVenue::HyperliquidSpot => credentials::hyperliquid_account(),
         }
     }
 

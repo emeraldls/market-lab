@@ -11,6 +11,7 @@ use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::bulk::ws::BulkCandleStream;
 use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 use crate::providers::hyperliquid::ws::HyperliquidCandleStream;
+use crate::providers::hyperliquid::{HyperliquidNetwork, HyperliquidProduct};
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::utils::{normalize_exchange_for_mmt, normalize_symbol_for_mmt};
 use crate::providers::mmt::ws_client::MmtWsClient;
@@ -113,22 +114,25 @@ async fn handle_bulk(args: SourceVolumesArgs) -> Result<()> {
 }
 
 async fn handle_hyperliquid(args: SourceVolumesArgs) -> Result<()> {
+    let product = HyperliquidProduct::from_exchange(args.exchange_name()?)?;
     if args.stream {
         if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("stream mode currently supports only --output terminal|json|jsonl");
         }
-        return stream_hyperliquid_volume_bars(args).await;
+        return stream_hyperliquid_volume_bars(args, product).await;
     }
-    let series = HyperliquidProvider::volume_bars(
+    let series = HyperliquidProvider::volume_bars_for(
+        product,
         &args.symbol,
         args.timeframe_name()?,
         args.from
             .ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?,
         args.to
             .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?,
+        HyperliquidNetwork::Mainnet,
     )
     .await?;
-    render_direct_volume_bars(&series, args.output, "hyperliquidf", "Hyperliquid")
+    render_direct_volume_bars(&series, args.output, product.exchange(), "Hyperliquid")
 }
 
 async fn handle_binance(args: SourceVolumesArgs, market: BinanceMarket) -> Result<()> {
@@ -353,9 +357,18 @@ async fn stream_bulk_volume_bars(args: SourceVolumesArgs) -> Result<()> {
     Ok(())
 }
 
-async fn stream_hyperliquid_volume_bars(args: SourceVolumesArgs) -> Result<()> {
-    let market = crate::providers::hyperliquid::markets::market(&args.symbol)?;
-    let mut stream = HyperliquidCandleStream::connect(&args.symbol, args.timeframe_name()?).await?;
+async fn stream_hyperliquid_volume_bars(
+    args: SourceVolumesArgs,
+    product: HyperliquidProduct,
+) -> Result<()> {
+    let market = crate::providers::hyperliquid::markets::market_for(product, &args.symbol)?;
+    let mut stream = HyperliquidCandleStream::connect_for(
+        product,
+        &args.symbol,
+        args.timeframe_name()?,
+        HyperliquidNetwork::Mainnet,
+    )
+    .await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest = None;
     let mut buf = VecDeque::with_capacity(args.buffer_size as usize);
@@ -376,7 +389,7 @@ async fn stream_hyperliquid_volume_bars(args: SourceVolumesArgs) -> Result<()> {
                 let Some(bar) = latest.as_ref() else { continue; };
                 let env = SourceEnvelope {
                     r#type: "source.volume-bars.stream".to_string(), version: "1",
-                    provider: "hyperliquidf", exchange: "hyperliquidf".to_string(),
+                    provider: product.exchange(), exchange: product.exchange().to_string(),
                     symbol: market.symbol.clone(), ts_ms: bar.t, stream: true, data: bar.clone(),
                     meta: SourceMeta { depth: None, min_size: None, max_size: None, price_group: None,
                         interval_ms: Some(args.interval_ms), timeframe: Some(args.timeframe_name()?.to_string()),

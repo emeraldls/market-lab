@@ -921,7 +921,17 @@ async fn fetch_direct_sources(
                     BulkProvider::candles(&market_symbol, interval, args.from, args.to).await
                 }
                 ProviderKind::Hyperliquid => {
-                    HyperliquidProvider::candles(&market_symbol, interval, args.from, args.to).await
+                    HyperliquidProvider::candles_for(
+                        crate::providers::hyperliquid::HyperliquidProduct::from_exchange(
+                            &config.exchange,
+                        )?,
+                        &market_symbol,
+                        interval,
+                        args.from,
+                        args.to,
+                        crate::providers::hyperliquid::HyperliquidNetwork::Mainnet,
+                    )
+                    .await
                 }
                 ProviderKind::Binance => {
                     BinanceProvider::candles_paginated(

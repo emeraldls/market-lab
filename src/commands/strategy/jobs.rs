@@ -179,6 +179,7 @@ fn venue_name(venue: crate::domain::execution::ExecutionVenue) -> &'static str {
     match venue {
         crate::domain::execution::ExecutionVenue::Bulk => "bulkf",
         crate::domain::execution::ExecutionVenue::Hyperliquid => "hyperliquidf",
+        crate::domain::execution::ExecutionVenue::HyperliquidSpot => "hyperliquid",
     }
 }
 

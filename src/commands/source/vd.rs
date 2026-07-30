@@ -10,6 +10,7 @@ use crate::domain::types::VolumeDeltaTick;
 use crate::providers::bulk::markets;
 use crate::providers::bulk::ws::BulkTradesStream;
 use crate::providers::hyperliquid::ws::HyperliquidTradesStream;
+use crate::providers::hyperliquid::{HyperliquidNetwork, HyperliquidProduct};
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::ws_vd::MmtVdStream;
 
@@ -259,9 +260,12 @@ async fn stream_bulk_vd(args: SourceVdArgs) -> Result<()> {
 
 async fn stream_hyperliquid_vd(args: SourceVdArgs) -> Result<()> {
     ensure_stream_output(args.output)?;
-    let market = crate::providers::hyperliquid::markets::market(&args.symbol)?;
+    let product = HyperliquidProduct::from_exchange(args.exchange_name()?)?;
+    let market = crate::providers::hyperliquid::markets::market_for(product, &args.symbol)?;
     let internal_symbol = market.symbol.clone();
-    let mut stream = HyperliquidTradesStream::connect(&args.symbol).await?;
+    let mut stream =
+        HyperliquidTradesStream::connect_for(product, &args.symbol, HyperliquidNetwork::Mainnet)
+            .await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest = None;
     let mut cumulative_delta = 0.0;
@@ -275,7 +279,10 @@ async fn stream_hyperliquid_vd(args: SourceVdArgs) -> Result<()> {
             trades = stream.next_trades() => {
                 let trades = trades?;
                 if let Some(delta) = volume_delta_from_trades(
-                    &trades, &mut cumulative_delta, "hyperliquidf", &internal_symbol,
+                    &trades,
+                    &mut cumulative_delta,
+                    product.exchange(),
+                    &internal_symbol,
                 ) {
                     latest = Some(delta);
                 }
@@ -284,7 +291,7 @@ async fn stream_hyperliquid_vd(args: SourceVdArgs) -> Result<()> {
                 let Some(delta) = latest.as_ref() else { continue; };
                 let env = SourceEnvelope {
                     r#type: "source.vd.trades.stream".to_string(), version: "1",
-                    provider: "hyperliquidf", exchange: "hyperliquidf".to_string(),
+                    provider: product.exchange(), exchange: product.exchange().to_string(),
                     symbol: internal_symbol.clone(), ts_ms: delta.timestamp_ms,
                     stream: true, data: delta.clone(),
                     meta: SourceMeta { depth: None, min_size: None, max_size: None, price_group: None,
