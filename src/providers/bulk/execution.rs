@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use bulk_keychain::{
     Action, Cancel, Hash, OnFill, Order, OrderItem, Pubkey, RangeOco, SignedTransaction, Signer,
-    Stop, TakeProfit, TimeInForce,
+    Stop, TakeProfit, TimeInForce, compute_order_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,6 +21,7 @@ use crate::domain::execution::{
 use super::client::BulkClient;
 use super::market_data::normalize_timestamp_ms;
 use super::markets;
+use super::signer;
 use super::ws::{BulkTradingClient, is_trading_acknowledgement};
 
 static LAST_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -124,7 +125,7 @@ impl BulkExecutionAdapter {
     }
 
     pub async fn fills(&self, account: &str) -> Result<Vec<Fill>> {
-        let response: Vec<FillEnvelope> = self
+        let response: HistoryResponse<BulkFill> = self
             .client
             .post(
                 "account",
@@ -135,18 +136,14 @@ impl BulkExecutionAdapter {
             )
             .await?;
         response
+            .data
             .into_iter()
-            .map(|entry| {
-                entry
-                    .fills
-                    .context("BULK fills response omitted fills")
-                    .and_then(|fill| fill.into_fill(account))
-            })
+            .map(|fill| fill.into_fill(account))
             .collect()
     }
 
     pub async fn order_history(&self, account: &str) -> Result<Vec<OrderRecord>> {
-        let response: Vec<OrderHistoryEnvelope> = self
+        let response: HistoryResponse<BulkOrderHistory> = self
             .client
             .post(
                 "account",
@@ -157,13 +154,9 @@ impl BulkExecutionAdapter {
             )
             .await?;
         response
+            .data
             .into_iter()
-            .map(|entry| {
-                entry
-                    .order_history
-                    .context("BULK order-history response omitted orderHistory")
-                    .and_then(OrderRecord::try_from)
-            })
+            .map(OrderRecord::try_from)
             .collect()
     }
 
@@ -177,7 +170,7 @@ impl BulkExecutionAdapter {
         if account.to_base58() != plan.account {
             bail!("trade plan account no longer matches the configured BULK account");
         }
-        let mut signer = Signer::new(credential.agent);
+        let mut signer = signer(credential.agent);
 
         if !plan.reduce_only {
             self.ensure_leverage(&mut signer, &account, plan).await?;
@@ -222,7 +215,7 @@ impl BulkExecutionAdapter {
             return Ok(Vec::new());
         }
         let account = credential.account;
-        let mut signer = Signer::new(credential.agent).with_batch_order_ids();
+        let mut signer = signer(credential.agent).with_batch_order_ids();
         let mut orders = Vec::with_capacity(plans.len());
         for plan in plans {
             validate_trade_plan(plan)?;
@@ -336,7 +329,7 @@ impl BulkExecutionAdapter {
         let action = Action::Order {
             orders: vec![OrderItem::Cancel(Cancel::new(venue_symbol, hash))],
         };
-        let mut signer = Signer::new(credential.agent);
+        let mut signer = signer(credential.agent);
         let signed = signer
             .sign_action(&action, next_nonce()?, &account)
             .context("failed to sign BULK order cancellation")?;
@@ -375,7 +368,7 @@ impl BulkExecutionAdapter {
             )));
             order_ids.push(plan.order_id.clone());
         }
-        let mut signer = Signer::new(credential.agent);
+        let mut signer = signer(credential.agent);
         let signed = signer
             .sign_action(&Action::Order { orders }, next_nonce()?, &account)
             .context("failed to sign BULK cancellation batch")?;
@@ -554,7 +547,6 @@ fn sign_trade_order(
     nonce: u64,
 ) -> Result<SignedTransaction> {
     let order = order_from_plan(plan)?;
-    let mut orders = vec![OrderItem::Order(order)];
     let mut protection = Vec::new();
     match (plan.stop_loss_price, plan.take_profit_price) {
         (Some(stop_loss), Some(take_profit)) => {
@@ -591,15 +583,26 @@ fn sign_trade_order(
         }
         (None, None) => {}
     }
-    if !protection.is_empty() {
-        orders.push(OrderItem::OnFill(OnFill {
-            p: 0,
+    let optimistic_order_id = compute_order_id(&order, nonce, account).to_base58();
+    let order = if protection.is_empty() {
+        OrderItem::Order(order)
+    } else {
+        OrderItem::OnFill(OnFill {
+            trigger: Box::new(OrderItem::Order(order)),
             actions: protection,
-        }));
-    }
-    signer
-        .sign_action(&Action::Order { orders }, nonce, account)
-        .context("failed to sign BULK order")
+        })
+    };
+    let mut signed = signer
+        .sign_action(
+            &Action::Order {
+                orders: vec![order],
+            },
+            nonce,
+            account,
+        )
+        .context("failed to sign BULK order")?;
+    signed.order_id = Some(optimistic_order_id);
+    Ok(signed)
 }
 
 fn order_from_plan(plan: &TradePlan) -> Result<Order> {
@@ -1009,6 +1012,11 @@ struct AccountQuery<'a> {
 }
 
 #[derive(Deserialize)]
+struct HistoryResponse<T> {
+    data: Vec<T>,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FullAccountEnvelope {
     full_account: Option<BulkFullAccount>,
@@ -1175,11 +1183,6 @@ impl TryFrom<BulkOpenOrder> for OpenOrder {
 }
 
 #[derive(Deserialize)]
-struct FillEnvelope {
-    fills: Option<BulkFill>,
-}
-
-#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BulkFill {
     maker: String,
@@ -1190,6 +1193,8 @@ struct BulkFill {
     symbol: String,
     amount: f64,
     price: f64,
+    #[serde(default)]
+    fee: Option<f64>,
     #[serde(default)]
     reason: Option<BulkFillReason>,
     #[serde(default)]
@@ -1230,7 +1235,7 @@ impl BulkFill {
                 self.order_id_taker
             }),
             maker: is_maker,
-            fee: None,
+            fee: self.fee,
             fee_asset: None,
             slot: self.slot,
             ts_ms: normalize_timestamp_ms(self.timestamp),
@@ -1260,12 +1265,6 @@ impl BulkFillReason {
 struct BulkLeverageSetting {
     symbol: String,
     leverage: f64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OrderHistoryEnvelope {
-    order_history: Option<BulkOrderHistory>,
 }
 
 #[derive(Deserialize)]
@@ -1536,6 +1535,49 @@ mod tests {
     }
 
     #[test]
+    fn decodes_paginated_fill_history_and_effective_fee() {
+        let response: HistoryResponse<BulkFill> = serde_json::from_value(serde_json::json!({
+            "data": [{
+                "tradeId": "123:4",
+                "maker": "account",
+                "taker": "counterparty",
+                "orderIdMaker": "oid",
+                "orderIdTaker": "other-oid",
+                "isBuy": true,
+                "symbol": "BTC-USD",
+                "amount": 0.001,
+                "price": 65000.0,
+                "makerFee": 0.01,
+                "takerFee": 0.02,
+                "fee": 0.01,
+                "reasonCode": 0,
+                "slot": 123,
+                "timestamp": 1_699_564_800_000_000_000_u64,
+                "sequence": 4,
+                "iso": false
+            }],
+            "page": {
+                "nextCursor": null,
+                "hasMore": false,
+                "asOfSlot": 123,
+                "startSlot": 123,
+                "endSlot": 123,
+                "coverage": "complete"
+            }
+        }))
+        .expect("history page decodes");
+
+        let normalized = response
+            .data
+            .into_iter()
+            .next()
+            .expect("fill row")
+            .into_fill("account")
+            .expect("fill normalizes");
+        assert_eq!(normalized.fee, Some(0.01));
+    }
+
+    #[test]
     fn decodes_fill_with_reason_and_reason_code() {
         let fill: BulkFill = serde_json::from_str(
             r#"{
@@ -1575,7 +1617,7 @@ mod tests {
         let account = master.pubkey();
         let agent = bulk_keychain::Keypair::generate();
         let agent_public_key = agent.pubkey().to_base58();
-        let mut signer = Signer::new(agent);
+        let mut signer = signer(agent);
         let plan = TradePlan {
             created_at_ms: 1_784_158_000_000,
             venue: ExecutionVenue::Bulk,
@@ -1624,21 +1666,23 @@ mod tests {
             1_784_158_000_000_000_001,
         )
         .expect("agent signs native on-fill protection");
-        assert_eq!(protected.actions.len(), 2);
+        assert!(protected.order_id.is_some());
+        assert_eq!(protected.actions.len(), 1);
         assert_eq!(
-            protected.actions[1]
-                .pointer("/of/p")
-                .and_then(Value::as_u64),
-            Some(0)
+            protected.actions[0]
+                .pointer("/of/trigger/l/c")
+                .and_then(Value::as_str),
+            Some("BTC-USD")
         );
+        assert!(protected.actions[0].pointer("/of/p").is_none());
         assert_eq!(
-            protected.actions[1]
+            protected.actions[0]
                 .pointer("/of/actions/0/rng/pmin")
                 .and_then(Value::as_f64),
             Some(64_000.0)
         );
         assert_eq!(
-            protected.actions[1]
+            protected.actions[0]
                 .pointer("/of/actions/0/rng/pmax")
                 .and_then(Value::as_f64),
             Some(67_000.0)
@@ -1725,7 +1769,7 @@ mod tests {
     #[test]
     fn signed_batch_ids_cover_single_and_multi_order_actions() {
         let account = bulk_keychain::Keypair::generate().pubkey();
-        let mut signer = Signer::new(bulk_keychain::Keypair::generate()).with_batch_order_ids();
+        let mut signer = signer(bulk_keychain::Keypair::generate()).with_batch_order_ids();
         let order = || {
             OrderItem::Order(Order::limit(
                 "BTC-USD",

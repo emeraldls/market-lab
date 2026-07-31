@@ -19,7 +19,7 @@ use crate::domain::types::{
 use super::market_data::{BulkKline, BulkTicker, normalize_timestamp_ms};
 use super::markets;
 
-const BULK_WS_URL: &str = "wss://exchange-ws1.bulk.trade";
+const BULK_WS_URL: &str = "wss://staging-ws.bulk.trade";
 const BULK_TRADING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 type WsStream =

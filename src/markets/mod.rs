@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::credentials::mmt_api_key;
 
 const SNAPSHOT_SCHEMA_VERSION: u8 = 1;
-const BULK_MARKETS_URL: &str = "https://exchange-api.bulk.trade/api/v1/exchangeInfo";
+const BULK_MARKETS_URL: &str = "https://staging-api.bulk.trade/api/v1/exchangeInfo";
 const BINANCE_SPOT_MARKETS_URL: &str = "https://api.binance.com/api/v3/exchangeInfo";
 const BINANCE_FUTURES_MARKETS_URL: &str = "https://fapi.binance.com/fapi/v1/exchangeInfo";
 const HYPERLIQUID_INFO_URL: &str = "https://api.hyperliquid.xyz/info";

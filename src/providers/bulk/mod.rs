@@ -1,7 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use bulk_keychain::{Keypair, Pubkey, SignedTransaction, Signer};
+use bulk_keychain::{Keypair, Pubkey, SignatureDomain, SignedTransaction, Signer};
 use serde_json::Value;
 
 use self::client::BulkClient;
@@ -15,6 +15,11 @@ pub mod ws;
 
 const AGENT_CONFIRMATION_ATTEMPTS: usize = 10;
 const AGENT_CONFIRMATION_DELAY: Duration = Duration::from_millis(250);
+pub(crate) const SIGNATURE_DOMAIN: SignatureDomain = SignatureDomain::Devnet;
+
+pub(crate) fn signer(keypair: Keypair) -> Signer {
+    Signer::new(keypair, SIGNATURE_DOMAIN)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRegistration {
@@ -93,7 +98,7 @@ fn sign_agent_authorization(
     agent: Pubkey,
     delete: bool,
 ) -> Result<SignedTransaction> {
-    let mut signer = Signer::new(master).without_order_id();
+    let mut signer = signer(master).without_order_id();
     signer
         .sign_agent_wallet(agent, delete, Some(unique_nonce()?))
         .context("failed to sign BULK agent-wallet authorization")
@@ -157,8 +162,15 @@ fn response_message(body: &Value) -> String {
     body.get("message")
         .and_then(Value::as_str)
         .or_else(|| body.pointer("/error/message").and_then(Value::as_str))
-        .unwrap_or("unknown error")
-        .to_string()
+        .or_else(|| body.pointer("/response/message").and_then(Value::as_str))
+        .or_else(|| {
+            body.pointer("/response/error/message")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| body.get("response").and_then(Value::as_str))
+        .or_else(|| body.get("error").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| body.to_string())
 }
 
 fn unique_nonce() -> Result<u64> {
@@ -173,6 +185,13 @@ fn unique_nonce() -> Result<u64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn production_bulk_signer_uses_mainnet_domain() {
+        let signer = signer(Keypair::generate());
+
+        assert_eq!(signer.signature_domain(), SignatureDomain::Mainnet);
+    }
 
     #[test]
     fn signs_agent_authorization_with_master_as_account() {
@@ -230,6 +249,18 @@ mod tests {
         let error = validate_agent_response(&body, "agent-public-key", false)
             .expect_err("failure status must be rejected");
         assert!(error.to_string().contains("Unauthorized"));
+    }
+
+    #[test]
+    fn preserves_top_level_string_rejection_details() {
+        let body = json!({
+            "status": "error",
+            "response": "bad signature"
+        });
+
+        let error = validate_agent_response(&body, "agent-public-key", false)
+            .expect_err("rejection must fail");
+        assert!(error.to_string().contains("bad signature"));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-const BULK_API_URL: &str = "https://exchange-api.bulk.trade/api/v1";
+const BULK_API_URL: &str = "https://staging-api.bulk.trade/api/v1";
 const BULK_HTTP_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Clone)]
