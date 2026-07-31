@@ -2628,7 +2628,7 @@ mod tests {
     fn event_payload_matches_live_source_metadata() {
         let configs = parse_source_configs(&[
             "btc@candles@binancef@mmt:timeframe=60".to_string(),
-            "btc@candles@okx@mmt:timeframe=60".to_string(),
+            "btc/usdt@candles@okx@mmt:timeframe=60".to_string(),
         ])
         .expect("parse source configs");
         let config = &configs["btc@candles@binancef@mmt"];
@@ -2639,7 +2639,7 @@ mod tests {
                     BacktestSeries::Candles(vec![candle(0, 10.0, 10.0, 10.0, 10.0)]),
                 ),
                 (
-                    "btc@candles@okx@mmt".to_string(),
+                    "btc/usdt@candles@okx@mmt".to_string(),
                     BacktestSeries::Candles(vec![candle(0, 20.0, 20.0, 20.0, 20.0)]),
                 ),
             ]),
@@ -2669,7 +2669,7 @@ mod tests {
             "binancef"
         );
         assert_eq!(
-            payload["source_configs"]["btc@candles@okx@mmt"]["exchange"],
+            payload["source_configs"]["btc/usdt@candles@okx@mmt"]["exchange"],
             "okx"
         );
         assert!(payload.get("sources").is_none());
@@ -2762,7 +2762,7 @@ export const script = {
 
 export function onData(ctx, input, history) {
   const binance = history.source("btc@candles@binancef@mmt");
-  const okx = history.source("btc@candles@okx@mmt");
+	  const okx = history.source("btc/usdt@candles@okx@mmt");
   return {
     metrics: {
       binance: binance.map((candle) => candle.c),
@@ -2781,7 +2781,7 @@ export function onData(ctx, input, history) {
         let script = Script::load(&path).expect("load history script");
         let configs = parse_source_configs(&[
             "btc@candles@binancef@mmt:timeframe=60".to_string(),
-            "btc@candles@okx@mmt:timeframe=60".to_string(),
+            "btc/usdt@candles@okx@mmt:timeframe=60".to_string(),
         ])
         .expect("parse source configs");
         let data = BacktestData {
@@ -2794,7 +2794,7 @@ export function onData(ctx, input, history) {
                     ]),
                 ),
                 (
-                    "btc@candles@okx@mmt".to_string(),
+                    "btc/usdt@candles@okx@mmt".to_string(),
                     BacktestSeries::Candles(vec![
                         candle(0, 20.0, 20.0, 20.0, 20.0),
                         candle(1, 21.0, 21.0, 21.0, 21.0),
@@ -2811,9 +2811,9 @@ export function onData(ctx, input, history) {
                 .collect::<Vec<_>>(),
             vec![
                 "btc@candles@binancef@mmt",
-                "btc@candles@okx@mmt",
+                "btc/usdt@candles@okx@mmt",
                 "btc@candles@binancef@mmt",
-                "btc@candles@okx@mmt",
+                "btc/usdt@candles@okx@mmt",
             ]
         );
         assert_eq!(events[0].ts_ms, candle(0, 0.0, 0.0, 0.0, 0.0).t + 60_000);
@@ -2854,7 +2854,7 @@ export function onData(ctx, input, history) {
         let second = &outputs[1];
         assert_eq!(second["binance"], json!([10]));
         assert_eq!(second["okx"], json!([20]));
-        assert_eq!(second["trigger"], "btc@candles@okx@mmt");
+        assert_eq!(second["trigger"], "btc/usdt@candles@okx@mmt");
 
         let last = outputs.last().unwrap();
         assert_eq!(last["binance"], json!([10, 11]));
@@ -3252,7 +3252,7 @@ export function onExecution(ctx, event) {
             },
             None,
             None,
-            Some("BTC/USDT".to_string()),
+            Some("BTC".to_string()),
         );
         let mut latest_output = None;
 

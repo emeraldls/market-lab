@@ -501,7 +501,7 @@ pub async fn handle(args: RunVwapArgs) -> Result<()> {
     .await?;
     let feasibility = VwapFeasibility::assess(parent.size, &curves.execution);
     let view = plan_view(PlanInput {
-        symbol: &args.symbol,
+        symbol: &parent.internal_symbol,
         side: side_name(args.side),
         parent: &parent,
         duration_secs: args.duration,
@@ -2007,7 +2007,7 @@ mod tests {
         ];
         let book = OrderBookSnapshot {
             exchange: "bulkf".to_string(),
-            symbol: "BTC/USDT".to_string(),
+            symbol: "BTC".to_string(),
             timestamp_ms: 0,
             bids: Vec::new(),
             asks: levels,
@@ -2021,7 +2021,7 @@ mod tests {
     fn dust_absorption_never_exceeds_guarded_depth() {
         let book = OrderBookSnapshot {
             exchange: "bulkf".to_string(),
-            symbol: "BTC/USDT".to_string(),
+            symbol: "BTC".to_string(),
             timestamp_ms: 0,
             bids: Vec::new(),
             asks: vec![OrderBookLevel {

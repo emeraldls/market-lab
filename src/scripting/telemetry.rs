@@ -318,7 +318,7 @@ mod tests {
             },
             Some("mmt".to_string()),
             Some("bybitf".to_string()),
-            Some("BTC/USDT".to_string()),
+            Some("BTC".to_string()),
         );
         let report = builder.finish_ok();
         let value = serde_json::to_value(report).expect("serialize report");

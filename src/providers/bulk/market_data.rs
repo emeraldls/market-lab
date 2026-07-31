@@ -24,7 +24,7 @@ impl BulkProvider {
                 "execution_requires_agent_wallet": true
             },
             "symbols": {
-                "internal_format": "BASE/USDT",
+                "internal_format": "BASE",
                 "venue_format": "BASE-USD",
                 "market_registry": "installed_snapshot"
             },
@@ -68,7 +68,7 @@ impl BulkProvider {
     }
 
     pub async fn health() -> Result<ProviderHealth> {
-        let ticker = Self::ticker("BTC/USDT").await?;
+        let ticker = Self::ticker("BTC").await?;
         Ok(ProviderHealth {
             provider: EXCHANGE.to_string(),
             status: "ok".to_string(),
@@ -448,7 +448,7 @@ impl BulkStatistics {
             .rates
             .into_iter()
             .map(|(venue_symbol, rate)| {
-                let market = markets::market(&venue_symbol).with_context(|| {
+                let market = markets::wire_market(&venue_symbol).with_context(|| {
                     format!("BULK stats returned unknown market `{venue_symbol}`")
                 })?;
                 Ok(FundingRateSnapshot {
@@ -505,7 +505,7 @@ struct BulkMarketStatistics {
 
 impl BulkMarketStatistics {
     fn into_statistics(self) -> Result<MarketStatistics> {
-        let market = markets::market(&self.symbol)
+        let market = markets::wire_market(&self.symbol)
             .with_context(|| format!("BULK stats returned unknown market `{}`", self.symbol))?;
         Ok(MarketStatistics {
             symbol: market.symbol.clone(),
@@ -549,21 +549,21 @@ mod tests {
 
         let book: BulkL2Book = serde_json::from_str(include_str!("fixtures/l2book.json"))
             .expect("book fixture parses");
-        let snapshot = book.into_snapshot("BTC/USDT", 10).expect("book converts");
+        let snapshot = book.into_snapshot("BTC", 10).expect("book converts");
         assert_eq!(snapshot.timestamp_ms, 1_784_055_043_011);
         assert_eq!(snapshot.bids[0].price, 64536.7);
 
         let ticker: BulkTicker = serde_json::from_str(include_str!("fixtures/ticker.json"))
             .expect("ticker fixture parses");
-        let ticker = ticker.into_ticker("BTC/USDT").expect("ticker converts");
+        let ticker = ticker.into_ticker("BTC").expect("ticker converts");
         assert_eq!(ticker.timestamp_ms, 1_784_056_184_006);
-        assert_eq!(ticker.symbol, "BTC/USDT");
+        assert_eq!(ticker.symbol, "BTC");
 
         let stats: BulkStatistics = serde_json::from_str(include_str!("fixtures/stats.json"))
             .expect("stats fixture parses");
         let stats = stats.into_statistics().expect("stats convert");
         assert_eq!(stats.period, "1d");
-        assert_eq!(stats.markets[0].symbol, "BTC/USDT");
+        assert_eq!(stats.markets[0].symbol, "BTC");
         assert_eq!(stats.funding[0].timestamp_ms, 1_784_056_178_873);
     }
 

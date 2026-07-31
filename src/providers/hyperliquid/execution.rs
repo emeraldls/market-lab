@@ -1132,7 +1132,7 @@ impl HyperliquidAssetPosition {
         let market = markets::market(&self.position.coin).ok();
         let mark = marks.get(&self.position.coin).copied().unwrap_or_default();
         let internal_symbol = market.as_ref().map_or_else(
-            || format!("{}/USDT", self.position.coin),
+            || self.position.coin.to_ascii_uppercase(),
             |market| market.symbol.clone(),
         );
         Ok(Position {
@@ -1366,10 +1366,10 @@ mod tests {
             .expect("spot fill");
 
         assert_eq!(fill.venue, ExecutionVenue::HyperliquidSpot);
-        assert_eq!(fill.internal_symbol, "BTC/USDT");
+        assert_eq!(fill.internal_symbol, "BTC/USDC");
         assert_eq!(fill.venue_symbol, "@142");
         assert_eq!(fill.fee, Some(-0.187391));
-        assert_eq!(fill.fee_asset.as_deref(), Some("USDT"));
+        assert_eq!(fill.fee_asset.as_deref(), Some("USDC"));
     }
 
     #[test]

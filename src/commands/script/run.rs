@@ -1774,7 +1774,7 @@ mod tests {
     fn cross_exchange_configs() -> SourceConfigs {
         parse_source_configs(&[
             "btc@candles@binancef@mmt:timeframe=60".to_string(),
-            "btc@candles@okx@mmt:timeframe=60".to_string(),
+            "btc/usdt@candles@okx@mmt:timeframe=60".to_string(),
         ])
         .expect("parse source configs")
     }
@@ -1793,7 +1793,7 @@ mod tests {
             .expect("route update")
             .expect("matching source config");
 
-        assert_eq!(config.selector, "btc@candles@okx@mmt");
+        assert_eq!(config.selector, "btc/usdt@candles@okx@mmt");
     }
 
     #[test]
@@ -1804,7 +1804,7 @@ mod tests {
         ])
         .expect("parse multi-symbol configs");
         let provider_symbol =
-            normalize_symbol_for_mmt("binancef", "AAVE/USDT").expect("resolve provider symbol");
+            normalize_symbol_for_mmt("binancef", "AAVE").expect("resolve provider symbol");
         let update = json!({
             "type": "data",
             "channel": "trades",
@@ -1862,7 +1862,7 @@ mod tests {
         let mut aggregators =
             trade_candle_aggregators(&configs, 60_000).expect("create aggregators");
         let provider_symbol =
-            normalize_symbol_for_mmt("binancef", "BTC/USDT").expect("resolve provider symbol");
+            normalize_symbol_for_mmt("binancef", "BTC").expect("resolve provider symbol");
 
         let first = json!({
             "type": "data",
@@ -1935,14 +1935,14 @@ mod tests {
     fn live_payload_contains_current_internal_record_and_source_metadata() {
         let configs = cross_exchange_configs();
         let okx = LiveUpdate::new(
-            &configs["btc@candles@okx@mmt"],
+            &configs["btc/usdt@candles@okx@mmt"],
             LiveRecord::Candles(candle(20.0)),
         );
 
         let payload = live_stream_payload(&okx, &configs, &[]).expect("build live payload");
 
-        assert_eq!(payload["source"], "btc@candles@okx@mmt");
-        assert_eq!(payload["symbol"], "btc");
+        assert_eq!(payload["source"], "btc/usdt@candles@okx@mmt");
+        assert_eq!(payload["symbol"], "btc/usdt");
         assert_eq!(payload["source_type"], "candles");
         assert_eq!(payload["exchange"], "okx");
         assert_eq!(payload["data"]["candle"]["c"], 20.0);
@@ -1951,7 +1951,7 @@ mod tests {
             "binancef"
         );
         assert_eq!(
-            payload["source_configs"]["btc@candles@okx@mmt"]["exchange"],
+            payload["source_configs"]["btc/usdt@candles@okx@mmt"]["exchange"],
             "okx"
         );
         assert!(payload.get("sources").is_none());

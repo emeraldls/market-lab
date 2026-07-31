@@ -356,7 +356,7 @@ mod tests {
         let trades = vec![
             TradeTick {
                 exchange: "bulkf".to_string(),
-                symbol: "BTC/USDT".to_string(),
+                symbol: "BTC".to_string(),
                 timestamp_ms: 1_700_000_000_000,
                 price: 100_000.0,
                 size: 0.15,
@@ -364,7 +364,7 @@ mod tests {
             },
             TradeTick {
                 exchange: "bulkf".to_string(),
-                symbol: "BTC/USDT".to_string(),
+                symbol: "BTC".to_string(),
                 timestamp_ms: 1_700_000_000_001,
                 price: 100_001.0,
                 size: 0.05,
@@ -372,12 +372,12 @@ mod tests {
             },
         ];
         let mut cumulative = 1.0;
-        let delta = volume_delta_from_trades(&trades, &mut cumulative, "bulkf", "BTC/USDT")
+        let delta = volume_delta_from_trades(&trades, &mut cumulative, "bulkf", "BTC")
             .expect("non-empty trades yield a delta");
 
         assert!((delta.delta - 0.10).abs() < f64::EPSILON);
         assert!((delta.cumulative_delta - 1.10).abs() < f64::EPSILON);
         assert_eq!(delta.timestamp_ms, 1_700_000_000_001);
-        assert_eq!(delta.symbol, "BTC/USDT");
+        assert_eq!(delta.symbol, "BTC");
     }
 }

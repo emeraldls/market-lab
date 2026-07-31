@@ -121,7 +121,7 @@ mod tests {
             version: "1",
             provider: "mmt",
             exchange: "bybitf".to_string(),
-            symbol: "BTC/USDT".to_string(),
+            symbol: "BTC".to_string(),
             ts_ms: 1,
             stream: false,
             study: StudyDescriptor {
@@ -148,7 +148,7 @@ mod tests {
             version: "1",
             provider: "mmt",
             exchange: "bybitf".to_string(),
-            symbol: "BTC/USDT".to_string(),
+            symbol: "BTC".to_string(),
             ts_ms: 1,
             stream: false,
             study: StudyDescriptor {

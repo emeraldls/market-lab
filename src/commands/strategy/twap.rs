@@ -101,7 +101,7 @@ pub async fn handle(args: RunTwapArgs) -> Result<()> {
         args.interval,
     )?;
     let view = plan_view(
-        &args.symbol,
+        &parent.internal_symbol,
         parent.venue,
         side_name(args.side),
         &schedule,

@@ -1336,7 +1336,7 @@ impl TryFrom<BulkLeverageSetting> for LeverageSetting {
 }
 
 fn normalize_account_symbol(symbol: &str) -> Result<(String, String, bool)> {
-    if let Ok(market) = markets::market(symbol) {
+    if let Ok(market) = markets::wire_market(symbol) {
         return Ok((market.symbol.clone(), market.venue_symbol.clone(), true));
     }
     let venue_symbol = symbol.trim().to_ascii_uppercase().replace('/', "-");
@@ -1347,8 +1347,7 @@ fn normalize_account_symbol(symbol: &str) -> Result<(String, String, bool)> {
     if base.is_empty() || quote.is_empty() {
         bail!("BULK account returned malformed symbol `{symbol}`");
     }
-    let internal_quote = if quote == "USD" { "USDT" } else { quote };
-    Ok((format!("{base}/{internal_quote}"), venue_symbol, false))
+    Ok((base.to_string(), venue_symbol, false))
 }
 
 #[cfg(test)]
@@ -1371,7 +1370,7 @@ mod tests {
             "account",
             OrderRecord {
                 venue: ExecutionVenue::Bulk,
-                internal_symbol: "BTC/USDT".to_string(),
+                internal_symbol: "BTC".to_string(),
                 venue_symbol: "BTC-USD".to_string(),
                 registry_supported: true,
                 order_id: "deterministic-id".to_string(),
@@ -1402,7 +1401,7 @@ mod tests {
     fn reconciled_fill_is_terminal_only_for_a_market_order() {
         let fill = Fill {
             venue: ExecutionVenue::Bulk,
-            internal_symbol: "BTC/USDT".to_string(),
+            internal_symbol: "BTC".to_string(),
             venue_symbol: "BTC-USD".to_string(),
             registry_supported: true,
             side: OrderSide::Buy,
@@ -1437,7 +1436,7 @@ mod tests {
             "account",
             OrderRecord {
                 venue: ExecutionVenue::Bulk,
-                internal_symbol: "BTC/USDT".to_string(),
+                internal_symbol: "BTC".to_string(),
                 venue_symbol: "BTC-USD".to_string(),
                 registry_supported: true,
                 order_id: "deterministic-id".to_string(),
@@ -1478,7 +1477,7 @@ mod tests {
             timestamp: 1_699_564_800_000_000_000,
         };
         let normalized = OpenOrder::try_from(order).expect("order converts");
-        assert_eq!(normalized.internal_symbol, "BTC/USDT");
+        assert_eq!(normalized.internal_symbol, "BTC");
         assert_eq!(normalized.ts_ms, 1_699_564_800_000);
         assert!(normalized.registry_supported);
     }
@@ -1565,7 +1564,7 @@ mod tests {
     fn preserves_account_markets_outside_installed_market_snapshot() {
         let (internal, venue, supported) =
             normalize_account_symbol("GOLD-USD").expect("symbol normalizes");
-        assert_eq!(internal, "GOLD/USDT");
+        assert_eq!(internal, "GOLD");
         assert_eq!(venue, "GOLD-USD");
         assert!(!supported);
     }
@@ -1582,7 +1581,7 @@ mod tests {
             venue: ExecutionVenue::Bulk,
             testnet: false,
             account: account.to_base58(),
-            internal_symbol: "BTC/USDT".to_string(),
+            internal_symbol: "BTC".to_string(),
             venue_symbol: "BTC-USD".to_string(),
             direction: PositionDirection::Long,
             side: OrderSide::Buy,

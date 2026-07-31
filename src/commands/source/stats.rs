@@ -56,10 +56,7 @@ fn render_stats(
         version: "1",
         provider,
         exchange: stats.exchange.clone(),
-        symbol: args
-            .symbol
-            .clone()
-            .unwrap_or_else(|| "ALL/USDT".to_string()),
+        symbol: args.symbol.clone().unwrap_or_else(|| "ALL".to_string()),
         ts_ms: stats.timestamp_ms,
         stream: false,
         data: stats,

@@ -72,7 +72,7 @@ impl BinanceProvider {
         from: u64,
         to: u64,
     ) -> Result<OhlcvSeries> {
-        validate_request(symbol, interval, from, to)?;
+        validate_request(market, symbol, interval, from, to)?;
         let request_limit = market.request_limit();
         let mut data = Vec::new();
         let mut next_from = from;
@@ -110,7 +110,7 @@ impl BinanceProvider {
         data.dedup_by_key(|candle| candle.t);
         Ok(OhlcvSeries {
             exchange: market.exchange().to_string(),
-            symbol: canonical_symbol(symbol)?,
+            symbol: canonical_symbol(market, symbol)?,
             tf: interval.to_string(),
             from,
             to,
@@ -156,10 +156,11 @@ impl BinanceProvider {
         to: u64,
         limit: usize,
     ) -> Result<OhlcvSeries> {
-        validate_request(symbol, interval, from, to)?;
-        let symbol = canonical_symbol(symbol)?;
+        validate_request(market, symbol, interval, from, to)?;
+        let market_metadata = crate::markets::exchange_market(market.exchange(), symbol)?;
+        let symbol = market_metadata.symbol.clone();
         let query = [
-            ("symbol", venue_symbol(&symbol)),
+            ("symbol", market_metadata.venue_symbol.clone()),
             ("interval", interval.to_string()),
             ("startTime", from.to_string()),
             ("endTime", to.to_string()),
@@ -205,8 +206,14 @@ pub fn timeframe_from_seconds(seconds: u32) -> Result<&'static str> {
     }
 }
 
-fn validate_request(symbol: &str, interval: &str, from: u64, to: u64) -> Result<()> {
-    canonical_symbol(symbol)?;
+fn validate_request(
+    market: BinanceMarket,
+    symbol: &str,
+    interval: &str,
+    from: u64,
+    to: u64,
+) -> Result<()> {
+    canonical_symbol(market, symbol)?;
     if !matches!(
         interval,
         "1m" | "3m"
@@ -234,29 +241,10 @@ fn validate_request(symbol: &str, interval: &str, from: u64, to: u64) -> Result<
     Ok(())
 }
 
-fn canonical_symbol(symbol: &str) -> Result<String> {
-    let mut parts = symbol.split('/');
-    let Some(base) = parts.next().map(str::trim).filter(|part| !part.is_empty()) else {
-        bail!("Binance symbol must look like BASE/QUOTE");
-    };
-    let Some(quote) = parts.next().map(str::trim).filter(|part| !part.is_empty()) else {
-        bail!("Binance symbol must look like BASE/QUOTE");
-    };
-    if parts.next().is_some()
-        || !base.chars().all(|ch| ch.is_ascii_alphanumeric())
-        || !quote.chars().all(|ch| ch.is_ascii_alphanumeric())
-    {
-        bail!("Binance symbol must look like BASE/QUOTE");
-    }
-    Ok(format!(
-        "{}/{}",
-        base.to_ascii_uppercase(),
-        quote.to_ascii_uppercase()
-    ))
-}
-
-fn venue_symbol(symbol: &str) -> String {
-    symbol.replace('/', "")
+fn canonical_symbol(market: BinanceMarket, symbol: &str) -> Result<String> {
+    Ok(crate::markets::exchange_market(market.exchange(), symbol)?
+        .symbol
+        .clone())
 }
 
 fn decode_kline(values: &[Value], index: usize) -> Result<OhlcvCandle> {
@@ -344,12 +332,16 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_only_base_quote_symbols() {
+    fn normalizes_symbols_by_product_type() {
         assert_eq!(
-            canonical_symbol("btc/usdt").expect("valid symbol"),
+            canonical_symbol(BinanceMarket::Spot, "btc/usdt").expect("valid spot symbol"),
             "BTC/USDT"
         );
-        assert!(canonical_symbol("BTCUSDT").is_err());
-        assert!(canonical_symbol("BTC/USDT/PERP").is_err());
+        assert_eq!(
+            canonical_symbol(BinanceMarket::Futures, "btc").expect("valid futures symbol"),
+            "BTC"
+        );
+        assert!(canonical_symbol(BinanceMarket::Spot, "BTC").is_err());
+        assert!(canonical_symbol(BinanceMarket::Futures, "BTC/USDT").is_err());
     }
 }

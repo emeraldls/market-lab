@@ -36,7 +36,7 @@ use crate::strategies::jobs::{
 };
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-const RUNTIME_VERSION: u8 = 32;
+const RUNTIME_VERSION: u8 = 33;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -5160,7 +5160,7 @@ mod tests {
 
     #[test]
     fn runtime_protocol_v29_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 32);
+        assert_eq!(RUNTIME_VERSION, 33);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",
@@ -5169,7 +5169,7 @@ mod tests {
                     "name": "oiwap",
                     "config": {
                         "venue": "bulkf",
-                        "symbol": "ZEC/USDT",
+                        "symbol": "ZEC",
                         "side": "buy",
                         "totalSize": 1.0,
                         "requestedMargin": 50.0,
@@ -5204,7 +5204,7 @@ mod tests {
                     "name": "mid_price",
                     "config": {
                         "venue": "bulkf",
-                        "symbol": "BTC/USDT",
+                        "symbol": "BTC",
                         "maxInventorySize": 0.02,
                         "requestedMargin": 100.0,
                         "maxInventoryMargin": 100.0,
@@ -5240,7 +5240,7 @@ mod tests {
                     "name": "volume_mid",
                     "config": {
                         "venue": "bulkf",
-                        "symbol": "BTC/USDT",
+                        "symbol": "BTC",
                         "maxInventorySize": 0.02,
                         "requestedMargin": 100.0,
                         "maxInventoryMargin": 100.0,
@@ -5277,7 +5277,7 @@ mod tests {
                     "name": "grid",
                     "config": {
                         "venue": "hyperliquidf",
-                        "symbol": "BTC/USDT",
+                        "symbol": "BTC",
                         "maxInventorySize": 0.02,
                         "requestedMargin": 100.0,
                         "maxInventoryMargin": 100.0,

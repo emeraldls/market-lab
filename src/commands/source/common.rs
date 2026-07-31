@@ -75,7 +75,7 @@ mod tests {
             version: "1",
             provider: "mmt",
             exchange: "bybitf".to_string(),
-            symbol: "BTC/USDT".to_string(),
+            symbol: "BTC".to_string(),
             ts_ms: 1,
             stream: false,
             data: vec![(1.0_f64, 2.0_f64)],

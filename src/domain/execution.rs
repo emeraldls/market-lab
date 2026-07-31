@@ -322,7 +322,7 @@ mod tests {
             venue: ExecutionVenue::HyperliquidSpot,
             testnet: true,
             account: "0xabc".to_string(),
-            internal_symbol: "HYPE/USDT".to_string(),
+            internal_symbol: "HYPE/USDC".to_string(),
             venue_symbol: "@1035".to_string(),
             direction: PositionDirection::Long,
             side: OrderSide::Buy,

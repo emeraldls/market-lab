@@ -109,7 +109,7 @@ impl<'de> Deserialize<'de> for ExchangeMarkets {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Market {
-    /// Market Lab's canonical BASE/QUOTE symbol.
+    /// Market Lab's canonical instrument: BASE for futures, BASE/QUOTE for spot.
     pub symbol: String,
     /// Symbol sent to the selected provider.
     pub provider_symbol: String,
@@ -209,7 +209,6 @@ struct MmtMarket {
     base: String,
     quote: String,
     normalised_base: String,
-    normalised_quote: String,
     tick_size: f64,
     step_size: f64,
 }
@@ -370,8 +369,8 @@ impl Market {
             .chain(self.aliases.iter().map(String::as_str))
     }
 
-    fn validate(&self, provider: &str, exchange: &str) -> Result<()> {
-        canonical_symbol(&self.symbol)?;
+    fn validate(&self, provider: &str, exchange: &str, market_type: MarketType) -> Result<()> {
+        canonical_market_symbol(&self.symbol, market_type)?;
         if self.provider_symbol.trim().is_empty() || self.venue_symbol.trim().is_empty() {
             bail!(
                 "{provider}/{exchange} market {} has an empty provider symbol",
@@ -492,7 +491,7 @@ impl MarketSnapshot {
                 );
             }
             for market in &exchange.markets {
-                market.validate(&self.provider, &exchange.exchange)?;
+                market.validate(&self.provider, &exchange.exchange, exchange.market_type)?;
             }
         }
         Ok(())
@@ -652,7 +651,16 @@ pub fn provider_market(provider: &str, exchange: &str, symbol: &str) -> Result<A
     let registry = market_registry()?;
     let provider_key = key(provider);
     let exchange_key = key(exchange);
-    let symbol_key = symbol_key(symbol);
+    let market_type = registry
+        .exchange_types
+        .get(&exchange_key)
+        .copied()
+        .with_context(|| {
+            format!(
+                "exchange `{exchange}` is not present in the installed market snapshots; refresh its markets first"
+            )
+        })?;
+    let symbol_key = symbol_key(&canonical_market_symbol(symbol, market_type)?);
     registry
         .provider_markets
         .get(&provider_key)
@@ -680,7 +688,16 @@ pub fn exchange_market(exchange: &str, symbol: &str) -> Result<Arc<Market>> {
     ensure_public_exchange_id(exchange)?;
     let registry = market_registry()?;
     let exchange_key = key(exchange);
-    let symbol_key = symbol_key(symbol);
+    let market_type = registry
+        .exchange_types
+        .get(&exchange_key)
+        .copied()
+        .with_context(|| {
+            format!(
+                "exchange `{exchange}` is not present in the installed market snapshots; refresh its markets first"
+            )
+        })?;
+    let symbol_key = symbol_key(&canonical_market_symbol(symbol, market_type)?);
     registry
         .exchange_markets
         .get(&exchange_key)
@@ -694,6 +711,29 @@ pub fn exchange_market(exchange: &str, symbol: &str) -> Result<Arc<Market>> {
         .with_context(|| {
             format!(
                 "standalone exchange `{exchange}` does not provide `{symbol}` in the local snapshot"
+            )
+        })
+}
+
+/// Resolve an exchange-native symbol received from a venue. This is separate
+/// from [`exchange_market`], whose input is always a user-facing canonical
+/// symbol.
+pub(crate) fn exchange_wire_market(exchange: &str, symbol: &str) -> Result<Arc<Market>> {
+    ensure_public_exchange_id(exchange)?;
+    let registry = market_registry()?;
+    registry
+        .exchange_markets
+        .get(&key(exchange))
+        .with_context(|| {
+            format!(
+                "market snapshot for standalone exchange `{exchange}` is not installed; run `mlab markets --exchange {exchange} --refresh`"
+            )
+        })?
+        .get(&symbol_key(symbol))
+        .cloned()
+        .with_context(|| {
+            format!(
+                "standalone exchange `{exchange}` returned unknown wire market `{symbol}`"
             )
         })
 }
@@ -884,25 +924,18 @@ async fn fetch_bulk_snapshot() -> Result<MarketSnapshot> {
     let markets = raw
         .into_iter()
         .map(|market| {
-            let internal_quote = internal_quote(&market.quote_asset);
+            let base_asset = market.base_asset.to_ascii_uppercase();
+            let quote_asset = market.quote_asset.to_ascii_uppercase();
             Market {
-                symbol: format!(
-                    "{}/{}",
-                    market.base_asset.to_ascii_uppercase(),
-                    internal_quote
-                ),
+                symbol: base_asset.clone(),
                 provider_symbol: market.symbol.clone(),
                 venue_symbol: market.symbol,
                 venue_id: None,
-                aliases: vec![format!(
-                    "{}/{}",
-                    market.base_asset.to_ascii_uppercase(),
-                    market.quote_asset.to_ascii_uppercase()
-                )],
-                base_asset: market.base_asset.to_ascii_uppercase(),
-                quote_asset: internal_quote,
-                venue_base_asset: market.base_asset.to_ascii_uppercase(),
-                venue_quote_asset: market.quote_asset.to_ascii_uppercase(),
+                aliases: Vec::new(),
+                base_asset: base_asset.clone(),
+                quote_asset: quote_asset.clone(),
+                venue_base_asset: base_asset,
+                venue_quote_asset: quote_asset,
                 status: market.status,
                 price_increment: Some(market.tick_size),
                 size_increment: Some(market.lot_size),
@@ -980,9 +1013,10 @@ async fn fetch_binance_snapshot(futures: bool) -> Result<MarketSnapshot> {
                     || market
                         .contract_type
                         .as_deref()
-                        .is_some_and(|kind| kind.eq_ignore_ascii_case("PERPETUAL")))
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("PERPETUAL"))
+                        && market.quote_asset.eq_ignore_ascii_case("USDT"))
         })
-        .map(binance_market)
+        .map(|market| binance_market(market, market_type))
         .collect::<Result<Vec<_>>>()?;
     if markets.is_empty() {
         bail!("{name} returned no active markets");
@@ -1005,13 +1039,17 @@ async fn fetch_binance_snapshot(futures: bool) -> Result<MarketSnapshot> {
     Ok(snapshot)
 }
 
-fn binance_market(market: BinanceMarket) -> Result<Market> {
+fn binance_market(market: BinanceMarket, market_type: MarketType) -> Result<Market> {
     let price_increment = binance_filter_increment(&market.filters, "PRICE_FILTER", "tickSize")?;
     let size_increment = binance_filter_increment(&market.filters, "LOT_SIZE", "stepSize")?;
     let base_asset = market.base_asset.to_ascii_uppercase();
     let quote_asset = market.quote_asset.to_ascii_uppercase();
     Ok(Market {
-        symbol: format!("{base_asset}/{quote_asset}"),
+        symbol: if market_type.is_futures() {
+            base_asset.clone()
+        } else {
+            format!("{base_asset}/{quote_asset}")
+        },
         provider_symbol: market.symbol.clone(),
         venue_symbol: market.symbol,
         venue_id: None,
@@ -1098,7 +1136,7 @@ async fn fetch_hyperliquid_snapshot() -> Result<MarketSnapshot> {
                 .with_context(|| format!("invalid Hyperliquid mark price for {}", market.name))?;
             let tick_size = hyperliquid_price_increment(mark_price, market.sz_decimals, 6)?;
             let lot_size = 10_f64.powi(-i32::from(market.sz_decimals));
-            let symbol = format!("{}/USDT", market.name.to_ascii_uppercase());
+            let symbol = market.name.to_ascii_uppercase();
             Ok(Market {
                 symbol,
                 provider_symbol: market.name.clone(),
@@ -1107,12 +1145,9 @@ async fn fetch_hyperliquid_snapshot() -> Result<MarketSnapshot> {
                     u32::try_from(asset_index)
                         .context("Hyperliquid perpetual asset index exceeds u32")?,
                 ),
-                aliases: vec![
-                    format!("{}/USD", market.name.to_ascii_uppercase()),
-                    format!("{}/USDC", market.name.to_ascii_uppercase()),
-                ],
+                aliases: Vec::new(),
                 base_asset: market.name.to_ascii_uppercase(),
-                quote_asset: "USDT".to_string(),
+                quote_asset: "USDC".to_string(),
                 venue_base_asset: market.name.to_ascii_uppercase(),
                 venue_quote_asset: "USDC".to_string(),
                 status: "TRADING".to_string(),
@@ -1321,12 +1356,7 @@ fn decode_hyperliquid_spot_network(
             } else {
                 normalized_base
             };
-        let canonical_quote = canonical_hyperliquid_spot_token(network, quote);
-        let quote_asset = if canonical_quote == "USDC" {
-            "USDT".to_string()
-        } else {
-            canonical_quote
-        };
+        let quote_asset = canonical_hyperliquid_spot_token(network, quote);
         let symbol = format!("{base_asset}/{quote_asset}");
         let lot_size = 10_f64.powi(-i32::from(base.sz_decimals));
         let tick_size = hyperliquid_price_increment(mark_price, base.sz_decimals, 8)?;
@@ -1353,10 +1383,6 @@ fn decode_hyperliquid_spot_network(
             format!("{base_asset}/{}", quote.name.to_ascii_uppercase()),
             pair.name.clone(),
         ];
-        if quote_asset == "USDT" {
-            aliases.push(format!("{base_asset}/USDC"));
-            aliases.push(format!("{}/USDT", base.name.to_ascii_uppercase()));
-        }
         aliases.sort();
         aliases.dedup();
         let built = BuiltHyperliquidSpotMarket {
@@ -1475,18 +1501,19 @@ async fn fetch_mmt_snapshot() -> Result<MarketSnapshot> {
             let mut markets = BTreeMap::new();
             for market in exchange.symbols {
                 let base_asset = market.normalised_base.to_ascii_uppercase();
-                let quote_asset = internal_quote(&market.normalised_quote);
-                let symbol = format!("{base_asset}/{quote_asset}");
+                let market_type = classify_mmt_exchange(&canonical_mmt_exchange(&exchange.id));
+                let quote_asset = market.quote.to_ascii_uppercase();
+                let symbol = if market_type.is_futures() {
+                    base_asset.clone()
+                } else {
+                    format!("{base_asset}/{quote_asset}")
+                };
                 markets.entry(symbol.clone()).or_insert_with(|| Market {
                     symbol,
                     provider_symbol: market.symbol,
                     venue_symbol: market.exchange_ticker,
                     venue_id: None,
-                    aliases: vec![format!(
-                        "{}/{}",
-                        market.base.to_ascii_uppercase(),
-                        market.quote.to_ascii_uppercase()
-                    )],
+                    aliases: Vec::new(),
                     base_asset,
                     quote_asset,
                     venue_base_asset: market.base.to_ascii_uppercase(),
@@ -1629,21 +1656,35 @@ fn validate_optional_increment(
     Ok(())
 }
 
-fn canonical_symbol(symbol: &str) -> Result<String> {
-    let normalized = symbol.trim().to_ascii_uppercase().replace('-', "/");
+pub fn canonical_market_symbol(symbol: &str, market_type: MarketType) -> Result<String> {
+    let normalized = symbol.trim().to_ascii_uppercase();
+    if market_type.is_futures() {
+        if normalized.is_empty()
+            || normalized.contains(['/', '-'])
+            || !normalized
+                .chars()
+                .all(|character| character.is_alphanumeric() || character == '_')
+        {
+            bail!("futures symbol must be a base asset, e.g. BTC");
+        }
+        return Ok(normalized);
+    }
+
     let mut parts = normalized.split('/');
     match (parts.next(), parts.next(), parts.next()) {
-        (Some(base), Some(quote), None) if !base.is_empty() && !quote.is_empty() => {
+        (Some(base), Some(quote), None)
+            if !base.is_empty()
+                && !quote.is_empty()
+                && base.chars().all(|character| {
+                    character.is_alphanumeric() || character == '-' || character == '_'
+                })
+                && quote.chars().all(|character| {
+                    character.is_alphanumeric() || character == '-' || character == '_'
+                }) =>
+        {
             Ok(format!("{base}/{quote}"))
         }
-        _ => bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT"),
-    }
-}
-
-fn internal_quote(quote: &str) -> String {
-    match quote.trim().to_ascii_uppercase().as_str() {
-        "USD" => "USDT".to_string(),
-        quote => quote.to_string(),
+        _ => bail!("spot symbol must look like BASE/QUOTE, e.g. HYPE/USDC"),
     }
 }
 
@@ -1652,7 +1693,7 @@ fn fetched_at() -> String {
 }
 
 fn symbol_key(symbol: &str) -> String {
-    symbol.trim().to_ascii_uppercase().replace('-', "/")
+    symbol.trim().to_ascii_uppercase()
 }
 
 fn key(value: &str) -> String {
@@ -1716,6 +1757,28 @@ fn canonicalize_snapshot(snapshot: &mut MarketSnapshot) {
             if exchange.exchange.eq_ignore_ascii_case("hyperliquid") {
                 exchange.exchange = "hyperliquidf".to_string();
                 exchange.name = "Hyperliquid Perpetuals".to_string();
+            }
+        }
+    }
+
+    for exchange in &mut snapshot.exchanges {
+        for market in &mut exchange.markets {
+            market.base_asset = market.base_asset.trim().to_ascii_uppercase();
+            market.quote_asset = market.quote_asset.trim().to_ascii_uppercase();
+            if exchange.market_type.is_futures() {
+                market.quote_asset = market.venue_quote_asset.trim().to_ascii_uppercase();
+                market.symbol = market.base_asset.clone();
+                market.aliases.retain(|alias| !alias.contains('/'));
+            } else if snapshot.provider.eq_ignore_ascii_case("mmt") {
+                market.quote_asset = market.venue_quote_asset.trim().to_ascii_uppercase();
+                market.symbol = format!("{}/{}", market.base_asset, market.quote_asset);
+            } else if exchange.exchange.eq_ignore_ascii_case("hyperliquid") {
+                market.quote_asset = market.venue_quote_asset.trim().to_ascii_uppercase();
+                market.symbol = format!("{}/{}", market.base_asset, market.quote_asset);
+                market.aliases.retain(|alias| {
+                    !alias.eq_ignore_ascii_case(&format!("{}/USDT", market.base_asset))
+                        || market.quote_asset == "USDT"
+                });
             }
         }
     }
@@ -2010,15 +2073,15 @@ mod tests {
         let registry = MarketRegistry::new(test_snapshots()).expect("snapshots index");
         assert_eq!(registry.snapshots.len(), 6);
 
-        let bulk = exchange_market("bulkf", "btc/usdt").expect("BULK market resolves");
-        assert_eq!(bulk.symbol, "BTC/USDT");
+        let bulk = exchange_market("bulkf", "btc").expect("BULK market resolves");
+        assert_eq!(bulk.symbol, "BTC");
         assert_eq!(bulk.venue_symbol, "BTC-USD");
         assert_eq!(
             bulk.execution_rules().expect("execution rules").lot_size,
             0.000001
         );
 
-        let mmt = provider_market("mmt", "binancef", "btc/usdt").expect("MMT market resolves");
+        let mmt = provider_market("mmt", "binancef", "btc").expect("MMT market resolves");
         assert_eq!(mmt.provider_symbol, "btc/usd");
         assert!(mmt.execution.is_none());
 
@@ -2026,8 +2089,7 @@ mod tests {
         assert_eq!(spot.provider_symbol, "BTCUSDT");
         assert!(!is_futures_exchange("binance").expect("Binance spot type resolves"));
 
-        let futures =
-            exchange_market("binancef", "btc/usdt").expect("Binance futures market resolves");
+        let futures = exchange_market("binancef", "btc").expect("Binance futures market resolves");
         assert_eq!(futures.provider_symbol, "BTCUSDT");
         assert!(is_futures_exchange("binancef").expect("Binance futures type resolves"));
     }
@@ -2059,16 +2121,16 @@ mod tests {
 
     #[test]
     fn provider_and_direct_routes_are_distinct() {
-        assert!(provider_market("mmt", "hyperliquidf", "BTC/USDT").is_ok());
+        assert!(provider_market("mmt", "hyperliquidf", "BTC").is_ok());
         assert_eq!(
             upstream_exchange("mmt", "hyperliquidf").expect("MMT exchange mapping resolves"),
             "hyperliquid"
         );
-        let direct = exchange_market("hyperliquidf", "BTC/USDT")
-            .expect("standalone Hyperliquid market resolves");
+        let direct =
+            exchange_market("hyperliquidf", "BTC").expect("standalone Hyperliquid market resolves");
         assert_eq!(direct.venue_symbol, "BTC");
         assert_eq!(direct.venue_id, Some(0));
-        let spot = exchange_market("hyperliquid", "BTC/USDT")
+        let spot = exchange_market("hyperliquid", "BTC/USDC")
             .expect("standalone Hyperliquid spot market resolves");
         assert_eq!(spot.base_asset, "BTC");
         assert_eq!(spot.venue_base_asset, "UBTC");
@@ -2084,20 +2146,37 @@ mod tests {
                 .provider_symbol,
             "@10"
         );
-        assert!(provider_market("mmt", "missing", "BTC/USDT").is_err());
+        assert!(provider_market("mmt", "missing", "BTC").is_err());
     }
 
     #[test]
-    fn bulk_native_and_usd_aliases_resolve() {
-        let native = exchange_market("bulkf", "BTC-USD").expect("native symbol resolves");
-        let usd = exchange_market("bulkf", "BTC/USD").expect("USD alias resolves");
-        assert_eq!(native.symbol, "BTC/USDT");
-        assert_eq!(native.symbol, usd.symbol);
+    fn futures_reject_native_and_legacy_pair_aliases() {
+        assert!(exchange_market("bulkf", "BTC-USD").is_err());
+        assert!(exchange_market("bulkf", "BTC/USD").is_err());
+        assert!(exchange_market("bulkf", "BTC/USDT").is_err());
+    }
+
+    #[test]
+    fn canonical_symbols_keep_only_real_instrument_identity() {
+        assert_eq!(
+            canonical_market_symbol("btc", MarketType::Futures).expect("futures base"),
+            "BTC"
+        );
+        assert!(canonical_market_symbol("BTC/USDT", MarketType::Futures).is_err());
+        assert_eq!(
+            canonical_market_symbol("hype/usdh", MarketType::Spot).expect("spot pair"),
+            "HYPE/USDH"
+        );
+        assert!(canonical_market_symbol("HYPE", MarketType::Spot).is_err());
+        assert_eq!(
+            canonical_market_symbol("币安人生", MarketType::Futures).expect("non-ASCII venue base"),
+            "币安人生"
+        );
     }
 
     #[test]
     fn bare_bulk_exchange_id_is_rejected() {
-        let error = exchange_market("bulk", "BTC/USDT")
+        let error = exchange_market("bulk", "BTC")
             .expect_err("bare bulk must not resolve as a public exchange");
         assert!(error.to_string().contains("use `bulkf`"));
     }
@@ -2192,7 +2271,7 @@ mod tests {
         )
         .expect("spot metadata decodes");
 
-        let market = decoded.get("BTC/USDT").expect("BTC spot market");
+        let market = decoded.get("BTC/USDC").expect("BTC spot market");
         assert_eq!(market.variant.provider_symbol, "@142");
         assert_eq!(market.variant.venue_id, 10_142);
         assert_eq!(market.variant.venue_base_asset, "UBTC");
@@ -2249,7 +2328,7 @@ mod tests {
 
         assert_eq!(
             decoded
-                .get("BTC/USDT")
+                .get("BTC/USDC")
                 .expect("BTC spot market")
                 .variant
                 .venue_id,
@@ -2298,7 +2377,7 @@ mod tests {
 
         assert_eq!(
             decoded
-                .get("PUMP/USDT")
+                .get("PUMP/USDC")
                 .expect("native PUMP")
                 .variant
                 .venue_base_asset,
@@ -2306,7 +2385,7 @@ mod tests {
         );
         assert_eq!(
             decoded
-                .get("UPUMP/USDT")
+                .get("UPUMP/USDC")
                 .expect("unit PUMP")
                 .variant
                 .venue_base_asset,

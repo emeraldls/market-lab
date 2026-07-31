@@ -2750,7 +2750,7 @@ mod tests {
         let definition = MidPriceJobDefinition {
             venue: ExecutionVenue::Bulk,
             testnet: false,
-            symbol: "BTC/USDT".to_string(),
+            symbol: "BTC".to_string(),
             max_inventory_size: 1.0,
             requested_margin: Some(200.0),
             max_inventory_margin: 200.0,
@@ -2802,7 +2802,7 @@ mod tests {
             venue: ExecutionVenue::Bulk,
             testnet: false,
             account: "account".to_string(),
-            internal_symbol: "BTC/USDT".to_string(),
+            internal_symbol: "BTC".to_string(),
             venue_symbol: "BTC-USD".to_string(),
             direction: PositionDirection::Long,
             side: OrderSide::Buy,

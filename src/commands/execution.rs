@@ -75,8 +75,8 @@ pub async fn handle_trade(args: TradeArgs, direction: PositionDirection) -> Resu
 
 pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
     args.validate()?;
-    let symbol = validate_optional_symbol(args.symbol.as_deref())?;
     let venue = ExecutionVenue::from(args.venue);
+    let symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
     let account = ExecutionAdapter::configured_account(venue)?;
     let snapshot = ExecutionAdapter::new(venue, args.testnet)
         .await?
@@ -110,8 +110,8 @@ pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
 
 pub async fn handle_orders(args: AccountQueryArgs) -> Result<()> {
     args.validate()?;
-    let symbol = validate_optional_symbol(args.symbol.as_deref())?;
     let venue = ExecutionVenue::from(args.venue);
+    let symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
     let account = ExecutionAdapter::configured_account(venue)?;
     let orders = ExecutionAdapter::new(venue, args.testnet)
         .await?
@@ -129,8 +129,8 @@ pub async fn handle_orders(args: AccountQueryArgs) -> Result<()> {
 
 pub async fn handle_fills(args: AccountQueryArgs) -> Result<()> {
     args.validate()?;
-    let symbol = validate_optional_symbol(args.symbol.as_deref())?;
     let venue = ExecutionVenue::from(args.venue);
+    let symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
     let account = ExecutionAdapter::configured_account(venue)?;
     let fills = ExecutionAdapter::new(venue, args.testnet)
         .await?
@@ -205,8 +205,8 @@ pub async fn handle_cancel(args: CancelOrderArgs) -> Result<()> {
 
 pub async fn handle_close(args: ClosePositionArgs) -> Result<()> {
     args.validate()?;
-    let requested_symbol = validate_optional_symbol(args.symbol.as_deref())?;
     let venue = ExecutionVenue::from(args.venue);
+    let requested_symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
     let account = ExecutionAdapter::configured_account(venue)?;
     let snapshot = ExecutionAdapter::new(venue, args.testnet)
         .await?
@@ -623,8 +623,10 @@ fn is_price_aligned(
     }
 }
 
-fn validate_optional_symbol(symbol: Option<&str>) -> Result<Option<String>> {
-    symbol.map(canonical_symbol).transpose()
+fn validate_optional_symbol(venue: ExecutionVenue, symbol: Option<&str>) -> Result<Option<String>> {
+    symbol
+        .map(|symbol| execution_market(venue, symbol).map(|market| market.symbol.clone()))
+        .transpose()
 }
 
 fn execution_market(venue: ExecutionVenue, symbol: &str) -> Result<std::sync::Arc<Market>> {
@@ -676,17 +678,6 @@ fn venue_network_label(venue: ExecutionVenue, testnet: bool) -> &'static str {
         (ExecutionVenue::HyperliquidSpot, true) => "Hyperliquid Spot testnet",
         (ExecutionVenue::HyperliquidSpot, false) => "Hyperliquid Spot mainnet",
         (ExecutionVenue::Bulk, _) => "BULK",
-    }
-}
-
-fn canonical_symbol(symbol: &str) -> Result<String> {
-    let normalized = symbol.trim().to_ascii_uppercase().replace('-', "/");
-    let mut parts = normalized.split('/');
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some(base), Some(quote), None) if !base.is_empty() && !quote.is_empty() => {
-            Ok(format!("{base}/{quote}"))
-        }
-        _ => bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT"),
     }
 }
 

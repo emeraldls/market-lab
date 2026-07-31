@@ -134,7 +134,7 @@ pub async fn handle(args: RunOiwapArgs) -> Result<()> {
     .await?;
     let feasibility = VwapFeasibility::assess(parent.size, &model.curves.execution);
     let view = plan_view(PlanInput {
-        symbol: &args.symbol,
+        symbol: &parent.internal_symbol,
         side: side_name(args.side),
         parent: &parent,
         duration_secs: args.duration,

@@ -258,7 +258,7 @@ mod tests {
             venue: ExecutionVenue::Bulk,
             testnet: false,
             account: "account".to_string(),
-            internal_symbol: "BTC/USDT".to_string(),
+            internal_symbol: "BTC".to_string(),
             venue_symbol: "BTC-USD".to_string(),
             direction: PositionDirection::Long,
             side: OrderSide::Buy,
@@ -292,7 +292,7 @@ mod tests {
         manager.owned_order_ids.insert("owned".to_string());
         let fill = Fill {
             venue: ExecutionVenue::Bulk,
-            internal_symbol: "BTC/USDT".to_string(),
+            internal_symbol: "BTC".to_string(),
             venue_symbol: "BTC-USD".to_string(),
             registry_supported: true,
             side: OrderSide::Buy,

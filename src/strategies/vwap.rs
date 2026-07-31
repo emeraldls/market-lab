@@ -277,10 +277,10 @@ mod tests {
     #[test]
     fn selector_defaults_to_execution_venue() {
         let selector =
-            VolumeSourceSelector::parse(&[], "bulkf", "BTC/USDT").expect("BULK default selector");
+            VolumeSourceSelector::parse(&[], "bulkf", "BTC").expect("BULK default selector");
         assert_eq!(selector.sources()[0].selector(), "bulkf");
 
-        let selector = VolumeSourceSelector::parse(&[], "hyperliquidf", "BTC/USDT")
+        let selector = VolumeSourceSelector::parse(&[], "hyperliquidf", "BTC")
             .expect("Hyperliquid default selector");
         assert_eq!(selector.sources()[0].selector(), "hyperliquidf");
     }
@@ -290,7 +290,7 @@ mod tests {
         let error = VolumeSourceSelector::parse(
             &["bulkf".to_string(), "bulkf".to_string()],
             "bulkf",
-            "BTC/USDT",
+            "BTC",
         )
         .expect_err("duplicate venue must fail");
         assert!(error.to_string().contains("selected more than once"));

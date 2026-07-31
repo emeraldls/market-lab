@@ -895,7 +895,7 @@ export function onData(ctx, input, history) {
 
         let book = json!({
             "exchange": "test",
-            "symbol": "BTC/USDT",
+            "symbol": "BTC",
             "timestamp_ms": 1,
             "bids": [
                 { "price": 99.0, "quantity": 1.0 },
@@ -957,14 +957,14 @@ export function onData(ctx, input, history) {
         let books = json!([
             {
                 "exchange": "test",
-                "symbol": "BTC/USDT",
+                "symbol": "BTC",
                 "timestamp_ms": 1,
                 "bids": [{ "price": 99.0, "quantity": 1.0 }],
                 "asks": [{ "price": 101.0, "quantity": 1.0 }]
             },
             {
                 "exchange": "test",
-                "symbol": "BTC/USDT",
+                "symbol": "BTC",
                 "timestamp_ms": 2,
                 "bids": [{ "price": 100.0, "quantity": 1.0 }],
                 "asks": [{ "price": 102.0, "quantity": 1.0 }]

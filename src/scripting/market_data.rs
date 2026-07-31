@@ -480,7 +480,7 @@ mod tests {
     fn trade(timestamp_ms: u64, price: f64, size: f64, taker_buy: bool) -> TradeTick {
         TradeTick {
             exchange: "test".to_string(),
-            symbol: "BTC/USDT".to_string(),
+            symbol: "BTC".to_string(),
             timestamp_ms,
             price,
             size,

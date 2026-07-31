@@ -80,6 +80,7 @@ pub fn parse_source_configs(values: &[String]) -> Result<SourceConfigs> {
                 (binding, options)
             });
         let (selector, symbol, source, provider, exchange) = parse_source_selector(binding)?;
+        validate_source_market(provider, &exchange, &script_symbol_to_market(&symbol))?;
         let config = configs.entry(selector.clone()).or_insert_with(|| {
             SourceConfig::new(
                 selector.clone(),
@@ -480,15 +481,29 @@ pub fn normalize_script_symbol(raw: &str) -> Result<String> {
     if symbol.is_empty()
         || !symbol
             .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_' | '/'))
+        || symbol.starts_with('/')
+        || symbol.ends_with('/')
+        || symbol.matches('/').count() > 1
     {
-        bail!("script symbol `{raw}` must use letters, numbers, `-`, or `_`, for example `btc`");
+        bail!(
+            "script symbol `{raw}` must be a base asset such as `btc` or a spot pair such as `hype/usdc`"
+        );
     }
     Ok(symbol)
 }
 
 pub fn script_symbol_to_market(symbol: &str) -> String {
-    format!("{}/USDT", symbol.trim().to_ascii_uppercase())
+    symbol.trim().to_ascii_uppercase()
+}
+
+fn validate_source_market(_provider: ProviderKind, exchange: &str, symbol: &str) -> Result<()> {
+    let market_type = if crate::markets::is_futures_exchange(exchange)? {
+        crate::markets::MarketType::Futures
+    } else {
+        crate::markets::MarketType::Spot
+    };
+    crate::markets::canonical_market_symbol(symbol, market_type).map(|_| ())
 }
 
 fn parse_source_provider(raw: &str) -> Result<ProviderKind> {
@@ -659,22 +674,25 @@ mod tests {
     #[test]
     fn parses_exchange_qualified_source_configs() {
         let configs = parse_source_configs(&[
-            "btc@candles@okx@mmt:timeframe=60".to_string(),
+            "btc/usdt@candles@okx@mmt:timeframe=60".to_string(),
             "btc@orderbook@binancef@mmt:timeframe=60,depth=50".to_string(),
             "btc@trades@hyperliquidf@mmt".to_string(),
             "btc@vd@hyperliquidf@mmt:timeframe=60,bucket=1".to_string(),
             "btc@oi@binancef@mmt:timeframe=60".to_string(),
-            "btc@volumes@okx@mmt:timeframe=60".to_string(),
+            "btc/usdt@volumes@okx@mmt:timeframe=60".to_string(),
         ])
         .unwrap();
-        assert_eq!(configs["btc@candles@okx@mmt"].exchange, "okx");
-        assert_eq!(configs["btc@candles@okx@mmt"].symbol, "btc");
-        assert_eq!(configs["btc@candles@okx@mmt"].provider, ProviderKind::Mmt);
+        assert_eq!(configs["btc/usdt@candles@okx@mmt"].exchange, "okx");
+        assert_eq!(configs["btc/usdt@candles@okx@mmt"].symbol, "btc/usdt");
+        assert_eq!(
+            configs["btc/usdt@candles@okx@mmt"].provider,
+            ProviderKind::Mmt
+        );
         assert_eq!(configs["btc@orderbook@binancef@mmt"].depth, Some(50));
         assert_eq!(configs["btc@trades@hyperliquidf@mmt"].timeframe, None);
         assert_eq!(configs["btc@vd@hyperliquidf@mmt"].bucket, Some(1));
         assert_eq!(configs["btc@oi@binancef@mmt"].timeframe, Some(60));
-        assert_eq!(configs["btc@volumes@okx@mmt"].timeframe, Some(60));
+        assert_eq!(configs["btc/usdt@volumes@okx@mmt"].timeframe, Some(60));
     }
 
     #[test]
@@ -682,14 +700,14 @@ mod tests {
         let manifest = manifest(vec![ScriptSource::Candles]);
         let configs = parse_source_configs(&[
             "btc@candles@binancef@mmt:timeframe=60".to_string(),
-            "btc@candles@okx@mmt:timeframe=300".to_string(),
+            "btc/usdt@candles@okx@mmt:timeframe=300".to_string(),
         ])
         .expect("qualified bindings should parse");
 
         validate_source_configs(&manifest, &configs).expect("backtest configs should validate");
         validate_source_configs_for_run(&manifest, &configs).expect("live configs should validate");
         assert_eq!(source_exchange_label(&configs), "binancef,okx");
-        assert_eq!(configs["btc@candles@okx@mmt"].timeframe, Some(300));
+        assert_eq!(configs["btc/usdt@candles@okx@mmt"].timeframe, Some(300));
     }
 
     #[test]
@@ -703,14 +721,8 @@ mod tests {
 
         validate_source_configs(&manifest, &configs).expect("multi-symbol configs should validate");
         assert_eq!(configs.len(), 2);
-        assert_eq!(
-            configs["btc@candles@binancef@mmt"].market_symbol(),
-            "BTC/USDT"
-        );
-        assert_eq!(
-            configs["zec@candles@binancef@mmt"].market_symbol(),
-            "ZEC/USDT"
-        );
+        assert_eq!(configs["btc@candles@binancef@mmt"].market_symbol(), "BTC");
+        assert_eq!(configs["zec@candles@binancef@mmt"].market_symbol(), "ZEC");
     }
 
     #[test]
@@ -820,24 +832,27 @@ mod tests {
             ScriptSource::Volumes,
         ]);
         let configs = parse_source_configs(&[
-            "btc@candles@hyperliquid:timeframe=60".to_string(),
-            "btc@orderbook@hyperliquid:depth=20".to_string(),
-            "btc@trades@hyperliquid".to_string(),
-            "btc@vd@hyperliquid".to_string(),
-            "btc@volumes@hyperliquid:timeframe=60".to_string(),
+            "btc/usdc@candles@hyperliquid:timeframe=60".to_string(),
+            "btc/usdc@orderbook@hyperliquid:depth=20".to_string(),
+            "btc/usdc@trades@hyperliquid".to_string(),
+            "btc/usdc@vd@hyperliquid".to_string(),
+            "btc/usdc@volumes@hyperliquid:timeframe=60".to_string(),
         ])
         .expect("standalone Hyperliquid spot selectors should parse");
 
         validate_source_configs_for_run(&live_manifest, &configs)
             .expect("standalone Hyperliquid spot live configs should validate");
-        assert_eq!(configs["btc@candles@hyperliquid"].exchange, "hyperliquid");
         assert_eq!(
-            configs["btc@candles@hyperliquid"].provider,
+            configs["btc/usdc@candles@hyperliquid"].exchange,
+            "hyperliquid"
+        );
+        assert_eq!(
+            configs["btc/usdc@candles@hyperliquid"].provider,
             ProviderKind::Hyperliquid
         );
 
         let oi_manifest = manifest(vec![ScriptSource::Oi]);
-        let oi = parse_source_configs(&["btc@oi@hyperliquid".to_string()])
+        let oi = parse_source_configs(&["btc/usdc@oi@hyperliquid".to_string()])
             .expect("spot OI selector parses before capability validation");
         let error = validate_source_configs_for_run(&oi_manifest, &oi)
             .expect_err("spot must not expose open interest");
@@ -848,7 +863,7 @@ mod tests {
     fn validates_historical_binance_spot_and_futures_bindings() {
         let manifest = manifest(vec![ScriptSource::Candles, ScriptSource::Volumes]);
         let configs = parse_source_configs(&[
-            "btc@candles@binance:timeframe=60".to_string(),
+            "btc/usdt@candles@binance:timeframe=60".to_string(),
             "btc@volumes@binancef:timeframe=300".to_string(),
         ])
         .expect("standalone Binance selectors should parse");
@@ -856,7 +871,7 @@ mod tests {
         validate_source_configs(&manifest, &configs)
             .expect("historical Binance configs should validate");
         assert_eq!(
-            configs["btc@candles@binance"].provider,
+            configs["btc/usdt@candles@binance"].provider,
             ProviderKind::Binance
         );
         assert_eq!(
@@ -870,7 +885,7 @@ mod tests {
     #[test]
     fn rejects_open_interest_on_a_spot_exchange() {
         let manifest = manifest(vec![ScriptSource::Oi]);
-        let configs = parse_source_configs(&["btc@oi@binance@mmt:timeframe=60".to_string()])
+        let configs = parse_source_configs(&["btc/usdt@oi@binance@mmt:timeframe=60".to_string()])
             .expect("spot OI binding parses before capability validation");
 
         let error = validate_source_configs_for_run(&manifest, &configs)

@@ -139,9 +139,7 @@ pub struct TradeArgs {
 
 impl TradeArgs {
     pub fn validate_shape(&self) -> Result<()> {
-        if !is_valid_symbol(&self.symbol) {
-            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
+        validate_execution_symbol(self.venue, &self.symbol)?;
         if let Some(size) = self.size
             && (!size.is_finite() || size <= 0.0)
         {
@@ -241,9 +239,7 @@ pub struct CancelOrderArgs {
 
 impl CancelOrderArgs {
     pub fn validate(&self) -> Result<()> {
-        if !is_valid_symbol(&self.symbol) {
-            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
+        validate_execution_symbol(self.venue, &self.symbol)?;
         if self.order_id.trim().is_empty() {
             bail!("order id cannot be empty");
         }
@@ -276,10 +272,8 @@ pub struct ClosePositionArgs {
 
 impl ClosePositionArgs {
     pub fn validate(&self) -> Result<()> {
-        if let Some(symbol) = &self.symbol
-            && !is_valid_symbol(symbol)
-        {
-            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        if let Some(symbol) = &self.symbol {
+            validate_execution_symbol(self.venue, symbol)?;
         }
         if self.dry_run && self.yes {
             bail!("--yes is not used with --dry-run");
@@ -294,10 +288,8 @@ impl ClosePositionArgs {
 
 impl AccountQueryArgs {
     pub fn validate(&self) -> Result<()> {
-        if let Some(symbol) = &self.symbol
-            && !is_valid_symbol(symbol)
-        {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        if let Some(symbol) = &self.symbol {
+            validate_execution_symbol(self.venue, symbol)?;
         }
         if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("account queries support only --output terminal|json|jsonl");
@@ -1012,9 +1004,7 @@ impl TimeframeSourceValidation<'_> {
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
-        if !is_valid_symbol(self.symbol) {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
+        validate_exchange_symbol(self.exchange, self.symbol)?;
         provider_timeframe_from_seconds(self.provider, self.timeframe)?;
         if self.stream
             && matches!(
@@ -1050,9 +1040,7 @@ impl CvdArgs {
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
-        if !is_valid_symbol(&self.symbol) {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
+        validate_exchange_symbol(&self.exchange, &self.symbol)?;
         mmt_timeframe_from_seconds(self.timeframe)?;
         if self.stream {
             if self.from.is_some() || self.to.is_some() {
@@ -1169,10 +1157,8 @@ pub struct SourceStatsArgs {
 impl SourceStatsArgs {
     pub fn validate(&self) -> Result<()> {
         resolve_source_provider(None, &self.exchange)?;
-        if let Some(symbol) = &self.symbol
-            && !is_valid_symbol(symbol)
-        {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
+        if let Some(symbol) = &self.symbol {
+            validate_exchange_symbol(&self.exchange, symbol)?;
         }
         if !matches!(
             self.period.as_str(),
@@ -1213,9 +1199,7 @@ pub struct SourceFundingArgs {
 impl SourceFundingArgs {
     pub fn validate(&self) -> Result<()> {
         resolve_source_provider(None, &self.exchange)?;
-        if !is_valid_symbol(&self.symbol) {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
+        validate_exchange_symbol(&self.exchange, &self.symbol)?;
         if !crate::markets::is_futures_exchange(&self.exchange)? {
             bail!(
                 "funding requires a futures exchange; `{}` is spot",
@@ -1297,9 +1281,7 @@ impl InspectArgs {
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
-        if !is_valid_symbol(&self.symbol) {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
+        validate_exchange_symbol(&self.exchange, &self.symbol)?;
         validate_millisecond_timestamp(self.at, "--at")?;
         if self.depth == 0 {
             bail!("--depth must be >= 1");
@@ -1344,9 +1326,7 @@ impl ReplayArgs {
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
-        if !is_valid_symbol(&self.symbol) {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
+        validate_exchange_symbol(&self.exchange, &self.symbol)?;
         validate_millisecond_timestamp(self.from, "--from")?;
         validate_millisecond_timestamp(self.to, "--to")?;
         if self.from >= self.to {
@@ -1403,9 +1383,7 @@ impl SlippageArgs {
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
-        if !is_valid_symbol(&self.symbol) {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
+        validate_exchange_symbol(&self.exchange, &self.symbol)?;
         if self.notional <= 0.0 {
             bail!("--notional must be > 0");
         }
@@ -1462,9 +1440,7 @@ impl ImbalanceArgs {
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
-        if !is_valid_symbol(&self.symbol) {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
+        validate_exchange_symbol(&self.exchange, &self.symbol)?;
         if self.depth == 0 {
             bail!("--depth must be >= 1");
         }
@@ -1540,9 +1516,7 @@ impl SpreadArgs {
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
-        if !is_valid_symbol(&self.symbol) {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
+        validate_exchange_symbol(&self.exchange, &self.symbol)?;
         if self.depth == 0 {
             bail!("--depth must be >= 1");
         }
@@ -1890,9 +1864,7 @@ impl RunTwapArgs {
         if self.venue == ExecutionVenueArg::HyperliquidSpot {
             bail!("TWAP does not support spot execution yet");
         }
-        if !is_valid_symbol(&self.symbol) {
-            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
+        validate_execution_symbol(self.venue, &self.symbol)?;
         if self
             .size
             .is_some_and(|size| !size.is_finite() || size <= 0.0)
@@ -1938,9 +1910,7 @@ impl RunTwapArgs {
 
 impl RunVwapArgs {
     pub fn validate(&self) -> Result<()> {
-        if !is_valid_symbol(&self.symbol) {
-            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
+        validate_execution_symbol(self.venue, &self.symbol)?;
         if self
             .size
             .is_some_and(|size| !size.is_finite() || size <= 0.0)
@@ -1998,9 +1968,7 @@ impl RunOiwapArgs {
         if self.venue == ExecutionVenueArg::HyperliquidSpot {
             bail!("OIWAP does not support spot execution yet");
         }
-        if !is_valid_symbol(&self.symbol) {
-            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
+        validate_execution_symbol(self.venue, &self.symbol)?;
         if self
             .size
             .is_some_and(|size| !size.is_finite() || size <= 0.0)
@@ -2050,9 +2018,7 @@ impl RunMidPriceArgs {
         if self.venue == ExecutionVenueArg::HyperliquidSpot {
             bail!("market-making bots do not support spot execution yet");
         }
-        if !is_valid_symbol(&self.symbol) {
-            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
+        validate_execution_symbol(self.venue, &self.symbol)?;
         if self
             .size
             .is_some_and(|size| !size.is_finite() || size <= 0.0)
@@ -2124,9 +2090,7 @@ impl RunGridArgs {
         if self.venue == ExecutionVenueArg::HyperliquidSpot {
             bail!("grid does not support spot execution yet");
         }
-        if !is_valid_symbol(&self.symbol) {
-            bail!("symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
+        validate_execution_symbol(self.venue, &self.symbol)?;
         if self
             .size
             .is_some_and(|size| !size.is_finite() || size <= 0.0)
@@ -2185,9 +2149,7 @@ impl DepthArgs {
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
-        if !is_valid_symbol(&self.symbol) {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
+        validate_exchange_symbol(&self.exchange, &self.symbol)?;
         if self.levels == 0 {
             bail!("--levels must be >= 1");
         }
@@ -2217,9 +2179,7 @@ impl VampArgs {
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
-        if !is_valid_symbol(&self.symbol) {
-            bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-        }
+        validate_exchange_symbol(&self.exchange, &self.symbol)?;
         if self.depth == 0 {
             bail!("--depth must be >= 1");
         }
@@ -2247,12 +2207,14 @@ impl VampArgs {
     }
 }
 
-fn is_valid_symbol(symbol: &str) -> bool {
-    let mut parts = symbol.split('/');
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some(base), Some(quote), None) => !base.trim().is_empty() && !quote.trim().is_empty(),
-        _ => false,
-    }
+fn validate_execution_symbol(venue: ExecutionVenueArg, symbol: &str) -> Result<()> {
+    let market_type = match venue {
+        ExecutionVenueArg::Bulk | ExecutionVenueArg::Hyperliquid => {
+            crate::markets::MarketType::Futures
+        }
+        ExecutionVenueArg::HyperliquidSpot => crate::markets::MarketType::Spot,
+    };
+    crate::markets::canonical_market_symbol(symbol, market_type).map(|_| ())
 }
 
 fn validate_source_identity(
@@ -2261,10 +2223,17 @@ fn validate_source_identity(
     symbol: &str,
 ) -> Result<CliProviderKind> {
     let provider = resolve_source_provider(provider, exchange)?;
-    if !is_valid_symbol(symbol) {
-        bail!("--symbol must look like BASE/QUOTE, e.g. BTC/USDT");
-    }
+    validate_exchange_symbol(exchange, symbol)?;
     Ok(provider)
+}
+
+fn validate_exchange_symbol(exchange: &str, symbol: &str) -> Result<()> {
+    let market_type = if crate::markets::is_futures_exchange(exchange)? {
+        crate::markets::MarketType::Futures
+    } else {
+        crate::markets::MarketType::Spot
+    };
+    crate::markets::canonical_market_symbol(symbol, market_type).map(|_| ())
 }
 
 fn resolve_source_provider(
@@ -2471,7 +2440,7 @@ mod tests {
             "--exchange",
             "bulkf",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
             "--json",
         ])
         .expect("markets command should parse");
@@ -2480,7 +2449,7 @@ mod tests {
             Commands::Markets(args) => {
                 assert!(args.provider.is_none());
                 assert_eq!(args.exchange, "bulkf");
-                assert_eq!(args.symbol.as_deref(), Some("BTC/USDT"));
+                assert_eq!(args.symbol.as_deref(), Some("BTC"));
                 assert!(!args.refresh);
                 assert!(args.json);
                 args.validate().expect("BULK markets should validate");
@@ -2495,7 +2464,7 @@ mod tests {
             "mlab",
             "trade",
             "long",
-            "BTC/USDT",
+            "BTC",
             "--venue",
             "bulk",
             "--margin",
@@ -2529,7 +2498,7 @@ mod tests {
             "--exchange",
             "hyperliquidf",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
             "--depth",
             "20",
         ])
@@ -2557,7 +2526,7 @@ mod tests {
             "--exchange",
             "hyperliquidf",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
             "--timeframe",
             "60",
             "--stream",
@@ -2580,7 +2549,7 @@ mod tests {
             "mlab",
             "trade",
             "long",
-            "BTC/USDT",
+            "BTC",
             "--venue",
             "hyperliquidf",
             "--margin",
@@ -2605,7 +2574,7 @@ mod tests {
             "mlab",
             "trade",
             "buy",
-            "BTC/USDT",
+            "BTC/USDC",
             "--venue",
             "hyperliquid",
             "--size",
@@ -2629,7 +2598,7 @@ mod tests {
                 "mlab",
                 "trade",
                 "long",
-                "BTC/USDT",
+                "BTC/USDC",
                 "--venue",
                 "hyperliquid",
                 "--margin",
@@ -2673,7 +2642,7 @@ mod tests {
             "--exchange",
             "binancef",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
         ])
         .expect("MMT markets command should parse");
 
@@ -2693,7 +2662,7 @@ mod tests {
             "mlab",
             "trade",
             "long",
-            "BTC/USDT",
+            "BTC",
             "--venue",
             "bulkf",
             "--size",
@@ -2719,7 +2688,7 @@ mod tests {
                 command: TradeCommands::Long(args),
             } => {
                 args.validate_shape().expect("trade shape is valid");
-                assert_eq!(args.symbol, "BTC/USDT");
+                assert_eq!(args.symbol, "BTC");
                 assert_eq!(args.size, Some(0.001));
                 assert!(matches!(args.order_kind, TradeOrderKind::Limit));
                 assert!(matches!(args.tif, TradeTimeInForce::Alo));
@@ -2738,7 +2707,7 @@ mod tests {
             "mlab",
             "trade",
             "long",
-            "HYPE/USDT",
+            "HYPE/USDC",
             "--venue",
             "hyperliquid",
             "--margin",
@@ -2759,12 +2728,65 @@ mod tests {
     }
 
     #[test]
+    fn execution_symbols_distinguish_futures_from_spot() {
+        let futures = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "long",
+            "BTC/USDT",
+            "--venue",
+            "bulkf",
+            "--size",
+            "0.001",
+            "--dry-run",
+        ])
+        .expect("futures command should parse before semantic validation");
+
+        match futures.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => {
+                let error = args
+                    .validate_shape()
+                    .expect_err("futures pair syntax must be rejected");
+                assert!(error.to_string().contains("base asset"));
+            }
+            _ => panic!("expected trade long command"),
+        }
+
+        let spot = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "long",
+            "HYPE",
+            "--venue",
+            "hyperliquid",
+            "--size",
+            "1",
+            "--dry-run",
+        ])
+        .expect("spot command should parse before semantic validation");
+
+        match spot.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => {
+                let error = args
+                    .validate_shape()
+                    .expect_err("bare spot asset syntax must be rejected");
+                assert!(error.to_string().contains("BASE/QUOTE"));
+            }
+            _ => panic!("expected trade long command"),
+        }
+    }
+
+    #[test]
     fn trade_buy_and_sell_aliases_map_to_position_directions() {
         let buy = Cli::try_parse_from([
             "mlab",
             "trade",
             "buy",
-            "BTC/USDT",
+            "BTC",
             "--margin",
             "100",
             "--dry-run",
@@ -2774,7 +2796,7 @@ mod tests {
             "mlab",
             "trade",
             "sell",
-            "BTC/USDT",
+            "BTC",
             "--size",
             "0.001",
             "--dry-run",
@@ -2796,7 +2818,7 @@ mod tests {
 
     #[test]
     fn live_trade_rejects_legacy_notional_sizing() {
-        let error = Cli::try_parse_from(["mlab", "trade", "long", "BTC/USDT", "--notional", "100"])
+        let error = Cli::try_parse_from(["mlab", "trade", "long", "BTC", "--notional", "100"])
             .expect_err("live trade sizing must use margin or size");
 
         assert!(error.to_string().contains("--notional"));
@@ -2807,15 +2829,15 @@ mod tests {
         let cancel = Cli::try_parse_from([
             "mlab",
             "cancel",
-            "BTC/USDT",
+            "BTC",
             "Fpa3oVuL3UzjNANAMZZdmrn6D1Zhk83GmBuJpuAWG51F",
             "--dry-run",
         ])
         .expect("cancel should parse");
         assert!(matches!(cancel.command, Commands::Cancel(_)));
 
-        let close = Cli::try_parse_from(["mlab", "close", "BTC/USDT", "--dry-run"])
-            .expect("close should parse");
+        let close =
+            Cli::try_parse_from(["mlab", "close", "BTC", "--dry-run"]).expect("close should parse");
         assert!(matches!(close.command, Commands::Close(_)));
 
         let daemon = Cli::try_parse_from(["mlab", "daemon", "events", "--limit", "10"])
@@ -2910,7 +2932,7 @@ mod tests {
             "--exchange",
             "binancef",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
             "--timeframe",
             "60",
             "--from",
@@ -2946,7 +2968,7 @@ mod tests {
             "--exchange",
             "binancef",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
             "--timeframe",
             "60",
             "--from",
@@ -2984,7 +3006,7 @@ mod tests {
             "--exchange",
             "binancef",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
             "--timeframe",
             "60",
             "--bucket",
@@ -3022,7 +3044,7 @@ mod tests {
             "--exchange",
             "binancef",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
             "--timeframe",
             "60",
             "--from",
@@ -3057,7 +3079,7 @@ mod tests {
             "--exchange",
             "binancef",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
             "--timeframe",
             "60",
             "--from",
@@ -3122,7 +3144,7 @@ mod tests {
             "--exchange",
             "binancef",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
             "--timeframe",
             "60",
             "--from",
@@ -3157,7 +3179,7 @@ mod tests {
             "--exchange",
             "binancef",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
             "--timeframe",
             "60",
             "--stream",
@@ -3231,7 +3253,7 @@ mod tests {
             "--exchange",
             "bybitf",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
             "--depth",
             "25",
             "--stream",
@@ -3261,7 +3283,7 @@ mod tests {
             "--exchange",
             "bybitf",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
             "--depth",
             "100",
             "--dollar-depth",
@@ -3292,7 +3314,7 @@ mod tests {
             "--exchange",
             "bybitf",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
             "--depth",
             "100",
             "--stream",
@@ -3326,7 +3348,7 @@ mod tests {
             "--exchange",
             "bulkf",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
             "--timeframe",
             "60",
             "--from",
@@ -3357,7 +3379,7 @@ mod tests {
             "--exchange",
             "bulkf",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
         ])
         .expect("BULK stats should parse");
         assert!(matches!(
@@ -3374,7 +3396,7 @@ mod tests {
             "--exchange",
             "bulkf",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
         ])
         .expect("BULK funding should parse");
         assert!(matches!(
@@ -3396,7 +3418,7 @@ mod tests {
             "--exchange",
             "bulkf",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
         ])
         .expect_err("BULK must not be accepted as a provider");
 
@@ -3416,7 +3438,7 @@ mod tests {
             "--exchange",
             "binancef",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
         ])
         .expect("MMT source should parse");
         match mmt.command {
@@ -3441,7 +3463,7 @@ mod tests {
             "--exchange",
             "bulkf",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
         ])
         .expect("syntax should parse before provider validation");
         match invalid.command {
@@ -3466,7 +3488,7 @@ mod tests {
             "--exchange",
             "binancef",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
             "--timeframe",
             "60",
         ])
@@ -3492,7 +3514,7 @@ mod tests {
             "--exchange",
             "binancef",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
             "--timeframe",
             "60",
         ])
@@ -3519,7 +3541,7 @@ mod tests {
             "--exchange",
             "bulkf",
             "--symbol",
-            "BTC/USDT",
+            "BTC",
             "--timeframe",
             "60",
             "--from",
@@ -3546,7 +3568,7 @@ mod tests {
             "strategy",
             "run",
             "twap",
-            "BTC/USDT",
+            "BTC",
             "--venue",
             "bulkf",
             "--side",
@@ -3585,7 +3607,7 @@ mod tests {
             "bot",
             "run",
             "mid-price",
-            "BTC/USDT",
+            "BTC",
             "--venue",
             "bulkf",
             "--margin",
@@ -3630,7 +3652,7 @@ mod tests {
             "bot",
             "run",
             "volume-mid",
-            "BTC/USDT",
+            "BTC",
             "--margin",
             "100",
             "--duration",
@@ -3667,7 +3689,7 @@ mod tests {
             "bot",
             "run",
             "grid",
-            "BTC/USDT",
+            "BTC",
             "--venue",
             "hyperliquidf",
             "--margin",
@@ -3710,7 +3732,7 @@ mod tests {
             "strategy",
             "run",
             "vwap",
-            "BTC/USDT",
+            "BTC",
             "--venue",
             "bulkf",
             "--side",
@@ -3751,7 +3773,7 @@ mod tests {
             "strategy",
             "run",
             "vwap",
-            "BTC/USDT",
+            "BTC",
             "--side",
             "buy",
             "--margin",
@@ -3772,7 +3794,7 @@ mod tests {
             "strategy",
             "run",
             "oiwap",
-            "BTC/USDT",
+            "BTC",
             "--venue",
             "bulkf",
             "--side",
@@ -3810,7 +3832,7 @@ mod tests {
             "strategy",
             "run",
             "oiwap",
-            "BTC/USDT",
+            "BTC",
             "--side",
             "buy",
             "--margin",
@@ -3843,7 +3865,7 @@ mod tests {
             "strategy",
             "run",
             "oiwap",
-            "BTC/USDT",
+            "BTC",
             "--side",
             "buy",
             "--margin",
@@ -3866,7 +3888,7 @@ mod tests {
             "strategy",
             "run",
             "twap",
-            "BTC/USDT",
+            "BTC",
             "--margin",
             "1000",
             "--duration",
@@ -3884,7 +3906,7 @@ mod tests {
             "strategy",
             "run",
             "twap",
-            "BTC/USDT",
+            "BTC",
             "--side",
             "sell",
             "--size",
@@ -4207,15 +4229,9 @@ mod tests {
 
     #[test]
     fn script_commands_reject_the_removed_symbol_flag() {
-        let error = Cli::try_parse_from([
-            "mlab",
-            "script",
-            "run",
-            "strategy.js",
-            "--symbol",
-            "BTC/USDT",
-        ])
-        .expect_err("script --symbol must remain removed");
+        let error =
+            Cli::try_parse_from(["mlab", "script", "run", "strategy.js", "--symbol", "BTC"])
+                .expect_err("script --symbol must remain removed");
 
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }

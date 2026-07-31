@@ -334,19 +334,19 @@ mod tests {
     fn selector_requires_mmt_futures_sources() {
         let selector = OpenInterestSourceSelector::parse(
             &["binancef@mmt".to_string(), "hyperliquidf@mmt".to_string()],
-            "BTC/USDT",
+            "BTC",
         )
         .expect("futures OI selector");
         assert_eq!(selector.sources().len(), 2);
 
         assert!(
-            OpenInterestSourceSelector::parse(&["binance@mmt".to_string()], "BTC/USDT")
+            OpenInterestSourceSelector::parse(&["binance@mmt".to_string()], "BTC")
                 .expect_err("spot OI must fail")
                 .to_string()
                 .contains("spot")
         );
         assert!(
-            OpenInterestSourceSelector::parse(&["binancef".to_string()], "BTC/USDT")
+            OpenInterestSourceSelector::parse(&["binancef".to_string()], "BTC")
                 .expect_err("direct OI must fail")
                 .to_string()
                 .contains("standalone historical OI adapter")

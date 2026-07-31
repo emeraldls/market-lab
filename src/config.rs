@@ -416,7 +416,7 @@ version = 1
 [market]
 provider = "mmt"
 exchange = "bybitf"
-symbol = "HYPE/USDT"
+symbol = "HYPE"
 
 [script]
 path = "strategy.js"
@@ -472,13 +472,13 @@ to = 2000
 version = 1
 
 [market]
-symbol = "BTC/USDT"
+symbol = "BTC"
 
 [script]
 path = "strategy.js"
 duration = 3600
 
-[sources."btc@candles@okx@mmt"]
+[sources."btc/usdt@candles@okx@mmt"]
 timeframe = 60
 
 [sources."btc@orderbook@bulkf"]
@@ -511,7 +511,7 @@ max_spread = 1
                 assert_eq!(
                     args.source,
                     vec![
-                        "btc@candles@okx@mmt:timeframe=60",
+                        "btc/usdt@candles@okx@mmt:timeframe=60",
                         "btc@orderbook@bulkf:depth=20",
                     ]
                 );
@@ -558,7 +558,7 @@ max_spread = 1
 version = 1
 
 [market]
-symbol = "BTC/USDT"
+symbol = "BTC"
 
 [execution]
 venue = "bulkf"
@@ -595,7 +595,7 @@ format = "json"
             Commands::Trade {
                 command: crate::cli::TradeCommands::Long(args),
             } => {
-                assert_eq!(args.symbol, "BTC/USDT");
+                assert_eq!(args.symbol, "BTC");
                 assert_eq!(args.margin, Some(250.0));
                 assert_eq!(args.leverage, Some(5.0));
                 assert!(args.dry_run);

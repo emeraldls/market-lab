@@ -682,7 +682,7 @@ mod tests {
 
     #[test]
     fn normalize_symbol_maps_usdt_to_usd() {
-        let got = normalize_symbol_for_mmt("binancef", "BTC/USDT").expect("must normalize");
+        let got = normalize_symbol_for_mmt("binancef", "BTC").expect("must normalize");
         assert_eq!(got, "btc/usd");
     }
 
