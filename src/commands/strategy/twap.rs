@@ -357,6 +357,7 @@ fn worker_trade_args(definition: &TwapJobDefinition, size: f64) -> TradeArgs {
         venue: match definition.venue {
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
             ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
+            ExecutionVenue::HyperliquidXyz => ExecutionVenueArg::HyperliquidXyz,
             ExecutionVenue::HyperliquidSpot => ExecutionVenueArg::HyperliquidSpot,
         },
         testnet: definition.testnet,
@@ -501,6 +502,7 @@ fn venue_name(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "bulkf",
         ExecutionVenue::Hyperliquid => "hyperliquidf",
+        ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
         ExecutionVenue::HyperliquidSpot => "hyperliquid",
     }
 }
@@ -510,6 +512,8 @@ fn execution_venue_name(venue: ExecutionVenue, testnet: bool) -> &'static str {
         (ExecutionVenue::Bulk, _) => "BULK testnet",
         (ExecutionVenue::Hyperliquid, true) => "Hyperliquid testnet",
         (ExecutionVenue::Hyperliquid, false) => "Hyperliquid mainnet",
+        (ExecutionVenue::HyperliquidXyz, true) => "Hyperliquid XYZ testnet",
+        (ExecutionVenue::HyperliquidXyz, false) => "Hyperliquid XYZ mainnet",
         (ExecutionVenue::HyperliquidSpot, true) => "Hyperliquid Spot testnet",
         (ExecutionVenue::HyperliquidSpot, false) => "Hyperliquid Spot mainnet",
     }

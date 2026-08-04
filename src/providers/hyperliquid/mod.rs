@@ -9,6 +9,8 @@ pub mod ws;
 use serde::{Deserialize, Serialize};
 
 pub const EXCHANGE: &str = "hyperliquidf";
+pub const XYZ_EXCHANGE: &str = "hyperliquidf-xyz";
+pub const XYZ_DEX: &str = "xyz";
 pub const SPOT_EXCHANGE: &str = "hyperliquid";
 pub const MAINNET_HTTP_URL: &str = "https://api.hyperliquid.xyz";
 pub const MAINNET_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
@@ -28,6 +30,7 @@ pub enum HyperliquidNetwork {
 pub enum HyperliquidProduct {
     Spot,
     Perpetual,
+    XyzPerpetual,
 }
 
 impl HyperliquidProduct {
@@ -35,8 +38,9 @@ impl HyperliquidProduct {
         match exchange.trim().to_ascii_lowercase().as_str() {
             SPOT_EXCHANGE => Ok(Self::Spot),
             EXCHANGE => Ok(Self::Perpetual),
+            XYZ_EXCHANGE => Ok(Self::XyzPerpetual),
             _ => anyhow::bail!(
-                "Hyperliquid exchange must be `hyperliquid` (spot) or `hyperliquidf` (perpetuals)"
+                "Hyperliquid exchange must be `hyperliquid` (spot), `hyperliquidf` (native perpetuals), or `hyperliquidf-xyz` (XYZ perpetuals)"
             ),
         }
     }
@@ -45,13 +49,25 @@ impl HyperliquidProduct {
         match self {
             Self::Spot => SPOT_EXCHANGE,
             Self::Perpetual => EXCHANGE,
+            Self::XyzPerpetual => XYZ_EXCHANGE,
         }
+    }
+
+    pub const fn dex(self) -> Option<&'static str> {
+        match self {
+            Self::XyzPerpetual => Some(XYZ_DEX),
+            Self::Spot | Self::Perpetual => None,
+        }
+    }
+
+    pub const fn is_perpetual(self) -> bool {
+        matches!(self, Self::Perpetual | Self::XyzPerpetual)
     }
 
     pub const fn max_price_decimals(self) -> u8 {
         match self {
             Self::Spot => 8,
-            Self::Perpetual => 6,
+            Self::Perpetual | Self::XyzPerpetual => 6,
         }
     }
 }

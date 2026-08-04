@@ -25,6 +25,13 @@ impl ExecutionAdapter {
                 )
                 .await?,
             )),
+            ExecutionVenue::HyperliquidXyz => Ok(Self::Hyperliquid(
+                HyperliquidExecutionAdapter::new_for(
+                    HyperliquidProduct::XyzPerpetual,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
+            )),
             ExecutionVenue::HyperliquidSpot => Ok(Self::Hyperliquid(
                 HyperliquidExecutionAdapter::new_for(
                     HyperliquidProduct::Spot,
@@ -39,6 +46,9 @@ impl ExecutionAdapter {
         match venue {
             ExecutionVenue::Bulk => BulkExecutionAdapter::capabilities(),
             ExecutionVenue::Hyperliquid => HyperliquidExecutionAdapter::capabilities(),
+            ExecutionVenue::HyperliquidXyz => {
+                HyperliquidExecutionAdapter::capabilities_for(HyperliquidProduct::XyzPerpetual)
+            }
             ExecutionVenue::HyperliquidSpot => {
                 HyperliquidExecutionAdapter::capabilities_for(HyperliquidProduct::Spot)
             }
@@ -49,6 +59,7 @@ impl ExecutionAdapter {
         match venue {
             ExecutionVenue::Bulk => credentials::bulk_account(),
             ExecutionVenue::Hyperliquid => credentials::hyperliquid_account(),
+            ExecutionVenue::HyperliquidXyz => credentials::hyperliquid_account(),
             ExecutionVenue::HyperliquidSpot => credentials::hyperliquid_account(),
         }
     }

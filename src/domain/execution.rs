@@ -7,6 +7,8 @@ pub enum ExecutionVenue {
     Bulk,
     #[serde(rename = "hyperliquidf")]
     Hyperliquid,
+    #[serde(rename = "hyperliquidf-xyz")]
+    HyperliquidXyz,
     #[serde(rename = "hyperliquid")]
     HyperliquidSpot,
 }
@@ -313,6 +315,10 @@ mod tests {
 
         let spot = serde_json::to_value(ExecutionVenue::HyperliquidSpot).expect("venue serializes");
         assert_eq!(spot, serde_json::json!("hyperliquid"));
+
+        let xyz =
+            serde_json::to_value(ExecutionVenue::HyperliquidXyz).expect("XYZ venue serializes");
+        assert_eq!(xyz, serde_json::json!("hyperliquidf-xyz"));
     }
 
     #[test]

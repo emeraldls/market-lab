@@ -19,7 +19,7 @@ impl HyperliquidProvider {
     pub fn capabilities() -> serde_json::Value {
         serde_json::json!({
             "network": "mainnet",
-            "products": ["spot", "native_perpetuals"],
+            "products": ["spot", "native_perpetuals", "xyz_perpetuals"],
             "authentication": {
                 "market_data_requires_api_key": false,
                 "execution_requires_agent_wallet": true
@@ -207,8 +207,8 @@ impl HyperliquidProvider {
     ) -> Result<MarketTicker> {
         let (market, variant) = require_market(product, network, symbol)?;
         match product {
-            HyperliquidProduct::Perpetual => {
-                let (meta, contexts) = meta_and_contexts(network).await?;
+            HyperliquidProduct::Perpetual | HyperliquidProduct::XyzPerpetual => {
+                let (meta, contexts) = meta_and_contexts(network, product).await?;
                 let index = meta
                     .universe
                     .iter()
@@ -242,7 +242,23 @@ impl HyperliquidProvider {
     }
 
     pub async fn open_interest(symbol: &str) -> Result<OpenInterestSnapshot> {
-        let ticker = Self::ticker(symbol).await?;
+        Self::open_interest_for(
+            HyperliquidProduct::Perpetual,
+            symbol,
+            HyperliquidNetwork::Mainnet,
+        )
+        .await
+    }
+
+    pub async fn open_interest_for(
+        product: HyperliquidProduct,
+        symbol: &str,
+        network: HyperliquidNetwork,
+    ) -> Result<OpenInterestSnapshot> {
+        if !product.is_perpetual() {
+            bail!("Hyperliquid spot does not expose open interest");
+        }
+        let ticker = Self::ticker_for(product, symbol, network).await?;
         Ok(OpenInterestSnapshot {
             exchange: ticker.exchange,
             symbol: ticker.symbol,
@@ -254,7 +270,23 @@ impl HyperliquidProvider {
     }
 
     pub async fn funding(symbol: &str) -> Result<FundingRateSnapshot> {
-        let ticker = Self::ticker(symbol).await?;
+        Self::funding_for(
+            HyperliquidProduct::Perpetual,
+            symbol,
+            HyperliquidNetwork::Mainnet,
+        )
+        .await
+    }
+
+    pub async fn funding_for(
+        product: HyperliquidProduct,
+        symbol: &str,
+        network: HyperliquidNetwork,
+    ) -> Result<FundingRateSnapshot> {
+        if !product.is_perpetual() {
+            bail!("Hyperliquid spot does not expose funding");
+        }
+        let ticker = Self::ticker_for(product, symbol, network).await?;
         Ok(FundingRateSnapshot {
             exchange: ticker.exchange,
             symbol: ticker.symbol,
@@ -283,7 +315,7 @@ impl HyperliquidProvider {
             .map(|symbol| require_market(product, HyperliquidNetwork::Mainnet, symbol))
             .transpose()?
             .map(|(market, _)| market);
-        let (meta, contexts) = meta_and_contexts(HyperliquidNetwork::Mainnet).await?;
+        let (meta, contexts) = meta_and_contexts(HyperliquidNetwork::Mainnet, product).await?;
         let timestamp_ms = now_ms()?;
         let mut markets_out = Vec::new();
         let mut funding = Vec::new();
@@ -452,9 +484,19 @@ fn parse(value: &str, name: &str) -> Result<f64> {
 
 async fn meta_and_contexts(
     network: HyperliquidNetwork,
+    product: HyperliquidProduct,
 ) -> Result<(HyperliquidMeta, Vec<HyperliquidContext>)> {
+    let mut request = serde_json::json!({ "type": "metaAndAssetCtxs" });
+    if let Some(dex) = product.dex()
+        && let Some(request) = request.as_object_mut()
+    {
+        request.insert(
+            "dex".to_string(),
+            serde_json::Value::String(dex.to_string()),
+        );
+    }
     let value: serde_json::Value = HyperliquidClient::for_network(network)?
-        .info(&serde_json::json!({ "type": "metaAndAssetCtxs" }))
+        .info(&request)
         .await?;
     let entries = value
         .as_array()

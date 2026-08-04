@@ -73,6 +73,15 @@ impl WeightedOrderBookStream {
                 )
                 .await?,
             )),
+            ExecutionVenue::HyperliquidXyz => Ok(Self::Hyperliquid(
+                HyperliquidOrderBookStream::connect_for(
+                    crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual,
+                    symbol,
+                    depth.min(20),
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
+            )),
             ExecutionVenue::HyperliquidSpot => Ok(Self::Hyperliquid(
                 HyperliquidOrderBookStream::connect_for(
                     crate::providers::hyperliquid::HyperliquidProduct::Spot,
@@ -104,6 +113,14 @@ impl WeightedTradesStream {
             "bulkf" => Ok(Self::Bulk(BulkTradesStream::connect(symbol).await?)),
             "hyperliquidf" => Ok(Self::Hyperliquid(
                 HyperliquidTradesStream::connect_on(
+                    symbol,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
+            )),
+            "hyperliquidf-xyz" => Ok(Self::Hyperliquid(
+                HyperliquidTradesStream::connect_for(
+                    crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual,
                     symbol,
                     HyperliquidNetwork::from_testnet(testnet),
                 )
@@ -497,6 +514,7 @@ pub async fn handle(args: RunVwapArgs) -> Result<()> {
         selector.sources(),
         &parent.internal_symbol,
         parent.venue,
+        args.testnet,
     )
     .await?;
     let feasibility = VwapFeasibility::assess(parent.size, &curves.execution);
@@ -596,6 +614,7 @@ async fn run_worker(job_id: &str, definition: &VwapJobDefinition) -> Result<()> 
         &definition.volume_sources,
         &definition.symbol,
         definition.venue,
+        definition.testnet,
     )
     .await?;
     let direction = strategy_direction(weighted.side);
@@ -982,6 +1001,7 @@ async fn build_curves(
     sources: &[VolumeSource],
     symbol: &str,
     execution_venue: ExecutionVenue,
+    testnet: bool,
 ) -> Result<WeightedCurves> {
     let history_to = start_ms / MINUTE_MS * MINUTE_MS;
     let history_from = history_to.saturating_sub(HISTORY_DAYS * 86_400_000);
@@ -991,7 +1011,8 @@ async fn build_curves(
         .map(|source| source.exchange.clone())
         .collect::<Vec<_>>();
     let execution_history =
-        fetch_execution_volume_history(execution_venue, symbol, history_from, history_to).await?;
+        fetch_execution_volume_history(execution_venue, symbol, history_from, history_to, testnet)
+            .await?;
     let mmt_history = if mmt_exchanges.is_empty() {
         Vec::new()
     } else {
@@ -1040,8 +1061,16 @@ pub(super) async fn fetch_execution_volume_history(
     symbol: &str,
     from_ms: u64,
     to_ms: u64,
+    testnet: bool,
 ) -> Result<Vec<HistoricalVolume>> {
-    fetch_direct_volume_history(execution_venue_name(venue), symbol, from_ms, to_ms).await
+    fetch_direct_volume_history_on(
+        execution_venue_name(venue),
+        symbol,
+        from_ms,
+        to_ms,
+        HyperliquidNetwork::from_testnet(testnet),
+    )
+    .await
 }
 
 async fn fetch_direct_volume_history(
@@ -1049,6 +1078,23 @@ async fn fetch_direct_volume_history(
     symbol: &str,
     from_ms: u64,
     to_ms: u64,
+) -> Result<Vec<HistoricalVolume>> {
+    fetch_direct_volume_history_on(
+        exchange,
+        symbol,
+        from_ms,
+        to_ms,
+        HyperliquidNetwork::Mainnet,
+    )
+    .await
+}
+
+async fn fetch_direct_volume_history_on(
+    exchange: &str,
+    symbol: &str,
+    from_ms: u64,
+    to_ms: u64,
+    network: HyperliquidNetwork,
 ) -> Result<Vec<HistoricalVolume>> {
     const CHUNK_MINUTES: u64 = 2_000;
     let chunk_ms = CHUNK_MINUTES * MINUTE_MS;
@@ -1059,7 +1105,26 @@ async fn fetch_direct_volume_history(
         let series = match exchange {
             "bulkf" => BulkProvider::volume_bars(symbol, "1m", cursor, chunk_to).await?,
             "hyperliquidf" => {
-                HyperliquidProvider::volume_bars(symbol, "1m", cursor, chunk_to).await?
+                HyperliquidProvider::volume_bars_for(
+                    crate::providers::hyperliquid::HyperliquidProduct::Perpetual,
+                    symbol,
+                    "1m",
+                    cursor,
+                    chunk_to,
+                    network,
+                )
+                .await?
+            }
+            "hyperliquidf-xyz" => {
+                HyperliquidProvider::volume_bars_for(
+                    crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual,
+                    symbol,
+                    "1m",
+                    cursor,
+                    chunk_to,
+                    network,
+                )
+                .await?
             }
             _ => bail!("standalone volume adapter for `{exchange}` is not implemented"),
         };
@@ -1764,6 +1829,7 @@ pub(super) fn worker_trade_args(
         venue: match definition.venue {
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
             ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
+            ExecutionVenue::HyperliquidXyz => ExecutionVenueArg::HyperliquidXyz,
             ExecutionVenue::HyperliquidSpot => ExecutionVenueArg::HyperliquidSpot,
         },
         testnet: definition.testnet,
@@ -1813,6 +1879,8 @@ pub(super) fn execution_venue_network_name(venue: ExecutionVenue, testnet: bool)
         (ExecutionVenue::Bulk, _) => "BULK testnet",
         (ExecutionVenue::Hyperliquid, true) => "Hyperliquid testnet",
         (ExecutionVenue::Hyperliquid, false) => "Hyperliquid mainnet",
+        (ExecutionVenue::HyperliquidXyz, true) => "Hyperliquid XYZ testnet",
+        (ExecutionVenue::HyperliquidXyz, false) => "Hyperliquid XYZ mainnet",
         (ExecutionVenue::HyperliquidSpot, true) => "Hyperliquid Spot testnet",
         (ExecutionVenue::HyperliquidSpot, false) => "Hyperliquid Spot mainnet",
     }
@@ -1822,6 +1890,7 @@ pub(super) fn execution_venue_name(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "bulkf",
         ExecutionVenue::Hyperliquid => "hyperliquidf",
+        ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
         ExecutionVenue::HyperliquidSpot => "hyperliquid",
     }
 }

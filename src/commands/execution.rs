@@ -314,7 +314,9 @@ pub(crate) async fn build_trade_plan(
     validate_market_rules(venue, &market, args)?;
     let leverage = match venue {
         ExecutionVenue::HyperliquidSpot => None,
-        ExecutionVenue::Bulk | ExecutionVenue::Hyperliquid => Some(args.leverage.unwrap_or(1.0)),
+        ExecutionVenue::Bulk | ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidXyz => {
+            Some(args.leverage.unwrap_or(1.0))
+        }
     };
     let sizing_leverage = leverage.unwrap_or(1.0);
     let rules = execution_rules(venue, args.testnet, &market)?;
@@ -327,6 +329,15 @@ pub(crate) async fn build_trade_plan(
             ExecutionVenue::Bulk => BulkProvider::ticker(&market.symbol).await?.mark_price,
             ExecutionVenue::Hyperliquid => {
                 HyperliquidProvider::ticker_on(
+                    &market.symbol,
+                    HyperliquidNetwork::from_testnet(args.testnet),
+                )
+                .await?
+                .mark_price
+            }
+            ExecutionVenue::HyperliquidXyz => {
+                HyperliquidProvider::ticker_for(
+                    crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual,
                     &market.symbol,
                     HyperliquidNetwork::from_testnet(args.testnet),
                 )
@@ -559,7 +570,11 @@ fn validate_market_rules(venue: ExecutionVenue, market: &Market, args: &TradeArg
             market.symbol
         );
     }
-    if venue == ExecutionVenue::Hyperliquid && leverage.fract().abs() > f64::EPSILON {
+    if matches!(
+        venue,
+        ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidXyz
+    ) && leverage.fract().abs() > f64::EPSILON
+    {
         bail!("Hyperliquid leverage must be a whole number");
     }
     if venue == ExecutionVenue::HyperliquidSpot {
@@ -608,7 +623,7 @@ fn is_price_aligned(
 ) -> bool {
     match venue {
         ExecutionVenue::Bulk => is_step_aligned(price, rules.tick_size),
-        ExecutionVenue::Hyperliquid => {
+        ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidXyz => {
             crate::providers::hyperliquid::execution::validate_price(price, rules.size_precision)
                 .is_ok()
         }
@@ -639,7 +654,7 @@ fn execution_rules(
     market: &Market,
 ) -> Result<crate::markets::ExecutionRules> {
     match venue {
-        ExecutionVenue::HyperliquidSpot => market
+        ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidXyz => market
             .network_variant(HyperliquidNetwork::from_testnet(testnet).label())
             .map(|variant| variant.execution),
         ExecutionVenue::Bulk | ExecutionVenue::Hyperliquid => market.execution_rules().cloned(),
@@ -648,7 +663,7 @@ fn execution_rules(
 
 fn execution_venue_symbol(venue: ExecutionVenue, testnet: bool, market: &Market) -> Result<String> {
     match venue {
-        ExecutionVenue::HyperliquidSpot => market
+        ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidXyz => market
             .network_variant(HyperliquidNetwork::from_testnet(testnet).label())
             .map(|variant| variant.venue_symbol),
         ExecutionVenue::Bulk | ExecutionVenue::Hyperliquid => Ok(market.venue_symbol.clone()),
@@ -659,6 +674,7 @@ fn venue_key(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "bulkf",
         ExecutionVenue::Hyperliquid => "hyperliquidf",
+        ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
         ExecutionVenue::HyperliquidSpot => "hyperliquid",
     }
 }
@@ -667,6 +683,7 @@ fn venue_label(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "BULK",
         ExecutionVenue::Hyperliquid => "Hyperliquid",
+        ExecutionVenue::HyperliquidXyz => "Hyperliquid XYZ",
         ExecutionVenue::HyperliquidSpot => "Hyperliquid Spot",
     }
 }
@@ -675,6 +692,8 @@ fn venue_network_label(venue: ExecutionVenue, testnet: bool) -> &'static str {
     match (venue, testnet) {
         (ExecutionVenue::Hyperliquid, true) => "Hyperliquid testnet",
         (ExecutionVenue::Hyperliquid, false) => "Hyperliquid mainnet",
+        (ExecutionVenue::HyperliquidXyz, true) => "Hyperliquid XYZ testnet",
+        (ExecutionVenue::HyperliquidXyz, false) => "Hyperliquid XYZ mainnet",
         (ExecutionVenue::HyperliquidSpot, true) => "Hyperliquid Spot testnet",
         (ExecutionVenue::HyperliquidSpot, false) => "Hyperliquid Spot mainnet",
         (ExecutionVenue::Bulk, _) => "BULK",
@@ -720,7 +739,9 @@ fn render_trade_plan(plan: &TradePlan, dry_run: bool, output: OutputFormat) -> R
             println!("  venue:             {}", venue_key(plan.venue));
             if matches!(
                 plan.venue,
-                ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidSpot
+                ExecutionVenue::Hyperliquid
+                    | ExecutionVenue::HyperliquidXyz
+                    | ExecutionVenue::HyperliquidSpot
             ) {
                 println!(
                     "  network:           {}",

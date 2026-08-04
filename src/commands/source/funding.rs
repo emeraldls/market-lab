@@ -10,6 +10,7 @@ use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::bulk::ws::BulkTickerStream;
 use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 use crate::providers::hyperliquid::ws::HyperliquidAssetContextStream;
+use crate::providers::hyperliquid::{HyperliquidNetwork, HyperliquidProduct};
 
 use super::common::{SourceEnvelope, SourceMeta, render_terminal};
 
@@ -37,11 +38,14 @@ async fn handle_bulk(args: SourceFundingArgs) -> Result<()> {
 }
 
 async fn handle_hyperliquid(args: SourceFundingArgs) -> Result<()> {
+    let product = HyperliquidProduct::from_exchange(&args.exchange)?;
     if args.stream {
-        return stream_hyperliquid_funding(args).await;
+        return stream_hyperliquid_funding(args, product).await;
     }
-    let funding = HyperliquidProvider::funding(&args.symbol).await?;
-    render_funding(funding, &args, "hyperliquidf")
+    let funding =
+        HyperliquidProvider::funding_for(product, &args.symbol, HyperliquidNetwork::Mainnet)
+            .await?;
+    render_funding(funding, &args, product.exchange())
 }
 
 fn render_funding(
@@ -152,8 +156,16 @@ async fn stream_bulk_funding(args: SourceFundingArgs) -> Result<()> {
     Ok(())
 }
 
-async fn stream_hyperliquid_funding(args: SourceFundingArgs) -> Result<()> {
-    let mut stream = HyperliquidAssetContextStream::connect(&args.symbol).await?;
+async fn stream_hyperliquid_funding(
+    args: SourceFundingArgs,
+    product: HyperliquidProduct,
+) -> Result<()> {
+    let mut stream = HyperliquidAssetContextStream::connect_for(
+        product,
+        &args.symbol,
+        HyperliquidNetwork::Mainnet,
+    )
+    .await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest = None;
     let mut buf = VecDeque::with_capacity(args.buffer_size as usize);
@@ -175,7 +187,7 @@ async fn stream_hyperliquid_funding(args: SourceFundingArgs) -> Result<()> {
                 let Some(snapshot) = latest.as_ref() else { continue; };
                 let env = SourceEnvelope {
                     r#type: "source.funding.stream".to_string(), version: "1",
-                    provider: "hyperliquidf", exchange: snapshot.exchange.clone(),
+                    provider: product.exchange(), exchange: snapshot.exchange.clone(),
                     symbol: snapshot.symbol.clone(), ts_ms: snapshot.timestamp_ms,
                     stream: true, data: snapshot.clone(),
                     meta: SourceMeta { depth: None, min_size: None, max_size: None, price_group: None,

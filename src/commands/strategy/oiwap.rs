@@ -130,6 +130,7 @@ pub async fn handle(args: RunOiwapArgs) -> Result<()> {
         selector.sources(),
         &parent.internal_symbol,
         parent.venue,
+        args.testnet,
     )
     .await?;
     let feasibility = VwapFeasibility::assess(parent.size, &model.curves.execution);
@@ -229,6 +230,7 @@ async fn run_worker(job_id: &str, definition: &OiwapJobDefinition) -> Result<()>
         &definition.oi_sources,
         &definition.symbol,
         definition.venue,
+        definition.testnet,
     )
     .await?;
     let parent = build_trade_plan(
@@ -274,14 +276,21 @@ async fn build_curves(
     sources: &[OpenInterestSource],
     symbol: &str,
     execution_venue: ExecutionVenue,
+    testnet: bool,
 ) -> Result<OiwapModel> {
     let history_to = start_ms / MINUTE_MS * MINUTE_MS;
     let history_from = history_to.saturating_sub(HISTORY_DAYS * 86_400_000);
     let execution_history_from = history_to.saturating_sub(EXECUTION_HISTORY_DAYS * 86_400_000);
     let (oi_history, execution_history, price_window) = tokio::join!(
         fetch_open_interest_activity(sources, symbol, history_from, history_to),
-        fetch_execution_volume_history(execution_venue, symbol, execution_history_from, history_to,),
-        fetch_directional_price_window(execution_venue, symbol, history_to),
+        fetch_execution_volume_history(
+            execution_venue,
+            symbol,
+            execution_history_from,
+            history_to,
+            testnet,
+        ),
+        fetch_directional_price_window(execution_venue, symbol, history_to, testnet),
     );
     let oi_history = oi_history?;
     let execution_history = execution_history?;
@@ -396,21 +405,33 @@ async fn fetch_directional_price_window(
     venue: ExecutionVenue,
     symbol: &str,
     to_ms: u64,
+    testnet: bool,
 ) -> Result<(f64, f64)> {
     let from_ms = to_ms.saturating_sub(DIRECTIONAL_CONTEXT_WINDOW_SECS * 1_000);
     let series = match venue {
         ExecutionVenue::Bulk => BulkProvider::candles(symbol, "1m", from_ms, to_ms).await?,
-        ExecutionVenue::Hyperliquid => {
-            HyperliquidProvider::candles(symbol, "1m", from_ms, to_ms).await?
-        }
-        ExecutionVenue::HyperliquidSpot => {
+        ExecutionVenue::Hyperliquid
+        | ExecutionVenue::HyperliquidXyz
+        | ExecutionVenue::HyperliquidSpot => {
+            let product = match venue {
+                ExecutionVenue::Hyperliquid => {
+                    crate::providers::hyperliquid::HyperliquidProduct::Perpetual
+                }
+                ExecutionVenue::HyperliquidXyz => {
+                    crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual
+                }
+                ExecutionVenue::HyperliquidSpot => {
+                    crate::providers::hyperliquid::HyperliquidProduct::Spot
+                }
+                ExecutionVenue::Bulk => unreachable!(),
+            };
             HyperliquidProvider::candles_for(
-                crate::providers::hyperliquid::HyperliquidProduct::Spot,
+                product,
                 symbol,
                 "1m",
                 from_ms,
                 to_ms,
-                crate::providers::hyperliquid::HyperliquidNetwork::Mainnet,
+                crate::providers::hyperliquid::HyperliquidNetwork::from_testnet(testnet),
             )
             .await?
         }

@@ -223,6 +223,9 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
     let venue = job.definition.venue.map(|venue| match venue {
         crate::domain::execution::ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
         crate::domain::execution::ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
+        crate::domain::execution::ExecutionVenue::HyperliquidXyz => {
+            ExecutionVenueArg::HyperliquidXyz
+        }
         crate::domain::execution::ExecutionVenue::HyperliquidSpot => {
             ExecutionVenueArg::HyperliquidSpot
         }

@@ -289,6 +289,7 @@ fn worker_trade_args(definition: &MidPriceJobDefinition) -> TradeArgs {
         venue: match definition.venue {
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
             ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
+            ExecutionVenue::HyperliquidXyz => ExecutionVenueArg::HyperliquidXyz,
             ExecutionVenue::HyperliquidSpot => ExecutionVenueArg::HyperliquidSpot,
         },
         testnet: definition.testnet,
@@ -454,6 +455,8 @@ fn execution_venue_label(venue: ExecutionVenue, testnet: bool) -> &'static str {
         (ExecutionVenue::Bulk, _) => "BULK testnet",
         (ExecutionVenue::Hyperliquid, true) => "Hyperliquid testnet",
         (ExecutionVenue::Hyperliquid, false) => "Hyperliquid mainnet",
+        (ExecutionVenue::HyperliquidXyz, true) => "Hyperliquid XYZ testnet",
+        (ExecutionVenue::HyperliquidXyz, false) => "Hyperliquid XYZ mainnet",
         (ExecutionVenue::HyperliquidSpot, true) => "Hyperliquid Spot testnet",
         (ExecutionVenue::HyperliquidSpot, false) => "Hyperliquid Spot mainnet",
     }
@@ -463,6 +466,7 @@ pub(super) fn venue_key(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "bulkf",
         ExecutionVenue::Hyperliquid => "hyperliquidf",
+        ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
         ExecutionVenue::HyperliquidSpot => "hyperliquid",
     }
 }
@@ -471,6 +475,7 @@ pub(super) fn venue_label(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "BULK",
         ExecutionVenue::Hyperliquid => "Hyperliquid",
+        ExecutionVenue::HyperliquidXyz => "Hyperliquid XYZ",
         ExecutionVenue::HyperliquidSpot => "Hyperliquid Spot",
     }
 }
@@ -491,6 +496,16 @@ pub(super) async fn live_orderbook(
         ExecutionVenue::Bulk => BulkProvider::live_orderbook(symbol, BOOK_DEPTH, None).await,
         ExecutionVenue::Hyperliquid => {
             HyperliquidProvider::live_orderbook_on(
+                symbol,
+                BOOK_DEPTH,
+                None,
+                HyperliquidNetwork::from_testnet(testnet),
+            )
+            .await
+        }
+        ExecutionVenue::HyperliquidXyz => {
+            HyperliquidProvider::live_orderbook_for(
+                crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual,
                 symbol,
                 BOOK_DEPTH,
                 None,
@@ -835,6 +850,15 @@ impl BotOrderBookStream {
                 )
                 .await?,
             )),
+            ExecutionVenue::HyperliquidXyz => Ok(Self::Hyperliquid(
+                HyperliquidOrderBookStream::connect_for(
+                    crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual,
+                    symbol,
+                    BOOK_DEPTH,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
+            )),
             ExecutionVenue::HyperliquidSpot => Ok(Self::Hyperliquid(
                 HyperliquidOrderBookStream::connect_for(
                     crate::providers::hyperliquid::HyperliquidProduct::Spot,
@@ -929,6 +953,13 @@ impl BotAccountStream {
         match venue {
             ExecutionVenue::Bulk => Ok(Self::Bulk(BulkAccountStream::connect(account).await?)),
             ExecutionVenue::Hyperliquid => Ok(Self::Hyperliquid(
+                HyperliquidAccountStream::connect_on(
+                    account,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
+            )),
+            ExecutionVenue::HyperliquidXyz => Ok(Self::Hyperliquid(
                 HyperliquidAccountStream::connect_on(
                     account,
                     HyperliquidNetwork::from_testnet(testnet),

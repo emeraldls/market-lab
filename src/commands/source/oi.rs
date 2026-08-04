@@ -10,6 +10,7 @@ use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::bulk::ws::BulkTickerStream;
 use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 use crate::providers::hyperliquid::ws::HyperliquidAssetContextStream;
+use crate::providers::hyperliquid::{HyperliquidNetwork, HyperliquidProduct};
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::utils::{normalize_exchange_for_mmt, normalize_symbol_for_mmt};
 use crate::providers::mmt::ws_client::MmtWsClient;
@@ -105,14 +106,17 @@ async fn handle_bulk(args: SourceOiArgs) -> Result<()> {
 }
 
 async fn handle_hyperliquid(args: SourceOiArgs) -> Result<()> {
+    let product = HyperliquidProduct::from_exchange(args.exchange_name()?)?;
     if args.stream {
         if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("stream mode currently supports only --output terminal|json|jsonl");
         }
-        return stream_hyperliquid_oi(args).await;
+        return stream_hyperliquid_oi(args, product).await;
     }
-    let snapshot = HyperliquidProvider::open_interest(&args.symbol).await?;
-    render_direct_snapshot(snapshot, &args, "hyperliquidf")
+    let snapshot =
+        HyperliquidProvider::open_interest_for(product, &args.symbol, HyperliquidNetwork::Mainnet)
+            .await?;
+    render_direct_snapshot(snapshot, &args, product.exchange())
 }
 
 fn render_direct_snapshot(
@@ -312,8 +316,13 @@ async fn stream_bulk_oi(args: SourceOiArgs) -> Result<()> {
     Ok(())
 }
 
-async fn stream_hyperliquid_oi(args: SourceOiArgs) -> Result<()> {
-    let mut stream = HyperliquidAssetContextStream::connect(&args.symbol).await?;
+async fn stream_hyperliquid_oi(args: SourceOiArgs, product: HyperliquidProduct) -> Result<()> {
+    let mut stream = HyperliquidAssetContextStream::connect_for(
+        product,
+        &args.symbol,
+        HyperliquidNetwork::Mainnet,
+    )
+    .await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest = None;
     let mut buf = VecDeque::with_capacity(args.buffer_size as usize);
@@ -338,7 +347,7 @@ async fn stream_hyperliquid_oi(args: SourceOiArgs) -> Result<()> {
                 let Some(snapshot) = latest.as_ref() else { continue; };
                 let env = SourceEnvelope {
                     r#type: "source.oi.stream".to_string(), version: "1",
-                    provider: "hyperliquidf", exchange: snapshot.exchange.clone(),
+                    provider: product.exchange(), exchange: snapshot.exchange.clone(),
                     symbol: snapshot.symbol.clone(), ts_ms: snapshot.timestamp_ms,
                     stream: true, data: snapshot.clone(),
                     meta: SourceMeta { depth: None, min_size: None, max_size: None, price_group: None,

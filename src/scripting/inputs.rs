@@ -510,7 +510,7 @@ fn parse_source_provider(raw: &str) -> Result<ProviderKind> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "mmt" => Ok(ProviderKind::Mmt),
         "bulkf" => Ok(ProviderKind::Bulk),
-        "hyperliquid" | "hyperliquidf" => Ok(ProviderKind::Hyperliquid),
+        "hyperliquid" | "hyperliquidf" | "hyperliquidf-xyz" => Ok(ProviderKind::Hyperliquid),
         "binance" => Ok(ProviderKind::Binance),
         "binancef" => Ok(ProviderKind::BinanceFutures),
         other => bail!("unsupported script source provider `{other}`"),
@@ -820,6 +820,49 @@ mod tests {
         .expect("historical Hyperliquid selectors should parse");
         validate_source_configs(&historical_manifest, &historical_configs)
             .expect("Hyperliquid candles and volume should support backtests");
+    }
+
+    #[test]
+    fn validates_standalone_hyperliquid_xyz_bindings() {
+        let live_manifest = manifest(vec![
+            ScriptSource::Candles,
+            ScriptSource::Orderbook,
+            ScriptSource::Trades,
+            ScriptSource::Vd,
+            ScriptSource::Oi,
+            ScriptSource::Volumes,
+        ]);
+        let configs = parse_source_configs(&[
+            "tsla@candles@hyperliquidf-xyz:timeframe=60".to_string(),
+            "tsla@orderbook@hyperliquidf-xyz:depth=20".to_string(),
+            "tsla@trades@hyperliquidf-xyz".to_string(),
+            "tsla@vd@hyperliquidf-xyz".to_string(),
+            "tsla@oi@hyperliquidf-xyz".to_string(),
+            "tsla@volumes@hyperliquidf-xyz:timeframe=60".to_string(),
+        ])
+        .expect("standalone XYZ selectors should parse");
+
+        validate_source_configs_for_run(&live_manifest, &configs)
+            .expect("standalone XYZ live configs should validate");
+        assert_eq!(
+            configs["tsla@candles@hyperliquidf-xyz"].provider,
+            ProviderKind::Hyperliquid
+        );
+        assert_eq!(
+            configs["tsla@candles@hyperliquidf-xyz"].exchange,
+            "hyperliquidf-xyz"
+        );
+
+        let historical_manifest = manifest(vec![ScriptSource::Candles, ScriptSource::Volumes]);
+        validate_source_configs(
+            &historical_manifest,
+            &parse_source_configs(&[
+                "tsla@candles@hyperliquidf-xyz:timeframe=60".to_string(),
+                "tsla@volumes@hyperliquidf-xyz:timeframe=60".to_string(),
+            ])
+            .expect("historical XYZ selectors should parse"),
+        )
+        .expect("XYZ candles and volume should support backtests");
     }
 
     #[test]

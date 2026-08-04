@@ -63,10 +63,10 @@ impl HyperliquidExecutionAdapter {
             venue: venue_for_product(product),
             order_kinds: vec![OrderKind::Market, OrderKind::Limit],
             time_in_forces: vec![TimeInForce::Gtc, TimeInForce::Ioc, TimeInForce::Alo],
-            reduce_only: product == HyperliquidProduct::Perpetual,
+            reduce_only: product.is_perpetual(),
             deterministic_order_ids: false,
             delegated_agent_signing: true,
-            native_protective_triggers: product == HyperliquidProduct::Perpetual,
+            native_protective_triggers: product.is_perpetual(),
             native_oco: false,
             native_on_fill: false,
         }
@@ -104,18 +104,20 @@ impl HyperliquidExecutionAdapter {
         if self.product == HyperliquidProduct::Spot {
             return self.spot_account_snapshot(account).await;
         }
+        let mut request = serde_json::json!({
+            "type": "clearinghouseState",
+            "user": account
+        });
+        attach_dex(&mut request, self.product);
         let raw: ClearinghouseState = HyperliquidClient::for_network(self.network)?
-            .info(&serde_json::json!({
-                "type": "clearinghouseState",
-                "user": account
-            }))
+            .info(&request)
             .await?;
-        let contexts = load_mark_prices(self.network).await?;
+        let contexts = load_mark_prices(self.network, self.product).await?;
         let positions = raw
             .asset_positions
             .into_iter()
             .filter(|position| position.position.size().is_ok_and(|size| size != 0.0))
-            .map(|position| position.into_position(&contexts))
+            .map(|position| position.into_position(&contexts, self.product, self.network))
             .collect::<Result<Vec<_>>>()?;
         let unrealized_pnl = positions
             .iter()
@@ -196,11 +198,13 @@ impl HyperliquidExecutionAdapter {
 
     pub async fn open_orders(&self, account: &str) -> Result<Vec<OpenOrder>> {
         ensure_account(account, &self.account)?;
+        let mut request = serde_json::json!({
+            "type": "frontendOpenOrders",
+            "user": account
+        });
+        attach_dex(&mut request, self.product);
         let raw: Vec<HyperliquidOpenOrder> = HyperliquidClient::for_network(self.network)?
-            .info(&serde_json::json!({
-                "type": "frontendOpenOrders",
-                "user": account
-            }))
+            .info(&request)
             .await?;
         raw.into_iter()
             .filter_map(|order| order.into_order(self.product, self.network).transpose())
@@ -225,7 +229,7 @@ impl HyperliquidExecutionAdapter {
         ensure_account(&plan.account, &self.account)?;
         let resolved = self.resolve_market(&plan.internal_symbol).await?;
         validate_resolved_trade_plan(plan, &resolved)?;
-        if self.product == HyperliquidProduct::Perpetual && !plan.reduce_only {
+        if self.product.is_perpetual() && !plan.reduce_only {
             self.ensure_leverage(
                 resolved.asset,
                 plan.leverage
@@ -326,7 +330,7 @@ impl HyperliquidExecutionAdapter {
             }
             let resolved = self.resolve_market(&plan.internal_symbol).await?;
             validate_resolved_trade_plan(plan, &resolved)?;
-            if self.product == HyperliquidProduct::Perpetual && !plan.reduce_only {
+            if self.product.is_perpetual() && !plan.reduce_only {
                 self.ensure_leverage(
                     resolved.asset,
                     plan.leverage
@@ -384,7 +388,7 @@ impl HyperliquidExecutionAdapter {
             let _ = (internal_symbol, leverage);
             bail!("Hyperliquid spot does not support leverage configuration");
         }
-        let market = markets::market(internal_symbol)?;
+        let market = markets::market_for(self.product, internal_symbol)?;
         let resolved = self.resolve_market(&market.symbol).await?;
         if !leverage.is_finite()
             || leverage < 1.0
@@ -532,6 +536,9 @@ impl HyperliquidExecutionAdapter {
                 let market = markets::market(symbol)?;
                 resolved_testnet_market(&market.venue_symbol).await
             }
+            (HyperliquidProduct::XyzPerpetual, network) => {
+                resolved_network_perpetual_market(self.product, network, symbol)
+            }
         }
     }
 }
@@ -570,7 +577,7 @@ fn validate_trade_plan(
             market.symbol
         );
     }
-    if product == HyperliquidProduct::Perpetual {
+    if product.is_perpetual() {
         let leverage = plan
             .leverage
             .context("Hyperliquid perpetual trade plan is missing leverage")?;
@@ -660,6 +667,23 @@ fn resolved_spot_market(network: HyperliquidNetwork, symbol: &str) -> Result<Res
         max_leverage: 1,
         cross_margin: false,
         max_price_decimals: HyperliquidProduct::Spot.max_price_decimals(),
+    })
+}
+
+fn resolved_network_perpetual_market(
+    product: HyperliquidProduct,
+    network: HyperliquidNetwork,
+    symbol: &str,
+) -> Result<ResolvedMarket> {
+    let (_market, variant) = markets::network_market(product, network, symbol)?;
+    let rules = &variant.execution;
+    Ok(ResolvedMarket {
+        asset: variant.venue_id,
+        size_precision: rules.size_precision,
+        lot_size: rules.lot_size,
+        max_leverage: u32::from(rules.max_leverage),
+        cross_margin: rules.cross_margin,
+        max_price_decimals: product.max_price_decimals(),
     })
 }
 
@@ -932,6 +956,18 @@ const fn venue_for_product(product: HyperliquidProduct) -> ExecutionVenue {
     match product {
         HyperliquidProduct::Spot => ExecutionVenue::HyperliquidSpot,
         HyperliquidProduct::Perpetual => ExecutionVenue::Hyperliquid,
+        HyperliquidProduct::XyzPerpetual => ExecutionVenue::HyperliquidXyz,
+    }
+}
+
+fn attach_dex(request: &mut serde_json::Value, product: HyperliquidProduct) {
+    if let Some(dex) = product.dex()
+        && let Some(request) = request.as_object_mut()
+    {
+        request.insert(
+            "dex".to_string(),
+            serde_json::Value::String(dex.to_string()),
+        );
     }
 }
 
@@ -1010,9 +1046,14 @@ fn is_step_aligned(value: f64, step: f64) -> bool {
     (units - units.round()).abs() <= 1e-8_f64.max(units.abs() * 1e-12)
 }
 
-async fn load_mark_prices(network: HyperliquidNetwork) -> Result<HashMap<String, f64>> {
+async fn load_mark_prices(
+    network: HyperliquidNetwork,
+    product: HyperliquidProduct,
+) -> Result<HashMap<String, f64>> {
+    let mut request = serde_json::json!({ "type": "metaAndAssetCtxs" });
+    attach_dex(&mut request, product);
     let value: serde_json::Value = HyperliquidClient::for_network(network)?
-        .info(&serde_json::json!({ "type": "metaAndAssetCtxs" }))
+        .info(&request)
         .await?;
     let entries = value
         .as_array()
@@ -1127,16 +1168,21 @@ impl HyperliquidPosition {
 }
 
 impl HyperliquidAssetPosition {
-    fn into_position(self, marks: &HashMap<String, f64>) -> Result<Position> {
+    fn into_position(
+        self,
+        marks: &HashMap<String, f64>,
+        product: HyperliquidProduct,
+        network: HyperliquidNetwork,
+    ) -> Result<Position> {
         let signed_size = self.position.size()?;
-        let market = markets::market(&self.position.coin).ok();
+        let market = markets::market_for_wire(product, network, &self.position.coin).ok();
         let mark = marks.get(&self.position.coin).copied().unwrap_or_default();
         let internal_symbol = market.as_ref().map_or_else(
             || self.position.coin.to_ascii_uppercase(),
             |market| market.symbol.clone(),
         );
         Ok(Position {
-            venue: ExecutionVenue::Hyperliquid,
+            venue: venue_for_product(product),
             internal_symbol,
             venue_symbol: self.position.coin.clone(),
             registry_supported: market.is_some(),
@@ -1321,6 +1367,45 @@ mod tests {
     fn maps_hyperliquid_sides() {
         assert_eq!(side("B").expect("buy"), OrderSide::Buy);
         assert_eq!(side("A").expect("sell"), OrderSide::Sell);
+    }
+
+    #[test]
+    fn xyz_uses_its_venue_and_network_specific_asset_ids() {
+        assert_eq!(
+            venue_for_product(HyperliquidProduct::XyzPerpetual),
+            ExecutionVenue::HyperliquidXyz
+        );
+        assert_eq!(
+            resolved_network_perpetual_market(
+                HyperliquidProduct::XyzPerpetual,
+                HyperliquidNetwork::Mainnet,
+                "TSLA",
+            )
+            .expect("mainnet XYZ market resolves")
+            .asset,
+            110_001
+        );
+        assert_eq!(
+            resolved_network_perpetual_market(
+                HyperliquidProduct::XyzPerpetual,
+                HyperliquidNetwork::Testnet,
+                "TSLA",
+            )
+            .expect("testnet XYZ market resolves")
+            .asset,
+            750_001
+        );
+    }
+
+    #[test]
+    fn xyz_info_requests_are_scoped_to_the_xyz_dex() {
+        let mut request = serde_json::json!({ "type": "clearinghouseState", "user": "0xabc" });
+        attach_dex(&mut request, HyperliquidProduct::XyzPerpetual);
+        assert_eq!(request["dex"], "xyz");
+
+        let mut native = serde_json::json!({ "type": "clearinghouseState", "user": "0xabc" });
+        attach_dex(&mut native, HyperliquidProduct::Perpetual);
+        assert!(native.get("dex").is_none());
     }
 
     #[test]

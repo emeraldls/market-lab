@@ -305,6 +305,8 @@ pub enum ExecutionVenueArg {
     Bulk,
     #[value(name = "hyperliquidf")]
     Hyperliquid,
+    #[value(name = "hyperliquidf-xyz")]
+    HyperliquidXyz,
     #[value(name = "hyperliquid")]
     HyperliquidSpot,
 }
@@ -313,10 +315,12 @@ fn validate_execution_network(venue: ExecutionVenueArg, testnet: bool) -> Result
     if testnet
         && !matches!(
             venue,
-            ExecutionVenueArg::Hyperliquid | ExecutionVenueArg::HyperliquidSpot
+            ExecutionVenueArg::Hyperliquid
+                | ExecutionVenueArg::HyperliquidXyz
+                | ExecutionVenueArg::HyperliquidSpot
         )
     {
-        bail!("--testnet is only valid with --venue hyperliquid or hyperliquidf");
+        bail!("--testnet is only valid with a Hyperliquid venue");
     }
     Ok(())
 }
@@ -326,6 +330,7 @@ impl From<ExecutionVenueArg> for ExecutionVenue {
         match value {
             ExecutionVenueArg::Bulk => ExecutionVenue::Bulk,
             ExecutionVenueArg::Hyperliquid => ExecutionVenue::Hyperliquid,
+            ExecutionVenueArg::HyperliquidXyz => ExecutionVenue::HyperliquidXyz,
             ExecutionVenueArg::HyperliquidSpot => ExecutionVenue::HyperliquidSpot,
         }
     }
@@ -600,10 +605,14 @@ impl ScriptRunArgs {
         if self.testnet
             && !matches!(
                 self.venue,
-                Some(ExecutionVenueArg::Hyperliquid | ExecutionVenueArg::HyperliquidSpot)
+                Some(
+                    ExecutionVenueArg::Hyperliquid
+                        | ExecutionVenueArg::HyperliquidXyz
+                        | ExecutionVenueArg::HyperliquidSpot
+                )
             )
         {
-            bail!("--testnet requires --venue hyperliquid or hyperliquidf");
+            bail!("--testnet requires a Hyperliquid execution venue");
         }
         Ok(())
     }
@@ -894,9 +903,14 @@ impl SourceOiArgs {
                 self.exchange
             );
         }
-        if provider == CliProviderKind::Bulk {
+        if matches!(
+            provider,
+            CliProviderKind::Bulk | CliProviderKind::Hyperliquid
+        ) {
             if self.timeframe.is_some() || self.from.is_some() || self.to.is_some() {
-                bail!("BULK open interest is current/live only; omit --timeframe/--from/--to");
+                bail!(
+                    "standalone open interest is current/live only; omit --timeframe/--from/--to"
+                );
             }
         } else {
             let timeframe = self
@@ -1949,6 +1963,7 @@ impl RunVwapArgs {
         let execution_venue = match self.venue {
             ExecutionVenueArg::Bulk => "bulkf",
             ExecutionVenueArg::Hyperliquid => "hyperliquidf",
+            ExecutionVenueArg::HyperliquidXyz => "hyperliquidf-xyz",
             ExecutionVenueArg::HyperliquidSpot => {
                 bail!("VWAP does not support spot execution yet")
             }
@@ -2209,9 +2224,9 @@ impl VampArgs {
 
 fn validate_execution_symbol(venue: ExecutionVenueArg, symbol: &str) -> Result<()> {
     let market_type = match venue {
-        ExecutionVenueArg::Bulk | ExecutionVenueArg::Hyperliquid => {
-            crate::markets::MarketType::Futures
-        }
+        ExecutionVenueArg::Bulk
+        | ExecutionVenueArg::Hyperliquid
+        | ExecutionVenueArg::HyperliquidXyz => crate::markets::MarketType::Futures,
         ExecutionVenueArg::HyperliquidSpot => crate::markets::MarketType::Spot,
     };
     crate::markets::canonical_market_symbol(symbol, market_type).map(|_| ())
@@ -2252,7 +2267,9 @@ fn resolve_source_provider(
     if exchange.eq_ignore_ascii_case("bulkf") {
         return Ok(CliProviderKind::Bulk);
     }
-    if exchange.eq_ignore_ascii_case("hyperliquidf") || exchange.eq_ignore_ascii_case("hyperliquid")
+    if exchange.eq_ignore_ascii_case("hyperliquidf")
+        || exchange.eq_ignore_ascii_case("hyperliquidf-xyz")
+        || exchange.eq_ignore_ascii_case("hyperliquid")
     {
         return Ok(CliProviderKind::Hyperliquid);
     }
@@ -2285,6 +2302,9 @@ fn resolve_system_provider(
         (Some(_), _) => Ok(ProviderKind::Mmt),
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("bulkf") => Ok(ProviderKind::Bulk),
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquidf") => {
+            Ok(ProviderKind::Hyperliquid)
+        }
+        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquidf-xyz") => {
             Ok(ProviderKind::Hyperliquid)
         }
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquid") => {
@@ -2568,6 +2588,55 @@ mod tests {
                 assert!(matches!(args.venue, ExecutionVenueArg::Hyperliquid));
             }
             _ => panic!("expected trade long command"),
+        }
+
+        let xyz_source = Cli::try_parse_from([
+            "mlab",
+            "source",
+            "orderbook",
+            "--exchange",
+            "hyperliquidf-xyz",
+            "--symbol",
+            "TSLA",
+            "--depth",
+            "20",
+        ])
+        .expect("XYZ source command should parse");
+        match xyz_source.command {
+            Commands::Source {
+                command: SourceCommands::Orderbook(args),
+            } => {
+                args.validate().expect("standalone XYZ source validates");
+                assert_eq!(
+                    args.provider_kind().expect("XYZ provider resolves"),
+                    CliProviderKind::Hyperliquid
+                );
+            }
+            _ => panic!("expected XYZ source orderbook command"),
+        }
+
+        let xyz_trade = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "long",
+            "TSLA",
+            "--venue",
+            "hyperliquidf-xyz",
+            "--margin",
+            "100",
+            "--leverage",
+            "5",
+            "--dry-run",
+        ])
+        .expect("XYZ trade command should parse");
+        match xyz_trade.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => {
+                args.validate_shape().expect("XYZ trade shape validates");
+                assert!(matches!(args.venue, ExecutionVenueArg::HyperliquidXyz));
+            }
+            _ => panic!("expected XYZ trade long command"),
         }
 
         let spot_trade = Cli::try_parse_from([
