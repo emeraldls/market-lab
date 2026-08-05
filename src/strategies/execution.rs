@@ -276,6 +276,7 @@ mod tests {
             reduce_only: false,
             stop_loss_price: None,
             take_profit_price: None,
+            market_fingerprint: None,
         }
     }
 

@@ -11,6 +11,8 @@ pub enum ExecutionVenue {
     HyperliquidXyz,
     #[serde(rename = "hyperliquid")]
     HyperliquidSpot,
+    #[serde(rename = "hyperliquid-outcomes")]
+    HyperliquidOutcomes,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -95,6 +97,10 @@ pub struct TradePlan {
     pub stop_loss_price: Option<f64>,
     #[serde(default)]
     pub take_profit_price: Option<f64>,
+    /// Dynamic market-definition identity. Outcome orders refuse to execute
+    /// if the venue rotates the selected contract before submission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_fingerprint: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -106,6 +112,8 @@ pub struct AccountSnapshot {
     pub positions: Vec<Position>,
     #[serde(default)]
     pub spot_balances: Vec<SpotBalance>,
+    #[serde(default)]
+    pub outcome_holdings: Vec<OutcomeHolding>,
     pub open_orders: Vec<OpenOrder>,
     pub leverage_settings: Vec<LeverageSetting>,
 }
@@ -121,6 +129,26 @@ pub struct SpotBalance {
     pub held: f64,
     pub available: f64,
     pub entry_notional: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeHolding {
+    pub venue: ExecutionVenue,
+    pub symbol: String,
+    pub outcome_id: u32,
+    pub side: u8,
+    pub side_name: String,
+    pub question_id: Option<u32>,
+    pub question_name: Option<String>,
+    pub outcome_name: String,
+    pub quote_token: String,
+    pub venue_asset: String,
+    pub total: f64,
+    pub held: f64,
+    pub available: f64,
+    pub entry_notional: f64,
+    pub metadata_fingerprint: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -319,6 +347,10 @@ mod tests {
         let xyz =
             serde_json::to_value(ExecutionVenue::HyperliquidXyz).expect("XYZ venue serializes");
         assert_eq!(xyz, serde_json::json!("hyperliquidf-xyz"));
+
+        let outcomes = serde_json::to_value(ExecutionVenue::HyperliquidOutcomes)
+            .expect("outcome venue serializes");
+        assert_eq!(outcomes, serde_json::json!("hyperliquid-outcomes"));
     }
 
     #[test]
@@ -346,6 +378,7 @@ mod tests {
             reduce_only: false,
             stop_loss_price: None,
             take_profit_price: None,
+            market_fingerprint: None,
         };
 
         let encoded = serde_json::to_value(plan).expect("spot plan serializes");

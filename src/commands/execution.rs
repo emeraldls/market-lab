@@ -9,8 +9,8 @@ use crate::cli::{
     TradeTimeInForce,
 };
 use crate::domain::execution::{
-    CancelPlan, ExecutionReceipt, ExecutionVenue, OpenOrder, Position, PositionDirection,
-    SpotBalance, TimeInForce, TradePlan,
+    CancelPlan, ExecutionReceipt, ExecutionVenue, OpenOrder, OutcomeHolding, Position,
+    PositionDirection, SpotBalance, TimeInForce, TradePlan,
 };
 use crate::markets::Market;
 use crate::providers::bulk::market_data::BulkProvider;
@@ -18,8 +18,18 @@ use crate::providers::execution::ExecutionAdapter;
 use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 use crate::providers::hyperliquid::{HyperliquidNetwork, MARKET_ORDER_SLIPPAGE};
 
-pub async fn handle_trade(args: TradeArgs, direction: PositionDirection) -> Result<()> {
+pub async fn handle_trade(mut args: TradeArgs, direction: PositionDirection) -> Result<()> {
+    args.apply_symbol_flag();
     args.validate_shape()?;
+    if args.venue == crate::cli::ExecutionVenueArg::HyperliquidOutcomes
+        && args.symbol.trim().is_empty()
+    {
+        args.symbol = crate::providers::hyperliquid::outcomes::select_interactive(
+            HyperliquidNetwork::from_testnet(args.testnet),
+        )
+        .await?
+        .symbol;
+    }
     let plan = build_trade_plan(&args, direction).await?;
     if args.dry_run {
         render_trade_plan(&plan, true, args.output)?;
@@ -96,6 +106,18 @@ pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
             .collect::<Vec<_>>();
         return render_spot_balances(&balances, args.output);
     }
+    if venue == ExecutionVenue::HyperliquidOutcomes {
+        let holdings = snapshot
+            .outcome_holdings
+            .into_iter()
+            .filter(|holding| {
+                symbol
+                    .as_deref()
+                    .is_none_or(|symbol| holding.symbol == symbol)
+            })
+            .collect::<Vec<_>>();
+        return render_outcome_holdings(&holdings, args.output);
+    }
     let positions = snapshot
         .positions
         .into_iter()
@@ -166,7 +188,7 @@ pub async fn handle_fills(args: AccountQueryArgs) -> Result<()> {
 pub async fn handle_cancel(args: CancelOrderArgs) -> Result<()> {
     args.validate()?;
     let venue = ExecutionVenue::from(args.venue);
-    let market = execution_market(venue, &args.symbol)?;
+    let market = execution_market_on(venue, args.testnet, &args.symbol).await?;
     if venue == ExecutionVenue::Bulk {
         bulk_keychain::Hash::from_base58(&args.order_id).context("invalid BULK order id")?;
     } else {
@@ -229,6 +251,7 @@ pub async fn handle_close(args: ClosePositionArgs) -> Result<()> {
     handle_trade(
         TradeArgs {
             symbol: position.internal_symbol,
+            symbol_flag: None,
             config: None,
             venue: args.venue,
             testnet: args.testnet,
@@ -310,10 +333,26 @@ pub(crate) async fn build_trade_plan(
     direction: PositionDirection,
 ) -> Result<TradePlan> {
     let venue = ExecutionVenue::from(args.venue);
-    let market = execution_market(venue, &args.symbol)?;
+    let outcome = if venue == ExecutionVenue::HyperliquidOutcomes {
+        Some(
+            crate::providers::hyperliquid::outcomes::resolve(
+                HyperliquidNetwork::from_testnet(args.testnet),
+                &args.symbol,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let market = outcome.as_ref().map_or_else(
+        || execution_market(venue, &args.symbol),
+        |instrument| {
+            Ok(crate::providers::hyperliquid::outcomes::market_from_instrument(instrument))
+        },
+    )?;
     validate_market_rules(venue, &market, args)?;
     let leverage = match venue {
-        ExecutionVenue::HyperliquidSpot => None,
+        ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidOutcomes => None,
         ExecutionVenue::Bulk | ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidXyz => {
             Some(args.leverage.unwrap_or(1.0))
         }
@@ -353,6 +392,15 @@ pub(crate) async fn build_trade_plan(
                 .await?
                 .mark_price
             }
+            ExecutionVenue::HyperliquidOutcomes => {
+                HyperliquidProvider::ticker_for(
+                    crate::providers::hyperliquid::HyperliquidProduct::Outcome,
+                    &market.symbol,
+                    HyperliquidNetwork::from_testnet(args.testnet),
+                )
+                .await?
+                .mark_price
+            }
         },
     };
     if !reference_price.is_finite() || reference_price <= 0.0 {
@@ -378,8 +426,10 @@ pub(crate) async fn build_trade_plan(
         let margin = args
             .margin
             .context("one of --size or --margin is required")?;
-        let sizing_price = if venue == ExecutionVenue::HyperliquidSpot
-            && direction == PositionDirection::Long
+        let sizing_price = if matches!(
+            venue,
+            ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidOutcomes
+        ) && direction == PositionDirection::Long
             && matches!(args.order_kind, TradeOrderKind::Market)
         {
             reference_price * (1.0 + MARKET_ORDER_SLIPPAGE)
@@ -390,7 +440,10 @@ pub(crate) async fn build_trade_plan(
         floor_to_step(raw_size, rules.lot_size, rules.size_precision)
     };
     if size <= 0.0 {
-        if venue == ExecutionVenue::HyperliquidSpot {
+        if matches!(
+            venue,
+            ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidOutcomes
+        ) {
             bail!(
                 "requested amount produces a size below {} spot lot size {} on {}",
                 venue_label(venue),
@@ -431,6 +484,24 @@ pub(crate) async fn build_trade_plan(
         )
         .await?;
     }
+    if venue == ExecutionVenue::HyperliquidOutcomes {
+        validate_outcome_funds(
+            args.testnet,
+            &account,
+            outcome
+                .as_ref()
+                .context("outcome metadata was not resolved")?,
+            direction,
+            size,
+            match args.order_kind {
+                TradeOrderKind::Market if direction == PositionDirection::Long => {
+                    reference_price * (1.0 + MARKET_ORDER_SLIPPAGE)
+                }
+                TradeOrderKind::Market | TradeOrderKind::Limit => reference_price,
+            },
+        )
+        .await?;
+    }
 
     Ok(TradePlan {
         created_at_ms: now_ms()?,
@@ -456,6 +527,7 @@ pub(crate) async fn build_trade_plan(
         reduce_only: args.reduce_only,
         stop_loss_price: args.sl,
         take_profit_price: args.tp,
+        market_fingerprint: outcome.map(|instrument| instrument.metadata_fingerprint),
     })
 }
 
@@ -485,6 +557,49 @@ async fn validate_spot_funds(
     if available + tolerance < required {
         bail!(
             "insufficient Hyperliquid spot {venue_asset} balance: {available:.8} available, {required:.8} {unit} amount required"
+        );
+    }
+    Ok(())
+}
+
+async fn validate_outcome_funds(
+    testnet: bool,
+    account: &str,
+    instrument: &crate::providers::hyperliquid::outcomes::OutcomeInstrument,
+    direction: PositionDirection,
+    size: f64,
+    execution_price: f64,
+) -> Result<()> {
+    let snapshot = ExecutionAdapter::new(ExecutionVenue::HyperliquidOutcomes, testnet)
+        .await?
+        .account_snapshot(account)
+        .await?;
+    let (available, required, asset) = match direction {
+        PositionDirection::Long => {
+            let available = snapshot
+                .spot_balances
+                .iter()
+                .find(|balance| balance.asset.eq_ignore_ascii_case(&instrument.quote_token))
+                .map_or(0.0, |balance| balance.available);
+            (
+                available,
+                size * execution_price,
+                instrument.quote_token.as_str(),
+            )
+        }
+        PositionDirection::Short => {
+            let available = snapshot
+                .outcome_holdings
+                .iter()
+                .find(|holding| holding.symbol == instrument.symbol)
+                .map_or(0.0, |holding| holding.available);
+            (available, size, instrument.token_name.as_str())
+        }
+    };
+    let tolerance = 1e-12_f64.max(required.abs() * 1e-12);
+    if available + tolerance < required {
+        bail!(
+            "insufficient Hyperliquid outcome {asset} balance: {available:.8} available, {required:.8} required"
         );
     }
     Ok(())
@@ -557,8 +672,12 @@ fn validate_market_rules(venue: ExecutionVenue, market: &Market, args: &TradeArg
             market.venue_symbol
         );
     }
-    if venue == ExecutionVenue::HyperliquidSpot && args.leverage.is_some() {
-        bail!("--leverage is not supported for Hyperliquid spot");
+    if matches!(
+        venue,
+        ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidOutcomes
+    ) && args.leverage.is_some()
+    {
+        bail!("--leverage is not supported for Hyperliquid spot or outcome markets");
     }
     let leverage = args.leverage.unwrap_or(1.0);
     if leverage > f64::from(rules.max_leverage) {
@@ -577,12 +696,17 @@ fn validate_market_rules(venue: ExecutionVenue, market: &Market, args: &TradeArg
     {
         bail!("Hyperliquid leverage must be a whole number");
     }
-    if venue == ExecutionVenue::HyperliquidSpot {
+    if matches!(
+        venue,
+        ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidOutcomes
+    ) {
         if args.reduce_only {
-            bail!("Hyperliquid spot orders do not support --reduce-only");
+            bail!("Hyperliquid spot and outcome orders do not support --reduce-only");
         }
         if args.sl.is_some() || args.tp.is_some() {
-            bail!("Hyperliquid spot does not support attached --sl or --tp orders");
+            bail!(
+                "Hyperliquid spot and outcome markets do not support attached --sl or --tp orders"
+            );
         }
     }
     if let Some(price) = args.price
@@ -635,10 +759,29 @@ fn is_price_aligned(
             )
             .is_ok()
         }
+        ExecutionVenue::HyperliquidOutcomes => {
+            crate::providers::hyperliquid::execution::validate_price_for(
+                price,
+                rules.size_precision,
+                8,
+            )
+            .is_ok()
+        }
     }
 }
 
 fn validate_optional_symbol(venue: ExecutionVenue, symbol: Option<&str>) -> Result<Option<String>> {
+    if venue == ExecutionVenue::HyperliquidOutcomes {
+        return symbol
+            .map(|symbol| {
+                crate::providers::hyperliquid::outcomes::parse_symbol(symbol).map(
+                    |(outcome, side)| {
+                        crate::providers::hyperliquid::outcomes::canonical_symbol(outcome, side)
+                    },
+                )
+            })
+            .transpose();
+    }
     symbol
         .map(|symbol| execution_market(venue, symbol).map(|market| market.symbol.clone()))
         .transpose()
@@ -646,6 +789,22 @@ fn validate_optional_symbol(venue: ExecutionVenue, symbol: Option<&str>) -> Resu
 
 fn execution_market(venue: ExecutionVenue, symbol: &str) -> Result<std::sync::Arc<Market>> {
     crate::markets::exchange_market(venue_key(venue), symbol)
+}
+
+async fn execution_market_on(
+    venue: ExecutionVenue,
+    testnet: bool,
+    symbol: &str,
+) -> Result<std::sync::Arc<Market>> {
+    if venue == ExecutionVenue::HyperliquidOutcomes {
+        let instrument = crate::providers::hyperliquid::outcomes::resolve(
+            HyperliquidNetwork::from_testnet(testnet),
+            symbol,
+        )
+        .await?;
+        return Ok(crate::providers::hyperliquid::outcomes::market_from_instrument(&instrument));
+    }
+    execution_market(venue, symbol)
 }
 
 fn execution_rules(
@@ -657,7 +816,9 @@ fn execution_rules(
         ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidXyz => market
             .network_variant(HyperliquidNetwork::from_testnet(testnet).label())
             .map(|variant| variant.execution),
-        ExecutionVenue::Bulk | ExecutionVenue::Hyperliquid => market.execution_rules().cloned(),
+        ExecutionVenue::HyperliquidOutcomes
+        | ExecutionVenue::Bulk
+        | ExecutionVenue::Hyperliquid => market.execution_rules().cloned(),
     }
 }
 
@@ -666,7 +827,9 @@ fn execution_venue_symbol(venue: ExecutionVenue, testnet: bool, market: &Market)
         ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidXyz => market
             .network_variant(HyperliquidNetwork::from_testnet(testnet).label())
             .map(|variant| variant.venue_symbol),
-        ExecutionVenue::Bulk | ExecutionVenue::Hyperliquid => Ok(market.venue_symbol.clone()),
+        ExecutionVenue::HyperliquidOutcomes
+        | ExecutionVenue::Bulk
+        | ExecutionVenue::Hyperliquid => Ok(market.venue_symbol.clone()),
     }
 }
 
@@ -676,6 +839,7 @@ fn venue_key(venue: ExecutionVenue) -> &'static str {
         ExecutionVenue::Hyperliquid => "hyperliquidf",
         ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
         ExecutionVenue::HyperliquidSpot => "hyperliquid",
+        ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
     }
 }
 
@@ -685,6 +849,7 @@ fn venue_label(venue: ExecutionVenue) -> &'static str {
         ExecutionVenue::Hyperliquid => "Hyperliquid",
         ExecutionVenue::HyperliquidXyz => "Hyperliquid XYZ",
         ExecutionVenue::HyperliquidSpot => "Hyperliquid Spot",
+        ExecutionVenue::HyperliquidOutcomes => "Hyperliquid Outcomes",
     }
 }
 
@@ -696,6 +861,8 @@ fn venue_network_label(venue: ExecutionVenue, testnet: bool) -> &'static str {
         (ExecutionVenue::HyperliquidXyz, false) => "Hyperliquid XYZ mainnet",
         (ExecutionVenue::HyperliquidSpot, true) => "Hyperliquid Spot testnet",
         (ExecutionVenue::HyperliquidSpot, false) => "Hyperliquid Spot mainnet",
+        (ExecutionVenue::HyperliquidOutcomes, true) => "Hyperliquid Outcomes testnet",
+        (ExecutionVenue::HyperliquidOutcomes, false) => "Hyperliquid Outcomes mainnet",
         (ExecutionVenue::Bulk, _) => "BULK",
     }
 }
@@ -968,6 +1135,43 @@ fn render_spot_balances(balances: &[SpotBalance], output: OutputFormat) -> Resul
             );
         }
     })
+}
+
+fn render_outcome_holdings(holdings: &[OutcomeHolding], output: OutputFormat) -> Result<()> {
+    render_structured(holdings, output, || {
+        if holdings.is_empty() {
+            println!("no outcome holdings");
+            return;
+        }
+        println!(
+            "{:<12} {:<24} {:<16} {:>14} {:>14} {:>14}",
+            "SYMBOL", "OUTCOME", "SIDE", "TOTAL", "HELD", "AVAILABLE"
+        );
+        for holding in holdings {
+            println!(
+                "{:<12} {:<24} {:<16} {:>14} {:>14} {:>14}",
+                holding.symbol,
+                truncate_terminal(&holding.outcome_name, 24),
+                truncate_terminal(&holding.side_name, 16),
+                format_decimal(holding.total, 8),
+                format_decimal(holding.held, 8),
+                format_decimal(holding.available, 8),
+            );
+        }
+    })
+}
+
+fn truncate_terminal(value: &str, width: usize) -> String {
+    let clean = crate::providers::hyperliquid::outcomes::clean_terminal_text(value);
+    if clean.chars().count() <= width {
+        clean
+    } else {
+        clean
+            .chars()
+            .take(width.saturating_sub(1))
+            .collect::<String>()
+            + "…"
+    }
 }
 
 fn render_orders(orders: &[OpenOrder], output: OutputFormat) -> Result<()> {

@@ -74,11 +74,7 @@ pub fn parse_source_configs(values: &[String]) -> Result<SourceConfigs> {
     let mut configs = SourceConfigs::new();
 
     for (position, value) in values.iter().enumerate() {
-        let (binding, options) = value
-            .split_once(':')
-            .map_or((value.as_str(), ""), |(binding, options)| {
-                (binding, options)
-            });
+        let (binding, options) = split_source_options(value);
         let (selector, symbol, source, provider, exchange) = parse_source_selector(binding)?;
         validate_source_market(provider, &exchange, &script_symbol_to_market(&symbol))?;
         let config = configs.entry(selector.clone()).or_insert_with(|| {
@@ -134,6 +130,15 @@ pub fn parse_source_configs(values: &[String]) -> Result<SourceConfigs> {
     reject_duplicate_resolved_sources(&configs)?;
 
     Ok(configs)
+}
+
+fn split_source_options(value: &str) -> (&str, &str) {
+    let separator = value.rfind('@').and_then(|last_at| {
+        value[last_at..]
+            .find(':')
+            .map(|relative| last_at + relative)
+    });
+    separator.map_or((value, ""), |index| (&value[..index], &value[index + 1..]))
 }
 
 pub fn parse_param_values(values: &[String]) -> Result<RawParamValues> {
@@ -481,13 +486,13 @@ pub fn normalize_script_symbol(raw: &str) -> Result<String> {
     if symbol.is_empty()
         || !symbol
             .chars()
-            .all(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_' | '/'))
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_' | '/' | ':'))
         || symbol.starts_with('/')
         || symbol.ends_with('/')
         || symbol.matches('/').count() > 1
     {
         bail!(
-            "script symbol `{raw}` must be a base asset such as `btc` or a spot pair such as `hype/usdc`"
+            "script symbol `{raw}` must be a base asset, spot pair, or outcome side such as `btc`, `hype/usdc`, or `1001:0`"
         );
     }
     Ok(symbol)
@@ -498,6 +503,9 @@ pub fn script_symbol_to_market(symbol: &str) -> String {
 }
 
 fn validate_source_market(_provider: ProviderKind, exchange: &str, symbol: &str) -> Result<()> {
+    if exchange.eq_ignore_ascii_case("hyperliquid-outcomes") {
+        return crate::providers::hyperliquid::outcomes::parse_symbol(symbol).map(|_| ());
+    }
     let market_type = if crate::markets::is_futures_exchange(exchange)? {
         crate::markets::MarketType::Futures
     } else {
@@ -510,7 +518,9 @@ fn parse_source_provider(raw: &str) -> Result<ProviderKind> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "mmt" => Ok(ProviderKind::Mmt),
         "bulkf" => Ok(ProviderKind::Bulk),
-        "hyperliquid" | "hyperliquidf" | "hyperliquidf-xyz" => Ok(ProviderKind::Hyperliquid),
+        "hyperliquid" | "hyperliquidf" | "hyperliquidf-xyz" | "hyperliquid-outcomes" => {
+            Ok(ProviderKind::Hyperliquid)
+        }
         "binance" => Ok(ProviderKind::Binance),
         "binancef" => Ok(ProviderKind::BinanceFutures),
         other => bail!("unsupported script source provider `{other}`"),
@@ -900,6 +910,49 @@ mod tests {
         let error = validate_source_configs_for_run(&oi_manifest, &oi)
             .expect_err("spot must not expose open interest");
         assert!(error.to_string().contains("requires a futures exchange"));
+    }
+
+    #[test]
+    fn validates_dynamic_hyperliquid_outcome_bindings() {
+        let live_manifest = manifest(vec![
+            ScriptSource::Candles,
+            ScriptSource::Orderbook,
+            ScriptSource::Trades,
+            ScriptSource::Vd,
+            ScriptSource::Volumes,
+        ]);
+        let configs = parse_source_configs(&[
+            "1001:0@candles@hyperliquid-outcomes:timeframe=60".to_string(),
+            "1001:0@orderbook@hyperliquid-outcomes:depth=20".to_string(),
+            "1001:0@trades@hyperliquid-outcomes".to_string(),
+            "1001:0@vd@hyperliquid-outcomes".to_string(),
+            "1001:0@volumes@hyperliquid-outcomes:timeframe=60".to_string(),
+        ])
+        .expect("outcome selectors should preserve the side separator");
+
+        validate_source_configs_for_run(&live_manifest, &configs)
+            .expect("outcome live configs should validate");
+        assert_eq!(
+            configs["1001:0@candles@hyperliquid-outcomes"].market_symbol(),
+            "1001:0"
+        );
+        assert_eq!(
+            configs["1001:0@orderbook@hyperliquid-outcomes"].depth,
+            Some(20)
+        );
+
+        let historical_manifest = manifest(vec![ScriptSource::Candles, ScriptSource::Volumes]);
+        validate_source_configs(
+            &historical_manifest,
+            &parse_source_configs(&[
+                "1001:1@candles@hyperliquid-outcomes:timeframe=60".to_string(),
+                "1001:1@volumes@hyperliquid-outcomes:timeframe=60".to_string(),
+            ])
+            .expect("historical outcome selectors should parse"),
+        )
+        .expect("outcome candles and volume should support backtests");
+
+        assert!(parse_source_configs(&["1001:2@trades@hyperliquid-outcomes".to_string()]).is_err());
     }
 
     #[test]

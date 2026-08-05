@@ -361,7 +361,15 @@ async fn stream_hyperliquid_volume_bars(
     args: SourceVolumesArgs,
     product: HyperliquidProduct,
 ) -> Result<()> {
-    let market = crate::providers::hyperliquid::markets::market_for(product, &args.symbol)?;
+    let internal_symbol = if product == HyperliquidProduct::Outcome {
+        crate::providers::hyperliquid::outcomes::resolve(HyperliquidNetwork::Mainnet, &args.symbol)
+            .await?
+            .symbol
+    } else {
+        crate::providers::hyperliquid::markets::market_for(product, &args.symbol)?
+            .symbol
+            .clone()
+    };
     let mut stream = HyperliquidCandleStream::connect_for(
         product,
         &args.symbol,
@@ -390,7 +398,7 @@ async fn stream_hyperliquid_volume_bars(
                 let env = SourceEnvelope {
                     r#type: "source.volume-bars.stream".to_string(), version: "1",
                     provider: product.exchange(), exchange: product.exchange().to_string(),
-                    symbol: market.symbol.clone(), ts_ms: bar.t, stream: true, data: bar.clone(),
+                    symbol: internal_symbol.clone(), ts_ms: bar.t, stream: true, data: bar.clone(),
                     meta: SourceMeta { depth: None, min_size: None, max_size: None, price_group: None,
                         interval_ms: Some(args.interval_ms), timeframe: Some(args.timeframe_name()?.to_string()),
                         bucket: None, from: None, to: None },

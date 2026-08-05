@@ -37,3 +37,4 @@ rpassword = "7.4.0"
 toml = "1.1.2"
 zeroize = "1.8.2"
 libc = "0.2"
+dialoguer = { version = "0.11.0", features = ["fuzzy-select"] }

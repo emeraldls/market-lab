@@ -19,6 +19,22 @@ use super::{HyperliquidNetwork, HyperliquidProduct};
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+async fn network_market_for_stream(
+    product: HyperliquidProduct,
+    network: HyperliquidNetwork,
+    symbol: &str,
+) -> Result<(
+    Arc<markets::HyperliquidMarket>,
+    markets::HyperliquidNetworkMarket,
+)> {
+    if product == HyperliquidProduct::Outcome {
+        let (market, variant, _) = super::outcomes::market_and_variant(network, symbol).await?;
+        Ok((market, variant))
+    } else {
+        markets::network_market(product, network, symbol)
+    }
+}
+
 const TRADING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 const TRADING_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const SUBSCRIPTION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -334,7 +350,7 @@ impl HyperliquidOrderBookStream {
         if depth == 0 || depth > 20 {
             bail!("Hyperliquid orderbook depth must be between 1 and 20");
         }
-        let (market, variant) = markets::network_market(product, network, symbol)?;
+        let (market, variant) = network_market_for_stream(product, network, symbol).await?;
         let client = HyperliquidWsClient::subscribe(
             network,
             [orderbook_subscription(&variant.venue_symbol)],
@@ -437,7 +453,7 @@ impl HyperliquidTradesStream {
         symbol: &str,
         network: HyperliquidNetwork,
     ) -> Result<Self> {
-        let (market, variant) = markets::network_market(product, network, symbol)?;
+        let (market, variant) = network_market_for_stream(product, network, symbol).await?;
         let client = HyperliquidWsClient::subscribe(
             network,
             [serde_json::json!({
@@ -517,7 +533,7 @@ impl HyperliquidCandleStream {
         interval: &str,
         network: HyperliquidNetwork,
     ) -> Result<Self> {
-        let (_, variant) = markets::network_market(product, network, symbol)?;
+        let (_, variant) = network_market_for_stream(product, network, symbol).await?;
         let client = HyperliquidWsClient::subscribe(
             network,
             [serde_json::json!({
@@ -580,7 +596,7 @@ impl HyperliquidAssetContextStream {
         symbol: &str,
         network: HyperliquidNetwork,
     ) -> Result<Self> {
-        let (market, variant) = markets::network_market(product, network, symbol)?;
+        let (market, variant) = network_market_for_stream(product, network, symbol).await?;
         let client = HyperliquidWsClient::subscribe(
             network,
             [serde_json::json!({

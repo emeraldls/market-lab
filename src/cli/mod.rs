@@ -31,6 +31,10 @@ pub enum Commands {
     Fills(AccountQueryArgs),
     Cancel(CancelOrderArgs),
     Close(ClosePositionArgs),
+    Outcome {
+        #[command(subcommand)]
+        command: OutcomeCommands,
+    },
     Daemon {
         #[command(subcommand)]
         command: DaemonCommands,
@@ -98,7 +102,12 @@ pub struct DaemonEventsArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct TradeArgs {
+    #[arg(default_value = "")]
     pub symbol: String,
+    /// Explicit HIP-4 outcome side, e.g. 1001:0. Outcome trades may instead
+    /// omit this flag and use the interactive market picker.
+    #[arg(long = "symbol", value_name = "SYMBOL", conflicts_with = "symbol")]
+    pub symbol_flag: Option<String>,
     #[arg(long)]
     pub config: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
@@ -138,8 +147,33 @@ pub struct TradeArgs {
 }
 
 impl TradeArgs {
+    pub fn requested_symbol(&self) -> &str {
+        self.symbol_flag.as_deref().unwrap_or(&self.symbol)
+    }
+
+    pub fn apply_symbol_flag(&mut self) {
+        if let Some(symbol) = self.symbol_flag.take() {
+            self.symbol = symbol;
+        }
+    }
+
     pub fn validate_shape(&self) -> Result<()> {
-        validate_execution_symbol(self.venue, &self.symbol)?;
+        if self.symbol_flag.is_some() && self.venue != ExecutionVenueArg::HyperliquidOutcomes {
+            bail!(
+                "--symbol is available only for hyperliquid-outcomes; other venues use the positional symbol"
+            );
+        }
+        let symbol = self.requested_symbol();
+        if symbol.trim().is_empty() {
+            if self.venue != ExecutionVenueArg::HyperliquidOutcomes {
+                bail!("a symbol is required for this execution venue");
+            }
+            if self.yes || !matches!(self.output, OutputFormat::Terminal) {
+                bail!("non-interactive outcome execution requires a symbol such as `1001:0`");
+            }
+        } else {
+            validate_execution_symbol(self.venue, symbol)?;
+        }
         if let Some(size) = self.size
             && (!size.is_finite() || size <= 0.0)
         {
@@ -309,6 +343,8 @@ pub enum ExecutionVenueArg {
     HyperliquidXyz,
     #[value(name = "hyperliquid")]
     HyperliquidSpot,
+    #[value(name = "hyperliquid-outcomes")]
+    HyperliquidOutcomes,
 }
 
 fn validate_execution_network(venue: ExecutionVenueArg, testnet: bool) -> Result<()> {
@@ -318,6 +354,7 @@ fn validate_execution_network(venue: ExecutionVenueArg, testnet: bool) -> Result
             ExecutionVenueArg::Hyperliquid
                 | ExecutionVenueArg::HyperliquidXyz
                 | ExecutionVenueArg::HyperliquidSpot
+                | ExecutionVenueArg::HyperliquidOutcomes
         )
     {
         bail!("--testnet is only valid with a Hyperliquid venue");
@@ -332,6 +369,7 @@ impl From<ExecutionVenueArg> for ExecutionVenue {
             ExecutionVenueArg::Hyperliquid => ExecutionVenue::Hyperliquid,
             ExecutionVenueArg::HyperliquidXyz => ExecutionVenue::HyperliquidXyz,
             ExecutionVenueArg::HyperliquidSpot => ExecutionVenue::HyperliquidSpot,
+            ExecutionVenueArg::HyperliquidOutcomes => ExecutionVenue::HyperliquidOutcomes,
         }
     }
 }
@@ -376,6 +414,12 @@ pub struct MarketsArgs {
     pub exchange: String,
     #[arg(long)]
     pub symbol: Option<String>,
+    /// Filter dynamic outcome markets by question, outcome, side, or id.
+    #[arg(long)]
+    pub search: Option<String>,
+    /// Fetch Hyperliquid testnet markets instead of the default mainnet.
+    #[arg(long, default_value_t = false)]
+    pub testnet: bool,
     /// Replace the installed snapshot with current provider markets.
     #[arg(long, default_value_t = false)]
     pub refresh: bool,
@@ -387,6 +431,91 @@ impl MarketsArgs {
     pub fn validate(&self) -> Result<()> {
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
+        }
+        if self.testnet && !self.exchange.eq_ignore_ascii_case("hyperliquid-outcomes") {
+            bail!("--testnet is currently supported by markets only for hyperliquid-outcomes");
+        }
+        if self
+            .search
+            .as_ref()
+            .is_some_and(|search| search.trim().is_empty())
+        {
+            bail!("--search cannot be empty");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum OutcomeCommands {
+    /// Convert quote collateral into equal shares of both outcome sides.
+    Split(OutcomeAmountArgs),
+    /// Convert equal shares of both outcome sides back into quote collateral.
+    Merge(OutcomeOptionalAmountArgs),
+    /// Merge complete question baskets back into quote collateral.
+    MergeQuestion(OutcomeQuestionArgs),
+    /// Convert one outcome's negative side into positive shares of the alternatives.
+    Negate(OutcomeNegateArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct OutcomeAmountArgs {
+    pub outcome: u32,
+    #[arg(long)]
+    pub amount: f64,
+    #[command(flatten)]
+    pub common: OutcomeActionCommonArgs,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct OutcomeOptionalAmountArgs {
+    pub outcome: u32,
+    /// Amount to merge. Omit to merge the maximum balanced amount.
+    #[arg(long)]
+    pub amount: Option<f64>,
+    #[command(flatten)]
+    pub common: OutcomeActionCommonArgs,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct OutcomeQuestionArgs {
+    pub question: u32,
+    /// Amount to merge. Omit to merge the maximum complete basket.
+    #[arg(long)]
+    pub amount: Option<f64>,
+    #[command(flatten)]
+    pub common: OutcomeActionCommonArgs,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct OutcomeNegateArgs {
+    pub question: u32,
+    pub outcome: u32,
+    #[arg(long)]
+    pub amount: f64,
+    #[command(flatten)]
+    pub common: OutcomeActionCommonArgs,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct OutcomeActionCommonArgs {
+    #[arg(long, default_value_t = false)]
+    pub testnet: bool,
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    #[arg(long, default_value_t = false)]
+    pub yes: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+impl OutcomeActionCommonArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.dry_run && self.yes {
+            bail!("--yes is not used with --dry-run");
+        }
+        if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
+            bail!("outcome actions support only --output terminal|json|jsonl");
         }
         Ok(())
     }
@@ -1875,8 +2004,11 @@ impl StrategyLogsArgs {
 
 impl RunTwapArgs {
     pub fn validate(&self) -> Result<()> {
-        if self.venue == ExecutionVenueArg::HyperliquidSpot {
-            bail!("TWAP does not support spot execution yet");
+        if matches!(
+            self.venue,
+            ExecutionVenueArg::HyperliquidSpot | ExecutionVenueArg::HyperliquidOutcomes
+        ) {
+            bail!("TWAP does not support spot or outcome-market execution");
         }
         validate_execution_symbol(self.venue, &self.symbol)?;
         if self
@@ -1967,6 +2099,9 @@ impl RunVwapArgs {
             ExecutionVenueArg::HyperliquidSpot => {
                 bail!("VWAP does not support spot execution yet")
             }
+            ExecutionVenueArg::HyperliquidOutcomes => {
+                bail!("VWAP does not support outcome-market execution")
+            }
         };
         crate::strategies::vwap::VolumeSourceSelector::parse(
             &self.volume_sources,
@@ -1980,8 +2115,11 @@ impl RunVwapArgs {
 
 impl RunOiwapArgs {
     pub fn validate(&self) -> Result<()> {
-        if self.venue == ExecutionVenueArg::HyperliquidSpot {
-            bail!("OIWAP does not support spot execution yet");
+        if matches!(
+            self.venue,
+            ExecutionVenueArg::HyperliquidSpot | ExecutionVenueArg::HyperliquidOutcomes
+        ) {
+            bail!("OIWAP does not support spot or outcome-market execution");
         }
         validate_execution_symbol(self.venue, &self.symbol)?;
         if self
@@ -2030,8 +2168,11 @@ impl RunOiwapArgs {
 
 impl RunMidPriceArgs {
     pub fn validate(&self) -> Result<()> {
-        if self.venue == ExecutionVenueArg::HyperliquidSpot {
-            bail!("market-making bots do not support spot execution yet");
+        if matches!(
+            self.venue,
+            ExecutionVenueArg::HyperliquidSpot | ExecutionVenueArg::HyperliquidOutcomes
+        ) {
+            bail!("market-making bots do not support spot or outcome-market execution");
         }
         validate_execution_symbol(self.venue, &self.symbol)?;
         if self
@@ -2102,8 +2243,11 @@ impl RunVolumeMidArgs {
 
 impl RunGridArgs {
     pub fn validate(&self) -> Result<()> {
-        if self.venue == ExecutionVenueArg::HyperliquidSpot {
-            bail!("grid does not support spot execution yet");
+        if matches!(
+            self.venue,
+            ExecutionVenueArg::HyperliquidSpot | ExecutionVenueArg::HyperliquidOutcomes
+        ) {
+            bail!("grid does not support spot or outcome-market execution");
         }
         validate_execution_symbol(self.venue, &self.symbol)?;
         if self
@@ -2223,11 +2367,15 @@ impl VampArgs {
 }
 
 fn validate_execution_symbol(venue: ExecutionVenueArg, symbol: &str) -> Result<()> {
+    if venue == ExecutionVenueArg::HyperliquidOutcomes {
+        return crate::providers::hyperliquid::outcomes::parse_symbol(symbol).map(|_| ());
+    }
     let market_type = match venue {
         ExecutionVenueArg::Bulk
         | ExecutionVenueArg::Hyperliquid
         | ExecutionVenueArg::HyperliquidXyz => crate::markets::MarketType::Futures,
         ExecutionVenueArg::HyperliquidSpot => crate::markets::MarketType::Spot,
+        ExecutionVenueArg::HyperliquidOutcomes => unreachable!("handled above"),
     };
     crate::markets::canonical_market_symbol(symbol, market_type).map(|_| ())
 }
@@ -2243,6 +2391,9 @@ fn validate_source_identity(
 }
 
 fn validate_exchange_symbol(exchange: &str, symbol: &str) -> Result<()> {
+    if exchange.eq_ignore_ascii_case("hyperliquid-outcomes") {
+        return crate::providers::hyperliquid::outcomes::parse_symbol(symbol).map(|_| ());
+    }
     let market_type = if crate::markets::is_futures_exchange(exchange)? {
         crate::markets::MarketType::Futures
     } else {
@@ -2270,6 +2421,7 @@ fn resolve_source_provider(
     if exchange.eq_ignore_ascii_case("hyperliquidf")
         || exchange.eq_ignore_ascii_case("hyperliquidf-xyz")
         || exchange.eq_ignore_ascii_case("hyperliquid")
+        || exchange.eq_ignore_ascii_case("hyperliquid-outcomes")
     {
         return Ok(CliProviderKind::Hyperliquid);
     }
@@ -2308,6 +2460,9 @@ fn resolve_system_provider(
             Ok(ProviderKind::Hyperliquid)
         }
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquid") => {
+            Ok(ProviderKind::Hyperliquid)
+        }
+        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquid-outcomes") => {
             Ok(ProviderKind::Hyperliquid)
         }
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("binance") => {
@@ -2698,6 +2853,142 @@ mod tests {
                 assert!(args.refresh);
             }
             _ => panic!("expected markets command"),
+        }
+    }
+
+    #[test]
+    fn parses_outcome_market_data_execution_and_user_actions() {
+        let source = Cli::try_parse_from([
+            "mlab",
+            "source",
+            "orderbook",
+            "--exchange",
+            "hyperliquid-outcomes",
+            "--symbol",
+            "1001:0",
+            "--depth",
+            "20",
+        ])
+        .expect("outcome source parses");
+        match source.command {
+            Commands::Source {
+                command: SourceCommands::Orderbook(args),
+            } => {
+                args.validate().expect("outcome source validates");
+                assert_eq!(
+                    args.provider_kind().expect("provider resolves"),
+                    CliProviderKind::Hyperliquid
+                );
+            }
+            _ => panic!("expected outcome orderbook source"),
+        }
+
+        let trade = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "buy",
+            "1001:1",
+            "--venue",
+            "hyperliquid-outcomes",
+            "--size",
+            "10",
+            "--dry-run",
+        ])
+        .expect("outcome trade parses");
+        match trade.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => {
+                args.validate_shape().expect("outcome trade validates");
+                assert_eq!(args.symbol, "1001:1");
+                assert_eq!(args.venue, ExecutionVenueArg::HyperliquidOutcomes);
+                assert!(args.leverage.is_none());
+            }
+            _ => panic!("expected outcome buy command"),
+        }
+
+        let flagged_trade = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "buy",
+            "--venue",
+            "hyperliquid-outcomes",
+            "--symbol",
+            "1001:0",
+            "--size",
+            "10",
+            "--dry-run",
+        ])
+        .expect("explicit outcome symbol flag parses");
+        match flagged_trade.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => {
+                args.validate_shape()
+                    .expect("outcome symbol flag validates");
+                assert_eq!(args.requested_symbol(), "1001:0");
+            }
+            _ => panic!("expected flagged outcome buy command"),
+        }
+
+        let split = Cli::try_parse_from([
+            "mlab",
+            "outcome",
+            "split",
+            "1001",
+            "--amount",
+            "10",
+            "--testnet",
+            "--dry-run",
+        ])
+        .expect("outcome split parses");
+        match split.command {
+            Commands::Outcome {
+                command: OutcomeCommands::Split(args),
+            } => {
+                assert_eq!(args.outcome, 1001);
+                assert_eq!(args.amount, 10.0);
+                assert!(args.common.testnet);
+            }
+            _ => panic!("expected outcome split command"),
+        }
+    }
+
+    #[test]
+    fn interactive_outcome_trade_may_omit_symbol_but_automation_may_not() {
+        let interactive = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "buy",
+            "--venue",
+            "hyperliquid-outcomes",
+            "--margin",
+            "100",
+        ])
+        .expect("interactive outcome trade parses");
+        match interactive.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => args.validate_shape().expect("interactive shape validates"),
+            _ => panic!("expected outcome buy command"),
+        }
+
+        let automated = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "buy",
+            "--venue",
+            "hyperliquid-outcomes",
+            "--margin",
+            "100",
+            "--yes",
+        ])
+        .expect("automated outcome trade parses");
+        match automated.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => assert!(args.validate_shape().is_err()),
+            _ => panic!("expected outcome buy command"),
         }
     }
 

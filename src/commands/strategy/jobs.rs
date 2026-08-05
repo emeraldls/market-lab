@@ -181,6 +181,7 @@ fn venue_name(venue: crate::domain::execution::ExecutionVenue) -> &'static str {
         crate::domain::execution::ExecutionVenue::Hyperliquid => "hyperliquidf",
         crate::domain::execution::ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
         crate::domain::execution::ExecutionVenue::HyperliquidSpot => "hyperliquid",
+        crate::domain::execution::ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
     }
 }
 

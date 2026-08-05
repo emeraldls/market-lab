@@ -3,6 +3,7 @@ pub mod exchange;
 pub mod execution;
 pub mod market_data;
 pub mod markets;
+pub mod outcomes;
 pub mod signing;
 pub mod ws;
 
@@ -12,6 +13,7 @@ pub const EXCHANGE: &str = "hyperliquidf";
 pub const XYZ_EXCHANGE: &str = "hyperliquidf-xyz";
 pub const XYZ_DEX: &str = "xyz";
 pub const SPOT_EXCHANGE: &str = "hyperliquid";
+pub const OUTCOMES_EXCHANGE: &str = "hyperliquid-outcomes";
 pub const MAINNET_HTTP_URL: &str = "https://api.hyperliquid.xyz";
 pub const MAINNET_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 pub const TESTNET_HTTP_URL: &str = "https://api.hyperliquid-testnet.xyz";
@@ -29,6 +31,7 @@ pub enum HyperliquidNetwork {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum HyperliquidProduct {
     Spot,
+    Outcome,
     Perpetual,
     XyzPerpetual,
 }
@@ -37,10 +40,11 @@ impl HyperliquidProduct {
     pub fn from_exchange(exchange: &str) -> anyhow::Result<Self> {
         match exchange.trim().to_ascii_lowercase().as_str() {
             SPOT_EXCHANGE => Ok(Self::Spot),
+            OUTCOMES_EXCHANGE => Ok(Self::Outcome),
             EXCHANGE => Ok(Self::Perpetual),
             XYZ_EXCHANGE => Ok(Self::XyzPerpetual),
             _ => anyhow::bail!(
-                "Hyperliquid exchange must be `hyperliquid` (spot), `hyperliquidf` (native perpetuals), or `hyperliquidf-xyz` (XYZ perpetuals)"
+                "Hyperliquid exchange must be `hyperliquid` (spot), `hyperliquid-outcomes` (HIP-4 outcomes), `hyperliquidf` (native perpetuals), or `hyperliquidf-xyz` (XYZ perpetuals)"
             ),
         }
     }
@@ -48,6 +52,7 @@ impl HyperliquidProduct {
     pub const fn exchange(self) -> &'static str {
         match self {
             Self::Spot => SPOT_EXCHANGE,
+            Self::Outcome => OUTCOMES_EXCHANGE,
             Self::Perpetual => EXCHANGE,
             Self::XyzPerpetual => XYZ_EXCHANGE,
         }
@@ -56,7 +61,7 @@ impl HyperliquidProduct {
     pub const fn dex(self) -> Option<&'static str> {
         match self {
             Self::XyzPerpetual => Some(XYZ_DEX),
-            Self::Spot | Self::Perpetual => None,
+            Self::Spot | Self::Outcome | Self::Perpetual => None,
         }
     }
 
@@ -66,7 +71,7 @@ impl HyperliquidProduct {
 
     pub const fn max_price_decimals(self) -> u8 {
         match self {
-            Self::Spot => 8,
+            Self::Spot | Self::Outcome => 8,
             Self::Perpetual | Self::XyzPerpetual => 6,
         }
     }

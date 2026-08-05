@@ -2,9 +2,14 @@ use anyhow::Result;
 
 use crate::cli::{CliDataProvider, MarketsArgs};
 use crate::markets::{ExchangeMarkets, Market, MarketSnapshot};
+use crate::providers::hyperliquid::outcomes::{OutcomeInstrument, clean_terminal_text};
+use crate::providers::hyperliquid::{HyperliquidNetwork, OUTCOMES_EXCHANGE};
 
 pub async fn handle(args: MarketsArgs) -> Result<()> {
     args.validate()?;
+    if args.provider.is_none() && args.exchange.eq_ignore_ascii_case(OUTCOMES_EXCHANGE) {
+        return handle_outcomes(args).await;
+    }
     if args.refresh {
         let provider = args.provider.map(|provider| match provider {
             CliDataProvider::Mmt => "mmt",
@@ -29,6 +34,127 @@ pub async fn handle(args: MarketsArgs) -> Result<()> {
     }
 
     print_exchange(&snapshot, &exchange, args.json)
+}
+
+async fn handle_outcomes(args: MarketsArgs) -> Result<()> {
+    if args.refresh {
+        anyhow::bail!(
+            "hyperliquid-outcomes is discovered live; --refresh is unnecessary and no static snapshot is written"
+        );
+    }
+    let network = HyperliquidNetwork::from_testnet(args.testnet);
+    let mut instruments = crate::providers::hyperliquid::outcomes::instruments(network).await?;
+    if let Some(symbol) = args.symbol.as_deref() {
+        let selected = crate::providers::hyperliquid::outcomes::resolve(network, symbol).await?;
+        return print_outcome_instrument(&selected, args.json);
+    }
+    if let Some(search) = args.search.as_deref() {
+        let needle = search.trim().to_ascii_lowercase();
+        instruments.retain(|instrument| outcome_search_text(instrument).contains(&needle));
+    }
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&instruments)?);
+        return Ok(());
+    }
+
+    println!(
+        "{} instruments (Hyperliquid {} live outcomeMeta)",
+        instruments.len(),
+        network.label()
+    );
+    println!();
+    println!(
+        "{:<12} {:<10} {:<46} {:<22} {:<16} {:<8}",
+        "SYMBOL", "QUESTION", "QUESTION NAME", "OUTCOME", "SIDE", "QUOTE"
+    );
+    for instrument in &instruments {
+        println!(
+            "{:<12} {:<10} {:<46} {:<22} {:<16} {:<8}",
+            instrument.symbol,
+            instrument
+                .question_id
+                .map_or_else(|| "-".to_string(), |id| id.to_string()),
+            truncate(
+                &clean_terminal_text(instrument.question_name.as_deref().unwrap_or("Standalone")),
+                46
+            ),
+            truncate(&clean_terminal_text(&instrument.outcome_name), 22),
+            truncate(&clean_terminal_text(&instrument.side_name), 16),
+            instrument.quote_token,
+        );
+    }
+    Ok(())
+}
+
+fn print_outcome_instrument(instrument: &OutcomeInstrument, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(instrument)?);
+        return Ok(());
+    }
+    println!("Hyperliquid outcome instrument");
+    println!("  network:       {}", instrument.network);
+    println!("  symbol:        {}", instrument.symbol);
+    println!(
+        "  question:      {}",
+        instrument
+            .question_id
+            .map_or_else(|| "standalone".to_string(), |id| id.to_string())
+    );
+    if let Some(name) = &instrument.question_name {
+        println!("  question name: {}", clean_terminal_text(name));
+    }
+    println!(
+        "  outcome:       {} ({})",
+        instrument.outcome_id,
+        clean_terminal_text(&instrument.outcome_name)
+    );
+    println!(
+        "  side:          {} ({})",
+        instrument.side,
+        clean_terminal_text(&instrument.side_name)
+    );
+    println!("  quote:         {}", instrument.quote_token);
+    println!("  market coin:   {}", instrument.coin);
+    println!("  action asset:  {}", instrument.asset_id);
+    println!(
+        "  status:        {}",
+        if instrument.settled {
+            "settled"
+        } else {
+            "available"
+        }
+    );
+    Ok(())
+}
+
+fn outcome_search_text(instrument: &OutcomeInstrument) -> String {
+    format!(
+        "{} {} {} {} {} {} {}",
+        instrument.symbol,
+        instrument
+            .question_id
+            .map_or_else(String::new, |id| id.to_string()),
+        instrument.question_name.as_deref().unwrap_or_default(),
+        instrument
+            .question_description
+            .as_deref()
+            .unwrap_or_default(),
+        instrument.outcome_name,
+        instrument.outcome_description,
+        instrument.side_name,
+    )
+    .to_ascii_lowercase()
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+    value
+        .chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>()
+        + "…"
 }
 
 fn print_market(

@@ -412,7 +412,8 @@ async fn fetch_directional_price_window(
         ExecutionVenue::Bulk => BulkProvider::candles(symbol, "1m", from_ms, to_ms).await?,
         ExecutionVenue::Hyperliquid
         | ExecutionVenue::HyperliquidXyz
-        | ExecutionVenue::HyperliquidSpot => {
+        | ExecutionVenue::HyperliquidSpot
+        | ExecutionVenue::HyperliquidOutcomes => {
             let product = match venue {
                 ExecutionVenue::Hyperliquid => {
                     crate::providers::hyperliquid::HyperliquidProduct::Perpetual
@@ -422,6 +423,9 @@ async fn fetch_directional_price_window(
                 }
                 ExecutionVenue::HyperliquidSpot => {
                     crate::providers::hyperliquid::HyperliquidProduct::Spot
+                }
+                ExecutionVenue::HyperliquidOutcomes => {
+                    crate::providers::hyperliquid::HyperliquidProduct::Outcome
                 }
                 ExecutionVenue::Bulk => unreachable!(),
             };
@@ -645,6 +649,7 @@ fn render_plan(plan: &OiwapPlanView<'_>, output: OutputFormat) -> Result<()> {
 fn trade_args(args: &RunOiwapArgs, size: Option<f64>, margin: Option<f64>) -> TradeArgs {
     TradeArgs {
         symbol: args.symbol.clone(),
+        symbol_flag: None,
         config: None,
         venue: args.venue,
         testnet: args.testnet,

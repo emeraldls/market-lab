@@ -327,7 +327,15 @@ async fn stream_hyperliquid_candles(
     args: SourceCandlesArgs,
     product: HyperliquidProduct,
 ) -> Result<()> {
-    let market = crate::providers::hyperliquid::markets::market_for(product, &args.symbol)?;
+    let internal_symbol = if product == HyperliquidProduct::Outcome {
+        crate::providers::hyperliquid::outcomes::resolve(HyperliquidNetwork::Mainnet, &args.symbol)
+            .await?
+            .symbol
+    } else {
+        crate::providers::hyperliquid::markets::market_for(product, &args.symbol)?
+            .symbol
+            .clone()
+    };
     let mut stream = HyperliquidCandleStream::connect_for(
         product,
         &args.symbol,
@@ -352,7 +360,7 @@ async fn stream_hyperliquid_candles(
                     version: "1",
                     provider: product.exchange(),
                     exchange: product.exchange().to_string(),
-                    symbol: market.symbol.clone(),
+                    symbol: internal_symbol.clone(),
                     ts_ms: candle.t,
                     stream: true,
                     data: candle.clone(),

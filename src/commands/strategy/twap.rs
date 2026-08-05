@@ -332,6 +332,7 @@ fn append_summary(
 fn trade_args(args: &RunTwapArgs, size: Option<f64>, margin: Option<f64>) -> TradeArgs {
     TradeArgs {
         symbol: args.symbol.clone(),
+        symbol_flag: None,
         config: None,
         venue: args.venue,
         testnet: args.testnet,
@@ -353,12 +354,14 @@ fn trade_args(args: &RunTwapArgs, size: Option<f64>, margin: Option<f64>) -> Tra
 fn worker_trade_args(definition: &TwapJobDefinition, size: f64) -> TradeArgs {
     TradeArgs {
         symbol: definition.symbol.clone(),
+        symbol_flag: None,
         config: None,
         venue: match definition.venue {
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
             ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
             ExecutionVenue::HyperliquidXyz => ExecutionVenueArg::HyperliquidXyz,
             ExecutionVenue::HyperliquidSpot => ExecutionVenueArg::HyperliquidSpot,
+            ExecutionVenue::HyperliquidOutcomes => ExecutionVenueArg::HyperliquidOutcomes,
         },
         testnet: definition.testnet,
         size: Some(size),
@@ -504,6 +507,7 @@ fn venue_name(venue: ExecutionVenue) -> &'static str {
         ExecutionVenue::Hyperliquid => "hyperliquidf",
         ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
         ExecutionVenue::HyperliquidSpot => "hyperliquid",
+        ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
     }
 }
 
@@ -516,6 +520,8 @@ fn execution_venue_name(venue: ExecutionVenue, testnet: bool) -> &'static str {
         (ExecutionVenue::HyperliquidXyz, false) => "Hyperliquid XYZ mainnet",
         (ExecutionVenue::HyperliquidSpot, true) => "Hyperliquid Spot testnet",
         (ExecutionVenue::HyperliquidSpot, false) => "Hyperliquid Spot mainnet",
+        (ExecutionVenue::HyperliquidOutcomes, true) => "Hyperliquid Outcomes testnet",
+        (ExecutionVenue::HyperliquidOutcomes, false) => "Hyperliquid Outcomes mainnet",
     }
 }
 

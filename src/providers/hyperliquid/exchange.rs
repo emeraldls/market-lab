@@ -52,6 +52,10 @@ impl HyperliquidExchangeClient {
         self.post_l1(Action::Order { orders, grouping }).await
     }
 
+    pub async fn user_outcome(&self, action: UserOutcomeAction) -> Result<ExchangeResponseStatus> {
+        self.post_l1(user_outcome_request(action)).await
+    }
+
     pub async fn cancel(&self, asset: u32, oid: u64) -> Result<ExchangeResponseStatus> {
         self.cancel_many(vec![CancelRequest { asset, oid }]).await
     }
@@ -84,7 +88,7 @@ impl HyperliquidExchangeClient {
         .await
     }
 
-    async fn post_l1(&self, action: Action) -> Result<ExchangeResponseStatus> {
+    async fn post_l1(&self, action: impl Serialize) -> Result<ExchangeResponseStatus> {
         let nonce = next_nonce()?;
         let signature = self.wallet.sign_l1_action(&action, nonce, self.network)?;
         let response = self
@@ -98,6 +102,108 @@ impl HyperliquidExchangeClient {
             .await?;
         serde_json::from_value(response).context("invalid Hyperliquid WebSocket exchange response")
     }
+}
+
+fn user_outcome_request(action: UserOutcomeAction) -> UserOutcomeRequest {
+    match action {
+        UserOutcomeAction::Split { outcome, amount } => UserOutcomeRequest {
+            action_type: "userOutcome",
+            split_outcome: Some(OutcomeAmountRequest { outcome, amount }),
+            merge_outcome: None,
+            merge_question: None,
+            negate_outcome: None,
+        },
+        UserOutcomeAction::Merge { outcome, amount } => UserOutcomeRequest {
+            action_type: "userOutcome",
+            split_outcome: None,
+            merge_outcome: Some(OutcomeOptionalAmountRequest { outcome, amount }),
+            merge_question: None,
+            negate_outcome: None,
+        },
+        UserOutcomeAction::MergeQuestion { question, amount } => UserOutcomeRequest {
+            action_type: "userOutcome",
+            split_outcome: None,
+            merge_outcome: None,
+            merge_question: Some(QuestionAmountRequest { question, amount }),
+            negate_outcome: None,
+        },
+        UserOutcomeAction::Negate {
+            question,
+            outcome,
+            amount,
+        } => UserOutcomeRequest {
+            action_type: "userOutcome",
+            split_outcome: None,
+            merge_outcome: None,
+            merge_question: None,
+            negate_outcome: Some(NegateOutcomeRequest {
+                question,
+                outcome,
+                amount,
+            }),
+        },
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum UserOutcomeAction {
+    Split {
+        outcome: u32,
+        amount: String,
+    },
+    Merge {
+        outcome: u32,
+        amount: Option<String>,
+    },
+    MergeQuestion {
+        question: u32,
+        amount: Option<String>,
+    },
+    Negate {
+        question: u32,
+        outcome: u32,
+        amount: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserOutcomeRequest {
+    #[serde(rename = "type")]
+    action_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    split_outcome: Option<OutcomeAmountRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge_outcome: Option<OutcomeOptionalAmountRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge_question: Option<QuestionAmountRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    negate_outcome: Option<NegateOutcomeRequest>,
+}
+
+#[derive(Debug, Serialize)]
+struct OutcomeAmountRequest {
+    outcome: u32,
+    amount: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OutcomeOptionalAmountRequest {
+    outcome: u32,
+    amount: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct QuestionAmountRequest {
+    question: u32,
+    amount: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NegateOutcomeRequest {
+    question: u32,
+    outcome: u32,
+    amount: String,
 }
 
 pub async fn approve_agent(
@@ -163,8 +269,8 @@ async fn post_exchange_http(
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ExchangePayload {
-    action: Action,
+struct ExchangePayload<T> {
+    action: T,
     signature: WireSignature,
     nonce: u64,
     vault_address: Option<String>,
@@ -411,6 +517,63 @@ mod tests {
         })
         .expect("normal cancel serializes");
         assert!(normal.get("f").is_none());
+    }
+
+    #[test]
+    fn outcome_actions_match_the_hip4_wire_shapes() {
+        let split = serde_json::to_value(user_outcome_request(UserOutcomeAction::Split {
+            outcome: 1001,
+            amount: "10".to_string(),
+        }))
+        .expect("split serializes");
+        assert_eq!(
+            split,
+            serde_json::json!({
+                "type": "userOutcome",
+                "splitOutcome": { "outcome": 1001, "amount": "10" }
+            })
+        );
+
+        let merge = serde_json::to_value(user_outcome_request(UserOutcomeAction::Merge {
+            outcome: 1001,
+            amount: None,
+        }))
+        .expect("merge serializes");
+        assert_eq!(
+            merge,
+            serde_json::json!({
+                "type": "userOutcome",
+                "mergeOutcome": { "outcome": 1001, "amount": null }
+            })
+        );
+
+        let merge_question =
+            serde_json::to_value(user_outcome_request(UserOutcomeAction::MergeQuestion {
+                question: 165,
+                amount: Some("3".to_string()),
+            }))
+            .expect("question merge serializes");
+        assert_eq!(
+            merge_question,
+            serde_json::json!({
+                "type": "userOutcome",
+                "mergeQuestion": { "question": 165, "amount": "3" }
+            })
+        );
+
+        let negate = serde_json::to_value(user_outcome_request(UserOutcomeAction::Negate {
+            question: 165,
+            outcome: 1001,
+            amount: "2.5".to_string(),
+        }))
+        .expect("negate serializes");
+        assert_eq!(
+            negate,
+            serde_json::json!({
+                "type": "userOutcome",
+                "negateOutcome": { "question": 165, "outcome": 1001, "amount": "2.5" }
+            })
+        );
     }
 
     #[test]

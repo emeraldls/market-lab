@@ -264,6 +264,7 @@ pub async fn handle_worker_job(job_id: &str, job: BotJob) -> Result<()> {
 fn trade_args(args: &RunMidPriceArgs, size: Option<f64>, margin: Option<f64>) -> TradeArgs {
     TradeArgs {
         symbol: args.symbol.clone(),
+        symbol_flag: None,
         config: None,
         venue: args.venue,
         testnet: args.testnet,
@@ -285,12 +286,14 @@ fn trade_args(args: &RunMidPriceArgs, size: Option<f64>, margin: Option<f64>) ->
 fn worker_trade_args(definition: &MidPriceJobDefinition) -> TradeArgs {
     TradeArgs {
         symbol: definition.symbol.clone(),
+        symbol_flag: None,
         config: None,
         venue: match definition.venue {
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
             ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
             ExecutionVenue::HyperliquidXyz => ExecutionVenueArg::HyperliquidXyz,
             ExecutionVenue::HyperliquidSpot => ExecutionVenueArg::HyperliquidSpot,
+            ExecutionVenue::HyperliquidOutcomes => ExecutionVenueArg::HyperliquidOutcomes,
         },
         testnet: definition.testnet,
         size: Some(definition.max_inventory_size),
@@ -459,6 +462,8 @@ fn execution_venue_label(venue: ExecutionVenue, testnet: bool) -> &'static str {
         (ExecutionVenue::HyperliquidXyz, false) => "Hyperliquid XYZ mainnet",
         (ExecutionVenue::HyperliquidSpot, true) => "Hyperliquid Spot testnet",
         (ExecutionVenue::HyperliquidSpot, false) => "Hyperliquid Spot mainnet",
+        (ExecutionVenue::HyperliquidOutcomes, true) => "Hyperliquid Outcomes testnet",
+        (ExecutionVenue::HyperliquidOutcomes, false) => "Hyperliquid Outcomes mainnet",
     }
 }
 
@@ -468,6 +473,7 @@ pub(super) fn venue_key(venue: ExecutionVenue) -> &'static str {
         ExecutionVenue::Hyperliquid => "hyperliquidf",
         ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
         ExecutionVenue::HyperliquidSpot => "hyperliquid",
+        ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
     }
 }
 
@@ -477,6 +483,7 @@ pub(super) fn venue_label(venue: ExecutionVenue) -> &'static str {
         ExecutionVenue::Hyperliquid => "Hyperliquid",
         ExecutionVenue::HyperliquidXyz => "Hyperliquid XYZ",
         ExecutionVenue::HyperliquidSpot => "Hyperliquid Spot",
+        ExecutionVenue::HyperliquidOutcomes => "Hyperliquid Outcomes",
     }
 }
 
@@ -522,6 +529,9 @@ pub(super) async fn live_orderbook(
                 HyperliquidNetwork::from_testnet(testnet),
             )
             .await
+        }
+        ExecutionVenue::HyperliquidOutcomes => {
+            bail!("mid-price market making does not support outcome markets")
         }
     }
 }
@@ -868,6 +878,9 @@ impl BotOrderBookStream {
                 )
                 .await?,
             )),
+            ExecutionVenue::HyperliquidOutcomes => {
+                bail!("mid-price market making does not support outcome markets")
+            }
         }
     }
 
@@ -973,6 +986,9 @@ impl BotAccountStream {
                 )
                 .await?,
             )),
+            ExecutionVenue::HyperliquidOutcomes => {
+                bail!("mid-price market making does not support outcome markets")
+            }
         }
     }
 
@@ -1888,6 +1904,7 @@ pub(super) fn quote_plan(
         reduce_only: false,
         stop_loss_price: None,
         take_profit_price: None,
+        market_fingerprint: parent.market_fingerprint.clone(),
     })
 }
 
@@ -1926,6 +1943,7 @@ pub(super) fn inventory_unwind_plan(
         reduce_only: false,
         stop_loss_price: None,
         take_profit_price: None,
+        market_fingerprint: parent.market_fingerprint.clone(),
     })
 }
 
@@ -2851,6 +2869,7 @@ mod tests {
             reduce_only: false,
             stop_loss_price: None,
             take_profit_price: None,
+            market_fingerprint: None,
         };
 
         let plan = inventory_unwind_plan(&parent, PositionDirection::Short, 0.25, 100.0)

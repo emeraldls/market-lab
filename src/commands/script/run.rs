@@ -229,6 +229,9 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
         crate::domain::execution::ExecutionVenue::HyperliquidSpot => {
             ExecutionVenueArg::HyperliquidSpot
         }
+        crate::domain::execution::ExecutionVenue::HyperliquidOutcomes => {
+            ExecutionVenueArg::HyperliquidOutcomes
+        }
     });
     let args = ScriptRunArgs {
         script: job.definition.snapshot_path.display().to_string(),
@@ -601,12 +604,21 @@ impl ScriptLiveStreams {
                 let requested = config.market_symbol();
                 let venue_symbol = match provider {
                     ProviderKind::Bulk => bulk_markets::market(&requested)?.symbol.clone(),
-                    ProviderKind::Hyperliquid => hyperliquid_markets::market_for(
-                        HyperliquidProduct::from_exchange(&config.exchange)?,
-                        &requested,
-                    )?
-                    .symbol
-                    .clone(),
+                    ProviderKind::Hyperliquid => {
+                        let product = HyperliquidProduct::from_exchange(&config.exchange)?;
+                        if product == HyperliquidProduct::Outcome {
+                            crate::providers::hyperliquid::outcomes::resolve(
+                                HyperliquidNetwork::from_testnet(testnet),
+                                &requested,
+                            )
+                            .await?
+                            .symbol
+                        } else {
+                            hyperliquid_markets::market_for(product, &requested)?
+                                .symbol
+                                .clone()
+                        }
+                    }
                     _ => unreachable!(),
                 };
                 direct.push(Box::new(

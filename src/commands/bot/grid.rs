@@ -177,6 +177,7 @@ pub async fn handle_worker_job(job_id: &str, job: BotJob) -> Result<()> {
 fn trade_args(args: &RunGridArgs, size: Option<f64>, margin: Option<f64>) -> TradeArgs {
     TradeArgs {
         symbol: args.symbol.clone(),
+        symbol_flag: None,
         config: None,
         venue: args.venue,
         testnet: args.testnet,
@@ -198,12 +199,14 @@ fn trade_args(args: &RunGridArgs, size: Option<f64>, margin: Option<f64>) -> Tra
 fn worker_trade_args(definition: &GridJobDefinition) -> TradeArgs {
     TradeArgs {
         symbol: definition.symbol.clone(),
+        symbol_flag: None,
         config: None,
         venue: match definition.venue {
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
             ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
             ExecutionVenue::HyperliquidXyz => ExecutionVenueArg::HyperliquidXyz,
             ExecutionVenue::HyperliquidSpot => ExecutionVenueArg::HyperliquidSpot,
+            ExecutionVenue::HyperliquidOutcomes => ExecutionVenueArg::HyperliquidOutcomes,
         },
         testnet: definition.testnet,
         size: Some(definition.max_inventory_size),

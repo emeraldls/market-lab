@@ -261,8 +261,15 @@ async fn stream_bulk_vd(args: SourceVdArgs) -> Result<()> {
 async fn stream_hyperliquid_vd(args: SourceVdArgs) -> Result<()> {
     ensure_stream_output(args.output)?;
     let product = HyperliquidProduct::from_exchange(args.exchange_name()?)?;
-    let market = crate::providers::hyperliquid::markets::market_for(product, &args.symbol)?;
-    let internal_symbol = market.symbol.clone();
+    let internal_symbol = if product == HyperliquidProduct::Outcome {
+        crate::providers::hyperliquid::outcomes::resolve(HyperliquidNetwork::Mainnet, &args.symbol)
+            .await?
+            .symbol
+    } else {
+        crate::providers::hyperliquid::markets::market_for(product, &args.symbol)?
+            .symbol
+            .clone()
+    };
     let mut stream =
         HyperliquidTradesStream::connect_for(product, &args.symbol, HyperliquidNetwork::Mainnet)
             .await?;

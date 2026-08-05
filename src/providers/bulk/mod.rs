@@ -187,10 +187,10 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn production_bulk_signer_uses_mainnet_domain() {
+    fn configured_bulk_signer_uses_devnet_domain() {
         let signer = signer(Keypair::generate());
 
-        assert_eq!(signer.signature_domain(), SignatureDomain::Mainnet);
+        assert_eq!(signer.signature_domain(), SignatureDomain::Devnet);
     }
 
     #[test]

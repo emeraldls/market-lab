@@ -89,6 +89,7 @@ impl BulkExecutionAdapter {
                 .map(Position::try_from)
                 .collect::<Result<Vec<_>>>()?,
             spot_balances: Vec::new(),
+            outcome_holdings: Vec::new(),
             open_orders: full
                 .open_orders
                 .into_iter()
@@ -1641,6 +1642,7 @@ mod tests {
             reduce_only: false,
             stop_loss_price: None,
             take_profit_price: None,
+            market_fingerprint: None,
         };
 
         let signed = sign_trade_order(&mut signer, &account, &plan, 1_784_158_000_000_000_000)

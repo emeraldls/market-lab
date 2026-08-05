@@ -115,7 +115,7 @@ pub fn expand_args(args: impl IntoIterator<Item = OsString>) -> Result<Vec<OsStr
             direction_idx,
         } => {
             let mut expanded = args[..=direction_idx].to_vec();
-            if !has_trade_positional(&args, direction_idx + 1) {
+            if !has_trade_symbol(&args, direction_idx + 1) {
                 let symbol = config
                     .market
                     .as_ref()
@@ -322,7 +322,7 @@ fn has_script_positional(args: &[OsString], start: usize) -> bool {
     false
 }
 
-fn has_trade_positional(args: &[OsString], start: usize) -> bool {
+fn has_trade_symbol(args: &[OsString], start: usize) -> bool {
     let value_flags = [
         "--config",
         "--venue",
@@ -342,6 +342,9 @@ fn has_trade_positional(args: &[OsString], start: usize) -> bool {
         if skip_value {
             skip_value = false;
             continue;
+        }
+        if arg == "--symbol" || arg.starts_with("--symbol=") {
+            return true;
         }
         if arg.starts_with("--") {
             if !arg.contains('=') && value_flags.contains(&arg.as_ref()) {

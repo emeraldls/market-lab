@@ -39,6 +39,13 @@ impl ExecutionAdapter {
                 )
                 .await?,
             )),
+            ExecutionVenue::HyperliquidOutcomes => Ok(Self::Hyperliquid(
+                HyperliquidExecutionAdapter::new_for(
+                    HyperliquidProduct::Outcome,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
+            )),
         }
     }
 
@@ -52,6 +59,9 @@ impl ExecutionAdapter {
             ExecutionVenue::HyperliquidSpot => {
                 HyperliquidExecutionAdapter::capabilities_for(HyperliquidProduct::Spot)
             }
+            ExecutionVenue::HyperliquidOutcomes => {
+                HyperliquidExecutionAdapter::capabilities_for(HyperliquidProduct::Outcome)
+            }
         }
     }
 
@@ -61,6 +71,7 @@ impl ExecutionAdapter {
             ExecutionVenue::Hyperliquid => credentials::hyperliquid_account(),
             ExecutionVenue::HyperliquidXyz => credentials::hyperliquid_account(),
             ExecutionVenue::HyperliquidSpot => credentials::hyperliquid_account(),
+            ExecutionVenue::HyperliquidOutcomes => credentials::hyperliquid_account(),
         }
     }
 
