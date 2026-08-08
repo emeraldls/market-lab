@@ -444,8 +444,8 @@ pub(super) async fn handle_mid(
 ) -> Result<()> {
     args.validate()?;
     let network = HyperliquidNetwork::from_testnet(args.testnet);
-    let selected = crate::providers::hyperliquid::outcomes::resolve(network, &args.symbol).await?;
-    let pair = resolve_pair(network, selected.outcome_id, selected.side).await?;
+    let outcome_id = crate::providers::hyperliquid::outcomes::parse_market_id(&args.symbol)?;
+    let pair = resolve_pair(network, outcome_id, 0).await?;
     let rules = outcome_execution_rules();
     let pair_size = args
         .size
@@ -474,7 +474,7 @@ pub(super) async fn handle_mid(
     )?;
     validate_quote_notional(pair_size, quotes)?;
     let outcome = OutcomeExecutionDefinition {
-        outcome_id: selected.outcome_id,
+        outcome_id,
         primary_symbol: pair.primary.symbol.clone(),
         complement_symbol: pair.complement.symbol.clone(),
         primary_name: pair.primary.side_name.clone(),
@@ -534,8 +534,8 @@ pub(super) async fn handle_mid(
 pub(super) async fn handle_grid(args: RunGridArgs) -> Result<()> {
     args.validate()?;
     let network = HyperliquidNetwork::from_testnet(args.testnet);
-    let selected = crate::providers::hyperliquid::outcomes::resolve(network, &args.symbol).await?;
-    let pair = resolve_pair(network, selected.outcome_id, selected.side).await?;
+    let outcome_id = crate::providers::hyperliquid::outcomes::parse_market_id(&args.symbol)?;
+    let pair = resolve_pair(network, outcome_id, 0).await?;
     let rules = outcome_execution_rules();
     let requested = args
         .size
@@ -562,7 +562,7 @@ pub(super) async fn handle_grid(args: RunGridArgs) -> Result<()> {
     validate_grid_quotes(&quotes, &pair)?;
 
     let outcome = OutcomeExecutionDefinition {
-        outcome_id: selected.outcome_id,
+        outcome_id,
         primary_symbol: pair.primary.symbol.clone(),
         complement_symbol: pair.complement.symbol.clone(),
         primary_name: pair.primary.side_name.clone(),
@@ -2580,6 +2580,15 @@ mod tests {
         let side_one = pair_from_candidates(&candidates, 10225, 1).expect("side 1 pair");
         assert_eq!(side_one.primary.side_name, "No Change");
         assert_eq!(side_one.complement.side_name, "Change");
+    }
+
+    #[test]
+    fn outcome_bots_accept_only_a_bare_market_id() {
+        let parse = crate::providers::hyperliquid::outcomes::parse_market_id;
+        assert_eq!(parse("10225").expect("market ID"), 10225);
+        assert!(parse("10225:0").is_err());
+        assert!(parse("10225:1").is_err());
+        assert!(parse("+102250").is_err());
     }
 
     #[test]

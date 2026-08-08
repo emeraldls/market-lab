@@ -2173,7 +2173,7 @@ impl RunMidPriceArgs {
         if self.venue == ExecutionVenueArg::HyperliquidSpot {
             bail!("market-making bots do not support spot execution");
         }
-        validate_execution_symbol(self.venue, &self.symbol)?;
+        validate_bot_execution_symbol(self.venue, &self.symbol)?;
         if self
             .size
             .is_some_and(|size| !size.is_finite() || size <= 0.0)
@@ -2255,7 +2255,7 @@ impl RunGridArgs {
         if self.venue == ExecutionVenueArg::HyperliquidSpot {
             bail!("grid does not support spot execution");
         }
-        validate_execution_symbol(self.venue, &self.symbol)?;
+        validate_bot_execution_symbol(self.venue, &self.symbol)?;
         if self
             .size
             .is_some_and(|size| !size.is_finite() || size <= 0.0)
@@ -2391,6 +2391,13 @@ fn validate_execution_symbol(venue: ExecutionVenueArg, symbol: &str) -> Result<(
         ExecutionVenueArg::HyperliquidOutcomes => unreachable!("handled above"),
     };
     crate::markets::canonical_market_symbol(symbol, market_type).map(|_| ())
+}
+
+fn validate_bot_execution_symbol(venue: ExecutionVenueArg, symbol: &str) -> Result<()> {
+    if venue == ExecutionVenueArg::HyperliquidOutcomes {
+        return crate::providers::hyperliquid::outcomes::parse_market_id(symbol).map(|_| ());
+    }
+    validate_execution_symbol(venue, symbol)
 }
 
 fn validate_source_identity(
@@ -4062,7 +4069,7 @@ mod tests {
             "bot",
             "run",
             "mid-price",
-            "1009:0",
+            "1009",
             "--venue",
             "hyperliquid-outcomes",
             "--margin",
@@ -4093,7 +4100,7 @@ mod tests {
             "bot",
             "run",
             "volume-mid",
-            "1009:0",
+            "1009",
             "--venue",
             "hyperliquid-outcomes",
             "--margin",
@@ -4129,7 +4136,7 @@ mod tests {
             "bot",
             "run",
             "grid",
-            "1009:0",
+            "1009",
             "--venue",
             "hyperliquid-outcomes",
             "--margin",
@@ -4165,7 +4172,7 @@ mod tests {
             "bot",
             "run",
             "mid-price",
-            "1009:0",
+            "1009",
             "--venue",
             "hyperliquid-outcomes",
             "--margin",

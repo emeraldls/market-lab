@@ -416,6 +416,21 @@ fn numeric_prefix(value: &str) -> Option<&str> {
     number.parse::<f64>().is_ok().then_some(number)
 }
 
+pub fn parse_market_id(symbol: &str) -> Result<u32> {
+    let value = symbol.trim();
+    if value.is_empty() {
+        bail!("outcome market ID cannot be empty");
+    }
+    if value.contains(':') || value.starts_with(['#', '+']) {
+        bail!(
+            "outcome bots accept the market ID without a side, e.g. 10225; side-qualified symbols are reserved for direct trading and market data"
+        );
+    }
+    value
+        .parse::<u32>()
+        .context("outcome market ID must be numeric, e.g. 10225")
+}
+
 pub fn parse_symbol(symbol: &str) -> Result<(u32, u8)> {
     let value = symbol.trim();
     if value.starts_with('#') || value.starts_with('+') {
