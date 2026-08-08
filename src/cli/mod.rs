@@ -1833,8 +1833,9 @@ pub struct RunMidPriceArgs {
     /// Percentage size bias: -100 favors asks, +100 favors bids, 0 is neutral.
     #[arg(long = "directional-bias", alias = "bias", default_value_t = 0.0)]
     pub directional_bias: f64,
-    #[arg(long, default_value_t = 1.0)]
-    pub leverage: f64,
+    /// Exposure multiplier for perpetual markets. Not applicable to outcome markets.
+    #[arg(long)]
+    pub leverage: Option<f64>,
     /// Stop after net bot PnL loses this percentage of allocated margin. Zero disables it.
     #[arg(long)]
     pub stop_loss_pct: Option<f64>,
@@ -1869,7 +1870,7 @@ pub struct RunGridArgs {
     /// Hard one-sided inventory limit in base-asset units.
     #[arg(long, conflicts_with = "margin", required_unless_present = "margin")]
     pub size: Option<f64>,
-    /// Collateral allocated to the bot. Margin multiplied by leverage is the total working exposure.
+    /// Collateral allocated to the bot. On perpetuals, leverage multiplies this exposure.
     #[arg(long, conflicts_with = "size", required_unless_present = "size")]
     pub margin: Option<f64>,
     /// Maximum bot runtime in seconds.
@@ -1881,8 +1882,9 @@ pub struct RunGridArgs {
     /// Distance in basis points between adjacent fixed grid prices.
     #[arg(long, default_value_t = 2.0)]
     pub step_bps: f64,
-    #[arg(long, default_value_t = 1.0)]
-    pub leverage: f64,
+    /// Exposure multiplier for perpetual markets. Not applicable to outcome markets.
+    #[arg(long)]
+    pub leverage: Option<f64>,
     /// Stop after net bot PnL loses this percentage of allocated margin. Zero disables it.
     #[arg(long)]
     pub stop_loss_pct: Option<f64>,
@@ -2168,11 +2170,8 @@ impl RunOiwapArgs {
 
 impl RunMidPriceArgs {
     pub fn validate(&self) -> Result<()> {
-        if matches!(
-            self.venue,
-            ExecutionVenueArg::HyperliquidSpot | ExecutionVenueArg::HyperliquidOutcomes
-        ) {
-            bail!("market-making bots do not support spot or outcome-market execution");
+        if self.venue == ExecutionVenueArg::HyperliquidSpot {
+            bail!("market-making bots do not support spot execution");
         }
         validate_execution_symbol(self.venue, &self.symbol)?;
         if self
@@ -2202,7 +2201,17 @@ impl RunMidPriceArgs {
         {
             bail!("--directional-bias must be between -100 and 100 percent");
         }
-        if !self.leverage.is_finite() || self.leverage < 1.0 {
+        if self.venue == ExecutionVenueArg::HyperliquidOutcomes {
+            if self.leverage.is_some() {
+                bail!("--leverage is not used with outcome markets");
+            }
+            if self.directional_bias != 0.0 {
+                bail!("--directional-bias is not supported for outcome markets");
+            }
+        } else if self
+            .leverage
+            .is_some_and(|leverage| !leverage.is_finite() || leverage < 1.0)
+        {
             bail!("--leverage must be at least 1");
         }
         if self
@@ -2213,7 +2222,7 @@ impl RunMidPriceArgs {
         }
         if self
             .margin
-            .is_some_and(|margin| !(margin * self.leverage).is_finite())
+            .is_some_and(|margin| !(margin * self.leverage.unwrap_or(1.0)).is_finite())
         {
             bail!("--margin multiplied by --leverage is too large");
         }
@@ -2243,11 +2252,8 @@ impl RunVolumeMidArgs {
 
 impl RunGridArgs {
     pub fn validate(&self) -> Result<()> {
-        if matches!(
-            self.venue,
-            ExecutionVenueArg::HyperliquidSpot | ExecutionVenueArg::HyperliquidOutcomes
-        ) {
-            bail!("grid does not support spot or outcome-market execution");
+        if self.venue == ExecutionVenueArg::HyperliquidSpot {
+            bail!("grid does not support spot execution");
         }
         validate_execution_symbol(self.venue, &self.symbol)?;
         if self
@@ -2276,7 +2282,14 @@ impl RunGridArgs {
         if !self.step_bps.is_finite() || self.step_bps <= 0.0 {
             bail!("--step-bps must be greater than zero");
         }
-        if !self.leverage.is_finite() || self.leverage < 1.0 {
+        if self.venue == ExecutionVenueArg::HyperliquidOutcomes {
+            if self.leverage.is_some() {
+                bail!("--leverage is not used with outcome markets");
+            }
+        } else if self
+            .leverage
+            .is_some_and(|leverage| !leverage.is_finite() || leverage < 1.0)
+        {
             bail!("--leverage must be at least 1");
         }
         if self
@@ -2287,7 +2300,7 @@ impl RunGridArgs {
         }
         if self
             .margin
-            .is_some_and(|margin| !(margin * self.leverage).is_finite())
+            .is_some_and(|margin| !(margin * self.leverage.unwrap_or(1.0)).is_finite())
         {
             bail!("--margin multiplied by --leverage is too large");
         }
@@ -3997,7 +4010,7 @@ mod tests {
                 assert_eq!(args.duration, 300);
                 assert_eq!(args.spread_bps, 2.0);
                 assert_eq!(args.directional_bias, 0.0);
-                assert_eq!(args.leverage, 10.0);
+                assert_eq!(args.leverage, Some(10.0));
                 assert_eq!(args.stop_loss_pct, Some(5.0));
                 assert!(args.dry_run);
             }
@@ -4040,6 +4053,155 @@ mod tests {
             }
             _ => panic!("expected bot run volume-mid command"),
         }
+    }
+
+    #[test]
+    fn existing_mid_price_bots_accept_outcome_execution_without_leverage() {
+        let mid = Cli::try_parse_from([
+            "mlab",
+            "bot",
+            "run",
+            "mid-price",
+            "1009:0",
+            "--venue",
+            "hyperliquid-outcomes",
+            "--margin",
+            "100",
+            "--duration",
+            "300",
+            "--spread-bps",
+            "20",
+            "--dry-run",
+        ])
+        .expect("outcome mid-price bot should parse");
+        let Commands::Bot {
+            command:
+                BotCommands::Run {
+                    command: BotRunCommands::MidPrice(mid),
+                },
+        } = mid.command
+        else {
+            panic!("expected outcome-enabled mid-price command");
+        };
+        mid.validate()
+            .expect("outcome mid-price arguments should validate");
+        assert_eq!(mid.venue, ExecutionVenueArg::HyperliquidOutcomes);
+        assert_eq!(mid.leverage, None);
+
+        let volume = Cli::try_parse_from([
+            "mlab",
+            "bot",
+            "run",
+            "volume-mid",
+            "1009:0",
+            "--venue",
+            "hyperliquid-outcomes",
+            "--margin",
+            "100",
+            "--duration",
+            "300",
+            "--refresh-time",
+            "5",
+            "--refresh-tolerance-bps",
+            "0.5",
+            "--dry-run",
+        ])
+        .expect("outcome volume-mid bot should parse");
+        let Commands::Bot {
+            command:
+                BotCommands::Run {
+                    command: BotRunCommands::VolumeMid(volume),
+                },
+        } = volume.command
+        else {
+            panic!("expected outcome-enabled volume-mid command");
+        };
+        volume
+            .validate()
+            .expect("outcome volume-mid arguments should validate");
+        assert_eq!(volume.common.leverage, None);
+    }
+
+    #[test]
+    fn existing_grid_bot_accepts_outcome_execution_without_leverage() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "bot",
+            "run",
+            "grid",
+            "1009:0",
+            "--venue",
+            "hyperliquid-outcomes",
+            "--margin",
+            "100",
+            "--duration",
+            "300",
+            "--levels",
+            "4",
+            "--step-bps",
+            "20",
+            "--dry-run",
+        ])
+        .expect("outcome grid bot should parse");
+        let Commands::Bot {
+            command:
+                BotCommands::Run {
+                    command: BotRunCommands::Grid(grid),
+                },
+        } = cli.command
+        else {
+            panic!("expected outcome-enabled grid command");
+        };
+        grid.validate()
+            .expect("outcome grid arguments should validate");
+        assert_eq!(grid.venue, ExecutionVenueArg::HyperliquidOutcomes);
+        assert_eq!(grid.leverage, None);
+    }
+
+    #[test]
+    fn outcome_bots_reject_leverage_and_have_no_standalone_command() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "bot",
+            "run",
+            "mid-price",
+            "1009:0",
+            "--venue",
+            "hyperliquid-outcomes",
+            "--margin",
+            "100",
+            "--duration",
+            "300",
+            "--leverage",
+            "1",
+            "--dry-run",
+        ])
+        .expect("outcome mid-price bot should parse before semantic validation");
+        let Commands::Bot {
+            command:
+                BotCommands::Run {
+                    command: BotRunCommands::MidPrice(mid),
+                },
+        } = cli.command
+        else {
+            panic!("expected outcome-enabled mid-price command");
+        };
+        assert!(mid.validate().is_err());
+
+        assert!(
+            Cli::try_parse_from([
+                "mlab",
+                "bot",
+                "run",
+                "outcome",
+                "1009:0",
+                "--margin",
+                "100",
+                "--duration",
+                "300",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

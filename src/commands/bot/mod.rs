@@ -1,6 +1,7 @@
 pub mod grid;
 pub mod jobs;
 pub mod mid_price;
+pub mod outcome;
 
 pub async fn handle_worker(job_id: &str) -> anyhow::Result<()> {
     let job = crate::runtime::get_bot_job_from_running_daemon(job_id).await?;

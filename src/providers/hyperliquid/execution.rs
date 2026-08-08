@@ -222,6 +222,12 @@ impl HyperliquidExecutionAdapter {
             let total = parse(&balance.total, "outcome balance total")?;
             let held = parse(&balance.hold, "outcome balance hold")?;
             if quote_tokens.contains(balance.coin.as_str()) {
+                let token_index = balance.token.with_context(|| {
+                    format!(
+                        "Hyperliquid outcome quote balance `{}` omitted its token index",
+                        balance.coin
+                    )
+                })?;
                 total_balance += total;
                 available_balance += (total - held).max(0.0);
                 margin_used += held;
@@ -229,7 +235,7 @@ impl HyperliquidExecutionAdapter {
                     venue: ExecutionVenue::HyperliquidOutcomes,
                     asset: balance.coin.clone(),
                     venue_asset: balance.coin.clone(),
-                    token_index: balance.token,
+                    token_index,
                     registry_supported: true,
                     total,
                     held,
@@ -1145,15 +1151,21 @@ fn normalize_spot_balance(
     network: HyperliquidNetwork,
     balance: HyperliquidSpotBalance,
 ) -> Result<SpotBalance> {
+    let token_index = balance.token.with_context(|| {
+        format!(
+            "Hyperliquid spot balance `{}` omitted its token index",
+            balance.coin
+        )
+    })?;
     let (asset, venue_asset, registry_supported) =
-        resolve_spot_token(network, Some(balance.token), &balance.coin)?;
+        resolve_spot_token(network, Some(token_index), &balance.coin)?;
     let total = parse(&balance.total, "spot balance total")?;
     let held = parse(&balance.hold, "spot balance hold")?;
     Ok(SpotBalance {
         venue: ExecutionVenue::HyperliquidSpot,
         asset,
         venue_asset,
-        token_index: balance.token,
+        token_index,
         registry_supported,
         total,
         held,
@@ -1287,7 +1299,8 @@ struct SpotClearinghouseState {
 #[serde(rename_all = "camelCase")]
 struct HyperliquidSpotBalance {
     coin: String,
-    token: u32,
+    /// Outcome-token balance rows omit this field and encode their identity in `coin`.
+    token: Option<u32>,
     hold: String,
     total: String,
     #[serde(default)]
@@ -1690,7 +1703,7 @@ mod tests {
             HyperliquidNetwork::Mainnet,
             HyperliquidSpotBalance {
                 coin: "UBTC".to_string(),
-                token: 197,
+                token: Some(197),
                 hold: "0.25".to_string(),
                 total: "1.5".to_string(),
                 entry_ntl: Some("90000".to_string()),
@@ -1704,6 +1717,38 @@ mod tests {
         assert_eq!(balance.held, 0.25);
         assert_eq!(balance.available, 1.25);
         assert!(balance.registry_supported);
+    }
+
+    #[test]
+    fn outcome_balance_rows_may_omit_spot_token_index() {
+        let state: SpotClearinghouseState = serde_json::from_value(serde_json::json!({
+            "balances": [
+                {
+                    "coin": "USDC",
+                    "token": 0,
+                    "total": "96.051268",
+                    "hold": "0.0",
+                    "entryNtl": "0.0"
+                },
+                {
+                    "coin": "+102250",
+                    "total": "400.0",
+                    "hold": "0.0",
+                    "entryNtl": "200.0"
+                },
+                {
+                    "coin": "+102251",
+                    "total": "400.0",
+                    "hold": "0.0",
+                    "entryNtl": "200.0"
+                }
+            ]
+        }))
+        .expect("outcome balances should decode without token indexes");
+
+        assert_eq!(state.balances[0].token, Some(0));
+        assert_eq!(state.balances[1].token, None);
+        assert_eq!(state.balances[2].token, None);
     }
 
     #[test]

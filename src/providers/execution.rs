@@ -107,6 +107,16 @@ impl ExecutionAdapter {
         }
     }
 
+    pub async fn submit_user_outcome(
+        &self,
+        action: crate::providers::hyperliquid::exchange::UserOutcomeAction,
+    ) -> Result<serde_json::Value> {
+        match self {
+            Self::Hyperliquid(adapter) => adapter.submit_user_outcome(action).await,
+            Self::Bulk(_) => anyhow::bail!("user outcome actions require Hyperliquid outcomes"),
+        }
+    }
+
     pub async fn cancel_order(&self, plan: &CancelPlan) -> Result<ExecutionReceipt> {
         match self {
             Self::Bulk(adapter) => {

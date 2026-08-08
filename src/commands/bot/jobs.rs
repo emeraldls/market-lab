@@ -111,7 +111,11 @@ fn render_job(job: &BotJob, output: OutputFormat) -> Result<()> {
                     println!("  take profit:      uncapped");
                     println!("  sizing:           equal, fixed paired cells");
                     println!("  duration:         {}s", definition.duration_seconds);
-                    println!("  leverage:         {}x", definition.leverage);
+                    if let Some(outcome) = &definition.outcome {
+                        render_outcome_execution(outcome, definition.max_inventory_margin);
+                    } else if let Some(leverage) = definition.leverage {
+                        println!("  leverage:         {leverage}x");
+                    }
                     if let Some(percent) = definition.stop_loss_pct.filter(|value| *value > 0.0) {
                         println!("  stop loss:        {percent}% of allocated margin");
                     }
@@ -137,31 +141,57 @@ fn render_job(job: &BotJob, output: OutputFormat) -> Result<()> {
                         "  directional bias: {}%",
                         definition.directional_bias_percent
                     );
-                    println!("  leverage:         {}x", definition.leverage);
+                    if let Some(outcome) = &definition.outcome {
+                        render_outcome_execution(outcome, definition.max_inventory_margin);
+                    } else if let Some(leverage) = definition.leverage {
+                        println!("  leverage:         {leverage}x");
+                    }
                     if let Some(percent) = definition.stop_loss_pct.filter(|value| *value > 0.0) {
                         println!("  stop loss:        {percent}% of allocated margin");
                     }
                 }
             }
             if let Some(performance) = &job.performance {
-                println!(
-                    "  bought / sold:    {:.8} / {:.8}",
-                    performance.bought_size, performance.sold_size
-                );
-                println!(
-                    "  avg buy / sell:   {} / {}",
-                    optional_f64(performance.average_buy_price),
-                    optional_f64(performance.average_sell_price)
-                );
-                println!("  matched size:     {:.8}", performance.matched_size);
-                println!(
-                    "  inventory:        {:.8} @ {}",
-                    performance.inventory_size,
-                    optional_f64(performance.average_entry_price)
-                );
-                println!("  mark:             {:.8}", performance.mark_price);
-                println!("  gross realized:   {:+.8}", performance.gross_realized_pnl);
-                println!("  unrealized:       {:+.8}", performance.unrealized_pnl);
+                if let Some(outcome) = &performance.outcome {
+                    let metadata = job.definition.outcome();
+                    let primary_name =
+                        metadata.map_or("primary", |value| value.primary_name.as_str());
+                    let complement_name =
+                        metadata.map_or("complement", |value| value.complement_name.as_str());
+                    println!("  total split:      {:.8}", outcome.split_size);
+                    println!("  total merged:     {:.8}", outcome.merged_size);
+                    println!(
+                        "  {primary_name} / {complement_name} sold: {:.8} / {:.8}",
+                        outcome.primary_sold_size, outcome.complement_sold_size
+                    );
+                    println!(
+                        "  {primary_name} / {complement_name} held: {:.8} / {:.8}",
+                        outcome.primary_inventory, outcome.complement_inventory
+                    );
+                    println!("  completed cycles: {}", outcome.completed_cycles);
+                    println!("  primary mark:     {:.8}", performance.mark_price);
+                    println!("  gross realized:   {:+.8}", performance.gross_realized_pnl);
+                    println!("  unrealized:       {:+.8}", performance.unrealized_pnl);
+                } else {
+                    println!(
+                        "  bought / sold:    {:.8} / {:.8}",
+                        performance.bought_size, performance.sold_size
+                    );
+                    println!(
+                        "  avg buy / sell:   {} / {}",
+                        optional_f64(performance.average_buy_price),
+                        optional_f64(performance.average_sell_price)
+                    );
+                    println!("  matched size:     {:.8}", performance.matched_size);
+                    println!(
+                        "  inventory:        {:.8} @ {}",
+                        performance.inventory_size,
+                        optional_f64(performance.average_entry_price)
+                    );
+                    println!("  mark:             {:.8}", performance.mark_price);
+                    println!("  gross realized:   {:+.8}", performance.gross_realized_pnl);
+                    println!("  unrealized:       {:+.8}", performance.unrealized_pnl);
+                }
                 println!(
                     "  fees / rebates:   {:+.8}{}",
                     performance.fees,
@@ -184,7 +214,14 @@ fn render_job(job: &BotJob, output: OutputFormat) -> Result<()> {
                         |value| format!("{value:+.4}%")
                     )
                 );
-                println!("  pnl scope:        bot-owned fills; funding excluded");
+                println!(
+                    "  pnl scope:        {}",
+                    if performance.outcome.is_some() {
+                        "bot split/merge actions and bot-owned fills"
+                    } else {
+                        "bot-owned fills; funding excluded"
+                    }
+                );
             } else {
                 println!("  performance:      awaiting first worker heartbeat");
             }
@@ -216,6 +253,29 @@ fn venue_name(venue: crate::domain::execution::ExecutionVenue) -> &'static str {
         crate::domain::execution::ExecutionVenue::HyperliquidSpot => "hyperliquid",
         crate::domain::execution::ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
     }
+}
+
+fn render_outcome_execution(
+    outcome: &crate::bots::jobs::OutcomeExecutionDefinition,
+    allocated_margin: f64,
+) {
+    println!("  outcome id:       {}", outcome.outcome_id);
+    println!(
+        "  primary:          {} ({})",
+        outcome.primary_name, outcome.primary_symbol
+    );
+    println!(
+        "  complement:       {} ({})",
+        outcome.complement_name, outcome.complement_symbol
+    );
+    println!(
+        "  collateral:       {} {}",
+        allocated_margin, outcome.quote_token
+    );
+    println!(
+        "  split pair size:  {} {} + {} {}",
+        outcome.pair_size, outcome.primary_name, outcome.pair_size, outcome.complement_name
+    );
 }
 
 fn render_log_values(values: &[serde_json::Value], output: OutputFormat) -> Result<()> {

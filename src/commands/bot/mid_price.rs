@@ -136,6 +136,15 @@ async fn handle(
     refresh_tolerance_bps: f64,
 ) -> Result<()> {
     args.validate()?;
+    if args.venue == ExecutionVenueArg::HyperliquidOutcomes {
+        return super::outcome::handle_mid(
+            args,
+            mode.name(),
+            refresh_seconds,
+            refresh_tolerance_bps,
+        )
+        .await;
+    }
     let parent = build_trade_plan(
         &trade_args(&args, args.size, args.margin),
         PositionDirection::Long,
@@ -192,8 +201,9 @@ async fn handle(
         refresh_seconds,
         refresh_tolerance_bps,
         directional_bias_percent: args.directional_bias,
-        leverage: args.leverage,
+        leverage: Some(args.leverage.unwrap_or(1.0)),
         stop_loss_pct: args.stop_loss_pct.filter(|percent| *percent > 0.0),
+        outcome: None,
     };
     let view = plan_view(
         mode.name(),
@@ -238,7 +248,11 @@ pub async fn handle_worker_job(job_id: &str, job: BotJob) -> Result<()> {
     };
     let pid = std::process::id();
     crate::runtime::bot_worker_started(job_id, pid).await?;
-    let result = run_worker(job_id, mode, &definition).await;
+    let result = if definition.outcome.is_some() {
+        super::outcome::run_mid_worker(job_id, mode.name(), &definition).await
+    } else {
+        run_worker(job_id, mode, &definition).await
+    };
     let error = result
         .as_ref()
         .err()
@@ -273,7 +287,7 @@ fn trade_args(args: &RunMidPriceArgs, size: Option<f64>, margin: Option<f64>) ->
         order_kind: TradeOrderKind::Market,
         price: None,
         tif: TradeTimeInForce::Gtc,
-        leverage: Some(args.leverage),
+        leverage: Some(args.leverage.unwrap_or(1.0)),
         reduce_only: false,
         sl: None,
         tp: None,
@@ -301,7 +315,7 @@ fn worker_trade_args(definition: &MidPriceJobDefinition) -> TradeArgs {
         order_kind: TradeOrderKind::Market,
         price: None,
         tif: TradeTimeInForce::Gtc,
-        leverage: Some(definition.leverage),
+        leverage: definition.leverage,
         reduce_only: false,
         sl: None,
         tp: None,
@@ -346,7 +360,7 @@ fn plan_view<'a>(
         directional_bias_percent: definition.directional_bias_percent,
         sizing: "continuous, inventory-skewed",
         duration_secs: definition.duration_seconds,
-        leverage: definition.leverage,
+        leverage: definition.leverage.unwrap_or(1.0),
         execution: "maker-only post-only ALO quotes",
         shutdown: "cancel owned quotes, then unwind bot-owned inventory",
         dry_run,
@@ -531,7 +545,14 @@ pub(super) async fn live_orderbook(
             .await
         }
         ExecutionVenue::HyperliquidOutcomes => {
-            bail!("mid-price market making does not support outcome markets")
+            HyperliquidProvider::live_orderbook_for(
+                crate::providers::hyperliquid::HyperliquidProduct::Outcome,
+                symbol,
+                BOOK_DEPTH,
+                None,
+                HyperliquidNetwork::from_testnet(testnet),
+            )
+            .await
         }
     }
 }
@@ -837,6 +858,7 @@ impl FillLedger {
             return_on_margin_pct: trading_pnl.and_then(|pnl| {
                 (self.allocated_margin > 0.0).then_some(pnl / self.allocated_margin * 100.0)
             }),
+            outcome: None,
         }
     }
 }
@@ -878,9 +900,15 @@ impl BotOrderBookStream {
                 )
                 .await?,
             )),
-            ExecutionVenue::HyperliquidOutcomes => {
-                bail!("mid-price market making does not support outcome markets")
-            }
+            ExecutionVenue::HyperliquidOutcomes => Ok(Self::Hyperliquid(
+                HyperliquidOrderBookStream::connect_for(
+                    crate::providers::hyperliquid::HyperliquidProduct::Outcome,
+                    symbol,
+                    BOOK_DEPTH,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
+            )),
         }
     }
 
@@ -986,9 +1014,13 @@ impl BotAccountStream {
                 )
                 .await?,
             )),
-            ExecutionVenue::HyperliquidOutcomes => {
-                bail!("mid-price market making does not support outcome markets")
-            }
+            ExecutionVenue::HyperliquidOutcomes => Ok(Self::Hyperliquid(
+                HyperliquidAccountStream::connect_on(
+                    account,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
+            )),
         }
     }
 
@@ -2809,8 +2841,9 @@ mod tests {
             refresh_seconds: 0.5,
             refresh_tolerance_bps: 0.25,
             directional_bias_percent: 0.0,
-            leverage: 10.0,
+            leverage: Some(10.0),
             stop_loss_pct: Some(5.0),
+            outcome: None,
         };
         assert_eq!(stop_loss_amount(&definition, 200.0), Some(10.0));
 

@@ -22,6 +22,7 @@ use crate::domain::execution::{
 use crate::providers::bulk::execution::BulkExecutionAdapter;
 use crate::providers::bulk::ws::BulkAccountStream;
 use crate::providers::hyperliquid::HyperliquidNetwork;
+use crate::providers::hyperliquid::exchange::UserOutcomeAction;
 use crate::providers::hyperliquid::ws::HyperliquidAccountStream;
 use crate::scripting::execution::{
     ScriptCancelRequest, ScriptManagedRequest, ScriptOrderRef, ScriptRawOrderRequest,
@@ -36,7 +37,7 @@ use crate::strategies::jobs::{
 };
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-const RUNTIME_VERSION: u8 = 33;
+const RUNTIME_VERSION: u8 = 34;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -248,6 +249,11 @@ enum RuntimeRequest {
         job_id: String,
         items: Vec<SequencedCancelPlan>,
     },
+    BotOutcomeAction {
+        job_id: String,
+        sequence: u64,
+        action: UserOutcomeAction,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -291,6 +297,8 @@ struct RuntimeResponse {
     bot_job: Option<BotJob>,
     #[serde(default)]
     bot_jobs: Option<Vec<BotJob>>,
+    #[serde(default)]
+    action_response: Option<serde_json::Value>,
 }
 
 impl RuntimeResponse {
@@ -310,6 +318,7 @@ impl RuntimeResponse {
             strategy_jobs: None,
             bot_job: None,
             bot_jobs: None,
+            action_response: None,
         }
     }
 
@@ -353,6 +362,8 @@ struct RuntimeState {
     bot_executions: BTreeMap<String, ExecutionReceipt>,
     #[serde(default)]
     bot_cancellations: BTreeMap<String, ExecutionReceipt>,
+    #[serde(default)]
+    bot_outcome_actions: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     script_orders: BTreeMap<String, ScriptManagedOrder>,
     #[serde(default)]
@@ -472,6 +483,7 @@ pub async fn serve() -> Result<()> {
         bot_jobs: BTreeMap::new(),
         bot_executions: BTreeMap::new(),
         bot_cancellations: BTreeMap::new(),
+        bot_outcome_actions: BTreeMap::new(),
         script_orders: BTreeMap::new(),
         script_cancel_keys: BTreeMap::new(),
         account_positions: BTreeMap::new(),
@@ -1036,6 +1048,25 @@ pub async fn submit_bot_cancels(
     response
         .outcomes
         .context("mlabd omitted the bot batch cancellation outcomes")
+}
+
+pub async fn submit_bot_outcome_action(
+    job_id: &str,
+    sequence: u64,
+    action: &UserOutcomeAction,
+) -> Result<serde_json::Value> {
+    let response = request(RuntimeRequest::BotOutcomeAction {
+        job_id: job_id.to_string(),
+        sequence,
+        action: action.clone(),
+    })
+    .await?;
+    if !response.ok {
+        bail!("bot outcome action failed: {}", response.message);
+    }
+    response
+        .action_response
+        .context("mlabd omitted the bot outcome-action response")
 }
 
 pub fn append_bot_output(job_id: &str, value: &impl Serialize) -> Result<()> {
@@ -1980,7 +2011,10 @@ async fn create_bot_job(
         .await?
         .configure_leverage(
             submission.definition.symbol(),
-            submission.definition.leverage(),
+            submission
+                .definition
+                .leverage()
+                .context("perpetual bot leverage is missing")?,
         )
         .await
         .context("failed to configure Hyperliquid leverage before starting the bot")?;
@@ -2964,33 +2998,40 @@ async fn execute_bot_trade(
 }
 
 fn validate_bot_trade(definition: &BotJobDefinition, plan: &TradePlan) -> Result<()> {
-    let (venue, symbol, leverage, max_inventory_size, name) = match definition {
-        BotJobDefinition::Grid(definition) => (
-            definition.venue,
-            definition.symbol.as_str(),
-            definition.leverage,
-            definition.max_inventory_size,
-            "grid",
-        ),
-        BotJobDefinition::MidPrice(definition) | BotJobDefinition::VolumeMid(definition) => (
-            definition.venue,
-            definition.symbol.as_str(),
-            definition.leverage,
-            definition.max_inventory_size,
-            "mid-price",
-        ),
+    let (venue, leverage, name) = match definition {
+        BotJobDefinition::Grid(definition) => (definition.venue, definition.leverage, "grid"),
+        BotJobDefinition::MidPrice(definition) | BotJobDefinition::VolumeMid(definition) => {
+            (definition.venue, definition.leverage, "mid-price")
+        }
     };
+    let maximum_order_size = definition.maximum_order_size();
     if plan.venue != venue
-        || plan.internal_symbol != symbol
-        || plan
-            .leverage
-            .is_none_or(|plan_leverage| (plan_leverage - leverage).abs() > f64::EPSILON)
+        || plan.testnet != definition.testnet()
+        || !definition.accepts_symbol(&plan.internal_symbol)
+        || match leverage {
+            Some(leverage) => plan
+                .leverage
+                .is_none_or(|value| (value - leverage).abs() > f64::EPSILON),
+            None => plan.leverage.is_some(),
+        }
         || plan.stop_loss_price.is_some()
         || plan.take_profit_price.is_some()
-        || plan.size > max_inventory_size + 1e-12_f64.max(max_inventory_size.abs() * 1e-12)
+        || plan.size > maximum_order_size + 1e-12_f64.max(maximum_order_size.abs() * 1e-12)
         || crate::domain::execution::OrderSide::from(plan.direction) != plan.side
     {
         bail!("bot order does not match its persisted {name} definition");
+    }
+    if let Some(outcome) = definition.outcome() {
+        let expected_fingerprint = if plan.internal_symbol == outcome.primary_symbol {
+            &outcome.primary_market_fingerprint
+        } else {
+            &outcome.complement_market_fingerprint
+        };
+        if plan.market_fingerprint.as_deref() != Some(expected_fingerprint)
+            || plan.side != crate::domain::execution::OrderSide::Sell
+        {
+            bail!("outcome quote does not match its persisted market side");
+        }
     }
 
     match plan.order_kind {
@@ -3009,6 +3050,81 @@ fn validate_bot_trade(definition: &BotJobDefinition, plan: &TradePlan) -> Result
         }
     }
     Ok(())
+}
+
+async fn execute_bot_outcome_action(
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
+    job_id: &str,
+    sequence: u64,
+    action: UserOutcomeAction,
+) -> Result<serde_json::Value> {
+    if sequence == 0 {
+        bail!("bot outcome-action sequence must start at 1");
+    }
+    let job = state
+        .bot_jobs
+        .get(job_id)
+        .cloned()
+        .with_context(|| format!("bot job `{job_id}` was not found"))?;
+    if !job.status.is_active() {
+        bail!("bot job `{job_id}` is not running");
+    }
+    let definition = job
+        .definition
+        .outcome()
+        .context("only an outcome-enabled bot may submit outcome actions")?;
+
+    let (outcome, amount) = match &action {
+        UserOutcomeAction::Split { outcome, amount } => (*outcome, amount.as_str()),
+        UserOutcomeAction::Merge {
+            outcome,
+            amount: Some(amount),
+        } => (*outcome, amount.as_str()),
+        UserOutcomeAction::Merge { amount: None, .. }
+        | UserOutcomeAction::MergeQuestion { .. }
+        | UserOutcomeAction::Negate { .. } => {
+            bail!("outcome market maker permits only bounded split and merge actions")
+        }
+    };
+    if outcome != definition.outcome_id {
+        bail!("outcome action does not match its persisted bot definition");
+    }
+    let amount = amount
+        .parse::<f64>()
+        .context("outcome action amount is not a number")?;
+    let tolerance = 1e-12_f64.max(definition.pair_size.abs() * 1e-12);
+    if !amount.is_finite() || amount <= 0.0 || amount > definition.pair_size + tolerance {
+        bail!("outcome action amount exceeds its persisted bot allocation");
+    }
+
+    let network = HyperliquidNetwork::from_testnet(job.definition.testnet());
+    let primary =
+        crate::providers::hyperliquid::outcomes::resolve(network, &definition.primary_symbol)
+            .await?;
+    let complement =
+        crate::providers::hyperliquid::outcomes::resolve(network, &definition.complement_symbol)
+            .await?;
+    if primary.metadata_fingerprint != definition.primary_market_fingerprint
+        || complement.metadata_fingerprint != definition.complement_market_fingerprint
+    {
+        bail!("outcome metadata changed after the bot was planned; refusing to sign");
+    }
+
+    let key = format!("{job_id}:{sequence}");
+    if let Some(value) = state.bot_outcome_actions.get(&key) {
+        return Ok(value.clone());
+    }
+    let value = crate::providers::execution::ExecutionAdapter::new(
+        ExecutionVenue::HyperliquidOutcomes,
+        job.definition.testnet(),
+    )
+    .await?
+    .submit_user_outcome(action)
+    .await?;
+    state.bot_outcome_actions.insert(key, value.clone());
+    persist_state(paths, state)?;
+    Ok(value)
 }
 
 async fn execute_bot_cancel(
@@ -3031,7 +3147,8 @@ async fn execute_bot_cancel(
     }
     let order_prefix = format!("{job_id}:");
     if plan.venue != job.definition.venue()
-        || plan.internal_symbol != job.definition.symbol()
+        || plan.testnet != job.definition.testnet()
+        || !job.definition.accepts_symbol(&plan.internal_symbol)
         || !state.bot_executions.iter().any(|(key, receipt)| {
             key.starts_with(&order_prefix)
                 && receipt.order_id.as_deref() == Some(plan.order_id.as_str())
@@ -3158,7 +3275,8 @@ async fn execute_bot_cancels(
             bail!("bot cancellation batch sequences must be unique and start at 1");
         }
         if item.plan.venue != job.definition.venue()
-            || item.plan.internal_symbol != job.definition.symbol()
+            || item.plan.testnet != job.definition.testnet()
+            || !job.definition.accepts_symbol(&item.plan.internal_symbol)
             || !state.bot_executions.iter().any(|(key, receipt)| {
                 key.starts_with(&order_prefix)
                     && receipt.order_id.as_deref() == Some(item.plan.order_id.as_str())
@@ -3873,6 +3991,20 @@ async fn handle_connection(
                 Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
             }
         }
+        RuntimeRequest::BotOutcomeAction {
+            job_id,
+            sequence,
+            action,
+        } => match execute_bot_outcome_action(paths, state, &job_id, sequence, action).await {
+            Ok(value) => RuntimeResponse {
+                ok: true,
+                message: "bot outcome action processed".to_string(),
+                status: Some(runtime_status(state)),
+                action_response: Some(value),
+                ..RuntimeResponse::empty()
+            },
+            Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+        },
     };
     let mut encoded = serde_json::to_vec(&response).context("failed to encode mlabd response")?;
     encoded.push(b'\n');
@@ -5226,8 +5358,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_protocol_v29_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 33);
+    fn runtime_protocol_v34_decodes_oiwap_submissions() {
+        assert_eq!(RUNTIME_VERSION, 34);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",
@@ -5367,6 +5499,30 @@ mod tests {
                     definition: BotJobDefinition::Grid(_)
                 }
             }
+        ));
+    }
+
+    #[test]
+    fn runtime_protocol_v34_decodes_outcome_bot_actions() {
+        let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
+            "type": "bot_outcome_action",
+            "job_id": "bot_outcome_1",
+            "sequence": 7,
+            "action": {
+                "type": "split",
+                "outcome": 1_009,
+                "amount": "25"
+            }
+        }))
+        .expect("runtime protocol should decode outcome bot actions");
+
+        assert!(matches!(
+            request,
+            RuntimeRequest::BotOutcomeAction {
+                job_id,
+                sequence: 7,
+                action: UserOutcomeAction::Split { outcome: 1_009, amount }
+            } if job_id == "bot_outcome_1" && amount == "25"
         ));
     }
 

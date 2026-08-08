@@ -66,6 +66,9 @@ struct GridPlanView<'a> {
 
 pub async fn handle(args: RunGridArgs) -> Result<()> {
     args.validate()?;
+    if args.venue == ExecutionVenueArg::HyperliquidOutcomes {
+        return super::outcome::handle_grid(args).await;
+    }
     let parent = build_trade_plan(
         &trade_args(&args, args.size, args.margin),
         PositionDirection::Long,
@@ -117,8 +120,9 @@ pub async fn handle(args: RunGridArgs) -> Result<()> {
         duration_seconds: args.duration,
         levels_per_side: args.levels,
         step_bps: args.step_bps,
-        leverage: args.leverage,
+        leverage: Some(args.leverage.unwrap_or(1.0)),
         stop_loss_pct: args.stop_loss_pct.filter(|percent| *percent > 0.0),
+        outcome: None,
     };
     definition.validate()?;
     let view = plan_view(&parent, &definition, center, &initial, args.dry_run);
@@ -151,7 +155,11 @@ pub async fn handle_worker_job(job_id: &str, job: BotJob) -> Result<()> {
     };
     let pid = std::process::id();
     crate::runtime::bot_worker_started(job_id, pid).await?;
-    let result = run_worker(job_id, &definition).await;
+    let result = if definition.outcome.is_some() {
+        super::outcome::run_grid_worker(job_id, &definition).await
+    } else {
+        run_worker(job_id, &definition).await
+    };
     let error = result
         .as_ref()
         .err()
@@ -186,7 +194,7 @@ fn trade_args(args: &RunGridArgs, size: Option<f64>, margin: Option<f64>) -> Tra
         order_kind: TradeOrderKind::Market,
         price: None,
         tif: TradeTimeInForce::Gtc,
-        leverage: Some(args.leverage),
+        leverage: Some(args.leverage.unwrap_or(1.0)),
         reduce_only: false,
         sl: None,
         tp: None,
@@ -214,7 +222,7 @@ fn worker_trade_args(definition: &GridJobDefinition) -> TradeArgs {
         order_kind: TradeOrderKind::Market,
         price: None,
         tif: TradeTimeInForce::Gtc,
-        leverage: Some(definition.leverage),
+        leverage: definition.leverage,
         reduce_only: false,
         sl: None,
         tp: None,
@@ -256,7 +264,7 @@ fn plan_view<'a>(
         step_bps: definition.step_bps,
         stop_loss_pct: definition.stop_loss_pct,
         duration_secs: definition.duration_seconds,
-        leverage: definition.leverage,
+        leverage: definition.leverage.unwrap_or(1.0),
         sizing: "equal, fixed paired grid cells",
         execution: "maker-only post-only ALO paired grid orders",
         shutdown: "cancel owned quotes, then unwind bot-owned inventory",

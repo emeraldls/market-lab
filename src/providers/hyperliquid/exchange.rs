@@ -145,7 +145,8 @@ fn user_outcome_request(action: UserOutcomeAction) -> UserOutcomeRequest {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
 pub enum UserOutcomeAction {
     Split {
         outcome: u32,

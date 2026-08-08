@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::bots::grid::MAX_GRID_LEVELS_PER_SIDE;
@@ -27,9 +27,12 @@ pub struct MidPriceJobDefinition {
     pub refresh_tolerance_bps: f64,
     #[serde(default)]
     pub directional_bias_percent: f64,
-    pub leverage: f64,
+    #[serde(default)]
+    pub leverage: Option<f64>,
     #[serde(default)]
     pub stop_loss_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<OutcomeExecutionDefinition>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -47,8 +50,54 @@ pub struct GridJobDefinition {
     pub duration_seconds: u64,
     pub levels_per_side: u16,
     pub step_bps: f64,
-    pub leverage: f64,
+    #[serde(default)]
+    pub leverage: Option<f64>,
     pub stop_loss_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<OutcomeExecutionDefinition>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeExecutionDefinition {
+    pub outcome_id: u32,
+    /// Instrument selected by the user and used as the normalized reference book.
+    pub primary_symbol: String,
+    /// The other binary side of the outcome market.
+    pub complement_symbol: String,
+    pub primary_name: String,
+    pub complement_name: String,
+    pub primary_market_fingerprint: String,
+    pub complement_market_fingerprint: String,
+    pub quote_token: String,
+    /// Quote collateral split into one share of each binary side per unit.
+    pub pair_size: f64,
+}
+
+impl OutcomeExecutionDefinition {
+    pub fn validate(&self) -> Result<()> {
+        if self.primary_symbol.trim().is_empty()
+            || self.complement_symbol.trim().is_empty()
+            || self.primary_symbol == self.complement_symbol
+        {
+            bail!("outcome execution requires distinct primary and complementary instruments");
+        }
+        if self.primary_name.trim().is_empty() || self.complement_name.trim().is_empty() {
+            bail!("outcome execution requires names for both binary sides");
+        }
+        if self.primary_market_fingerprint.trim().is_empty()
+            || self.complement_market_fingerprint.trim().is_empty()
+        {
+            bail!("outcome execution requires market fingerprints");
+        }
+        if self.quote_token.trim().is_empty() {
+            bail!("outcome execution quote token is required");
+        }
+        if !self.pair_size.is_finite() || self.pair_size <= 0.0 {
+            bail!("outcome execution pair size must be greater than zero");
+        }
+        Ok(())
+    }
 }
 
 impl GridJobDefinition {
@@ -80,16 +129,18 @@ impl GridJobDefinition {
         if !self.step_bps.is_finite() || self.step_bps <= 0.0 {
             bail!("grid bot step must be greater than zero");
         }
-        if !self.leverage.is_finite() || self.leverage < 1.0 {
-            bail!("grid bot leverage must be at least 1");
-        }
+        validate_outcome_mode(self.venue, self.leverage, self.outcome.as_ref())?;
         if self
             .stop_loss_pct
             .is_some_and(|percent| !percent.is_finite() || !(0.0..=100.0).contains(&percent))
         {
             bail!("grid bot stop loss must be between 0 and 100 percent");
         }
-        let expected_margin = self.max_inventory_exposure / self.leverage;
+        let expected_margin = if self.outcome.is_some() {
+            self.max_inventory_exposure
+        } else {
+            self.max_inventory_exposure / self.leverage.context("grid bot leverage is required")?
+        };
         if (self.max_inventory_margin - expected_margin).abs()
             > 1e-8_f64.max(expected_margin.abs() * 1e-10)
         {
@@ -136,16 +187,21 @@ impl MidPriceJobDefinition {
         {
             bail!("mid-price bot directional bias must be between -100 and 100 percent");
         }
-        if !self.leverage.is_finite() || self.leverage < 1.0 {
-            bail!("mid-price bot leverage must be at least 1");
-        }
+        validate_outcome_mode(self.venue, self.leverage, self.outcome.as_ref())?;
         if self
             .stop_loss_pct
             .is_some_and(|percent| !percent.is_finite() || !(0.0..=100.0).contains(&percent))
         {
             bail!("mid-price bot stop loss must be between 0 and 100 percent");
         }
-        let expected_margin = self.max_inventory_exposure / self.leverage;
+        let expected_margin = if self.outcome.is_some() {
+            self.max_inventory_exposure
+        } else {
+            self.max_inventory_exposure
+                / self
+                    .leverage
+                    .context("mid-price bot leverage is required")?
+        };
         if (self.max_inventory_margin - expected_margin).abs()
             > 1e-8_f64.max(expected_margin.abs() * 1e-10)
         {
@@ -193,7 +249,7 @@ impl BotJobDefinition {
         }
     }
 
-    pub fn leverage(&self) -> f64 {
+    pub fn leverage(&self) -> Option<f64> {
         match self {
             Self::Grid(definition) => definition.leverage,
             Self::MidPrice(definition) | Self::VolumeMid(definition) => definition.leverage,
@@ -206,6 +262,57 @@ impl BotJobDefinition {
             Self::MidPrice(definition) | Self::VolumeMid(definition) => definition.validate(),
         }
     }
+
+    pub fn accepts_symbol(&self, symbol: &str) -> bool {
+        self.outcome().map_or_else(
+            || symbol == self.symbol(),
+            |outcome| symbol == outcome.primary_symbol || symbol == outcome.complement_symbol,
+        )
+    }
+
+    pub fn maximum_order_size(&self) -> f64 {
+        if let Some(outcome) = self.outcome() {
+            return outcome.pair_size;
+        }
+        match self {
+            Self::Grid(definition) => definition.max_inventory_size,
+            Self::MidPrice(definition) | Self::VolumeMid(definition) => {
+                definition.max_inventory_size
+            }
+        }
+    }
+
+    pub fn outcome(&self) -> Option<&OutcomeExecutionDefinition> {
+        match self {
+            Self::Grid(definition) => definition.outcome.as_ref(),
+            Self::MidPrice(definition) | Self::VolumeMid(definition) => definition.outcome.as_ref(),
+        }
+    }
+}
+
+fn validate_outcome_mode(
+    venue: ExecutionVenue,
+    leverage: Option<f64>,
+    outcome: Option<&OutcomeExecutionDefinition>,
+) -> Result<()> {
+    match (venue, outcome) {
+        (ExecutionVenue::HyperliquidOutcomes, Some(outcome)) => {
+            outcome.validate()?;
+            if leverage.is_some() {
+                bail!("outcome execution does not use leverage");
+            }
+        }
+        (ExecutionVenue::HyperliquidOutcomes, None) => {
+            bail!("outcome execution metadata is required");
+        }
+        (_, Some(_)) => bail!("outcome execution metadata requires hyperliquid-outcomes"),
+        (_, None) => {
+            if leverage.is_none_or(|value| !value.is_finite() || value < 1.0) {
+                bail!("bot leverage must be at least 1");
+            }
+        }
+    }
+    Ok(())
 }
 
 const fn legacy_hyperliquid_testnet() -> bool {
@@ -255,6 +362,20 @@ pub struct BotPerformance {
     /// Realized plus unrealized PnL and signed fees. Funding is excluded.
     pub trading_pnl: Option<f64>,
     pub return_on_margin_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<OutcomeMakerPerformance>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeMakerPerformance {
+    pub split_size: f64,
+    pub merged_size: f64,
+    pub primary_sold_size: f64,
+    pub complement_sold_size: f64,
+    pub primary_inventory: f64,
+    pub complement_inventory: f64,
+    pub completed_cycles: u64,
 }
 
 impl BotJobStatus {
@@ -311,5 +432,47 @@ mod tests {
         assert_eq!(definition.refresh_seconds, 0.0);
         assert_eq!(definition.refresh_tolerance_bps, 0.0);
         assert!(definition.validate().is_err());
+    }
+
+    #[test]
+    fn mid_price_jobs_can_persist_outcome_execution_without_becoming_a_new_bot() {
+        let definition: BotJobDefinition = serde_json::from_value(serde_json::json!({
+            "name": "mid_price",
+            "config": {
+                "venue": "hyperliquid-outcomes",
+                "testnet": false,
+                "symbol": "1009:0",
+                "maxInventorySize": 50.0,
+                "requestedMargin": 25.0,
+                "maxInventoryMargin": 25.0,
+                "maxInventoryExposure": 25.0,
+                "durationSeconds": 300,
+                "spreadBps": 20.0,
+                "refreshSeconds": 1.0,
+                "refreshToleranceBps": 1.0,
+                "directionalBiasPercent": 0.0,
+                "stopLossPct": 5.0,
+                "outcome": {
+                    "outcomeId": 1009,
+                    "primarySymbol": "1009:0",
+                    "complementSymbol": "1009:1",
+                    "primaryName": "Change",
+                    "complementName": "No Change",
+                    "primaryMarketFingerprint": "primary-fingerprint",
+                    "complementMarketFingerprint": "complement-fingerprint",
+                    "quoteToken": "USDC",
+                    "pairSize": 25.0
+                }
+            }
+        }))
+        .expect("outcome definition should decode");
+
+        definition.validate().expect("outcome job should validate");
+        assert!(definition.accepts_symbol("1009:0"));
+        assert!(definition.accepts_symbol("1009:1"));
+        assert!(!definition.accepts_symbol("1009:2"));
+        assert_eq!(definition.name(), "mid-price");
+        assert_eq!(definition.maximum_order_size(), 25.0);
+        assert_eq!(definition.leverage(), None);
     }
 }
