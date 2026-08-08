@@ -15,7 +15,7 @@ pub mod ws;
 
 const AGENT_CONFIRMATION_ATTEMPTS: usize = 10;
 const AGENT_CONFIRMATION_DELAY: Duration = Duration::from_millis(250);
-pub(crate) const SIGNATURE_DOMAIN: SignatureDomain = SignatureDomain::Devnet;
+pub(crate) const SIGNATURE_DOMAIN: SignatureDomain = SignatureDomain::Testnet;
 
 pub(crate) fn signer(keypair: Keypair) -> Signer {
     Signer::new(keypair, SIGNATURE_DOMAIN)
