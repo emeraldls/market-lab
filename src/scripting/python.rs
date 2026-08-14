@@ -1,11 +1,14 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -15,56 +18,68 @@ use super::execution::{
     ScriptCommandBuffer, ScriptExecutionCommand, ScriptExecutionContext, queue_execution_call,
 };
 use super::language::PythonRuntime;
-use super::limits::SCRIPT_PYTHON_HOOK_TIMEOUT_MS;
+use super::limits::{
+    SCRIPT_PYTHON_FINISH_TIMEOUT_MS, SCRIPT_PYTHON_HOOK_TIMEOUT_MS, SCRIPT_PYTHON_LOG_BYTES,
+    SCRIPT_PYTHON_MAX_PROCESSES, SCRIPT_PYTHON_MEMORY_BYTES, SCRIPT_PYTHON_PROTOCOL_BYTES,
+    SCRIPT_PYTHON_STARTUP_TIMEOUT_MS,
+};
 use super::manifest::ScriptManifest;
 use super::output::ScriptOutput;
 use super::telemetry::ScriptHookStats;
 
-const PYTHON_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const PYTHON_STARTUP_TIMEOUT: Duration = Duration::from_millis(SCRIPT_PYTHON_STARTUP_TIMEOUT_MS);
 const PYTHON_HOOK_TIMEOUT: Duration = Duration::from_millis(SCRIPT_PYTHON_HOOK_TIMEOUT_MS);
-const PYTHON_FINISH_TIMEOUT: Duration = Duration::from_secs(60);
+const PYTHON_FINISH_TIMEOUT: Duration = Duration::from_millis(SCRIPT_PYTHON_FINISH_TIMEOUT_MS);
+const PYTHON_RESOURCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Copy)]
+struct PythonProcessLimits {
+    memory_bytes: usize,
+    max_processes: usize,
+    protocol_bytes: usize,
+    log_bytes: usize,
+}
+
+impl Default for PythonProcessLimits {
+    fn default() -> Self {
+        Self {
+            memory_bytes: SCRIPT_PYTHON_MEMORY_BYTES,
+            max_processes: SCRIPT_PYTHON_MAX_PROCESSES,
+            protocol_bytes: SCRIPT_PYTHON_PROTOCOL_BYTES,
+            log_bytes: SCRIPT_PYTHON_LOG_BYTES,
+        }
+    }
+}
 
 pub(crate) fn inspect_python_script(
     path: &Path,
     runtime: &PythonRuntime,
 ) -> Result<ScriptManifest> {
-    let output = Command::new(&runtime.interpreter)
-        .args(["-u", "-c", PYTHON_RUNNER])
-        .arg(path)
-        .arg("describe")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| {
+    inspect_python_script_with_limits(
+        path,
+        runtime,
+        PYTHON_STARTUP_TIMEOUT,
+        PythonProcessLimits::default(),
+    )
+}
+
+fn inspect_python_script_with_limits(
+    path: &Path,
+    runtime: &PythonRuntime,
+    timeout: Duration,
+    limits: PythonProcessLimits,
+) -> Result<ScriptManifest> {
+    let mut process =
+        PythonProcess::spawn_mode(path, runtime, "describe", limits).with_context(|| {
             format!(
                 "failed to inspect Python script {} with {}",
                 path.display(),
                 runtime.interpreter.display()
             )
         })?;
-    let stdout =
-        String::from_utf8(output.stdout).context("Python bridge returned non-UTF-8 data")?;
-    let response = stdout
-        .lines()
-        .find_map(|line| serde_json::from_str::<Value>(line).ok());
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !output.status.success() {
-        if let Some(response) = response.as_ref()
-            && response.get("type").and_then(Value::as_str) == Some("error")
-        {
-            bail!(
-                "failed to load Python script: {}",
-                python_error_message(response)
-            );
-        }
-        bail!(
-            "failed to load Python script {}{}",
-            path.display(),
-            suffix_error(&stderr)
-        );
-    }
-    let response = response.context("Python bridge returned no manifest")?;
+    let response = process.receive(timeout).inspect_err(|_| {
+        process.kill();
+    })?;
     if response.get("type").and_then(Value::as_str) == Some("error") {
         bail!(
             "failed to load Python script: {}",
@@ -200,6 +215,9 @@ impl PythonSession {
                 Err(error) => {
                     process.kill();
                     self.clear_commands()?;
+                    if started.elapsed() >= timeout {
+                        bail!("Python {hook} exceeded {}ms", timeout.as_millis());
+                    }
                     return Err(error).with_context(|| format!("Python {hook} failed"));
                 }
             };
@@ -313,50 +331,100 @@ struct PythonProcess {
     stdin: ChildStdin,
     messages: mpsc::Receiver<Result<Value, String>>,
     request_id: u64,
+    monitor_stop: Arc<AtomicBool>,
+    protocol_reader: Option<JoinHandle<()>>,
+    log_forwarder: Option<JoinHandle<()>>,
+    resource_monitor: Option<JoinHandle<()>>,
+    protocol_bytes: usize,
+    process_group: u32,
+    limits: PythonProcessLimits,
+    resource_failure: Arc<Mutex<Option<String>>>,
 }
 
 impl PythonProcess {
     fn spawn(path: &Path, runtime: &PythonRuntime) -> Result<Self> {
-        let mut child = Command::new(&runtime.interpreter)
+        Self::spawn_mode(path, runtime, "session", PythonProcessLimits::default())
+    }
+
+    fn spawn_mode(
+        path: &Path,
+        runtime: &PythonRuntime,
+        mode: &str,
+        limits: PythonProcessLimits,
+    ) -> Result<Self> {
+        let mut command = Command::new(&runtime.interpreter);
+        command
             .args(["-u", "-c", PYTHON_RUNNER])
             .arg(path)
-            .arg("session")
+            .arg(mode)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to start Python script {} with {}",
-                    path.display(),
-                    runtime.interpreter.display()
-                )
-            })?;
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "failed to start Python script {} with {}",
+                path.display(),
+                runtime.interpreter.display()
+            )
+        })?;
+        let process_group = child.id();
         let stdin = child.stdin.take().context("Python bridge has no stdin")?;
         let stdout = child.stdout.take().context("Python bridge has no stdout")?;
+        let stderr = child.stderr.take().context("Python bridge has no stderr")?;
         let (sender, messages) = mpsc::channel();
-        thread::Builder::new()
+        let protocol_sender = sender.clone();
+        let protocol_reader = thread::Builder::new()
             .name("mlab-python-bridge".to_string())
             .spawn(move || {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines() {
-                    let message = match line {
-                        Ok(line) => serde_json::from_str(&line).map_err(|error| {
-                            format!("invalid Python bridge JSON: {error}; line={line}")
+                let mut reader = BufReader::new(stdout);
+                loop {
+                    let message = match read_bounded_line(&mut reader, limits.protocol_bytes) {
+                        Ok(Some(line)) => serde_json::from_slice(&line).map_err(|error| {
+                            let preview = String::from_utf8_lossy(&line)
+                                .chars()
+                                .take(512)
+                                .collect::<String>();
+                            format!("invalid Python bridge JSON: {error}; line={preview}")
                         }),
+                        Ok(None) => {
+                            let _ = protocol_sender
+                                .send(Err("Python bridge closed its output".to_string()));
+                            break;
+                        }
                         Err(error) => Err(format!("failed to read Python bridge: {error}")),
                     };
-                    if sender.send(message).is_err() {
+                    let terminal = message.is_err();
+                    if protocol_sender.send(message).is_err() || terminal {
                         break;
                     }
                 }
             })
             .context("failed to start Python bridge reader")?;
+        let log_forwarder = spawn_log_forwarder(stderr, limits.log_bytes)?;
+        let monitor_stop = Arc::new(AtomicBool::new(false));
+        let resource_failure = Arc::new(Mutex::new(None));
+        let resource_monitor = spawn_resource_monitor(
+            process_group,
+            limits,
+            Arc::clone(&monitor_stop),
+            Arc::clone(&resource_failure),
+            sender,
+        )?;
         Ok(Self {
             child,
             stdin,
             messages,
             request_id: 0,
+            monitor_stop,
+            protocol_reader: Some(protocol_reader),
+            log_forwarder: Some(log_forwarder),
+            resource_monitor: Some(resource_monitor),
+            protocol_bytes: limits.protocol_bytes,
+            process_group,
+            limits,
+            resource_failure,
         })
     }
 
@@ -366,7 +434,25 @@ impl PythonProcess {
     }
 
     fn send(&mut self, value: &Value) -> Result<()> {
-        serde_json::to_writer(&mut self.stdin, value)
+        if let Some(error) = self
+            .resource_failure
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Python resource monitor lock poisoned"))?
+            .clone()
+        {
+            bail!("{error}");
+        }
+        let encoded =
+            serde_json::to_vec(value).context("failed to encode Python bridge message")?;
+        if encoded.len() > self.protocol_bytes {
+            bail!(
+                "Python bridge message is {} bytes; limit is {} bytes",
+                encoded.len(),
+                self.protocol_bytes
+            );
+        }
+        self.stdin
+            .write_all(&encoded)
             .context("failed to write to Python bridge")?;
         self.stdin
             .write_all(b"\n")
@@ -376,7 +462,13 @@ impl PythonProcess {
 
     fn receive(&mut self, timeout: Duration) -> Result<Value> {
         match self.messages.recv_timeout(timeout) {
-            Ok(Ok(value)) => Ok(value),
+            Ok(Ok(value)) => {
+                if let Some(error) = resource_violation(self.process_group, self.limits) {
+                    self.kill();
+                    bail!("{error}");
+                }
+                Ok(value)
+            }
             Ok(Err(error)) => bail!("{error}"),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 bail!("timed out waiting for Python bridge")
@@ -392,8 +484,24 @@ impl PythonProcess {
     }
 
     fn kill(&mut self) {
+        self.monitor_stop.store(true, Ordering::Relaxed);
+        kill_process_group(self.child.id());
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.join_helpers();
+    }
+
+    fn join_helpers(&mut self) {
+        for handle in [
+            self.protocol_reader.take(),
+            self.log_forwarder.take(),
+            self.resource_monitor.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -402,8 +510,225 @@ impl Drop for PythonProcess {
         let _ = self.send(&json!({ "type": "shutdown" }));
         if self.child.try_wait().ok().flatten().is_none() {
             self.kill();
+        } else {
+            self.monitor_stop.store(true, Ordering::Relaxed);
+            self.join_helpers();
         }
     }
+}
+
+fn read_bounded_line<R: BufRead>(reader: &mut R, limit: usize) -> io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok((!line.is_empty()).then_some(line));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let chunk_len = newline.unwrap_or(available.len());
+        if line.len().saturating_add(chunk_len) > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Python protocol message exceeds the {limit}-byte limit"),
+            ));
+        }
+        line.extend_from_slice(&available[..chunk_len]);
+        let consumed = chunk_len + usize::from(newline.is_some());
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(line));
+        }
+    }
+}
+
+fn spawn_log_forwarder(stderr: ChildStderr, limit: usize) -> Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("mlab-python-logs".to_string())
+        .spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut buffer = [0_u8; 8 * 1024];
+            let mut forwarded = 0_usize;
+            let mut warned = false;
+            loop {
+                let read = match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                let allowed = limit.saturating_sub(forwarded).min(read);
+                if allowed > 0 {
+                    let mut output = io::stderr().lock();
+                    let _ = output.write_all(&buffer[..allowed]);
+                    let _ = output.flush();
+                    forwarded = forwarded.saturating_add(allowed);
+                }
+                if allowed < read && !warned {
+                    warned = true;
+                    let _ = writeln!(
+                        io::stderr(),
+                        "\nmarketlab: Python log output exceeded {limit} bytes; further output is discarded"
+                    );
+                }
+            }
+        })
+        .context("failed to start Python log forwarder")
+}
+
+fn spawn_resource_monitor(
+    process_group: u32,
+    limits: PythonProcessLimits,
+    stop: Arc<AtomicBool>,
+    failure: Arc<Mutex<Option<String>>>,
+    sender: mpsc::Sender<Result<Value, String>>,
+) -> Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("mlab-python-limits".to_string())
+        .spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if let Some(error) = resource_violation(process_group, limits) {
+                    if let Ok(mut failure) = failure.lock() {
+                        *failure = Some(error.clone());
+                    }
+                    let _ = sender.send(Err(error));
+                    kill_process_group(process_group);
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                thread::sleep(PYTHON_RESOURCE_POLL_INTERVAL);
+            }
+        })
+        .context("failed to start Python resource monitor")
+}
+
+fn resource_violation(process_group: u32, limits: PythonProcessLimits) -> Option<String> {
+    let (processes, memory_bytes) = process_group_usage(process_group)?;
+    if processes > limits.max_processes {
+        return Some(format!(
+            "Python process tree has {processes} processes; limit is {}",
+            limits.max_processes
+        ));
+    }
+    if memory_bytes > limits.memory_bytes as u64 {
+        return Some(format!(
+            "Python process tree uses {memory_bytes} bytes of memory; limit is {} bytes",
+            limits.memory_bytes
+        ));
+    }
+    None
+}
+
+#[cfg(unix)]
+fn kill_process_group(process_group: u32) {
+    if let Ok(process_group) = i32::try_from(process_group) {
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_process_group: u32) {}
+
+#[cfg(target_os = "linux")]
+fn process_group_usage(process_group: u32) -> Option<(usize, u64)> {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    let mut processes = 0_usize;
+    let mut memory_bytes = 0_u64;
+    let entries = fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_string_lossy().parse::<i32>().ok() else {
+            continue;
+        };
+        if unsafe { libc::getpgid(pid) } != process_group as i32 {
+            continue;
+        }
+        processes = processes.saturating_add(1);
+        let resident_pages = fs::read_to_string(entry.path().join("statm"))
+            .ok()
+            .and_then(|stat| {
+                stat.split_whitespace()
+                    .nth(1)
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .unwrap_or_default();
+        memory_bytes = memory_bytes.saturating_add(resident_pages.saturating_mul(page_size as u64));
+    }
+    Some((processes, memory_bytes))
+}
+
+#[cfg(target_os = "macos")]
+fn process_group_usage(process_group: u32) -> Option<(usize, u64)> {
+    const MAX_PIDS: usize = 256;
+    const RUSAGE_INFO_V2: i32 = 2;
+    let process_group = i32::try_from(process_group).ok()?;
+    let mut pids = [0_i32; MAX_PIDS];
+    let count = unsafe {
+        proc_listpgrppids(
+            process_group,
+            pids.as_mut_ptr().cast(),
+            std::mem::size_of_val(&pids) as i32,
+        )
+    };
+    if count < 0 {
+        return None;
+    }
+    let count = (count as usize).min(pids.len());
+    let mut memory_bytes = 0_u64;
+    for pid in &pids[..count] {
+        if *pid <= 0 {
+            continue;
+        }
+        let mut usage = std::mem::MaybeUninit::<RusageInfoV2>::zeroed();
+        let result = unsafe {
+            proc_pid_rusage(
+                *pid,
+                RUSAGE_INFO_V2,
+                usage.as_mut_ptr().cast::<std::ffi::c_void>(),
+            )
+        };
+        if result == 0 {
+            let usage = unsafe { usage.assume_init() };
+            memory_bytes = memory_bytes.saturating_add(usage.phys_footprint);
+        }
+    }
+    Some((count, memory_bytes))
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct RusageInfoV2 {
+    uuid: [u8; 16],
+    user_time: u64,
+    system_time: u64,
+    pkg_idle_wkups: u64,
+    interrupt_wkups: u64,
+    pageins: u64,
+    wired_size: u64,
+    resident_size: u64,
+    phys_footprint: u64,
+    proc_start_abstime: u64,
+    proc_exit_abstime: u64,
+    child_user_time: u64,
+    child_system_time: u64,
+    child_pkg_idle_wkups: u64,
+    child_interrupt_wkups: u64,
+    child_pageins: u64,
+    child_elapsed_abstime: u64,
+    diskio_bytesread: u64,
+    diskio_byteswritten: u64,
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn proc_listpgrppids(process_group: i32, buffer: *mut std::ffi::c_void, size: i32) -> i32;
+    fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut std::ffi::c_void) -> i32;
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_group_usage(_process_group: u32) -> Option<(usize, u64)> {
+    None
 }
 
 fn artifact_directory(job_id: &str) -> Result<PathBuf> {
@@ -447,14 +772,6 @@ fn python_error_message(response: &Value) -> String {
         .unwrap_or("unknown Python error")
         .trim()
         .to_string()
-}
-
-fn suffix_error(error: &str) -> String {
-    if error.is_empty() {
-        String::new()
-    } else {
-        format!(": {error}")
-    }
 }
 
 const PYTHON_RUNNER: &str = r#"
@@ -715,6 +1032,33 @@ mod tests {
         })
     }
 
+    fn resolved_python(path: &Path) -> Option<PythonRuntime> {
+        PythonRuntime::resolve(path, None).ok()
+    }
+
+    fn start_test_process(
+        path: &Path,
+        runtime: &PythonRuntime,
+        limits: PythonProcessLimits,
+    ) -> PythonProcess {
+        let mut process = PythonProcess::spawn_mode(path, runtime, "session", limits)
+            .expect("start limited Python process");
+        process
+            .send(&json!({
+                "type": "init",
+                "params": {},
+                "historyCapacity": 2,
+                "executionEnabled": false,
+                "artifactDir": std::env::temp_dir(),
+            }))
+            .expect("initialize limited Python process");
+        let ready = process
+            .receive(PYTHON_STARTUP_TIMEOUT)
+            .expect("limited Python process should start");
+        assert_eq!(ready["type"], "ready");
+        process
+    }
+
     #[test]
     fn python_v2_keeps_state_history_execution_and_artifacts() {
         let path = write_python_script(
@@ -907,5 +1251,193 @@ def on_finish(ctx, history):
         assert!(format!("{error:#}").contains("unavailable inside on_finish"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn python_manifest_import_is_time_bounded() {
+        let path = write_python_script(
+            r#"
+while True:
+    pass
+"#,
+            "import-timeout",
+        );
+        let Some(runtime) = resolved_python(&path) else {
+            let _ = fs::remove_file(path);
+            return;
+        };
+
+        let error = inspect_python_script_with_limits(
+            &path,
+            &runtime,
+            Duration::from_millis(150),
+            PythonProcessLimits::default(),
+        )
+        .expect_err("infinite import should time out");
+        assert!(format!("{error:#}").contains("timed out waiting for Python bridge"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn python_hook_infinite_loop_is_time_bounded() {
+        let path = write_python_script(
+            r#"
+script = {"name": "hook-timeout", "version": "2", "sources": ["candles"]}
+
+def on_data(ctx, event, history):
+    while True:
+        pass
+"#,
+            "hook-timeout",
+        );
+        let Some(runtime) = resolved_python(&path) else {
+            let _ = fs::remove_file(path);
+            return;
+        };
+        let session = PythonSession::start(
+            &path,
+            &runtime,
+            &json!({}),
+            2,
+            ScriptExecutionContext::disabled(),
+        )
+        .expect("start timeout session");
+
+        let error = session
+            .run_hook(
+                "on_data",
+                json!({
+                    "event": {},
+                    "record": {"source": "candles", "value": {}, "identity": null},
+                }),
+                Duration::from_millis(150),
+            )
+            .expect_err("infinite hook should time out");
+        assert!(format!("{error:#}").contains("Python on_data exceeded 150ms"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn python_process_tree_memory_is_limited() {
+        let path = write_python_script(
+            r#"
+script = {"name": "memory-limit", "version": "2", "sources": ["candles"]}
+
+def on_data(ctx, event, history):
+    global allocation
+    allocation = bytearray(256 * 1024 * 1024)
+"#,
+            "memory-limit",
+        );
+        let Some(runtime) = resolved_python(&path) else {
+            let _ = fs::remove_file(path);
+            return;
+        };
+        let limits = PythonProcessLimits {
+            memory_bytes: 96 * 1024 * 1024,
+            ..PythonProcessLimits::default()
+        };
+        let mut process = start_test_process(&path, &runtime, limits);
+        process
+            .send(&json!({
+                "type": "hook",
+                "hook": "on_data",
+                "id": 1,
+                "event": {},
+                "record": {"source": "candles", "value": {}, "identity": null},
+            }))
+            .expect("send allocation hook");
+        let error = process
+            .receive(Duration::from_secs(5))
+            .expect_err("memory-heavy hook should be terminated");
+        assert!(format!("{error:#}").contains("memory; limit is"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn python_subprocess_count_is_limited_and_tree_is_killed() {
+        let child_pid_path = std::env::temp_dir().join(format!(
+            "mlab-python-child-{}-{}.pid",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let source = format!(
+            r#"
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+script = {{"name": "process-limit", "version": "2", "sources": ["candles"]}}
+
+def on_data(ctx, event, history):
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    Path({pid_path:?}).write_text(str(child.pid))
+    time.sleep(60)
+"#,
+            pid_path = child_pid_path.display().to_string(),
+        );
+        let path = write_python_script(&source, "process-limit");
+        let Some(runtime) = resolved_python(&path) else {
+            let _ = fs::remove_file(path);
+            return;
+        };
+        let limits = PythonProcessLimits {
+            max_processes: 1,
+            ..PythonProcessLimits::default()
+        };
+        let mut process = start_test_process(&path, &runtime, limits);
+        process
+            .send(&json!({
+                "type": "hook",
+                "hook": "on_data",
+                "id": 1,
+                "event": {},
+                "record": {"source": "candles", "value": {}, "identity": null},
+            }))
+            .expect("send subprocess hook");
+        let error = process
+            .receive(Duration::from_secs(5))
+            .expect_err("subprocess-heavy hook should be terminated");
+        assert!(format!("{error:#}").contains("processes; limit is 1"));
+
+        if let Ok(pid) = fs::read_to_string(&child_pid_path)
+            && let Ok(pid) = pid.parse::<i32>()
+        {
+            for _ in 0..50 {
+                let exists = unsafe { libc::kill(pid, 0) } == 0;
+                if !exists {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert_ne!(
+                unsafe { libc::kill(pid, 0) },
+                0,
+                "subprocess survived group kill"
+            );
+        }
+
+        let _ = fs::remove_file(child_pid_path);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn python_protocol_lines_are_bounded() {
+        let mut accepted = io::Cursor::new(b"1234\n".to_vec());
+        assert_eq!(
+            read_bounded_line(&mut accepted, 4).expect("bounded line"),
+            Some(b"1234".to_vec())
+        );
+
+        let mut rejected = io::Cursor::new(b"12345\n".to_vec());
+        let error = read_bounded_line(&mut rejected, 4).expect_err("oversized line must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }

@@ -354,6 +354,14 @@ mod tests {
         assert_eq!(value["runtime"]["engine"], "python");
         assert_eq!(value["limits"]["heap_bytes"], 0);
         assert_eq!(
+            value["limits"]["process_memory_bytes"],
+            crate::scripting::limits::SCRIPT_PYTHON_MEMORY_BYTES
+        );
+        assert_eq!(
+            value["limits"]["max_processes"],
+            crate::scripting::limits::SCRIPT_PYTHON_MAX_PROCESSES
+        );
+        assert_eq!(
             value["limits"]["hook_timeout_ms"],
             crate::scripting::limits::SCRIPT_PYTHON_HOOK_TIMEOUT_MS
         );

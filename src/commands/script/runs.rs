@@ -307,6 +307,32 @@ fn print_show_terminal(path: &Path, json: &Value) {
         "  hook timeout: {}",
         format_duration(get_u64(json, &["limits", "hook_timeout_ms"]))
     );
+    if get_string(json, &["runtime", "engine"]).as_deref() == Some("python") {
+        println!(
+            "  startup timeout: {}",
+            format_duration(get_u64(json, &["limits", "startup_timeout_ms"]))
+        );
+        println!(
+            "  finish timeout: {}",
+            format_duration(get_u64(json, &["limits", "finish_timeout_ms"]))
+        );
+        println!(
+            "  process-tree memory: {}",
+            format_memory(get_u64(json, &["limits", "process_memory_bytes"]))
+        );
+        println!(
+            "  subprocesses: {}",
+            display_u64(json, &["limits", "max_processes"])
+        );
+        println!(
+            "  protocol message: {}",
+            format_memory(get_u64(json, &["limits", "protocol_message_bytes"]))
+        );
+        println!(
+            "  logs: {}",
+            format_memory(get_u64(json, &["limits", "log_bytes"]))
+        );
+    }
 
     if let Some(error) = json.get("error").filter(|value| !value.is_null()) {
         println!();
