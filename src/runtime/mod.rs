@@ -37,7 +37,7 @@ use crate::strategies::jobs::{
 };
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-const RUNTIME_VERSION: u8 = 34;
+const RUNTIME_VERSION: u8 = 35;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -1456,7 +1456,7 @@ fn create_script_job(
         .with_context(|| format!("failed to create {}", job_directory.display()))?;
     fs::set_permissions(&job_directory, fs::Permissions::from_mode(0o700))
         .with_context(|| format!("failed to secure {}", job_directory.display()))?;
-    let snapshot_path = job_directory.join("strategy.js");
+    let snapshot_path = job_directory.join(submission.language.snapshot_file_name());
     fs::write(&snapshot_path, submission.source.as_bytes())
         .with_context(|| format!("failed to write {}", snapshot_path.display()))?;
     fs::set_permissions(&snapshot_path, fs::Permissions::from_mode(0o600))
@@ -1467,6 +1467,8 @@ fn create_script_job(
         script_name: submission.script_name,
         original_path: submission.original_path,
         snapshot_path,
+        language: submission.language,
+        python_runtime: submission.python_runtime,
         providers: submission.providers,
         exchanges: submission.exchanges,
         sources: submission.sources,
@@ -5358,8 +5360,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_protocol_v34_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 34);
+    fn runtime_protocol_v35_decodes_oiwap_submissions() {
+        assert_eq!(RUNTIME_VERSION, 35);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",
@@ -5389,6 +5391,43 @@ mod tests {
             RuntimeRequest::SubmitStrategyJob {
                 submission: StrategyJobSubmission {
                     definition: StrategyJobDefinition::Oiwap(_)
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn runtime_protocol_v35_decodes_python_script_submissions() {
+        let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
+            "type": "submit_script_job",
+            "submission": {
+                "scriptName": "python-sma",
+                "originalPath": "/strategies/sma.py",
+                "source": "script = {}",
+                "language": "python_v2",
+                "pythonRuntime": {
+                    "interpreter": "/strategies/.venv/bin/python",
+                    "version": "3.12.4"
+                },
+                "providers": ["mmt"],
+                "exchanges": ["binancef"],
+                "sources": ["btc@candles@binancef@mmt:timeframe=60"],
+                "params": ["fast_period=20"],
+                "venue": "hyperliquidf",
+                "testnet": false,
+                "durationSeconds": 3_600,
+                "verbose": false
+            }
+        }))
+        .expect("runtime protocol should decode Python script submissions");
+
+        assert!(matches!(
+            request,
+            RuntimeRequest::SubmitScriptJob {
+                submission: ScriptJobSubmission {
+                    language: crate::scripting::language::ScriptLanguage::PythonV2,
+                    python_runtime: Some(_),
+                    ..
                 }
             }
         ));

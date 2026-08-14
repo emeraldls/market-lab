@@ -151,7 +151,7 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
             "--from/--to are not allowed with script run; use script backtest for historical data"
         );
     }
-    let script = Script::load(&args.script)?;
+    let script = Script::load_with_python(&args.script, args.python.as_deref())?;
     let source_configs = parse_source_configs(&args.source)?;
     validate_source_configs_for_run(&script.manifest, &source_configs)?;
     let raw_params = parse_param_values(&args.param)?;
@@ -169,6 +169,8 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
         script_name: script.manifest.name.clone(),
         original_path: script.path.display().to_string(),
         source: script.source().to_string(),
+        language: script.language,
+        python_runtime: script.python_runtime().cloned(),
         providers,
         exchanges,
         sources: args.source,
@@ -219,7 +221,11 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
 
 pub async fn handle_worker(job_id: &str) -> Result<()> {
     let job = crate::runtime::get_script_job_from_running_daemon(job_id).await?;
-    let script = Script::load(&job.definition.snapshot_path)?;
+    let script = Script::load_with_runtime(
+        &job.definition.snapshot_path,
+        job.definition.language,
+        job.definition.python_runtime.clone(),
+    )?;
     let venue = job.definition.venue.map(|venue| match venue {
         crate::domain::execution::ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
         crate::domain::execution::ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
@@ -236,6 +242,11 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
     let args = ScriptRunArgs {
         script: job.definition.snapshot_path.display().to_string(),
         config: None,
+        python: job
+            .definition
+            .python_runtime
+            .as_ref()
+            .map(|runtime| runtime.interpreter.clone()),
         venue,
         testnet: job.definition.testnet,
         from: None,
@@ -255,22 +266,7 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
     );
     let pid = std::process::id();
     crate::runtime::script_worker_started(job_id, pid).await?;
-    let result = if let Some(duration_seconds) = job.definition.duration_seconds {
-        match tokio::time::timeout(
-            Duration::from_secs(duration_seconds),
-            run(args, script, &mut report, job_id, job.worker_event_cursor),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                report.set_phase("duration_elapsed");
-                Ok(())
-            }
-        }
-    } else {
-        run(args, script, &mut report, job_id, job.worker_event_cursor).await
-    };
+    let result = run(args, script, &mut report, job_id, job.worker_event_cursor).await;
     let error = result
         .as_ref()
         .err()
@@ -359,12 +355,24 @@ async fn stream_sources(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to install script worker termination handler")?;
+    let duration_deadline = args
+        .duration
+        .map(|seconds| tokio::time::Instant::now() + Duration::from_secs(seconds));
+    let duration_elapsed = async move {
+        if let Some(deadline) = duration_deadline {
+            tokio::time::sleep_until(deadline).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(duration_elapsed);
 
     report.set_phase("streaming_sources");
     write_running_report_best_effort(report);
 
     loop {
         if session.is_cancelled() {
+            finish_live_session(&session, job_id, report)?;
             report.set_phase("cancelled");
             render_run_summary(&summary, args.output, args.verbose)?;
             return Err(ScriptCancelled.into());
@@ -408,11 +416,13 @@ async fn stream_sources(
                 }
             }
             _ = tokio::signal::ctrl_c() => {
+                finish_live_session(&session, job_id, report)?;
                 report.set_phase("cancelled");
                 render_run_summary(&summary, args.output, args.verbose)?;
                 return Err(ScriptCancelled.into());
             }
             _ = terminate.recv() => {
+                finish_live_session(&session, job_id, report)?;
                 report.set_phase("cancelled");
                 render_run_summary(&summary, args.output, args.verbose)?;
                 return Err(ScriptCancelled.into());
@@ -420,6 +430,12 @@ async fn stream_sources(
             _ = heartbeat.tick() => {
                 crate::runtime::script_worker_heartbeat(job_id, std::process::id()).await?;
                 continue;
+            }
+            _ = &mut duration_elapsed => {
+                finish_live_session(&session, job_id, report)?;
+                report.set_phase("duration_elapsed");
+                render_run_summary(&summary, args.output, args.verbose)?;
+                return Ok(());
             }
             _ = execution_events.tick() => {
                 dispatch_execution_events(&session, job_id, &mut event_cursor).await?;
@@ -483,6 +499,32 @@ async fn stream_sources(
         crate::runtime::append_script_output(job_id, &result)?;
         render_stream_result(&result, args.output, args.verbose, &mut rendered)?;
     }
+}
+
+fn finish_live_session(
+    session: &crate::scripting::engine::ScriptSession,
+    job_id: &str,
+    report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
+) -> Result<()> {
+    let Some(execution) = session.run_finish()? else {
+        return Ok(());
+    };
+    report.record_hook(&execution.stats);
+    if !execution.commands.is_empty() {
+        bail!("on_finish cannot submit execution commands");
+    }
+    if !execution.output.is_empty() {
+        crate::runtime::append_script_output(
+            job_id,
+            &json!({
+                "type": "script.finish.result",
+                "version": "2",
+                "ts_ms": now_ms(),
+                "output": execution.output,
+            }),
+        )?;
+    }
+    Ok(())
 }
 
 async fn dispatch_execution_commands(

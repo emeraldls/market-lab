@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use super::limits::{ScriptRuntimeLimits, default_limits};
+use super::limits::{ScriptRuntimeLimits, default_limits, python_limits};
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ScriptHookTelemetry {
@@ -114,6 +114,7 @@ pub struct ScriptRuntimeReportBuilder {
     telemetry: ScriptHookTelemetry,
     phase: Option<String>,
     progress: Option<ScriptRuntimeProgress>,
+    engine: &'static str,
 }
 
 impl ScriptRuntimeReportBuilder {
@@ -135,6 +136,14 @@ impl ScriptRuntimeReportBuilder {
             telemetry: ScriptHookTelemetry::default(),
             phase: Some("started".to_string()),
             progress: None,
+            engine: "quickjs",
+        }
+    }
+
+    pub fn set_engine(&mut self, engine: &'static str) {
+        self.engine = engine;
+        if engine == "python" {
+            self.limits = python_limits();
         }
     }
 
@@ -222,7 +231,7 @@ impl ScriptRuntimeReportBuilder {
             progress: self.progress.clone(),
             limits: self.limits,
             runtime: ScriptRuntimeMetrics {
-                engine: "quickjs",
+                engine: self.engine,
                 hooks_called: self.telemetry.hooks_called,
                 hook_failures: self.telemetry.hook_failures,
                 max_hook_duration_ms: self.telemetry.max_hook_duration_ms,
@@ -324,5 +333,29 @@ mod tests {
         let value = serde_json::to_value(report).expect("serialize report");
         assert_eq!(value["type"], "script.runtime.report");
         assert_eq!(value["runtime"]["engine"], "quickjs");
+    }
+
+    #[test]
+    fn python_report_exposes_subprocess_limits() {
+        let mut builder = ScriptRuntimeReportBuilder::start(
+            "script.backtest",
+            ScriptReportScript {
+                name: "x".to_string(),
+                path: "x.py".to_string(),
+                source: "candles".to_string(),
+            },
+            Some("mmt".to_string()),
+            Some("bybitf".to_string()),
+            Some("BTC".to_string()),
+        );
+        builder.set_engine("python");
+
+        let value = serde_json::to_value(builder.finish_ok()).expect("serialize report");
+        assert_eq!(value["runtime"]["engine"], "python");
+        assert_eq!(value["limits"]["heap_bytes"], 0);
+        assert_eq!(
+            value["limits"]["hook_timeout_ms"],
+            crate::scripting::limits::SCRIPT_PYTHON_HOOK_TIMEOUT_MS
+        );
     }
 }

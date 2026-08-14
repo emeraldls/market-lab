@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::execution::ExecutionVenue;
 
 use super::execution::{ScriptManagedRequest, ScriptOrderRef};
+use super::language::{PythonRuntime, ScriptLanguage};
 
 pub const MAX_SCRIPT_SOURCE_BYTES: usize = 1024 * 1024;
 
@@ -15,6 +16,10 @@ pub struct ScriptJobSubmission {
     pub script_name: String,
     pub original_path: String,
     pub source: String,
+    #[serde(default)]
+    pub language: ScriptLanguage,
+    #[serde(default)]
+    pub python_runtime: Option<PythonRuntime>,
     pub providers: Vec<String>,
     pub exchanges: Vec<String>,
     #[serde(default)]
@@ -45,6 +50,15 @@ impl ScriptJobSubmission {
         if self.source.len() > MAX_SCRIPT_SOURCE_BYTES {
             bail!("script source exceeds the 1 MiB job limit");
         }
+        match (self.language, &self.python_runtime) {
+            (ScriptLanguage::JavaScriptV1, Some(_)) => {
+                bail!("JavaScript jobs cannot specify a Python runtime")
+            }
+            (ScriptLanguage::PythonV2, None) => {
+                bail!("Python jobs require a resolved Python runtime")
+            }
+            _ => {}
+        }
         if self.duration_seconds == Some(0) {
             bail!("script job duration must be at least 1 second");
         }
@@ -58,6 +72,10 @@ pub struct ScriptJobDefinition {
     pub script_name: String,
     pub original_path: String,
     pub snapshot_path: PathBuf,
+    #[serde(default)]
+    pub language: ScriptLanguage,
+    #[serde(default)]
+    pub python_runtime: Option<PythonRuntime>,
     pub providers: Vec<String>,
     pub exchanges: Vec<String>,
     pub sources: Vec<String>,
@@ -154,6 +172,30 @@ mod tests {
         .expect("older job definition should deserialize");
 
         assert!(definition.duration_seconds.is_none());
+        assert_eq!(definition.language, ScriptLanguage::JavaScriptV1);
+        assert!(definition.python_runtime.is_none());
+    }
+
+    #[test]
+    fn python_job_requires_a_persisted_interpreter() {
+        let submission: ScriptJobSubmission = serde_json::from_value(serde_json::json!({
+            "scriptName": "python-maker",
+            "originalPath": "maker.py",
+            "source": "script = {}",
+            "language": "python_v2",
+            "providers": ["bulkf"],
+            "exchanges": ["bulkf"],
+            "sources": ["btc@orderbook@bulkf"],
+            "params": [],
+            "venue": "bulkf",
+            "verbose": false
+        }))
+        .expect("Python submission should deserialize");
+
+        let error = submission
+            .validate()
+            .expect_err("Python job without interpreter must fail");
+        assert!(format!("{error:#}").contains("resolved Python runtime"));
     }
 }
 

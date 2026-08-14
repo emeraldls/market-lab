@@ -48,5 +48,13 @@ pub(crate) fn report_builder(
     exchange: Option<String>,
     symbol: Option<String>,
 ) -> ScriptRuntimeReportBuilder {
-    ScriptRuntimeReportBuilder::start(command, report_script(script), provider, exchange, symbol)
+    let mut report = ScriptRuntimeReportBuilder::start(
+        command,
+        report_script(script),
+        provider,
+        exchange,
+        symbol,
+    );
+    report.set_engine(script.language.engine_name());
+    report
 }

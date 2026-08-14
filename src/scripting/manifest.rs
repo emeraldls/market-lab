@@ -52,11 +52,22 @@ pub struct ScriptManifest {
 
 impl ScriptManifest {
     pub fn validate(&self) -> Result<()> {
+        if !matches!(self.version.trim(), "1" | "2") {
+            bail!("script.version must be \"1\" or \"2\"");
+        }
+        self.validate_common()
+    }
+
+    pub fn validate_for_version(&self, expected: &str) -> Result<()> {
+        if self.version.trim() != expected {
+            bail!("script.version must be \"{expected}\" for this script language");
+        }
+        self.validate_common()
+    }
+
+    fn validate_common(&self) -> Result<()> {
         if self.name.trim().is_empty() {
             bail!("script.name is required");
-        }
-        if self.version.trim() != "1" {
-            bail!("script.version must be \"1\"");
         }
         if self.sources.is_empty() {
             bail!("script.sources must not be empty");

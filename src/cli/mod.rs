@@ -635,6 +635,9 @@ pub struct ScriptRunArgs {
     pub script: String,
     #[arg(long)]
     pub config: Option<PathBuf>,
+    /// Python interpreter for a .py script. Defaults to an adjacent .venv, then python3.
+    #[arg(long)]
+    pub python: Option<PathBuf>,
     /// Arms live execution for ctx.trade/ctx.cancel while data may come from any provider.
     #[arg(long, value_enum)]
     pub venue: Option<ExecutionVenueArg>,
@@ -752,6 +755,9 @@ pub struct ScriptBacktestArgs {
     pub script: String,
     #[arg(long)]
     pub config: Option<PathBuf>,
+    /// Python interpreter for a .py script. Defaults to an adjacent .venv, then python3.
+    #[arg(long)]
+    pub python: Option<PathBuf>,
     #[arg(long)]
     pub from: u64,
     #[arg(long)]
@@ -4522,6 +4528,50 @@ mod tests {
                 args.validate().expect("validate should succeed");
             }
             _ => panic!("expected script run command"),
+        }
+    }
+
+    #[test]
+    fn parse_python_script_commands() {
+        let run = Cli::try_parse_from([
+            "mlab",
+            "script",
+            "run",
+            "strategy.py",
+            "--python",
+            ".venv/bin/python",
+            "--source",
+            "btc@candles@hyperliquidf:timeframe=60",
+        ])
+        .expect("Python script run should parse");
+        match run.command {
+            Commands::Script {
+                command: ScriptCommands::Run(args),
+            } => {
+                assert_eq!(args.script, "strategy.py");
+                assert_eq!(args.python, Some(PathBuf::from(".venv/bin/python")));
+            }
+            _ => panic!("expected Python script run"),
+        }
+
+        let backtest = Cli::try_parse_from([
+            "mlab",
+            "script",
+            "backtest",
+            "strategy.py",
+            "--python",
+            ".venv/bin/python",
+            "--from",
+            "1704067200000",
+            "--to",
+            "1704067800000",
+        ])
+        .expect("Python script backtest should parse");
+        match backtest.command {
+            Commands::Script {
+                command: ScriptCommands::Backtest(args),
+            } => assert_eq!(args.python, Some(PathBuf::from(".venv/bin/python"))),
+            _ => panic!("expected Python script backtest"),
         }
     }
 

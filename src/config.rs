@@ -41,6 +41,7 @@ struct OutputConfig {
 #[serde(deny_unknown_fields)]
 struct ScriptConfig {
     path: Option<PathBuf>,
+    python: Option<PathBuf>,
     duration: Option<u64>,
     params: Option<BTreeMap<String, toml::Value>>,
 }
@@ -105,7 +106,7 @@ pub fn expand_args(args: impl IntoIterator<Item = OsString>) -> Result<Vec<OsStr
                     .context("script path is required in the command or [script].path")?;
                 expanded.push(resolve_config_path(&config_path, path).into_os_string());
             }
-            append_script_config_flags(&mut expanded, &config, mode)?;
+            append_script_config_flags(&mut expanded, &config_path, &config, mode)?;
             expanded.extend_from_slice(&args[mode_idx + 1..]);
             debug_assert_eq!(args[script_idx].to_string_lossy(), "script");
             Ok(expanded)
@@ -144,9 +145,23 @@ fn load_config(path: &Path) -> Result<MarketLabConfig> {
 
 fn append_script_config_flags(
     args: &mut Vec<OsString>,
+    config_path: &Path,
     config: &MarketLabConfig,
     mode: &str,
 ) -> Result<()> {
+    if let Some(python) = config
+        .script
+        .as_ref()
+        .and_then(|script| script.python.as_ref())
+    {
+        append_pair(
+            args,
+            "--python",
+            &resolve_config_path(config_path, python)
+                .display()
+                .to_string(),
+        );
+    }
     if let Some(sources) = &config.sources {
         for (source, values) in sources {
             if values.is_empty() {
@@ -460,6 +475,54 @@ to = 2000
                 assert!(args.script.ends_with("strategy.js"));
             }
             _ => panic!("expected script backtest"),
+        }
+    }
+
+    #[test]
+    fn expands_python_interpreter_relative_to_config() {
+        let dir = std::env::temp_dir().join(format!("mlab-python-config-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create config test directory");
+        let path = dir.join("marketlab.toml");
+        fs::write(
+            &path,
+            r#"
+version = 1
+
+[script]
+path = "strategy.py"
+python = ".venv/bin/python"
+
+[sources."btc@candles@hyperliquidf"]
+timeframe = 60
+
+[backtest]
+from = 1000
+to = 2000
+"#,
+        )
+        .expect("write config");
+
+        let expanded = expand_args(
+            [
+                "mlab",
+                "script",
+                "backtest",
+                "--config",
+                path.to_str().expect("utf8 path"),
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .expect("expand Python config");
+        let cli = Cli::try_parse_from(expanded).expect("parse Python config");
+        match cli.command {
+            Commands::Script {
+                command: ScriptCommands::Backtest(args),
+            } => {
+                assert!(args.script.ends_with("strategy.py"));
+                assert_eq!(args.python, Some(dir.join(".venv/bin/python")));
+            }
+            _ => panic!("expected Python script backtest"),
         }
     }
 

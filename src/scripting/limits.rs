@@ -3,6 +3,7 @@ use serde::Serialize;
 pub const SCRIPT_HEAP_BYTES: usize = 32 * 1024 * 1024;
 pub const SCRIPT_STACK_BYTES: usize = 1024 * 1024;
 pub const SCRIPT_HOOK_TIMEOUT_MS: u64 = 250;
+pub const SCRIPT_PYTHON_HOOK_TIMEOUT_MS: u64 = 5_000;
 pub const SCRIPT_DEFAULT_LOOKBACK_CANDLES: usize = 5_000;
 pub const SCRIPT_MAX_LOOKBACK_CANDLES: usize = 5_000;
 
@@ -18,5 +19,13 @@ pub fn default_limits() -> ScriptRuntimeLimits {
         heap_bytes: SCRIPT_HEAP_BYTES,
         stack_bytes: SCRIPT_STACK_BYTES,
         hook_timeout_ms: SCRIPT_HOOK_TIMEOUT_MS,
+    }
+}
+
+pub fn python_limits() -> ScriptRuntimeLimits {
+    ScriptRuntimeLimits {
+        heap_bytes: 0,
+        stack_bytes: 0,
+        hook_timeout_ms: SCRIPT_PYTHON_HOOK_TIMEOUT_MS,
     }
 }

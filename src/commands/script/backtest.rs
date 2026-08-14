@@ -289,7 +289,7 @@ pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
         bail!("script backtest currently supports only --output terminal|json|jsonl");
     }
 
-    let script = Script::load(&args.script)?;
+    let script = Script::load_with_python(&args.script, args.python.as_deref())?;
     let mut report = report_builder("script.backtest", &script, None, None, None);
     let source_configs = match parse_source_configs(&args.source) {
         Ok(configs) => configs,
@@ -503,6 +503,19 @@ async fn backtest_events(
             eprintln!("processed {}/{} source events", idx + 1, events.len());
             report.set_progress("executing_hooks", (idx + 1) as u64, events.len() as u64);
             write_running_report_best_effort(report);
+        }
+    }
+
+    if let Some(execution) = session.run_finish()? {
+        report.record_hook(&execution.stats);
+        if !execution.commands.is_empty() {
+            bail!("on_finish cannot submit execution commands");
+        }
+        if !execution.output.is_empty() {
+            latest_output = Some(ScriptBacktestLatestOutput {
+                metrics: execution.output.metrics,
+                meta: execution.output.meta,
+            });
         }
     }
 

@@ -449,68 +449,76 @@ fn native_execution_call(
     operation: &str,
     payload: &str,
 ) -> String {
-    let result = (|| -> Result<serde_json::Value> {
-        if !enabled {
-            bail!("script execution is disabled; deploy the script with --venue");
-        }
-        match operation {
-            "trade" => {
-                let request: ScriptTradeRequest = serde_json::from_str(payload)
-                    .context("ctx.trade request must be valid JSON")?;
-                request.validate()?;
-                let order = ScriptOrderRef {
-                    id: local_order_id(job_id, &request.key),
-                    key: request.key.clone(),
-                };
-                commands
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("script execution queue lock poisoned"))?
-                    .push(ScriptExecutionCommand::Trade {
-                        order: order.clone(),
-                        request,
-                    });
-                Ok(serde_json::to_value(order)?)
-            }
-            "order" => {
-                let request: ScriptRawOrderRequest = serde_json::from_str(payload)
-                    .context("ctx.order request must be valid JSON")?;
-                request.validate()?;
-                let order = ScriptOrderRef {
-                    id: local_order_id(job_id, &request.key),
-                    key: request.key.clone(),
-                };
-                commands
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("script execution queue lock poisoned"))?
-                    .push(ScriptExecutionCommand::Order {
-                        order: order.clone(),
-                        request,
-                    });
-                Ok(serde_json::to_value(order)?)
-            }
-            "cancel" => {
-                let request: ScriptCancelRequest = serde_json::from_str(payload)
-                    .context("ctx.cancel request must be valid JSON")?;
-                request.validate()?;
-                let response = json!({
-                    "key": request.key,
-                    "order": request.order,
-                    "status": "queued"
-                });
-                commands
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("script execution queue lock poisoned"))?
-                    .push(ScriptExecutionCommand::Cancel { request });
-                Ok(response)
-            }
-            _ => bail!("unknown script execution operation `{operation}`"),
-        }
-    })();
+    let result = queue_execution_call(job_id, enabled, commands, operation, payload);
     let response = match result {
         Ok(value) => json!({ "ok": true, "value": value }),
         Err(error) => json!({ "ok": false, "error": format!("{error:#}") }),
     };
     serde_json::to_string(&response).expect("native execution response must serialize")
+}
+
+pub(crate) fn queue_execution_call(
+    job_id: &str,
+    enabled: bool,
+    commands: &ScriptCommandBuffer,
+    operation: &str,
+    payload: &str,
+) -> Result<serde_json::Value> {
+    if !enabled {
+        bail!("script execution is disabled; deploy the script with --venue");
+    }
+    match operation {
+        "trade" => {
+            let request: ScriptTradeRequest =
+                serde_json::from_str(payload).context("ctx.trade request must be valid JSON")?;
+            request.validate()?;
+            let order = ScriptOrderRef {
+                id: local_order_id(job_id, &request.key),
+                key: request.key.clone(),
+            };
+            commands
+                .lock()
+                .map_err(|_| anyhow::anyhow!("script execution queue lock poisoned"))?
+                .push(ScriptExecutionCommand::Trade {
+                    order: order.clone(),
+                    request,
+                });
+            Ok(serde_json::to_value(order)?)
+        }
+        "order" => {
+            let request: ScriptRawOrderRequest =
+                serde_json::from_str(payload).context("ctx.order request must be valid JSON")?;
+            request.validate()?;
+            let order = ScriptOrderRef {
+                id: local_order_id(job_id, &request.key),
+                key: request.key.clone(),
+            };
+            commands
+                .lock()
+                .map_err(|_| anyhow::anyhow!("script execution queue lock poisoned"))?
+                .push(ScriptExecutionCommand::Order {
+                    order: order.clone(),
+                    request,
+                });
+            Ok(serde_json::to_value(order)?)
+        }
+        "cancel" => {
+            let request: ScriptCancelRequest =
+                serde_json::from_str(payload).context("ctx.cancel request must be valid JSON")?;
+            request.validate()?;
+            let response = json!({
+                "key": request.key,
+                "order": request.order,
+                "status": "queued"
+            });
+            commands
+                .lock()
+                .map_err(|_| anyhow::anyhow!("script execution queue lock poisoned"))?
+                .push(ScriptExecutionCommand::Cancel { request });
+            Ok(response)
+        }
+        _ => bail!("unknown script execution operation `{operation}`"),
+    }
 }
 
 pub fn local_order_id(job_id: &str, key: &str) -> String {

@@ -12,9 +12,11 @@ use serde_json::Value as JsonValue;
 use super::execution::{
     ScriptCommandBuffer, ScriptExecutionCommand, ScriptExecutionContext, attach_execution_helpers,
 };
+use super::language::{PythonRuntime, ScriptLanguage};
 use super::limits::{SCRIPT_DEFAULT_LOOKBACK_CANDLES, default_limits};
 use super::manifest::ScriptManifest;
 use super::output::ScriptOutput;
+use super::python::{PythonSession, inspect_python_script};
 use super::studies::attach_study_helpers;
 use super::telemetry::ScriptHookStats;
 
@@ -78,24 +80,81 @@ impl SourceHistory {
 pub struct Script {
     pub path: PathBuf,
     pub manifest: ScriptManifest,
+    pub language: ScriptLanguage,
     source: String,
+    python_runtime: Option<PythonRuntime>,
 }
 
 impl Script {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_python(path, None)
+    }
+
+    pub fn load_with_python(
+        path: impl AsRef<Path>,
+        requested_python: Option<&Path>,
+    ) -> Result<Self> {
         let path = path.as_ref();
         let source = fs::read_to_string(path)
             .with_context(|| format!("failed to read script {}", path.display()))?;
-        let manifest = inspect_manifest(path, &source)?;
+        let language = ScriptLanguage::from_path(path)?;
+        let python_runtime = match language {
+            ScriptLanguage::JavaScriptV1 => {
+                if requested_python.is_some() {
+                    anyhow::bail!("--python is only valid for .py scripts");
+                }
+                None
+            }
+            ScriptLanguage::PythonV2 => Some(PythonRuntime::resolve(path, requested_python)?),
+        };
+        Self::from_source(path, source, language, python_runtime)
+    }
+
+    pub fn load_with_runtime(
+        path: impl AsRef<Path>,
+        language: ScriptLanguage,
+        python_runtime: Option<PythonRuntime>,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let source = fs::read_to_string(path)
+            .with_context(|| format!("failed to read script {}", path.display()))?;
+        if ScriptLanguage::from_path(path)? != language {
+            anyhow::bail!("script snapshot extension does not match its stored language");
+        }
+        Self::from_source(path, source, language, python_runtime)
+    }
+
+    fn from_source(
+        path: &Path,
+        source: String,
+        language: ScriptLanguage,
+        python_runtime: Option<PythonRuntime>,
+    ) -> Result<Self> {
+        let manifest = match language {
+            ScriptLanguage::JavaScriptV1 => inspect_manifest(path, &source)?,
+            ScriptLanguage::PythonV2 => inspect_python_script(
+                path,
+                python_runtime
+                    .as_ref()
+                    .context("Python script has no resolved interpreter")?,
+            )?,
+        };
+        manifest.validate_for_version(language.manifest_version())?;
         Ok(Self {
             path: path.to_path_buf(),
             manifest,
+            language,
             source,
+            python_runtime,
         })
     }
 
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    pub fn python_runtime(&self) -> Option<&PythonRuntime> {
+        self.python_runtime.as_ref()
     }
 
     pub fn history_capacity(&self, params: &JsonValue) -> usize {
@@ -121,6 +180,20 @@ impl Script {
         params: &JsonValue,
         execution: ScriptExecutionContext,
     ) -> Result<ScriptSession> {
+        if self.language == ScriptLanguage::PythonV2 {
+            return PythonSession::start(
+                &self.path,
+                self.python_runtime
+                    .as_ref()
+                    .context("Python script has no resolved interpreter")?,
+                params,
+                self.history_capacity(params),
+                execution,
+            )
+            .map(|session| ScriptSession {
+                inner: ScriptSessionInner::Python(session),
+            });
+        }
         let limits = default_limits();
         let rt = Runtime::new().context("failed to create QuickJS runtime")?;
         rt.set_memory_limit(limits.heap_bytes);
@@ -192,17 +265,19 @@ impl Script {
         })?;
 
         Ok(ScriptSession {
-            rt,
-            ctx,
-            hook_started,
-            cancelled,
-            commands,
-            history,
+            inner: ScriptSessionInner::JavaScript(JavaScriptSession {
+                rt,
+                ctx,
+                hook_started,
+                cancelled,
+                commands,
+                history,
+            }),
         })
     }
 }
 
-pub struct ScriptSession {
+struct JavaScriptSession {
     ctx: Context,
     rt: Runtime,
     hook_started: Arc<Mutex<Instant>>,
@@ -211,7 +286,7 @@ pub struct ScriptSession {
     history: Arc<Mutex<SourceHistory>>,
 }
 
-impl ScriptSession {
+impl JavaScriptSession {
     pub fn cancel_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.cancelled)
     }
@@ -359,6 +434,103 @@ impl ScriptSession {
             .lock()
             .map_err(|_| anyhow::anyhow!("script execution queue lock poisoned"))?;
         Ok(std::mem::take(&mut *commands))
+    }
+}
+
+pub struct ScriptSession {
+    inner: ScriptSessionInner,
+}
+
+enum ScriptSessionInner {
+    JavaScript(JavaScriptSession),
+    Python(PythonSession),
+}
+
+impl ScriptSession {
+    pub fn cancel_handle(&self) -> Arc<AtomicBool> {
+        match &self.inner {
+            ScriptSessionInner::JavaScript(session) => session.cancel_handle(),
+            ScriptSessionInner::Python(session) => session.cancel_handle(),
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        match &self.inner {
+            ScriptSessionInner::JavaScript(session) => session.is_cancelled(),
+            ScriptSessionInner::Python(session) => session.is_cancelled(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn run_candles(&self, candles: &JsonValue) -> Result<ScriptExecution> {
+        match &self.inner {
+            ScriptSessionInner::JavaScript(session) => session.run_candles(candles),
+            ScriptSessionInner::Python(_) => {
+                anyhow::bail!("run_candles is a JavaScript test helper")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn run_orderbooks(&self, books: &JsonValue) -> Result<ScriptExecution> {
+        match &self.inner {
+            ScriptSessionInner::JavaScript(session) => session.run_orderbooks(books),
+            ScriptSessionInner::Python(_) => {
+                anyhow::bail!("run_orderbooks is a JavaScript test helper")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn run_on_data(&self, payload: JsonValue) -> Result<ScriptExecution> {
+        match &self.inner {
+            ScriptSessionInner::JavaScript(session) => session.run_on_data(payload),
+            ScriptSessionInner::Python(_) => {
+                anyhow::bail!("run_on_data is a JavaScript test helper")
+            }
+        }
+    }
+
+    pub fn run_event(&self, mut payload: JsonValue) -> Result<ScriptExecution> {
+        match &self.inner {
+            ScriptSessionInner::JavaScript(session) => session.run_event(payload),
+            ScriptSessionInner::Python(session) => {
+                let (source, record, identity) = event_history_entry(&payload)?;
+                strip_source_data(&mut payload);
+                session.run_event(payload, source, record, identity)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_source(
+        &self,
+        source: &str,
+        record: JsonValue,
+        identity: Option<u64>,
+    ) -> Result<()> {
+        match &self.inner {
+            ScriptSessionInner::JavaScript(session) => {
+                session.record_source(source, record, identity)
+            }
+            ScriptSessionInner::Python(_) => {
+                anyhow::bail!("direct source recording is unavailable for Python")
+            }
+        }
+    }
+
+    pub fn run_execution_event(&self, event: JsonValue) -> Result<Option<ScriptExecution>> {
+        match &self.inner {
+            ScriptSessionInner::JavaScript(session) => session.run_execution_event(event),
+            ScriptSessionInner::Python(session) => session.run_execution_event(event),
+        }
+    }
+
+    pub fn run_finish(&self) -> Result<Option<ScriptExecution>> {
+        match &self.inner {
+            ScriptSessionInner::JavaScript(_) => Ok(None),
+            ScriptSessionInner::Python(session) => session.run_finish(),
+        }
     }
 }
 
