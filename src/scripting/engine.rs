@@ -1724,6 +1724,7 @@ export function onExecution(ctx, event) {
                 crate::scripting::execution::ScriptExecutionContext {
                     job_id: "job_test".to_string(),
                     enabled: true,
+                    request_routed: false,
                 },
             )
             .expect("start execution session");
@@ -1737,7 +1738,9 @@ export function onExecution(ctx, event) {
         assert!(execution.output.metrics.as_object().unwrap().is_empty());
         assert_eq!(execution.commands.len(), 2);
         let order_id = match &execution.commands[0] {
-            crate::scripting::execution::ScriptExecutionCommand::Trade { order, request } => {
+            crate::scripting::execution::ScriptExecutionCommand::Trade {
+                order, request, ..
+            } => {
                 assert_eq!(request.sl, Some(63_000.0));
                 assert_eq!(request.tp, Some(67_000.0));
                 order.id.clone()

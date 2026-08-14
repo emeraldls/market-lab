@@ -638,10 +638,10 @@ pub struct ScriptRunArgs {
     /// Python interpreter for a .py script. Defaults to an adjacent .venv, then python3.
     #[arg(long)]
     pub python: Option<PathBuf>,
-    /// Arms live execution for ctx.trade/ctx.cancel while data may come from any provider.
+    /// JavaScript Scripting V1 execution venue. Python V2 selects exchange per request.
     #[arg(long, value_enum)]
     pub venue: Option<ExecutionVenueArg>,
-    /// Execute through Hyperliquid testnet instead of the default mainnet.
+    /// Route all Hyperliquid execution and data in this job through testnet.
     #[arg(long, default_value_t = false)]
     pub testnet: bool,
     #[arg(long)]
@@ -734,13 +734,23 @@ impl ScriptRunArgs {
         if self.duration == Some(0) {
             bail!("--duration must be at least 1 second");
         }
-        if self.testnet
+        let language = crate::scripting::language::ScriptLanguage::from_path(
+            std::path::Path::new(&self.script),
+        )?;
+        if language == crate::scripting::language::ScriptLanguage::PythonV2 {
+            if self.venue.is_some() {
+                bail!(
+                    "Python Scripting V2 routes execution through ctx.trade/ctx.order exchange; remove --venue"
+                );
+            }
+        } else if self.testnet
             && !matches!(
                 self.venue,
                 Some(
                     ExecutionVenueArg::Hyperliquid
                         | ExecutionVenueArg::HyperliquidXyz
                         | ExecutionVenueArg::HyperliquidSpot
+                        | ExecutionVenueArg::HyperliquidOutcomes
                 )
             )
         {
@@ -4804,6 +4814,36 @@ mod tests {
             }
             _ => panic!("expected script logs command"),
         }
+    }
+
+    #[test]
+    fn python_v2_rejects_job_wide_venue_and_accepts_job_wide_testnet() {
+        let with_venue =
+            Cli::try_parse_from(["mlab", "script", "run", "strategy.py", "--venue", "bulkf"])
+                .expect("Python command should parse before semantic validation");
+        let Commands::Script {
+            command: ScriptCommands::Run(args),
+        } = with_venue.command
+        else {
+            panic!("expected script run command");
+        };
+        assert!(
+            args.validate()
+                .expect_err("Python --venue must fail")
+                .to_string()
+                .contains("remove --venue")
+        );
+
+        let testnet = Cli::try_parse_from(["mlab", "script", "run", "strategy.py", "--testnet"])
+            .expect("Python testnet command should parse");
+        let Commands::Script {
+            command: ScriptCommands::Run(args),
+        } = testnet.command
+        else {
+            panic!("expected script run command");
+        };
+        args.validate()
+            .expect("Python --testnet does not require --venue");
     }
 
     #[test]

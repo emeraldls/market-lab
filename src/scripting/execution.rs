@@ -5,7 +5,7 @@ use rquickjs::{Ctx, Function, Object};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::domain::execution::{OrderKind, PositionDirection, TimeInForce};
+use crate::domain::execution::{ExecutionVenue, OrderKind, PositionDirection, TimeInForce};
 
 const MAX_EXECUTION_KEY_BYTES: usize = 128;
 
@@ -378,10 +378,12 @@ pub struct ScriptOrderRef {
 pub enum ScriptExecutionCommand {
     Trade {
         order: ScriptOrderRef,
+        exchange: Option<ExecutionVenue>,
         request: ScriptTradeRequest,
     },
     Order {
         order: ScriptOrderRef,
+        exchange: Option<ExecutionVenue>,
         request: ScriptRawOrderRequest,
     },
     Cancel {
@@ -393,6 +395,7 @@ pub enum ScriptExecutionCommand {
 pub struct ScriptExecutionContext {
     pub job_id: String,
     pub enabled: bool,
+    pub request_routed: bool,
 }
 
 impl ScriptExecutionContext {
@@ -400,6 +403,7 @@ impl ScriptExecutionContext {
         Self {
             job_id: "analysis".to_string(),
             enabled: false,
+            request_routed: false,
         }
     }
 }
@@ -414,9 +418,17 @@ pub fn attach_execution_helpers<'js>(
 ) -> Result<()> {
     let job_id = execution.job_id.clone();
     let enabled = execution.enabled;
+    let request_routed = execution.request_routed;
     let commands = Arc::clone(commands);
     let native = Function::new(ctx.clone(), move |operation: String, payload: String| {
-        native_execution_call(&job_id, enabled, &commands, &operation, &payload)
+        native_execution_call(
+            &job_id,
+            enabled,
+            request_routed,
+            &commands,
+            &operation,
+            &payload,
+        )
     })
     .context("failed to create native execution function")?;
     ctx.globals()
@@ -445,11 +457,19 @@ pub fn attach_execution_helpers<'js>(
 fn native_execution_call(
     job_id: &str,
     enabled: bool,
+    request_routed: bool,
     commands: &ScriptCommandBuffer,
     operation: &str,
     payload: &str,
 ) -> String {
-    let result = queue_execution_call(job_id, enabled, commands, operation, payload);
+    let result = queue_execution_call(
+        job_id,
+        enabled,
+        request_routed,
+        commands,
+        operation,
+        payload,
+    );
     let response = match result {
         Ok(value) => json!({ "ok": true, "value": value }),
         Err(error) => json!({ "ok": false, "error": format!("{error:#}") }),
@@ -460,6 +480,7 @@ fn native_execution_call(
 pub(crate) fn queue_execution_call(
     job_id: &str,
     enabled: bool,
+    request_routed: bool,
     commands: &ScriptCommandBuffer,
     operation: &str,
     payload: &str,
@@ -469,8 +490,11 @@ pub(crate) fn queue_execution_call(
     }
     match operation {
         "trade" => {
-            let request: ScriptTradeRequest =
-                serde_json::from_str(payload).context("ctx.trade request must be valid JSON")?;
+            let (exchange, request) = decode_execution_request::<ScriptTradeRequest>(
+                payload,
+                "ctx.trade",
+                request_routed,
+            )?;
             request.validate()?;
             let order = ScriptOrderRef {
                 id: local_order_id(job_id, &request.key),
@@ -481,13 +505,17 @@ pub(crate) fn queue_execution_call(
                 .map_err(|_| anyhow::anyhow!("script execution queue lock poisoned"))?
                 .push(ScriptExecutionCommand::Trade {
                     order: order.clone(),
+                    exchange,
                     request,
                 });
             Ok(serde_json::to_value(order)?)
         }
         "order" => {
-            let request: ScriptRawOrderRequest =
-                serde_json::from_str(payload).context("ctx.order request must be valid JSON")?;
+            let (exchange, request) = decode_execution_request::<ScriptRawOrderRequest>(
+                payload,
+                "ctx.order",
+                request_routed,
+            )?;
             request.validate()?;
             let order = ScriptOrderRef {
                 id: local_order_id(job_id, &request.key),
@@ -498,6 +526,7 @@ pub(crate) fn queue_execution_call(
                 .map_err(|_| anyhow::anyhow!("script execution queue lock poisoned"))?
                 .push(ScriptExecutionCommand::Order {
                     order: order.clone(),
+                    exchange,
                     request,
                 });
             Ok(serde_json::to_value(order)?)
@@ -519,6 +548,38 @@ pub(crate) fn queue_execution_call(
         }
         _ => bail!("unknown script execution operation `{operation}`"),
     }
+}
+
+fn decode_execution_request<T>(
+    payload: &str,
+    operation: &str,
+    request_routed: bool,
+) -> Result<(Option<ExecutionVenue>, T)>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut value: serde_json::Value = serde_json::from_str(payload)
+        .with_context(|| format!("{operation} request must be valid JSON"))?;
+    let exchange = if request_routed {
+        let object = value
+            .as_object_mut()
+            .with_context(|| format!("{operation} request must be an object"))?;
+        let raw = object
+            .remove("exchange")
+            .with_context(|| format!("{operation} requires exchange in Python Scripting V2"))?;
+        Some(
+            serde_json::from_value(raw).with_context(|| {
+                format!(
+                    "{operation} exchange must be a supported execution exchange: bulkf, hyperliquidf, hyperliquidf-xyz, hyperliquid, or hyperliquid-outcomes"
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+    let request =
+        serde_json::from_value(value).with_context(|| format!("{operation} request is invalid"))?;
+    Ok((exchange, request))
 }
 
 pub fn local_order_id(job_id: &str, key: &str) -> String {
@@ -687,5 +748,81 @@ mod tests {
             local_order_id("job_one", "entry"),
             local_order_id("job_one", "exit")
         );
+    }
+
+    #[test]
+    fn python_v2_requires_and_extracts_execution_exchange() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let value = queue_execution_call(
+            "python-job",
+            true,
+            true,
+            &commands,
+            "order",
+            &json!({
+                "key": "bid-1",
+                "exchange": "hyperliquidf",
+                "symbol": "btc",
+                "side": "buy",
+                "size": 0.1
+            })
+            .to_string(),
+        )
+        .expect("Python request should route");
+
+        assert_eq!(value["key"], "bid-1");
+        let queued = commands.lock().unwrap();
+        assert!(matches!(
+            queued.as_slice(),
+            [ScriptExecutionCommand::Order {
+                exchange: Some(ExecutionVenue::Hyperliquid),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn python_v2_rejects_missing_execution_exchange() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let error = queue_execution_call(
+            "python-job",
+            true,
+            true,
+            &commands,
+            "trade",
+            &json!({
+                "key": "entry-1",
+                "symbol": "btc",
+                "position": "open-long",
+                "size": 0.1
+            })
+            .to_string(),
+        )
+        .expect_err("Python request without exchange must fail");
+
+        assert!(format!("{error:#}").contains("requires exchange"));
+    }
+
+    #[test]
+    fn javascript_v1_still_rejects_request_exchange() {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let error = queue_execution_call(
+            "javascript-job",
+            true,
+            false,
+            &commands,
+            "order",
+            &json!({
+                "key": "bid-1",
+                "exchange": "bulkf",
+                "symbol": "btc",
+                "side": "buy",
+                "size": 0.1
+            })
+            .to_string(),
+        )
+        .expect_err("V1 request-level exchange must remain invalid");
+
+        assert!(format!("{error:#}").contains("unknown field `exchange`"));
     }
 }

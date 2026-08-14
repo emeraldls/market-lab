@@ -59,6 +59,11 @@ impl ScriptJobSubmission {
             }
             _ => {}
         }
+        if self.language == ScriptLanguage::PythonV2 && self.venue.is_some() {
+            bail!(
+                "Python Scripting V2 routes execution per request and cannot persist a job-wide venue"
+            );
+        }
         if self.duration_seconds == Some(0) {
             bail!("script job duration must be at least 1 second");
         }
@@ -196,6 +201,33 @@ mod tests {
             .validate()
             .expect_err("Python job without interpreter must fail");
         assert!(format!("{error:#}").contains("resolved Python runtime"));
+    }
+
+    #[test]
+    fn python_job_rejects_a_job_wide_execution_venue() {
+        let submission = ScriptJobSubmission {
+            script_name: "python-maker".to_string(),
+            original_path: "maker.py".to_string(),
+            source: "script = {}".to_string(),
+            language: ScriptLanguage::PythonV2,
+            python_runtime: Some(PythonRuntime {
+                interpreter: PathBuf::from("/usr/bin/python3"),
+                version: "3.12.0".to_string(),
+            }),
+            providers: vec!["bulkf".to_string()],
+            exchanges: vec!["bulkf".to_string()],
+            sources: vec!["btc@candles@bulkf".to_string()],
+            params: Vec::new(),
+            venue: Some(ExecutionVenue::Bulk),
+            testnet: false,
+            duration_seconds: None,
+            verbose: false,
+        };
+
+        let error = submission
+            .validate()
+            .expect_err("Python job-wide venue must fail");
+        assert!(format!("{error:#}").contains("per request"));
     }
 }
 

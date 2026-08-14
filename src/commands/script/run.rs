@@ -44,6 +44,7 @@ use crate::scripting::inputs::{
     source_provider_name, validate_source_configs_for_run,
 };
 use crate::scripting::jobs::ScriptJobSubmission;
+use crate::scripting::language::ScriptLanguage;
 use crate::scripting::manifest::ScriptSource;
 use crate::scripting::market_data::{
     ScriptCandle, ScriptOpenInterest, ScriptTrade, ScriptVolume, ScriptVolumeDelta,
@@ -152,6 +153,7 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
         );
     }
     let script = Script::load_with_python(&args.script, args.python.as_deref())?;
+    validate_execution_routing(&args, script.language)?;
     let source_configs = parse_source_configs(&args.source)?;
     validate_source_configs_for_run(&script.manifest, &source_configs)?;
     let raw_params = parse_param_values(&args.param)?;
@@ -198,11 +200,14 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
                     .join(",")
             );
             println!(
-                "  venue:     {}",
-                job.definition.venue.map_or_else(
-                    || "disabled".to_string(),
-                    |venue| format!("{venue:?}").to_ascii_lowercase()
-                )
+                "  execution: {}",
+                match job.definition.language {
+                    ScriptLanguage::PythonV2 => "per request".to_string(),
+                    ScriptLanguage::JavaScriptV1 => job.definition.venue.map_or_else(
+                        || "disabled".to_string(),
+                        |venue| format!("{venue:?}").to_ascii_lowercase()
+                    ),
+                }
             );
             println!(
                 "  duration:  {}",
@@ -335,7 +340,8 @@ async fn stream_sources(
         &resolved_params,
         ScriptExecutionContext {
             job_id: job_id.to_string(),
-            enabled: args.venue.is_some(),
+            enabled: script.language == ScriptLanguage::PythonV2 || args.venue.is_some(),
+            request_routed: script.language == ScriptLanguage::PythonV2,
         },
     )?;
     let cancel_handle = session.cancel_handle();
@@ -383,7 +389,9 @@ async fn stream_sources(
                 match event.context("script market-data supervisor stopped unexpectedly")? {
                     ScriptStreamEvent::Update(update) => update,
                     ScriptStreamEvent::Disconnected { error, retry_seconds } => {
-                        let cleanup_error = if args.venue.is_some() {
+                        let cleanup_error = if script.language == ScriptLanguage::PythonV2
+                            || args.venue.is_some()
+                        {
                             crate::runtime::cancel_all_script_orders(job_id)
                                 .await
                                 .err()
@@ -533,16 +541,20 @@ async fn dispatch_execution_commands(
 ) -> Result<()> {
     for command in commands {
         let result = match command {
-            ScriptExecutionCommand::Trade { order, request } => {
-                crate::runtime::submit_script_trade(job_id, order, request)
-                    .await
-                    .map(|_| ())
-            }
-            ScriptExecutionCommand::Order { order, request } => {
-                crate::runtime::submit_script_order(job_id, order, request)
-                    .await
-                    .map(|_| ())
-            }
+            ScriptExecutionCommand::Trade {
+                order,
+                exchange,
+                request,
+            } => crate::runtime::submit_script_trade(job_id, order, exchange, request)
+                .await
+                .map(|_| ()),
+            ScriptExecutionCommand::Order {
+                order,
+                exchange,
+                request,
+            } => crate::runtime::submit_script_order(job_id, order, exchange, request)
+                .await
+                .map(|_| ()),
             ScriptExecutionCommand::Cancel { request } => {
                 crate::runtime::submit_script_cancellation(job_id, request)
                     .await
@@ -562,6 +574,20 @@ async fn dispatch_execution_commands(
         }
     }
     Ok(())
+}
+
+fn validate_execution_routing(args: &ScriptRunArgs, language: ScriptLanguage) -> Result<()> {
+    match language {
+        ScriptLanguage::PythonV2 if args.venue.is_some() => {
+            bail!(
+                "Python Scripting V2 routes execution through ctx.trade/ctx.order exchange; remove --venue"
+            )
+        }
+        ScriptLanguage::JavaScriptV1 if args.testnet && args.venue.is_none() => {
+            bail!("--testnet requires a Hyperliquid execution venue for JavaScript Scripting V1")
+        }
+        _ => Ok(()),
+    }
 }
 
 async fn dispatch_execution_events(

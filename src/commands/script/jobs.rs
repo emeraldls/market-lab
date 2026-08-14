@@ -7,6 +7,7 @@ use crate::cli::{OutputFormat, ScriptJobArgs, ScriptJobsArgs, ScriptLogsArgs};
 use crate::runtime;
 use crate::scripting::inputs::parse_source_configs;
 use crate::scripting::jobs::{ScriptJob, ScriptJobStatus};
+use crate::scripting::language::ScriptLanguage;
 
 pub async fn handle_list(args: ScriptJobsArgs) -> Result<()> {
     validate_output(args.output)?;
@@ -81,7 +82,11 @@ fn render_jobs(jobs: &[ScriptJob], output: OutputFormat) -> Result<()> {
                     job.pid
                         .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
                     truncate(&job.definition.script_name, 22),
-                    job.definition.venue.map_or("-", venue_name),
+                    if job.definition.language == ScriptLanguage::PythonV2 {
+                        "per-request"
+                    } else {
+                        job.definition.venue.map_or("-", venue_name)
+                    },
                     job.definition.providers.join(","),
                     job_symbols(job)?,
                 );
@@ -123,11 +128,15 @@ fn render_job(job: &ScriptJob, output: OutputFormat) -> Result<()> {
             println!("  exchanges:        {}", job.definition.exchanges.join(","));
             println!("  symbols:          {}", job_symbols(job)?);
             println!(
-                "  venue:            {}",
-                job.definition.venue.map_or_else(
-                    || "disabled".to_string(),
-                    |venue| format!("{venue:?}").to_ascii_lowercase()
-                )
+                "  execution:        {}",
+                if job.definition.language == ScriptLanguage::PythonV2 {
+                    "per request".to_string()
+                } else {
+                    job.definition.venue.map_or_else(
+                        || "disabled".to_string(),
+                        |venue| venue_name(venue).to_string(),
+                    )
+                }
             );
             println!(
                 "  duration:         {}",

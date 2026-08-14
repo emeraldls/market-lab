@@ -118,6 +118,8 @@ struct ScriptBacktestTrade {
     position_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     order_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exchange: Option<crate::domain::execution::ExecutionVenue>,
     symbol: String,
     side: TradeSide,
     entry: ScriptBacktestTradeLeg,
@@ -146,6 +148,8 @@ struct ScriptBacktestOpenPosition {
     id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     order_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exchange: Option<crate::domain::execution::ExecutionVenue>,
     symbol: String,
     side: TradeSide,
     entry_ts_ms: u64,
@@ -176,6 +180,7 @@ enum TradeSide {
 struct OpenTrade {
     id: String,
     order_id: Option<String>,
+    exchange: Option<crate::domain::execution::ExecutionVenue>,
     symbol: String,
     side: TradeSide,
     entry_idx: usize,
@@ -206,6 +211,7 @@ enum SimulatedFillOutcome {
 #[derive(Debug, Clone)]
 struct SimulatedScriptOrder {
     order: ScriptOrderRef,
+    exchange: Option<crate::domain::execution::ExecutionVenue>,
     request: ScriptManagedRequest,
     submitted_idx: usize,
     status: SimulatedOrderStatus,
@@ -243,6 +249,7 @@ struct TradeEvent {
 
 struct TradeEntry {
     symbol: String,
+    exchange: Option<crate::domain::execution::ExecutionVenue>,
     side: TradeSide,
     idx: usize,
     ts_ms: u64,
@@ -359,6 +366,7 @@ async fn backtest_events(
         ScriptExecutionContext {
             job_id: "backtest".to_string(),
             enabled: true,
+            request_routed: script.language == crate::scripting::language::ScriptLanguage::PythonV2,
         },
     )?;
     let cancel_handle = session.cancel_handle();
@@ -423,18 +431,29 @@ async fn backtest_events(
             .get(&event.selector)
             .with_context(|| format!("{} data not loaded", event.selector))?;
         if reference_sources
-            .get(&config.symbol)
-            .is_some_and(|reference| reference.selector == event.selector)
+            .values()
+            .any(|reference| reference.selector == event.selector)
         {
+            let legacy_reference = reference_sources
+                .get(&config.symbol)
+                .is_some_and(|reference| reference.selector == event.selector);
             apply_protective_triggers(
                 config,
+                legacy_reference,
                 &data,
                 event.record_idx,
                 idx,
                 &mut simulation.open_trades,
                 &mut simulation.closed_trades,
             )?;
-            fill_pending_script_orders(config, &data, event.record_idx, idx, &mut simulation)?;
+            fill_pending_script_orders(
+                config,
+                legacy_reference,
+                &data,
+                event.record_idx,
+                idx,
+                &mut simulation,
+            )?;
             orders += dispatch_simulated_execution_events(
                 &session,
                 idx,
@@ -1101,16 +1120,14 @@ fn resolve_reference_sources<'a>(
     configs.sort_by_key(|config| config.position);
     let mut references = BTreeMap::new();
     for config in configs {
-        if references.contains_key(&config.symbol) {
-            continue;
-        }
         let series = data
             .series
             .get(&config.selector)
             .with_context(|| format!("{} data not loaded", config.selector))?;
         for idx in 0..backtest_series_len(series) {
             if backtest_series_reference_price(series, idx)?.is_some() {
-                references.insert(config.symbol.clone(), config);
+                references.entry(config.symbol.clone()).or_insert(config);
+                references.entry(source_mark_key(config)).or_insert(config);
                 break;
             }
         }
@@ -1139,21 +1156,19 @@ fn reference_marks_at_timestamp(
         .iter()
         .take_while(|candidate| candidate.ts_ms == ts_ms)
     {
-        let config = source_configs
+        source_configs
             .get(&candidate.selector)
             .with_context(|| format!("missing source config for {}", candidate.selector))?;
-        if reference_sources
-            .get(&config.symbol)
-            .is_none_or(|reference| reference.selector != candidate.selector)
-        {
-            continue;
-        }
         let series = data
             .series
             .get(&candidate.selector)
             .with_context(|| format!("{} data not loaded", candidate.selector))?;
         if let Some(price) = backtest_series_reference_price(series, candidate.record_idx)? {
-            marks.insert(config.symbol.clone(), (candidate.ts_ms, price));
+            for (key, reference) in reference_sources {
+                if reference.selector == candidate.selector {
+                    marks.insert(key.clone(), (candidate.ts_ms, price));
+                }
+            }
         }
     }
     Ok(marks)
@@ -1346,41 +1361,43 @@ fn apply_script_execution_commands(
     let mut submitted = 0;
     for command in commands {
         match command {
-            ScriptExecutionCommand::Trade { order, request } => {
+            ScriptExecutionCommand::Trade {
+                order,
+                exchange,
+                request,
+            } => {
                 request.validate()?;
-                validate_position_transition(&request, &simulation.open_trades)?;
-                let current_price =
-                    latest_price(latest_marks, &request.symbol).with_context(|| {
-                        format!(
-                            "ctx.trade symbol `{}` requires its own price-bearing source before submitting this order",
-                            request.symbol
-                        )
+                validate_position_transition(&request, exchange, &simulation.open_trades)?;
+                let current_price = latest_price(latest_marks, exchange, &request.symbol)
+                    .with_context(|| {
+                        missing_execution_price("ctx.trade", exchange, &request.symbol)
                     })?;
                 let reference_price = request.order.price.unwrap_or(current_price);
                 validate_script_protection(&request, reference_price)?;
                 submitted += usize::from(submit_simulated_script_order(
                     order,
+                    exchange,
                     ScriptManagedRequest::Trade(request),
-                    "ctx.trade",
                     idx,
                     ts_ms,
                     Some(current_price),
                     simulation,
                 )?);
             }
-            ScriptExecutionCommand::Order { order, request } => {
+            ScriptExecutionCommand::Order {
+                order,
+                exchange,
+                request,
+            } => {
                 request.validate()?;
-                let current_price =
-                    latest_price(latest_marks, &request.symbol).with_context(|| {
-                        format!(
-                            "ctx.order symbol `{}` requires its own price-bearing source before submitting this order",
-                            request.symbol
-                        )
+                let current_price = latest_price(latest_marks, exchange, &request.symbol)
+                    .with_context(|| {
+                        missing_execution_price("ctx.order", exchange, &request.symbol)
                     })?;
                 submitted += usize::from(submit_simulated_script_order(
                     order,
+                    exchange,
                     ScriptManagedRequest::Order(request),
-                    "ctx.order",
                     idx,
                     ts_ms,
                     Some(current_price),
@@ -1439,23 +1456,95 @@ fn dispatch_simulated_execution_events(
     Ok(submitted)
 }
 
-fn latest_price(latest_marks: &BTreeMap<String, (u64, f64)>, symbol: &str) -> Option<f64> {
+fn latest_price(
+    latest_marks: &BTreeMap<String, (u64, f64)>,
+    exchange: Option<crate::domain::execution::ExecutionVenue>,
+    symbol: &str,
+) -> Option<f64> {
     latest_marks
-        .get(&symbol.to_ascii_lowercase())
+        .get(&execution_mark_key(exchange, symbol))
         .map(|(_, price)| *price)
+}
+
+fn missing_execution_price(
+    operation: &str,
+    exchange: Option<crate::domain::execution::ExecutionVenue>,
+    symbol: &str,
+) -> String {
+    exchange.map_or_else(
+        || {
+            format!(
+                "{operation} symbol `{symbol}` requires its own price-bearing source before submitting this order"
+            )
+        },
+        |exchange| {
+            format!(
+                "{operation} symbol `{symbol}` on {} requires its own price-bearing source before submitting this order",
+                execution_venue_name(exchange)
+            )
+        },
+    )
+}
+
+fn source_mark_key(config: &SourceConfig) -> String {
+    format!(
+        "{}@{}",
+        config.symbol.to_ascii_lowercase(),
+        config.exchange.to_ascii_lowercase()
+    )
+}
+
+fn execution_mark_key(
+    exchange: Option<crate::domain::execution::ExecutionVenue>,
+    symbol: &str,
+) -> String {
+    match exchange {
+        Some(exchange) => format!(
+            "{}@{}",
+            symbol.to_ascii_lowercase(),
+            execution_venue_name(exchange)
+        ),
+        None => symbol.to_ascii_lowercase(),
+    }
+}
+
+fn execution_venue_name(exchange: crate::domain::execution::ExecutionVenue) -> &'static str {
+    match exchange {
+        crate::domain::execution::ExecutionVenue::Bulk => "bulkf",
+        crate::domain::execution::ExecutionVenue::Hyperliquid => "hyperliquidf",
+        crate::domain::execution::ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
+        crate::domain::execution::ExecutionVenue::HyperliquidSpot => "hyperliquid",
+        crate::domain::execution::ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
+    }
+}
+
+fn route_matches_source(
+    exchange: Option<crate::domain::execution::ExecutionVenue>,
+    config: &SourceConfig,
+    legacy_reference: bool,
+) -> bool {
+    exchange.map_or(legacy_reference, |exchange| {
+        config
+            .exchange
+            .eq_ignore_ascii_case(execution_venue_name(exchange))
+    })
 }
 
 fn submit_simulated_script_order(
     order: ScriptOrderRef,
+    exchange: Option<crate::domain::execution::ExecutionVenue>,
     request: ScriptManagedRequest,
-    operation: &str,
     idx: usize,
     ts_ms: u64,
     current_price: Option<f64>,
     simulation: &mut ScriptSimulationState,
 ) -> Result<bool> {
+    let operation = match &request {
+        ScriptManagedRequest::Trade(_) => "ctx.trade",
+        ScriptManagedRequest::Order(_) => "ctx.order",
+    };
     if let Some(existing) = simulation.orders.get(&order.id) {
-        if existing.request != request {
+        if existing.exchange != exchange || existing.request != request {
             bail!(
                 "{operation} key `{}` was reused with different order parameters",
                 request.key()
@@ -1472,6 +1561,7 @@ fn submit_simulated_script_order(
         order_id.clone(),
         SimulatedScriptOrder {
             order,
+            exchange,
             request,
             submitted_idx: idx,
             status: SimulatedOrderStatus::Pending,
@@ -1566,7 +1656,7 @@ fn queue_simulated_order_event(
         "orderId": order.order.id,
         "key": order.order.key,
         "symbol": order.request.symbol(),
-        "venue": "bulkf",
+        "venue": order.exchange,
         "status": status,
         "terminal": terminal,
         "data": data,
@@ -1575,6 +1665,7 @@ fn queue_simulated_order_event(
 
 fn fill_pending_script_orders(
     config: &SourceConfig,
+    legacy_reference: bool,
     data: &BacktestData,
     record_idx: usize,
     event_idx: usize,
@@ -1591,6 +1682,7 @@ fn fill_pending_script_orders(
             && order.submitted_idx < event_idx
             && order.request.order().kind == ScriptOrderKind::Limit
             && order.request.symbol().eq_ignore_ascii_case(&config.symbol)
+            && route_matches_source(order.exchange, config, legacy_reference)
     }) {
         let price = order
             .request
@@ -1651,15 +1743,26 @@ fn fill_script_order(
     if order.status != SimulatedOrderStatus::Pending {
         return Ok(());
     }
-    let outcome =
-        match &order.request {
-            ScriptManagedRequest::Trade(request) => SimulatedFillOutcome::Filled(
-                fill_simulated_trade(request, &order.order, idx, ts_ms, price, simulation)?,
-            ),
-            ScriptManagedRequest::Order(request) => {
-                fill_simulated_raw_order(request, &order.order, idx, ts_ms, price, simulation)?
-            }
-        };
+    let outcome = match &order.request {
+        ScriptManagedRequest::Trade(request) => SimulatedFillOutcome::Filled(fill_simulated_trade(
+            request,
+            order.exchange,
+            &order.order,
+            idx,
+            ts_ms,
+            price,
+            simulation,
+        )?),
+        ScriptManagedRequest::Order(request) => fill_simulated_raw_order(
+            request,
+            order.exchange,
+            &order.order,
+            idx,
+            ts_ms,
+            price,
+            simulation,
+        )?,
+    };
     let status = match outcome {
         SimulatedFillOutcome::Filled(_) => SimulatedOrderStatus::Filled,
         SimulatedFillOutcome::Cancelled => SimulatedOrderStatus::Cancelled,
@@ -1716,13 +1819,14 @@ fn fill_script_order(
 
 fn fill_simulated_trade(
     request: &ScriptTradeRequest,
+    exchange: Option<crate::domain::execution::ExecutionVenue>,
     order: &ScriptOrderRef,
     idx: usize,
     ts_ms: u64,
     price: f64,
     simulation: &mut ScriptSimulationState,
 ) -> Result<f64> {
-    validate_position_transition(request, &simulation.open_trades)?;
+    validate_position_transition(request, exchange, &simulation.open_trades)?;
     if request.position.is_open() {
         let side = trade_side(request.position.position_direction());
         let leverage = request.leverage_or_default();
@@ -1737,6 +1841,7 @@ fn fill_simulated_trade(
             &mut simulation.next_position_id,
             TradeEntry {
                 symbol: request.symbol.to_ascii_lowercase(),
+                exchange,
                 side,
                 idx,
                 ts_ms,
@@ -1751,11 +1856,9 @@ fn fill_simulated_trade(
             },
         );
         let filled_qty = opened.qty;
-        if let Some(existing) = simulation
-            .open_trades
-            .iter_mut()
-            .find(|open| open.symbol.eq_ignore_ascii_case(&request.symbol))
-        {
+        if let Some(existing) = simulation.open_trades.iter_mut().find(|open| {
+            open.exchange == exchange && open.symbol.eq_ignore_ascii_case(&request.symbol)
+        }) {
             add_to_open_position(existing, opened);
         } else {
             simulation.open_trades.push(opened);
@@ -1766,7 +1869,11 @@ fn fill_simulated_trade(
         let open_index = simulation
             .open_trades
             .iter()
-            .position(|open| open.side == side && open.symbol.eq_ignore_ascii_case(&request.symbol))
+            .position(|open| {
+                open.exchange == exchange
+                    && open.side == side
+                    && open.symbol.eq_ignore_ascii_case(&request.symbol)
+            })
             .context("matching simulated position disappeared before the close filled")?;
         let close_qty = request
             .size
@@ -1789,6 +1896,7 @@ fn fill_simulated_trade(
 
 fn fill_simulated_raw_order(
     request: &ScriptRawOrderRequest,
+    exchange: Option<crate::domain::execution::ExecutionVenue>,
     order: &ScriptOrderRef,
     idx: usize,
     ts_ms: u64,
@@ -1803,10 +1911,9 @@ fn fill_simulated_raw_order(
         .or_else(|| request.size.map(|size| size * price))
         .context("ctx.order simulation could not determine order notional")?;
     let quantity = notional / price;
-    let existing_index = simulation
-        .open_trades
-        .iter()
-        .position(|open| open.symbol.eq_ignore_ascii_case(&request.symbol));
+    let existing_index = simulation.open_trades.iter().position(|open| {
+        open.exchange == exchange && open.symbol.eq_ignore_ascii_case(&request.symbol)
+    });
     let existing = existing_index.map(|index| simulation.open_trades[index].side);
 
     if (existing.is_none() || existing == Some(side)) && request.reduce_only {
@@ -1841,6 +1948,7 @@ fn fill_simulated_raw_order(
             &mut simulation.next_position_id,
             TradeEntry {
                 symbol: request.symbol.to_ascii_lowercase(),
+                exchange,
                 side,
                 idx,
                 ts_ms,
@@ -1854,11 +1962,9 @@ fn fill_simulated_raw_order(
                 take_profit_price: None,
             },
         );
-        if let Some(existing) = simulation
-            .open_trades
-            .iter_mut()
-            .find(|open| open.symbol.eq_ignore_ascii_case(&request.symbol))
-        {
+        if let Some(existing) = simulation.open_trades.iter_mut().find(|open| {
+            open.exchange == exchange && open.symbol.eq_ignore_ascii_case(&request.symbol)
+        }) {
             add_to_open_position(existing, opened);
         } else {
             simulation.open_trades.push(opened);
@@ -1869,13 +1975,13 @@ fn fill_simulated_raw_order(
 
 fn validate_position_transition(
     request: &ScriptTradeRequest,
+    exchange: Option<crate::domain::execution::ExecutionVenue>,
     open_trades: &[OpenTrade],
 ) -> Result<()> {
     let target = trade_side(request.position.position_direction());
-    let Some(open) = open_trades
-        .iter()
-        .find(|open| open.symbol.eq_ignore_ascii_case(&request.symbol))
-    else {
+    let Some(open) = open_trades.iter().find(|open| {
+        open.exchange == exchange && open.symbol.eq_ignore_ascii_case(&request.symbol)
+    }) else {
         if request.position.is_close() {
             bail!(
                 "ctx.trade {} requires an open {} position",
@@ -1993,6 +2099,7 @@ fn validate_script_protection(request: &ScriptTradeRequest, entry_price: f64) ->
 
 fn apply_protective_triggers(
     config: &SourceConfig,
+    legacy_reference: bool,
     data: &BacktestData,
     record_idx: usize,
     event_idx: usize,
@@ -2009,6 +2116,7 @@ fn apply_protective_triggers(
         if !open_trades[open_index]
             .symbol
             .eq_ignore_ascii_case(&config.symbol)
+            || !route_matches_source(open_trades[open_index].exchange, config, legacy_reference)
         {
             open_index += 1;
             continue;
@@ -2095,6 +2203,7 @@ fn open_trade_from_entry(next_position_id: &mut usize, entry: TradeEntry) -> Ope
     OpenTrade {
         id,
         order_id: entry.order_id,
+        exchange: entry.exchange,
         symbol: entry.symbol,
         side: entry.side,
         entry_idx: entry.idx,
@@ -2130,6 +2239,7 @@ fn close_open_trade(
         id: format_trade_id(closed_trades.len() + 1),
         position_id: open.id,
         order_id: open.order_id,
+        exchange: open.exchange,
         symbol: open.symbol,
         side: open.side,
         entry: ScriptBacktestTradeLeg {
@@ -2162,18 +2272,18 @@ fn trade_pnl(side: TradeSide, entry_price: f64, exit_price: f64, qty: f64) -> f6
     }
 }
 
-fn position_return(open_trades: &[OpenTrade], symbol: &str, curr: f64, next: f64) -> f64 {
+fn position_return(open_trades: &[OpenTrade], mark_key: &str, curr: f64, next: f64) -> f64 {
     if open_trades.is_empty() {
         return 0.0;
     }
     let pnl = open_trades
         .iter()
-        .filter(|open| open.symbol.eq_ignore_ascii_case(symbol))
+        .filter(|open| execution_mark_key(open.exchange, &open.symbol) == mark_key)
         .map(|open| trade_pnl(open.side, curr, next, open.qty))
         .sum::<f64>();
     let margin = open_trades
         .iter()
-        .filter(|open| open.symbol.eq_ignore_ascii_case(symbol))
+        .filter(|open| execution_mark_key(open.exchange, &open.symbol) == mark_key)
         .map(|open| open.margin)
         .sum::<f64>();
     if margin.abs() > f64::EPSILON {
@@ -2191,10 +2301,13 @@ fn open_trades_to_positions(
     open_trades
         .iter()
         .filter_map(|open| {
-            let (mark_ts_ms, mark_price) = latest_marks.get(&open.symbol).copied()?;
+            let (mark_ts_ms, mark_price) = latest_marks
+                .get(&execution_mark_key(open.exchange, &open.symbol))
+                .copied()?;
             Some(ScriptBacktestOpenPosition {
                 id: open.id.clone(),
                 order_id: open.order_id.clone(),
+                exchange: open.exchange,
                 symbol: open.symbol.clone(),
                 side: open.side,
                 entry_ts_ms: open.entry_ts_ms,
@@ -2615,7 +2728,11 @@ mod tests {
             id: crate::scripting::execution::local_order_id("backtest", &request.key),
             key: request.key.clone(),
         };
-        ScriptExecutionCommand::Trade { order, request }
+        ScriptExecutionCommand::Trade {
+            order,
+            exchange: None,
+            request,
+        }
     }
 
     fn script_order(mut value: Value) -> ScriptExecutionCommand {
@@ -2630,11 +2747,67 @@ mod tests {
             id: crate::scripting::execution::local_order_id("backtest", &request.key),
             key: request.key.clone(),
         };
-        ScriptExecutionCommand::Order { order, request }
+        ScriptExecutionCommand::Order {
+            order,
+            exchange: None,
+            request,
+        }
+    }
+
+    fn routed_script_order(
+        value: Value,
+        exchange: crate::domain::execution::ExecutionVenue,
+    ) -> ScriptExecutionCommand {
+        let ScriptExecutionCommand::Order { order, request, .. } = script_order(value) else {
+            unreachable!()
+        };
+        ScriptExecutionCommand::Order {
+            order,
+            exchange: Some(exchange),
+            request,
+        }
     }
 
     fn marks(price: f64) -> BTreeMap<String, (u64, f64)> {
         BTreeMap::from([("btc".to_string(), (1_780_000_000_000, price))])
+    }
+
+    #[test]
+    fn request_routed_backtest_uses_exchange_prices_and_positions() {
+        let mut simulation = ScriptSimulationState::default();
+        let latest_marks = BTreeMap::from([
+            ("btc".to_string(), (1_780_000_000_000, 100.0)),
+            ("btc@bulkf".to_string(), (1_780_000_000_000, 100.0)),
+            ("btc@hyperliquidf".to_string(), (1_780_000_000_000, 110.0)),
+        ]);
+
+        apply_script_execution_commands(
+            vec![
+                routed_script_order(
+                    json!({ "key": "bulk-buy", "side": "buy", "size": 1 }),
+                    crate::domain::execution::ExecutionVenue::Bulk,
+                ),
+                routed_script_order(
+                    json!({ "key": "hl-buy", "side": "buy", "size": 1 }),
+                    crate::domain::execution::ExecutionVenue::Hyperliquid,
+                ),
+            ],
+            0,
+            1_780_000_000_000,
+            &latest_marks,
+            &mut simulation,
+        )
+        .expect("route simulated execution");
+
+        assert_eq!(simulation.open_trades.len(), 2);
+        assert!(simulation.open_trades.iter().any(|position| {
+            position.exchange == Some(crate::domain::execution::ExecutionVenue::Bulk)
+                && position.entry_price == 100.0
+        }));
+        assert!(simulation.open_trades.iter().any(|position| {
+            position.exchange == Some(crate::domain::execution::ExecutionVenue::Hyperliquid)
+                && position.entry_price == 110.0
+        }));
     }
 
     #[test]
@@ -2903,11 +3076,11 @@ export function onData(ctx, input, history) {
         .expect("queue limit order");
         assert_eq!(submitted, 1);
 
-        fill_pending_script_orders(&source, &data, 0, 0, &mut simulation)
+        fill_pending_script_orders(&source, true, &data, 0, 0, &mut simulation)
             .expect("same-event check");
         assert!(simulation.open_trades.is_empty());
 
-        fill_pending_script_orders(&source, &data, 1, 1, &mut simulation)
+        fill_pending_script_orders(&source, true, &data, 1, 1, &mut simulation)
             .expect("later-event fill");
         assert_eq!(simulation.open_trades.len(), 1);
         assert_eq!(simulation.open_trades[0].entry_price, 90.0);
@@ -2942,6 +3115,7 @@ export function onData(ctx, input, history) {
 
         apply_protective_triggers(
             &source,
+            true,
             &data,
             1,
             1,
@@ -3240,6 +3414,7 @@ export function onExecution(ctx, event) {
                 ScriptExecutionContext {
                     job_id: "backtest".to_string(),
                     enabled: true,
+                    request_routed: false,
                 },
             )
             .expect("start test session");

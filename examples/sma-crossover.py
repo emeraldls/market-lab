@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 
 
-SOURCE = "btc@candles@binancef@mmt"
+SOURCE = "btc@candles@hyperliquidf@mmt"
 
 script = {
     "name": "python-sma-crossover",
@@ -41,6 +41,7 @@ def on_data(ctx, event, history):
         ctx.trade(
             {
                 "key": f"sma-buy-{timestamp}",
+                "exchange": "hyperliquidf",
                 "symbol": "BTC",
                 "position": "open-long",
                 "margin": ctx.params["margin"],
@@ -51,6 +52,7 @@ def on_data(ctx, event, history):
         ctx.trade(
             {
                 "key": f"sma-sell-{timestamp}",
+                "exchange": "hyperliquidf",
                 "symbol": "BTC",
                 "position": "close-long",
                 "order": {"type": "market"},

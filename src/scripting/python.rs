@@ -288,6 +288,7 @@ impl PythonSession {
         let result = queue_execution_call(
             &self.execution.job_id,
             self.execution.enabled,
+            self.execution.request_routed,
             &self.commands,
             operation,
             &payload,
@@ -864,7 +865,7 @@ class Context:
         if self._finishing:
             raise RuntimeError(f"ctx.{operation} is unavailable inside on_finish")
         if not self._execution_enabled:
-            raise RuntimeError("script execution is disabled; deploy the script with --venue")
+            raise RuntimeError("script execution is disabled")
         if not isinstance(payload, dict):
             raise TypeError(f"ctx.{operation} requires a dictionary")
         self._request_id += 1
@@ -1082,6 +1083,7 @@ def on_data(ctx, event, history):
     if len(candles) == 2:
         result = ctx.order({
             "key": "bid-1",
+            "exchange": "bulkf",
             "symbol": "BTC",
             "side": "buy",
             "size": 0.1,
@@ -1120,6 +1122,7 @@ def on_finish(ctx, history):
                 ScriptExecutionContext {
                     job_id: format!("python-test-{}", std::process::id()),
                     enabled: true,
+                    request_routed: true,
                 },
             )
             .expect("start Python session");
@@ -1141,6 +1144,13 @@ def on_finish(ctx, history):
         assert_eq!(second.output.metrics["threshold"], 7);
         assert_eq!(second.commands.len(), 1);
         assert_eq!(second.output.metrics["order"]["key"], "bid-1");
+        assert!(matches!(
+            second.commands.as_slice(),
+            [ScriptExecutionCommand::Order {
+                exchange: Some(crate::domain::execution::ExecutionVenue::Bulk),
+                ..
+            }]
+        ));
 
         let execution = session
             .run_execution_event(json!({ "status": "filled" }))
@@ -1242,6 +1252,7 @@ def on_finish(ctx, history):
                 ScriptExecutionContext {
                     job_id: format!("python-test-{}", std::process::id()),
                     enabled: true,
+                    request_routed: true,
                 },
             )
             .expect("start Python session");
