@@ -13,8 +13,11 @@ pub async fn handle_start(args: DaemonOutputArgs) -> Result<()> {
 
 pub async fn handle_backend(args: DaemonBackendArgs) -> Result<()> {
     validate_output(args.output)?;
+    if args.image.is_some() && !matches!(args.backend, Some(crate::cli::DaemonBackendArg::Docker)) {
+        bail!("--image requires `mlab daemon backend docker`");
+    }
     let config = if let Some(backend) = args.backend {
-        runtime::configure_backend(backend.into()).await?
+        runtime::configure_backend(backend.into(), args.image).await?
     } else {
         daemon::load()?
     };

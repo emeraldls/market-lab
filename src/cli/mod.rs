@@ -107,6 +107,9 @@ pub struct DaemonBackendArgs {
     /// Set the persistent daemon backend. Omit to show the current selection.
     #[arg(value_enum)]
     pub backend: Option<DaemonBackendArg>,
+    /// Docker image to run. Valid only when selecting the Docker backend.
+    #[arg(long, value_name = "IMAGE")]
+    pub image: Option<String>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
 }
@@ -1438,6 +1441,9 @@ impl StatusArgs {
 pub struct UpgradeArgs {
     #[arg(long, default_value_t = false)]
     pub check: bool,
+    /// Replacement custom mlabd image built for the release being installed.
+    #[arg(long, value_name = "IMAGE", conflicts_with = "check")]
+    pub daemon_image: Option<String>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
 }
@@ -3294,6 +3300,26 @@ mod tests {
                 })
             }
         ));
+
+        let custom = Cli::try_parse_from([
+            "mlab",
+            "daemon",
+            "backend",
+            "docker",
+            "--image",
+            "marketlab-python:latest",
+        ])
+        .expect("custom Docker daemon image should parse");
+        assert!(matches!(
+            custom.command,
+            Commands::Daemon {
+                command: DaemonCommands::Backend(DaemonBackendArgs {
+                    backend: Some(DaemonBackendArg::Docker),
+                    image: Some(image),
+                    ..
+                })
+            } if image == "marketlab-python:latest"
+        ));
     }
 
     #[test]
@@ -3683,6 +3709,27 @@ mod tests {
             Commands::Upgrade(args) => {
                 assert!(args.check);
                 assert!(matches!(args.output, OutputFormat::Json));
+            }
+            _ => panic!("expected upgrade command"),
+        }
+    }
+
+    #[test]
+    fn parse_upgrade_with_custom_daemon_image() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "upgrade",
+            "--daemon-image",
+            "marketlab-python:v0.0.8",
+        ])
+        .expect("custom daemon upgrade image should parse");
+
+        match cli.command {
+            Commands::Upgrade(args) => {
+                assert_eq!(
+                    args.daemon_image.as_deref(),
+                    Some("marketlab-python:v0.0.8")
+                );
             }
             _ => panic!("expected upgrade command"),
         }

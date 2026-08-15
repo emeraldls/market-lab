@@ -729,7 +729,7 @@ async fn ensure_docker_running(config: &DaemonConfig) -> Result<RuntimeStatus> {
     }
     ensure_docker_available().await?;
     if !docker_container_exists(&config.docker.container).await? {
-        pull_docker_image(&config.docker.image).await?;
+        ensure_docker_image_available(&config.docker.image).await?;
         create_docker_container(config).await?;
     } else {
         let image = docker_container_image(&config.docker.container).await?;
@@ -762,10 +762,16 @@ async fn wait_for_runtime() -> Result<RuntimeStatus> {
     bail!("mlabd did not become ready within 15 seconds")
 }
 
-pub async fn configure_backend(backend: DaemonBackend) -> Result<DaemonConfig> {
+pub async fn configure_backend(
+    backend: DaemonBackend,
+    docker_image: Option<String>,
+) -> Result<DaemonConfig> {
     let previous = daemon::load()?;
     let target = match backend {
         DaemonBackend::Native => {
+            if docker_image.is_some() {
+                bail!("a custom Docker image cannot be used with the native daemon backend");
+            }
             let binary = daemon_binary()?;
             if !binary.exists() {
                 bail!(
@@ -777,9 +783,20 @@ pub async fn configure_backend(backend: DaemonBackend) -> Result<DaemonConfig> {
         }
         DaemonBackend::Docker => {
             ensure_docker_available().await?;
-            let target = DaemonConfig::docker_for_version(env!("CARGO_PKG_VERSION"));
+            let image = match docker_image {
+                Some(image) => validate_docker_image_reference(&image)?.to_string(),
+                None if previous.backend == DaemonBackend::Docker => previous.docker.image.clone(),
+                None => daemon::docker_image_for_version(env!("CARGO_PKG_VERSION")),
+            };
+            let mut target = if previous.backend == DaemonBackend::Docker {
+                previous.clone()
+            } else {
+                DaemonConfig::docker_for_version(env!("CARGO_PKG_VERSION"))
+            };
+            target.backend = DaemonBackend::Docker;
+            target.docker.image = image;
             daemon::ensure_token()?;
-            pull_docker_image(&target.docker.image).await?;
+            ensure_docker_image_available(&target.docker.image).await?;
             target
         }
     };
@@ -794,7 +811,22 @@ pub async fn configure_backend(backend: DaemonBackend) -> Result<DaemonConfig> {
     }
 
     if previous == target {
-        ensure_running().await?;
+        if let Err(error) = ensure_running().await {
+            if target.backend != DaemonBackend::Docker {
+                return Err(error);
+            }
+            if let Some(status) = try_status().await?
+                && runtime_has_active_work(&status)
+            {
+                return Err(error).context(
+                    "cannot replace the Docker daemon while jobs or managed orders are active",
+                );
+            }
+            replace_docker_container(&target)
+                .await
+                .context("failed to replace the configured Docker daemon")?;
+            ensure_running().await?;
+        }
         return Ok(target);
     }
 
@@ -802,22 +834,42 @@ pub async fn configure_backend(backend: DaemonBackend) -> Result<DaemonConfig> {
     daemon::save(&target)?;
     let configured = match target.backend {
         DaemonBackend::Native => ensure_native_running().await.map(|_| ()),
-        DaemonBackend::Docker => replace_docker_container(&target).await,
+        DaemonBackend::Docker => {
+            async {
+                replace_docker_container(&target).await?;
+                ensure_docker_running(&target).await.map(|_| ())
+            }
+            .await
+        }
     };
     if let Err(error) = configured {
+        let cleanup_error = match target.backend {
+            DaemonBackend::Native => stop_backend(&target).await.err(),
+            DaemonBackend::Docker => remove_docker_container(&target.docker.container)
+                .await
+                .err(),
+        };
         daemon::save(&previous).context("failed to restore the previous daemon configuration")?;
         let rollback = match previous.backend {
             DaemonBackend::Native => ensure_native_running().await.map(|_| ()),
-            DaemonBackend::Docker => ensure_docker_running(&previous).await.map(|_| ()),
+            DaemonBackend::Docker => {
+                async {
+                    replace_docker_container(&previous).await?;
+                    ensure_docker_running(&previous).await.map(|_| ())
+                }
+                .await
+            }
         };
         if let Err(rollback_error) = rollback {
             bail!(
-                "failed to configure daemon backend: {error:#}; restoring the previous backend also failed: {rollback_error:#}"
+                "failed to configure daemon backend: {error:#}; cleanup result: {}; restoring the previous backend also failed: {rollback_error:#}",
+                cleanup_error
+                    .map(|error| format!("failed: {error:#}"))
+                    .unwrap_or_else(|| "ok".to_string())
             );
         }
         return Err(error).context("failed to configure daemon backend; previous backend restored");
     }
-    ensure_running().await?;
     Ok(target)
 }
 
@@ -831,10 +883,13 @@ pub fn runtime_has_active_work(status: &RuntimeStatus) -> bool {
         || status.bot_jobs.iter().any(|job| job.status.is_active())
 }
 
-pub async fn prepare_docker_upgrade(version: &str) -> Result<()> {
+pub async fn prepare_docker_upgrade(version: &str, image: Option<&str>) -> Result<String> {
     let config = daemon::load()?;
     if config.backend != DaemonBackend::Docker {
-        return Ok(());
+        if image.is_some() {
+            bail!("--daemon-image requires the Docker daemon backend");
+        }
+        return Ok(String::new());
     }
     if let Some(status) = try_status().await?
         && runtime_has_active_work(&status)
@@ -842,16 +897,29 @@ pub async fn prepare_docker_upgrade(version: &str) -> Result<()> {
         bail!("cannot upgrade Docker mlabd while jobs or managed orders are active");
     }
     ensure_docker_available().await?;
-    pull_docker_image(&daemon::docker_image_for_version(version)).await
+    let current_official = daemon::docker_image_for_version(env!("CARGO_PKG_VERSION"));
+    let target = match image {
+        Some(image) => validate_docker_image_reference(image)?.to_string(),
+        None if config.docker.image != current_official => {
+            bail!(
+                "Docker mlabd uses custom image `{}`; build its replacement FROM `{}` and rerun `mlab upgrade --daemon-image <IMAGE>`",
+                config.docker.image,
+                daemon::docker_image_for_version(version)
+            );
+        }
+        None => daemon::docker_image_for_version(version),
+    };
+    ensure_docker_image_available(&target).await?;
+    Ok(target)
 }
 
-pub async fn activate_docker_upgrade(version: &str) -> Result<()> {
+pub async fn activate_docker_upgrade(image: &str) -> Result<()> {
     let mut config = daemon::load()?;
     if config.backend != DaemonBackend::Docker {
         return Ok(());
     }
     stop_docker_container(&config).await?;
-    config.docker.image = daemon::docker_image_for_version(version);
+    config.docker.image = image.to_string();
     daemon::save(&config)?;
     replace_docker_container(&config).await
 }
@@ -892,7 +960,29 @@ async fn ensure_docker_available() -> Result<()> {
     Ok(())
 }
 
-async fn pull_docker_image(image: &str) -> Result<()> {
+fn validate_docker_image_reference(image: &str) -> Result<&str> {
+    let image = image.trim();
+    if image.is_empty() {
+        bail!("Docker image cannot be empty");
+    }
+    if image.starts_with('-') || image.chars().any(char::is_whitespace) {
+        bail!("invalid Docker image reference `{image}`");
+    }
+    Ok(image)
+}
+
+async fn ensure_docker_image_available(image: &str) -> Result<()> {
+    validate_docker_image_reference(image)?;
+    let local = tokio::process::Command::new("docker")
+        .args(["image", "inspect", image])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .context("failed to inspect the Docker daemon image")?;
+    if local.success() {
+        return Ok(());
+    }
     let status = tokio::process::Command::new("docker")
         .args(["pull", image])
         .status()
@@ -905,11 +995,16 @@ async fn pull_docker_image(image: &str) -> Result<()> {
 }
 
 async fn replace_docker_container(config: &DaemonConfig) -> Result<()> {
-    if docker_container_exists(&config.docker.container).await? {
-        run_docker(&["rm", "--force", &config.docker.container]).await?;
-    }
+    remove_docker_container(&config.docker.container).await?;
     create_docker_container(config).await?;
     run_docker(&["start", &config.docker.container]).await
+}
+
+async fn remove_docker_container(container: &str) -> Result<()> {
+    if docker_container_exists(container).await? {
+        run_docker(&["rm", "--force", container]).await?;
+    }
+    Ok(())
 }
 
 async fn create_docker_container(config: &DaemonConfig) -> Result<()> {
@@ -5909,6 +6004,17 @@ mod tests {
         );
         assert!(command.contains("ghcr.io/emeraldls/market-lab-daemon:v1.2.3 serve"));
         assert!(!command.contains("docker.sock"));
+    }
+
+    #[test]
+    fn docker_image_references_reject_empty_flags_and_whitespace() {
+        assert_eq!(
+            validate_docker_image_reference(" marketlab-python:v1 ").unwrap(),
+            "marketlab-python:v1"
+        );
+        assert!(validate_docker_image_reference("").is_err());
+        assert!(validate_docker_image_reference("--privileged").is_err());
+        assert!(validate_docker_image_reference("marketlab python:v1").is_err());
     }
 
     #[test]

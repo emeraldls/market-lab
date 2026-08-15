@@ -67,13 +67,21 @@ pub async fn handle(args: UpgradeArgs) -> Result<()> {
     }
 
     let daemon_config = daemon::load()?;
-    if daemon_config.backend == DaemonBackend::Docker {
-        crate::runtime::prepare_docker_upgrade(&latest_version).await?;
-    }
+    let docker_image = if daemon_config.backend == DaemonBackend::Docker {
+        Some(
+            crate::runtime::prepare_docker_upgrade(&latest_version, args.daemon_image.as_deref())
+                .await?,
+        )
+    } else {
+        if args.daemon_image.is_some() {
+            bail!("--daemon-image requires the Docker daemon backend");
+        }
+        None
+    };
     let installed_cli =
         self_update(&asset_url, daemon_config.backend == DaemonBackend::Native).await?;
-    if daemon_config.backend == DaemonBackend::Docker {
-        crate::runtime::activate_docker_upgrade(&latest_version).await?;
+    if let Some(image) = docker_image {
+        crate::runtime::activate_docker_upgrade(&image).await?;
     }
     refresh_market_snapshots(&installed_cli).await?;
 
