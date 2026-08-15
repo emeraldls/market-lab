@@ -1,0 +1,7 @@
+.git
+.github
+.codex
+dist
+target
+*.md
+marketlab-docs

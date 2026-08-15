@@ -84,6 +84,8 @@ pub enum DaemonCommands {
     Status(DaemonOutputArgs),
     Stop(DaemonOutputArgs),
     Events(DaemonEventsArgs),
+    /// Show or change where mlabd runs.
+    Backend(DaemonBackendArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -98,6 +100,30 @@ pub struct DaemonEventsArgs {
     pub limit: usize,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct DaemonBackendArgs {
+    /// Set the persistent daemon backend. Omit to show the current selection.
+    #[arg(value_enum)]
+    pub backend: Option<DaemonBackendArg>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum DaemonBackendArg {
+    Native,
+    Docker,
+}
+
+impl From<DaemonBackendArg> for crate::daemon::DaemonBackend {
+    fn from(value: DaemonBackendArg) -> Self {
+        match value {
+            DaemonBackendArg::Native => Self::Native,
+            DaemonBackendArg::Docker => Self::Docker,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Args)]
@@ -3242,6 +3268,30 @@ mod tests {
             daemon.command,
             Commands::Daemon {
                 command: DaemonCommands::Events(DaemonEventsArgs { limit: 10, .. })
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_daemon_backend_commands() {
+        let show = Cli::try_parse_from(["mlab", "daemon", "backend"])
+            .expect("daemon backend query should parse");
+        assert!(matches!(
+            show.command,
+            Commands::Daemon {
+                command: DaemonCommands::Backend(DaemonBackendArgs { backend: None, .. })
+            }
+        ));
+
+        let docker = Cli::try_parse_from(["mlab", "daemon", "backend", "docker"])
+            .expect("Docker daemon backend should parse");
+        assert!(matches!(
+            docker.command,
+            Commands::Daemon {
+                command: DaemonCommands::Backend(DaemonBackendArgs {
+                    backend: Some(DaemonBackendArg::Docker),
+                    ..
+                })
             }
         ));
     }

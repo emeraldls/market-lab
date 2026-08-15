@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:bookworm AS builder
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --locked --release --bin mlabd && \
+    cp /src/target/release/mlabd /tmp/mlabd
+
+FROM debian:bookworm-slim
+
+LABEL org.opencontainers.image.source="https://github.com/emeraldls/market-lab"
+LABEL org.opencontainers.image.description="Isolated Market Lab daemon runtime"
+
+RUN apt-get update && \
+    apt-get install --yes --no-install-recommends ca-certificates python3 python3-venv tini && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd --gid 10001 marketlab && \
+    useradd --uid 10001 --gid marketlab --create-home --shell /usr/sbin/nologin marketlab
+
+COPY --from=builder /tmp/mlabd /usr/local/bin/mlabd
+
+USER marketlab:marketlab
+WORKDIR /home/marketlab
+ENV HOME=/home/marketlab
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
+    CMD ["/usr/local/bin/mlabd", "healthcheck"]
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/mlabd"]
+CMD ["serve"]

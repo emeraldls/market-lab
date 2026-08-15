@@ -12,6 +12,7 @@ use serde::Deserialize;
 use tar::Archive;
 
 use crate::cli::{OutputFormat, UpgradeArgs};
+use crate::daemon::{self, DaemonBackend};
 use crate::domain::types::UpgradeStatus;
 
 const REPO: &str = "emeraldls/market-lab";
@@ -65,7 +66,15 @@ pub async fn handle(args: UpgradeArgs) -> Result<()> {
         return render(&status, OutputFormat::Terminal);
     }
 
-    let installed_cli = self_update(&asset_url).await?;
+    let daemon_config = daemon::load()?;
+    if daemon_config.backend == DaemonBackend::Docker {
+        crate::runtime::prepare_docker_upgrade(&latest_version).await?;
+    }
+    let installed_cli =
+        self_update(&asset_url, daemon_config.backend == DaemonBackend::Native).await?;
+    if daemon_config.backend == DaemonBackend::Docker {
+        crate::runtime::activate_docker_upgrade(&latest_version).await?;
+    }
     refresh_market_snapshots(&installed_cli).await?;
 
     let status = UpgradeStatus {
@@ -138,7 +147,7 @@ fn is_latest(current: &str, latest: &str) -> Result<bool> {
     Ok(Version::parse(current)? >= Version::parse(latest)?)
 }
 
-async fn self_update(url: &str) -> Result<PathBuf> {
+async fn self_update(url: &str, install_daemon: bool) -> Result<PathBuf> {
     let client = reqwest::Client::builder()
         .user_agent(format!("{APP_NAME}/{}", env!("CARGO_PKG_VERSION")))
         .build()?;
@@ -159,18 +168,20 @@ async fn self_update(url: &str) -> Result<PathBuf> {
     let parent = current_exe
         .parent()
         .ok_or_else(|| anyhow::anyhow!("current executable has no parent directory"))?;
-    let daemon_exe = parent.join(DAEMON_NAME);
     let cli_temp_path = temp_binary_path(parent, APP_NAME);
-    let daemon_temp_path = temp_binary_path(parent, DAEMON_NAME);
 
     extract_binary(&bytes, APP_NAME, &cli_temp_path)?;
-    extract_binary(&bytes, DAEMON_NAME, &daemon_temp_path)?;
-    fs::rename(&daemon_temp_path, &daemon_exe).with_context(|| {
-        format!(
-            "failed to replace runtime executable {}",
-            daemon_exe.display()
-        )
-    })?;
+    if install_daemon {
+        let daemon_exe = parent.join(DAEMON_NAME);
+        let daemon_temp_path = temp_binary_path(parent, DAEMON_NAME);
+        extract_binary(&bytes, DAEMON_NAME, &daemon_temp_path)?;
+        fs::rename(&daemon_temp_path, &daemon_exe).with_context(|| {
+            format!(
+                "failed to replace runtime executable {}",
+                daemon_exe.display()
+            )
+        })?;
+    }
     fs::rename(&cli_temp_path, &current_exe).with_context(|| {
         format!(
             "failed to replace current executable {}",

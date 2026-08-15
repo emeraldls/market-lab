@@ -4,6 +4,7 @@ pub mod commands;
 pub mod config;
 pub mod core;
 pub mod credentials;
+pub mod daemon;
 pub mod domain;
 pub mod functions;
 pub mod markets;

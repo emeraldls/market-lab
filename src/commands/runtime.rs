@@ -1,13 +1,37 @@
 use anyhow::{Result, bail};
 use chrono::{Local, Utc};
 
-use crate::cli::{DaemonEventsArgs, DaemonOutputArgs, OutputFormat};
+use crate::cli::{DaemonBackendArgs, DaemonEventsArgs, DaemonOutputArgs, OutputFormat};
+use crate::daemon;
 use crate::runtime::{self, RuntimeStatus};
 
 pub async fn handle_start(args: DaemonOutputArgs) -> Result<()> {
     validate_output(args.output)?;
     let status = runtime::ensure_running().await?;
     render_status(&status, args.output)
+}
+
+pub async fn handle_backend(args: DaemonBackendArgs) -> Result<()> {
+    validate_output(args.output)?;
+    let config = if let Some(backend) = args.backend {
+        runtime::configure_backend(backend.into()).await?
+    } else {
+        daemon::load()?
+    };
+    match args.output {
+        OutputFormat::Terminal => {
+            println!("mlabd backend: {}", config.backend.as_str());
+            if config.backend == daemon::DaemonBackend::Docker {
+                println!("  container: {}", config.docker.container);
+                println!("  image:     {}", config.docker.image);
+                println!("  endpoint:  {}:{}", config.docker.host, config.docker.port);
+            }
+        }
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&config)?),
+        OutputFormat::Jsonl => println!("{}", serde_json::to_string(&config)?),
+        OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
+    }
+    Ok(())
 }
 
 pub async fn handle_status(args: DaemonOutputArgs) -> Result<()> {
@@ -68,6 +92,7 @@ pub fn handle_events(args: DaemonEventsArgs) -> Result<()> {
 fn render_status(status: &RuntimeStatus, output: OutputFormat) -> Result<()> {
     match output {
         OutputFormat::Terminal => {
+            println!("mlabd backend: {}", daemon::load()?.backend.as_str());
             if !status.running {
                 println!("mlabd: stopped");
                 return Ok(());

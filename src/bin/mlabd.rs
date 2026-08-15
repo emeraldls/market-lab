@@ -32,9 +32,10 @@ async fn main() -> Result<()> {
             }
             market_lab::commands::bot::handle_worker(&job_id).await
         }
+        Some("healthcheck") => market_lab::runtime::healthcheck().await,
         Some(command) => {
             anyhow::bail!(
-                "unknown mlabd command `{command}` (expected `serve|script-worker|strategy-worker|bot-worker`)"
+                "unknown mlabd command `{command}` (expected `serve|healthcheck|script-worker|strategy-worker|bot-worker`)"
             )
         }
     }

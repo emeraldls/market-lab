@@ -48,6 +48,7 @@ async fn main() -> Result<()> {
             DaemonCommands::Status(args) => commands::runtime::handle_status(args).await?,
             DaemonCommands::Stop(args) => commands::runtime::handle_stop(args).await?,
             DaemonCommands::Events(args) => commands::runtime::handle_events(args)?,
+            DaemonCommands::Backend(args) => commands::runtime::handle_backend(args).await?,
         },
         Commands::Inspect(args) => commands::market::inspect::handle(args).await?,
         Commands::Replay(args) => commands::market::replay::handle(args).await?,

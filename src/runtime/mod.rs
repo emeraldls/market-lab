@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,12 +10,13 @@ use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 use crate::bots::jobs::{BotJob, BotJobDefinition, BotJobStatus, BotJobSubmission, BotPerformance};
 use crate::credentials;
+use crate::daemon::{self, DaemonBackend, DaemonConfig};
 use crate::domain::execution::{
     CancelPlan, ExecutionOutcome, ExecutionReceipt, ExecutionVenue, Position, TradePlan,
 };
@@ -32,12 +33,13 @@ use crate::scripting::jobs::{
     ScriptExecutionEvent, ScriptJob, ScriptJobDefinition, ScriptJobStatus, ScriptJobSubmission,
     ScriptManagedOrder,
 };
+use crate::scripting::language::{PythonRuntime, ScriptLanguage};
 use crate::strategies::jobs::{
     StrategyJob, StrategyJobDefinition, StrategyJobStatus, StrategyJobSubmission, StrategySide,
 };
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-const RUNTIME_VERSION: u8 = 36;
+const RUNTIME_VERSION: u8 = 37;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -258,6 +260,21 @@ enum RuntimeRequest {
     },
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeWireRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth: Option<String>,
+    request: RuntimeRequest,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum IncomingRuntimeRequest {
+    Authenticated(RuntimeWireRequest),
+    Native(RuntimeRequest),
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SequencedTradePlan {
@@ -428,6 +445,33 @@ enum AccountConnectionEvent {
     },
 }
 
+trait RuntimeIo: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> RuntimeIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+type BoxedRuntimeIo = Box<dyn RuntimeIo>;
+
+enum RuntimeListener {
+    Unix(UnixListener),
+    Tcp(TcpListener),
+}
+
+impl RuntimeListener {
+    async fn accept(&self) -> std::io::Result<BoxedRuntimeIo> {
+        match self {
+            Self::Unix(listener) => {
+                let (stream, _) = listener.accept().await?;
+                Ok(Box::new(stream))
+            }
+            Self::Tcp(listener) => {
+                let (stream, _) = listener.accept().await?;
+                stream.set_nodelay(true)?;
+                Ok(Box::new(stream))
+            }
+        }
+    }
+}
+
 struct RuntimePaths {
     directory: PathBuf,
     socket: PathBuf,
@@ -439,9 +483,7 @@ struct RuntimePaths {
 
 impl RuntimePaths {
     fn load() -> Result<Self> {
-        let home =
-            std::env::var_os("HOME").context("HOME is required for the Market Lab runtime")?;
-        let directory = PathBuf::from(home).join(".market-lab").join("execution");
+        let directory = daemon::market_lab_home()?.join("execution");
         Ok(Self {
             socket: directory.join("mlabd.sock"),
             state: directory.join("runtime.json"),
@@ -456,18 +498,33 @@ impl RuntimePaths {
 pub async fn serve() -> Result<()> {
     let paths = RuntimePaths::load()?;
     secure_runtime_directory(&paths)?;
-    if paths.socket.exists() {
-        if UnixStream::connect(&paths.socket).await.is_ok() {
-            bail!("mlabd is already running");
+    let tcp_address = std::env::var("MLAB_DAEMON_TCP_ADDR").ok();
+    let required_auth = if tcp_address.is_some() {
+        Some(daemon::read_token().context("Docker mlabd requires its authentication token")?)
+    } else {
+        None
+    };
+    let listener = if let Some(address) = tcp_address {
+        RuntimeListener::Tcp(
+            TcpListener::bind(&address)
+                .await
+                .with_context(|| format!("failed to bind Docker mlabd to {address}"))?,
+        )
+    } else {
+        if paths.socket.exists() {
+            if UnixStream::connect(&paths.socket).await.is_ok() {
+                bail!("mlabd is already running");
+            }
+            fs::remove_file(&paths.socket).with_context(|| {
+                format!("failed to remove stale socket {}", paths.socket.display())
+            })?;
         }
-        fs::remove_file(&paths.socket)
-            .with_context(|| format!("failed to remove stale socket {}", paths.socket.display()))?;
-    }
-
-    let listener = UnixListener::bind(&paths.socket)
-        .with_context(|| format!("failed to bind {}", paths.socket.display()))?;
-    fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to secure {}", paths.socket.display()))?;
+        let listener = UnixListener::bind(&paths.socket)
+            .with_context(|| format!("failed to bind {}", paths.socket.display()))?;
+        fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to secure {}", paths.socket.display()))?;
+        RuntimeListener::Unix(listener)
+    };
     let mut state = load_state(&paths)?.unwrap_or_else(|| RuntimeState {
         version: RUNTIME_VERSION,
         pid: std::process::id(),
@@ -509,13 +566,17 @@ pub async fn serve() -> Result<()> {
         );
     }
     let mut should_stop = false;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to install mlabd SIGTERM handler")?;
     while !should_stop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => should_stop = true,
+            _ = terminate.recv() => should_stop = true,
             accepted = listener.accept() => {
-                let (stream, _) = accepted.context("mlabd failed to accept a local connection")?;
+                let stream = accepted.context("mlabd failed to accept a local connection")?;
                 match handle_connection(
                     stream,
+                    required_auth.as_deref(),
                     &paths,
                     &adapter,
                     &mut state,
@@ -575,7 +636,9 @@ pub async fn serve() -> Result<()> {
         let _ = stop_bot_job_in_daemon(&paths, &mut state, &job_id);
     }
     drop(listener);
-    let _ = fs::remove_file(&paths.socket);
+    if required_auth.is_none() {
+        let _ = fs::remove_file(&paths.socket);
+    }
     state.pid = 0;
     state.account_stream_connected = false;
     persist_state(&paths, &state)?;
@@ -583,6 +646,14 @@ pub async fn serve() -> Result<()> {
 }
 
 pub async fn ensure_running() -> Result<RuntimeStatus> {
+    let config = daemon::load()?;
+    match config.backend {
+        DaemonBackend::Native => ensure_native_running().await,
+        DaemonBackend::Docker => ensure_docker_running(&config).await,
+    }
+}
+
+async fn ensure_native_running() -> Result<RuntimeStatus> {
     if let Some(status) = try_status().await? {
         if status.version == RUNTIME_VERSION {
             return Ok(status);
@@ -645,6 +716,329 @@ pub async fn ensure_running() -> Result<RuntimeStatus> {
     )
 }
 
+async fn ensure_docker_running(config: &DaemonConfig) -> Result<RuntimeStatus> {
+    if let Some(status) = try_status().await? {
+        if status.version == RUNTIME_VERSION {
+            return Ok(status);
+        }
+        bail!(
+            "Docker mlabd runtime version {} does not match CLI runtime version {}; run `mlab daemon backend docker` to replace it",
+            status.version,
+            RUNTIME_VERSION
+        );
+    }
+    ensure_docker_available().await?;
+    if !docker_container_exists(&config.docker.container).await? {
+        pull_docker_image(&config.docker.image).await?;
+        create_docker_container(config).await?;
+    } else {
+        let image = docker_container_image(&config.docker.container).await?;
+        if image != config.docker.image {
+            bail!(
+                "Docker container `{}` uses `{image}`, expected `{}`; run `mlab daemon backend docker` to replace it",
+                config.docker.container,
+                config.docker.image
+            );
+        }
+    }
+    run_docker(&["start", &config.docker.container]).await?;
+    wait_for_runtime().await.with_context(|| {
+        format!(
+            "Docker mlabd did not become ready; inspect `docker logs {}`",
+            config.docker.container
+        )
+    })
+}
+
+async fn wait_for_runtime() -> Result<RuntimeStatus> {
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if let Some(status) = try_status().await?
+            && status.version == RUNTIME_VERSION
+        {
+            return Ok(status);
+        }
+    }
+    bail!("mlabd did not become ready within 15 seconds")
+}
+
+pub async fn configure_backend(backend: DaemonBackend) -> Result<DaemonConfig> {
+    let previous = daemon::load()?;
+    let target = match backend {
+        DaemonBackend::Native => {
+            let binary = daemon_binary()?;
+            if !binary.exists() {
+                bail!(
+                    "native mlabd is not installed at {}; rerun the installer and choose Native",
+                    binary.display()
+                );
+            }
+            DaemonConfig::default()
+        }
+        DaemonBackend::Docker => {
+            ensure_docker_available().await?;
+            let target = DaemonConfig::docker_for_version(env!("CARGO_PKG_VERSION"));
+            daemon::ensure_token()?;
+            pull_docker_image(&target.docker.image).await?;
+            target
+        }
+    };
+
+    if let Some(status) = try_status().await?
+        && runtime_has_active_work(&status)
+        && previous != target
+    {
+        bail!(
+            "cannot switch daemon backend while jobs or managed orders are active; stop them first"
+        );
+    }
+
+    if previous == target {
+        ensure_running().await?;
+        return Ok(target);
+    }
+
+    stop_backend(&previous).await?;
+    daemon::save(&target)?;
+    let configured = match target.backend {
+        DaemonBackend::Native => ensure_native_running().await.map(|_| ()),
+        DaemonBackend::Docker => replace_docker_container(&target).await,
+    };
+    if let Err(error) = configured {
+        daemon::save(&previous).context("failed to restore the previous daemon configuration")?;
+        let rollback = match previous.backend {
+            DaemonBackend::Native => ensure_native_running().await.map(|_| ()),
+            DaemonBackend::Docker => ensure_docker_running(&previous).await.map(|_| ()),
+        };
+        if let Err(rollback_error) = rollback {
+            bail!(
+                "failed to configure daemon backend: {error:#}; restoring the previous backend also failed: {rollback_error:#}"
+            );
+        }
+        return Err(error).context("failed to configure daemon backend; previous backend restored");
+    }
+    ensure_running().await?;
+    Ok(target)
+}
+
+pub fn runtime_has_active_work(status: &RuntimeStatus) -> bool {
+    !status.tracked_orders.is_empty()
+        || status.script_jobs.iter().any(|job| job.status.is_active())
+        || status
+            .strategy_jobs
+            .iter()
+            .any(|job| job.status.is_active())
+        || status.bot_jobs.iter().any(|job| job.status.is_active())
+}
+
+pub async fn prepare_docker_upgrade(version: &str) -> Result<()> {
+    let config = daemon::load()?;
+    if config.backend != DaemonBackend::Docker {
+        return Ok(());
+    }
+    if let Some(status) = try_status().await?
+        && runtime_has_active_work(&status)
+    {
+        bail!("cannot upgrade Docker mlabd while jobs or managed orders are active");
+    }
+    ensure_docker_available().await?;
+    pull_docker_image(&daemon::docker_image_for_version(version)).await
+}
+
+pub async fn activate_docker_upgrade(version: &str) -> Result<()> {
+    let mut config = daemon::load()?;
+    if config.backend != DaemonBackend::Docker {
+        return Ok(());
+    }
+    stop_docker_container(&config).await?;
+    config.docker.image = daemon::docker_image_for_version(version);
+    daemon::save(&config)?;
+    replace_docker_container(&config).await
+}
+
+async fn stop_backend(config: &DaemonConfig) -> Result<()> {
+    match config.backend {
+        DaemonBackend::Native => {
+            if let Some(response) = try_request(RuntimeRequest::Stop).await?
+                && !response.ok
+            {
+                bail!("mlabd refused to stop: {}", response.message);
+            }
+            for _ in 0..120 {
+                if try_status().await?.is_none() {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            bail!("native mlabd did not stop within 30 seconds")
+        }
+        DaemonBackend::Docker => stop_docker_container(config).await,
+    }
+}
+
+async fn ensure_docker_available() -> Result<()> {
+    let output = tokio::process::Command::new("docker")
+        .args(["info", "--format", "{{.ServerVersion}}"])
+        .output()
+        .await
+        .context("Docker is not installed; install Docker Desktop or Docker Engine")?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "Docker is installed but unavailable: {}; start Docker and retry",
+            error.trim()
+        );
+    }
+    Ok(())
+}
+
+async fn pull_docker_image(image: &str) -> Result<()> {
+    let status = tokio::process::Command::new("docker")
+        .args(["pull", image])
+        .status()
+        .await
+        .with_context(|| format!("failed to download Docker daemon image `{image}`"))?;
+    if !status.success() {
+        bail!("failed to download Docker daemon image `{image}`");
+    }
+    Ok(())
+}
+
+async fn replace_docker_container(config: &DaemonConfig) -> Result<()> {
+    if docker_container_exists(&config.docker.container).await? {
+        run_docker(&["rm", "--force", &config.docker.container]).await?;
+    }
+    create_docker_container(config).await?;
+    run_docker(&["start", &config.docker.container]).await
+}
+
+async fn create_docker_container(config: &DaemonConfig) -> Result<()> {
+    let home = daemon::market_lab_home()?;
+    fs::create_dir_all(&home).with_context(|| format!("failed to create {}", home.display()))?;
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to secure {}", home.display()))?;
+    daemon::ensure_token()?;
+    let args = docker_create_args(config, &home, unsafe { libc::geteuid() }, unsafe {
+        libc::getegid()
+    });
+    run_docker_owned(&args).await
+}
+
+fn docker_create_args(config: &DaemonConfig, home: &Path, uid: u32, gid: u32) -> Vec<String> {
+    let mount = format!(
+        "type=bind,source={},target=/home/marketlab/.market-lab",
+        home.display()
+    );
+    let publish = format!(
+        "{}:{}:{}",
+        config.docker.host,
+        config.docker.port,
+        daemon::DOCKER_CONTAINER_PORT
+    );
+    let user = format!("{uid}:{gid}");
+    let listen = format!("0.0.0.0:{}", daemon::DOCKER_CONTAINER_PORT);
+    let endpoint = format!("127.0.0.1:{}", daemon::DOCKER_CONTAINER_PORT);
+    vec![
+        "create".to_string(),
+        "--name".to_string(),
+        config.docker.container.clone(),
+        "--label".to_string(),
+        "io.marketlab.runtime=mlabd".to_string(),
+        "--label".to_string(),
+        format!("io.marketlab.version={}", env!("CARGO_PKG_VERSION")),
+        "--restart".to_string(),
+        "unless-stopped".to_string(),
+        "--stop-timeout".to_string(),
+        "60".to_string(),
+        "--read-only".to_string(),
+        "--cap-drop".to_string(),
+        "ALL".to_string(),
+        "--security-opt".to_string(),
+        "no-new-privileges:true".to_string(),
+        "--tmpfs".to_string(),
+        "/tmp:rw,nosuid,nodev,size=268435456".to_string(),
+        "--user".to_string(),
+        user,
+        "--env".to_string(),
+        "HOME=/home/marketlab".to_string(),
+        "--env".to_string(),
+        "MLAB_HOME=/home/marketlab/.market-lab".to_string(),
+        "--env".to_string(),
+        format!("MLAB_DAEMON_TCP_ADDR={listen}"),
+        "--env".to_string(),
+        format!("MLAB_DAEMON_ENDPOINT={endpoint}"),
+        "--publish".to_string(),
+        publish,
+        "--mount".to_string(),
+        mount,
+        config.docker.image.clone(),
+        "serve".to_string(),
+    ]
+}
+
+async fn docker_container_exists(container: &str) -> Result<bool> {
+    let status = tokio::process::Command::new("docker")
+        .args(["container", "inspect", container])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .context("failed to inspect Docker daemon container")?;
+    Ok(status.success())
+}
+
+async fn docker_container_image(container: &str) -> Result<String> {
+    let output = tokio::process::Command::new("docker")
+        .args([
+            "container",
+            "inspect",
+            "--format",
+            "{{.Config.Image}}",
+            container,
+        ])
+        .output()
+        .await
+        .context("failed to inspect Docker daemon image")?;
+    if !output.status.success() {
+        bail!(
+            "failed to inspect Docker container `{container}`: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+async fn stop_docker_container(config: &DaemonConfig) -> Result<()> {
+    if !docker_container_exists(&config.docker.container).await? {
+        return Ok(());
+    }
+    run_docker(&["stop", "--time", "60", &config.docker.container]).await
+}
+
+async fn run_docker(args: &[&str]) -> Result<()> {
+    let args = args
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    run_docker_owned(&args).await
+}
+
+async fn run_docker_owned(args: &[String]) -> Result<()> {
+    let output = tokio::process::Command::new("docker")
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("failed to run `docker {}`", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "`docker {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 fn secure_runtime_directory(paths: &RuntimePaths) -> Result<()> {
     fs::create_dir_all(&paths.directory)
         .with_context(|| format!("failed to create {}", paths.directory.display()))?;
@@ -656,7 +1050,31 @@ pub async fn status() -> Result<RuntimeStatus> {
     Ok(try_status().await?.unwrap_or_else(RuntimeStatus::stopped))
 }
 
+pub async fn healthcheck() -> Result<()> {
+    let status = try_status().await?.context("mlabd is not reachable")?;
+    if status.version != RUNTIME_VERSION {
+        bail!(
+            "mlabd runtime version {} does not match {}",
+            status.version,
+            RUNTIME_VERSION
+        );
+    }
+    Ok(())
+}
+
 pub async fn stop() -> Result<bool> {
+    let config = daemon::load()?;
+    if config.backend == DaemonBackend::Docker {
+        ensure_docker_available().await?;
+        if !docker_container_exists(&config.docker.container).await? {
+            return Ok(false);
+        }
+        if try_status().await?.is_none() {
+            return Ok(false);
+        }
+        stop_docker_container(&config).await?;
+        return Ok(true);
+    }
     let Some(response) = try_request(RuntimeRequest::Stop).await? else {
         return Ok(false);
     };
@@ -1438,8 +1856,18 @@ pub fn recent_events(limit: usize) -> Result<Vec<serde_json::Value>> {
 fn create_script_job(
     paths: &RuntimePaths,
     state: &mut RuntimeState,
-    submission: ScriptJobSubmission,
+    mut submission: ScriptJobSubmission,
 ) -> Result<ScriptJob> {
+    if submission.language == ScriptLanguage::PythonV2
+        && std::env::var_os("MLAB_DAEMON_TCP_ADDR").is_some()
+    {
+        let interpreter = std::env::var_os("MLAB_PYTHON")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/usr/bin/python3"));
+        submission.python_runtime = Some(PythonRuntime::inspect(interpreter).context(
+            "Docker mlabd could not resolve its Python runtime; use a daemon image containing Python 3.9 or newer",
+        )?);
+    }
     submission.validate()?;
     if let Some(venue) = submission.venue {
         crate::providers::execution::ExecutionAdapter::configured_account(venue).with_context(
@@ -3366,14 +3794,15 @@ async fn execute_bot_cancels(
 }
 
 async fn handle_connection(
-    stream: UnixStream,
+    stream: BoxedRuntimeIo,
+    required_auth: Option<&str>,
     paths: &RuntimePaths,
     adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
     account_tx: &mpsc::Sender<AccountConnectionEvent>,
     account_supervisors: &mut HashSet<String>,
 ) -> Result<bool> {
-    let (reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut line = String::new();
     BufReader::new(reader)
         .read_line(&mut line)
@@ -3382,7 +3811,7 @@ async fn handle_connection(
     if line.len() > MAX_RUNTIME_REQUEST_BYTES {
         bail!("mlabd request exceeds the runtime request limit");
     }
-    let request: RuntimeRequest = match serde_json::from_str(&line) {
+    let incoming: IncomingRuntimeRequest = match serde_json::from_str(&line) {
         Ok(request) => request,
         Err(error) => {
             let message = format!("invalid mlabd request: {error}");
@@ -3399,6 +3828,30 @@ async fn handle_connection(
             return Ok(false);
         }
     };
+    let (auth, request) = match incoming {
+        IncomingRuntimeRequest::Authenticated(wire) => (wire.auth, wire.request),
+        IncomingRuntimeRequest::Native(request) => (None, request),
+    };
+    if let Some(required_auth) = required_auth
+        && !auth
+            .as_deref()
+            .is_some_and(|provided| tokens_equal(required_auth, provided))
+    {
+        let response = RuntimeResponse {
+            ok: false,
+            message: "unauthorized mlabd request".to_string(),
+            ..RuntimeResponse::empty()
+        };
+        let mut encoded =
+            serde_json::to_vec(&response).context("failed to encode mlabd error response")?;
+        encoded.push(b'\n');
+        writer
+            .write_all(&encoded)
+            .await
+            .context("failed to write mlabd error response")?;
+        writer.shutdown().await.ok();
+        return Ok(false);
+    }
     let should_stop = matches!(request, RuntimeRequest::Stop);
     let response = match request {
         RuntimeRequest::Ping => RuntimeResponse {
@@ -5201,6 +5654,33 @@ async fn request(request: RuntimeRequest) -> Result<RuntimeResponse> {
 }
 
 async fn try_request(request: RuntimeRequest) -> Result<Option<RuntimeResponse>> {
+    let config = daemon::load()?;
+    let endpoint_override = std::env::var("MLAB_DAEMON_ENDPOINT").ok();
+    if config.backend == DaemonBackend::Docker || endpoint_override.is_some() {
+        let endpoint = endpoint_override
+            .unwrap_or_else(|| format!("{}:{}", config.docker.host, config.docker.port));
+        let stream = match TcpStream::connect(&endpoint).await {
+            Ok(stream) => stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to connect to Docker mlabd at {endpoint}"));
+            }
+        };
+        stream.set_nodelay(true)?;
+        return send_runtime_request(stream, request, Some(daemon::read_token()?))
+            .await
+            .map(Some);
+    }
     let paths = RuntimePaths::load()?;
     let stream = match UnixStream::connect(&paths.socket).await {
         Ok(stream) => stream,
@@ -5217,8 +5697,24 @@ async fn try_request(request: RuntimeRequest) -> Result<Option<RuntimeResponse>>
                 .with_context(|| format!("failed to connect to {}", paths.socket.display()));
         }
     };
-    let (reader, mut writer) = stream.into_split();
-    let mut encoded = serde_json::to_vec(&request).context("failed to encode mlabd request")?;
+    send_runtime_request(stream, request, None).await.map(Some)
+}
+
+async fn send_runtime_request<S>(
+    stream: S,
+    request: RuntimeRequest,
+    auth: Option<String>,
+) -> Result<RuntimeResponse>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut encoded = if auth.is_some() {
+        serde_json::to_vec(&RuntimeWireRequest { auth, request })
+    } else {
+        serde_json::to_vec(&request)
+    }
+    .context("failed to encode mlabd request")?;
     encoded.push(b'\n');
     writer
         .write_all(&encoded)
@@ -5234,7 +5730,7 @@ async fn try_request(request: RuntimeRequest) -> Result<Option<RuntimeResponse>>
         bail!("mlabd closed the local connection without a response");
     }
     let response = serde_json::from_str(&line).context("invalid mlabd response")?;
-    Ok(Some(response))
+    Ok(response)
 }
 
 fn runtime_status(state: &RuntimeState) -> RuntimeStatus {
@@ -5331,6 +5827,21 @@ fn daemon_binary() -> Result<PathBuf> {
     Ok(current.with_file_name("mlabd"))
 }
 
+fn tokens_equal(expected: &str, provided: &str) -> bool {
+    let expected = expected.as_bytes();
+    let provided = provided.as_bytes();
+    if expected.len() != provided.len() {
+        return false;
+    }
+    expected
+        .iter()
+        .zip(provided)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
 fn now_ms() -> Result<u64> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -5342,6 +5853,63 @@ fn now_ms() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_protocol_accepts_native_and_authenticated_envelopes() {
+        let native: IncomingRuntimeRequest =
+            serde_json::from_value(serde_json::json!({ "type": "ping" }))
+                .expect("native request should decode");
+        assert!(matches!(
+            native,
+            IncomingRuntimeRequest::Native(RuntimeRequest::Ping)
+        ));
+
+        let authenticated: IncomingRuntimeRequest = serde_json::from_value(serde_json::json!({
+            "auth": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "request": { "type": "ping" }
+        }))
+        .expect("authenticated request should decode");
+        assert!(matches!(
+            authenticated,
+            IncomingRuntimeRequest::Authenticated(RuntimeWireRequest {
+                request: RuntimeRequest::Ping,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn daemon_tokens_compare_without_prefix_matches() {
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(tokens_equal(token, token));
+        assert!(!tokens_equal(token, &token[..63]));
+        assert!(!tokens_equal(
+            token,
+            "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+    }
+
+    #[test]
+    fn docker_container_is_hardened_and_only_publishes_on_loopback() {
+        let mut config = DaemonConfig::docker_for_version("1.2.3");
+        config.docker.container = "marketlab-test".to_string();
+        config.docker.port = 49_731;
+        let home = PathBuf::from("/tmp/market lab");
+        let args = docker_create_args(&config, &home, 501, 20);
+        let command = args.join(" ");
+
+        assert!(command.contains("--publish 127.0.0.1:49731:47831"));
+        assert!(command.contains("--user 501:20"));
+        assert!(command.contains("--read-only"));
+        assert!(command.contains("--cap-drop ALL"));
+        assert!(command.contains("--security-opt no-new-privileges:true"));
+        assert!(!command.contains("--init"));
+        assert!(
+            command.contains("type=bind,source=/tmp/market lab,target=/home/marketlab/.market-lab")
+        );
+        assert!(command.contains("ghcr.io/emeraldls/market-lab-daemon:v1.2.3 serve"));
+        assert!(!command.contains("docker.sock"));
+    }
 
     #[test]
     fn stopped_status_has_no_process_or_workloads() {
@@ -5409,8 +5977,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_protocol_v36_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 36);
+    fn runtime_protocol_v37_decodes_oiwap_submissions() {
+        assert_eq!(RUNTIME_VERSION, 37);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",
