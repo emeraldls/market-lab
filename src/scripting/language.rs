@@ -71,12 +71,13 @@ impl PythonRuntime {
     }
 
     pub fn inspect(interpreter: PathBuf) -> Result<Self> {
-        let interpreter = interpreter.canonicalize().with_context(|| {
-            format!(
-                "failed to resolve Python interpreter {}",
-                interpreter.display()
-            )
-        })?;
+        let interpreter = if interpreter.is_absolute() {
+            interpreter
+        } else {
+            env::current_dir()
+                .context("failed to resolve the current directory for the Python interpreter")?
+                .join(interpreter)
+        };
         let output = Command::new(&interpreter)
             .args([
                 "-c",
@@ -168,5 +169,32 @@ mod tests {
             ScriptLanguage::PythonV2
         );
         assert!(ScriptLanguage::from_path(Path::new("alpha.txt")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn python_runtime_preserves_virtual_environment_symlink() {
+        use std::fs;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = std::env::temp_dir().join(format!(
+            "mlab-python-runtime-symlink-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let interpreter = directory.join("fake-python");
+        fs::write(&interpreter, "#!/bin/sh\nprintf '3.11.9\\n'\n").unwrap();
+        fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let virtualenv_bin = directory.join(".venv/bin");
+        fs::create_dir_all(&virtualenv_bin).unwrap();
+        let virtualenv_python = virtualenv_bin.join("python");
+        symlink("../../fake-python", &virtualenv_python).unwrap();
+
+        let runtime = PythonRuntime::inspect(virtualenv_python.clone()).unwrap();
+        assert_eq!(runtime.interpreter, virtualenv_python);
+        assert_eq!(runtime.version, "3.11.9");
+        fs::remove_dir_all(directory).unwrap();
     }
 }

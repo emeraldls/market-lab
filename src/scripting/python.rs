@@ -778,6 +778,7 @@ fn python_error_message(response: &Value) -> String {
 const PYTHON_RUNNER: &str = r#"
 import copy
 import importlib.util
+import inspect
 import json
 import os
 from pathlib import Path
@@ -788,6 +789,13 @@ SCRIPT_PATH = Path(sys.argv[1]).resolve()
 MODE = sys.argv[2]
 PROTOCOL_OUT = sys.stdout
 sys.stdout = sys.stderr
+
+HOOK_PARAMETERS = {}
+HOOK_INPUTS = {
+    "on_data": ("ctx", "event", "history"),
+    "on_execution": ("ctx", "event"),
+    "on_finish": ("ctx", "history"),
+}
 
 
 def json_default(value):
@@ -807,6 +815,44 @@ def write_message(message):
     PROTOCOL_OUT.flush()
 
 
+def configure_hook(module, name, required=False):
+    function = getattr(module, name, None)
+    if function is None:
+        if required:
+            raise TypeError(f"Python scripts require an `{name}` function")
+        return
+    if not callable(function):
+        raise TypeError(f"Python `{name}` must be callable")
+
+    signature = inspect.signature(function)
+    available = HOOK_INPUTS[name]
+    selected = []
+    for parameter in signature.parameters.values():
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            raise TypeError(
+                f"Python `{name}{signature}` must declare only named parameters from "
+                f"{', '.join(available)}"
+            )
+        if parameter.name not in available:
+            raise TypeError(
+                f"Python `{name}` does not provide `{parameter.name}`; choose from "
+                f"{', '.join(available)}"
+            )
+        selected.append(parameter.name)
+    HOOK_PARAMETERS[name] = tuple(selected)
+
+
+def invoke_hook(name, function, available):
+    return function(**{
+        parameter: available[parameter]
+        for parameter in HOOK_PARAMETERS[name]
+    })
+
+
 def load_module():
     script_directory = str(SCRIPT_PATH.parent)
     if script_directory not in sys.path:
@@ -819,8 +865,9 @@ def load_module():
     manifest = getattr(module, "script", None)
     if not isinstance(manifest, dict):
         raise TypeError("Python scripts require a `script` dictionary")
-    if not callable(getattr(module, "on_data", None)):
-        raise TypeError("Python scripts require `on_data(ctx, event, history)`")
+    configure_hook(module, "on_data", required=True)
+    configure_hook(module, "on_execution")
+    configure_hook(module, "on_finish")
     return module, manifest
 
 
@@ -944,18 +991,28 @@ try:
             if hook == "on_data":
                 record = request["record"]
                 HISTORY.record(record["source"], record["value"], record.get("identity"))
-                output = MODULE.on_data(CTX, request["event"], HISTORY)
+                output = invoke_hook("on_data", MODULE.on_data, {
+                    "ctx": CTX,
+                    "event": request["event"],
+                    "history": HISTORY,
+                })
                 present = True
             elif hook == "on_execution":
                 function = getattr(MODULE, "on_execution", None)
                 present = callable(function)
-                output = function(CTX, request["event"]) if present else None
+                output = invoke_hook("on_execution", function, {
+                    "ctx": CTX,
+                    "event": request["event"],
+                }) if present else None
             elif hook == "on_finish":
                 function = getattr(MODULE, "on_finish", None)
                 present = callable(function)
                 CTX._finishing = True
                 try:
-                    output = function(CTX, HISTORY) if present else None
+                    output = invoke_hook("on_finish", function, {
+                        "ctx": CTX,
+                        "history": HISTORY,
+                    }) if present else None
                 finally:
                     CTX._finishing = False
             else:
@@ -1197,6 +1254,51 @@ def on_data(ctx, event, history):
         let message = format!("{error:#}");
         assert!(message.contains("ValueError"));
         assert!(message.contains("broken signal"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn python_hooks_receive_only_the_parameters_they_declare() {
+        let path = write_python_script(
+            r#"
+script = {"name": "optional-hook-inputs", "version": "2", "sources": ["candles"]}
+
+def on_data(ctx):
+    return {"metrics": {"has_params": hasattr(ctx, "params")}}
+
+def on_execution(event):
+    return {"metrics": {"status": event["status"]}}
+
+def on_finish():
+    return {"meta": {"finished": True}}
+"#,
+            "optional-hook-inputs",
+        );
+        if !python_available(&path) {
+            let _ = fs::remove_file(path);
+            return;
+        }
+
+        let script = Script::load(&path).expect("load Python script");
+        let session = script.start_session(&json!({})).expect("start session");
+
+        let data = session
+            .run_event(candle_event(1_000, 100.0))
+            .expect("run one-parameter data hook");
+        assert_eq!(data.output.metrics["has_params"], true);
+
+        let execution = session
+            .run_execution_event(json!({ "status": "filled" }))
+            .expect("run one-parameter execution hook")
+            .expect("execution hook exists");
+        assert_eq!(execution.output.metrics["status"], "filled");
+
+        let finish = session
+            .run_finish()
+            .expect("run zero-parameter finish hook")
+            .expect("finish hook exists");
+        assert_eq!(finish.output.meta["finished"], true);
 
         let _ = fs::remove_file(path);
     }
