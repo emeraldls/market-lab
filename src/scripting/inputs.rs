@@ -194,6 +194,28 @@ pub fn source_provider_label(configs: &SourceConfigs) -> String {
     providers.join(",")
 }
 
+pub fn source_type_names(configs: &SourceConfigs) -> Vec<String> {
+    let mut configs = configs.values().collect::<Vec<_>>();
+    configs.sort_by_key(|config| config.position);
+    let mut names = Vec::new();
+    for config in configs {
+        let name = config.source.as_str().to_string();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+pub fn configured_source_selectors(configs: &SourceConfigs) -> Vec<String> {
+    let mut configs = configs.values().collect::<Vec<_>>();
+    configs.sort_by_key(|config| config.position);
+    configs
+        .into_iter()
+        .map(|config| config.selector.clone())
+        .collect()
+}
+
 fn source_config_provider_name(config: &SourceConfig) -> String {
     match config.provider {
         ProviderKind::Hyperliquid => config.exchange.clone(),
@@ -235,6 +257,15 @@ pub fn source_configs_payload(configs: &SourceConfigs) -> Value {
 }
 
 fn validate_source_requirements(manifest: &ScriptManifest, configs: &SourceConfigs) -> Result<()> {
+    if manifest.version.trim() == "2" {
+        if configs.is_empty() {
+            bail!(
+                "Python Scripting V2 requires at least one --source or TOML source configuration"
+            );
+        }
+        return Ok(());
+    }
+
     for config in configs.values() {
         if !manifest.sources.contains(&config.source) {
             bail!(
@@ -703,6 +734,55 @@ mod tests {
         assert_eq!(configs["btc@vd@hyperliquidf@mmt"].bucket, Some(1));
         assert_eq!(configs["btc@oi@binancef@mmt"].timeframe, Some(60));
         assert_eq!(configs["btc/usdt@volumes@okx@mmt"].timeframe, Some(60));
+    }
+
+    #[test]
+    fn python_v2_uses_configured_sources_without_manifest_duplication() {
+        let python_manifest = ScriptManifest {
+            name: "python-script".to_string(),
+            version: "2".to_string(),
+            sources: Vec::new(),
+            description: None,
+            lookback: None,
+            params: BTreeMap::new(),
+        };
+        let configs = parse_source_configs(&[
+            "btc@oi@binancef@mmt:timeframe=60".to_string(),
+            "eth@candles@hyperliquidf@mmt:timeframe=60".to_string(),
+            "eth@orderbook@binancef@mmt:timeframe=60,depth=20".to_string(),
+        ])
+        .expect("parse Python source configs");
+
+        validate_source_configs(&python_manifest, &configs)
+            .expect("configured Python sources are authoritative");
+        assert_eq!(
+            source_type_names(&configs),
+            vec!["oi", "candles", "orderbook"]
+        );
+        assert_eq!(
+            configured_source_selectors(&configs),
+            vec![
+                "btc@oi@binancef@mmt",
+                "eth@candles@hyperliquidf@mmt",
+                "eth@orderbook@binancef@mmt",
+            ]
+        );
+    }
+
+    #[test]
+    fn python_v2_requires_a_configured_source() {
+        let python_manifest = ScriptManifest {
+            name: "python-script".to_string(),
+            version: "2".to_string(),
+            sources: Vec::new(),
+            description: None,
+            lookback: None,
+            params: BTreeMap::new(),
+        };
+
+        let error = validate_source_configs(&python_manifest, &SourceConfigs::new())
+            .expect_err("Python must receive at least one source");
+        assert!(format!("{error:#}").contains("at least one --source or TOML"));
     }
 
     #[test]

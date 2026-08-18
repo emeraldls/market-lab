@@ -8,7 +8,6 @@ SOURCE = "btc@candles@hyperliquidf@mmt"
 script = {
     "name": "python-sma-crossover",
     "version": "2",
-    "sources": ["candles"],
     "lookback": 100,
     "params": {
         "fast_period": {"type": "number", "default": 5},

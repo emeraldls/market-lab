@@ -41,6 +41,7 @@ pub struct ScriptParamSchema {
 pub struct ScriptManifest {
     pub name: String,
     pub version: String,
+    #[serde(default)]
     pub sources: Vec<ScriptSource>,
     #[serde(default)]
     pub description: Option<String>,
@@ -69,8 +70,13 @@ impl ScriptManifest {
         if self.name.trim().is_empty() {
             bail!("script.name is required");
         }
-        if self.sources.is_empty() {
+        if self.version.trim() == "1" && self.sources.is_empty() {
             bail!("script.sources must not be empty");
+        }
+        if self.version.trim() == "2" && !self.sources.is_empty() {
+            bail!(
+                "Python Scripting V2 derives sources from --source or TOML; remove script.sources"
+            );
         }
         if matches!(self.lookback, Some(0)) {
             bail!("script.lookback must be >= 1");
@@ -240,6 +246,35 @@ mod tests {
         .expect_err("unknown source should fail");
 
         assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn python_v2_does_not_require_manifest_sources() {
+        let manifest: ScriptManifest = serde_json::from_value(serde_json::json!({
+            "name": "x",
+            "version": "2"
+        }))
+        .expect("decode Python manifest without sources");
+
+        manifest
+            .validate_for_version("2")
+            .expect("Python sources come from runtime configuration");
+        assert!(manifest.sources.is_empty());
+    }
+
+    #[test]
+    fn python_v2_rejects_redundant_manifest_sources() {
+        let manifest: ScriptManifest = serde_json::from_value(serde_json::json!({
+            "name": "x",
+            "version": "2",
+            "sources": ["candles"]
+        }))
+        .expect("decode Python manifest");
+
+        let error = manifest
+            .validate_for_version("2")
+            .expect_err("Python manifest sources must be rejected");
+        assert!(format!("{error:#}").contains("remove script.sources"));
     }
 
     #[test]

@@ -24,9 +24,9 @@ use crate::scripting::execution::{
     ScriptOrderKind, ScriptOrderRef, ScriptRawOrderRequest, ScriptTradeRequest,
 };
 use crate::scripting::inputs::{
-    SourceConfig, SourceConfigs, parse_param_values, parse_source_configs, resolve_params,
-    source_configs_payload, source_exchange_label, source_provider_label, source_provider_name,
-    validate_source_configs,
+    SourceConfig, SourceConfigs, configured_source_selectors, parse_param_values,
+    parse_source_configs, resolve_params, source_configs_payload, source_exchange_label,
+    source_provider_label, source_provider_name, source_type_names, validate_source_configs,
 };
 use crate::scripting::manifest::ScriptSource;
 use crate::scripting::market_data::{
@@ -314,6 +314,7 @@ pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
     }
     report.set_provider(Some(source_provider_label(&source_configs)));
     report.set_exchange(Some(source_exchange_label(&source_configs)));
+    report.set_source(source_type_names(&source_configs).join(","));
 
     let raw_params = match parse_param_values(&args.param) {
         Ok(raw_params) => raw_params,
@@ -361,13 +362,15 @@ async fn backtest_events(
     let mut simulation = ScriptSimulationState::default();
     let mut peak_margin = 0.0_f64;
     let mut latest_output = None;
-    let session = script.start_session_with_execution(
+    let configured_sources = configured_source_selectors(&source_configs);
+    let session = script.start_session_with_execution_and_sources(
         &resolved_params,
         ScriptExecutionContext {
             job_id: "backtest".to_string(),
             enabled: true,
             request_routed: script.language == crate::scripting::language::ScriptLanguage::PythonV2,
         },
+        Some(&configured_sources),
     )?;
     let cancel_handle = session.cancel_handle();
     let _cancel_task = AbortOnDrop(tokio::spawn(async move {
@@ -383,7 +386,7 @@ async fn backtest_events(
     eprintln!(
         "running script={} sources={} events={} references={} lookback={}",
         script.manifest.name,
-        script.manifest.source_names(),
+        source_type_names(&source_configs).join(","),
         events.len(),
         unique_reference_selectors(&reference_sources).join(","),
         lookback
@@ -391,32 +394,10 @@ async fn backtest_events(
     report.set_progress("executing_hooks", 0, events.len() as u64);
     write_running_report_best_effort(report);
 
-    let mut prepared_ts_ms = None;
     for (idx, event) in events.iter().enumerate() {
         if session.is_cancelled() {
             report.set_progress("cancelled", idx as u64, events.len() as u64);
             return Err(ScriptCancelled.into());
-        }
-
-        if prepared_ts_ms != Some(event.ts_ms) {
-            for (symbol, (ts_ms, price)) in reference_marks_at_timestamp(
-                &events,
-                idx,
-                &data,
-                &source_configs,
-                &reference_sources,
-            )? {
-                if let Some((_, previous_price)) = latest_marks.get(&symbol).copied() {
-                    returns.push(position_return(
-                        &simulation.open_trades,
-                        &symbol,
-                        previous_price,
-                        price,
-                    ));
-                }
-                latest_marks.insert(symbol, (ts_ms, price));
-            }
-            prepared_ts_ms = Some(event.ts_ms);
         }
 
         let config = source_configs
@@ -426,6 +407,14 @@ async fn backtest_events(
             .series
             .get(&event.selector)
             .with_context(|| format!("{} data not loaded", event.selector))?;
+        advance_reference_marks(
+            event,
+            series,
+            &reference_sources,
+            &simulation.open_trades,
+            &mut latest_marks,
+            &mut returns,
+        )?;
         if reference_sources
             .values()
             .any(|reference| reference.selector == event.selector)
@@ -569,12 +558,7 @@ async fn backtest_events(
         ts_ms: latest_ts_ms,
         script: ScriptDescriptor {
             name: script.manifest.name.clone(),
-            sources: script
-                .manifest
-                .sources
-                .iter()
-                .map(|source| source.as_str().to_string())
-                .collect(),
+            sources: source_type_names(&source_configs),
         },
         window: ScriptWindow {
             from: args.from,
@@ -1151,38 +1135,31 @@ fn unique_reference_selectors<'a>(
     selectors
 }
 
-fn reference_marks_at_timestamp(
-    events: &[BacktestEvent],
-    start_idx: usize,
-    data: &BacktestData,
-    source_configs: &SourceConfigs,
+fn advance_reference_marks(
+    event: &BacktestEvent,
+    series: &BacktestSeries,
     reference_sources: &BTreeMap<String, &SourceConfig>,
-) -> Result<BTreeMap<String, (u64, f64)>> {
-    let event = events
-        .get(start_idx)
-        .context("reference mark start event is out of range")?;
-    let ts_ms = event.ts_ms;
-    let mut marks = BTreeMap::new();
-    for candidate in events[start_idx..]
-        .iter()
-        .take_while(|candidate| candidate.ts_ms == ts_ms)
-    {
-        source_configs
-            .get(&candidate.selector)
-            .with_context(|| format!("missing source config for {}", candidate.selector))?;
-        let series = data
-            .series
-            .get(&candidate.selector)
-            .with_context(|| format!("{} data not loaded", candidate.selector))?;
-        if let Some(price) = backtest_series_reference_price(series, candidate.record_idx)? {
-            for (key, reference) in reference_sources {
-                if reference.selector == candidate.selector {
-                    marks.insert(key.clone(), (candidate.ts_ms, price));
-                }
-            }
+    open_trades: &[OpenTrade],
+    latest_marks: &mut BTreeMap<String, (u64, f64)>,
+    returns: &mut Vec<f64>,
+) -> Result<()> {
+    let Some(price) = backtest_series_reference_price(series, event.record_idx)? else {
+        return Ok(());
+    };
+    for (key, reference) in reference_sources {
+        if reference.selector != event.selector {
+            continue;
         }
+        if let Some((_, previous_price)) = latest_marks.get(key).copied()
+            && open_trades
+                .iter()
+                .any(|open| execution_mark_key(open.exchange, &open.symbol) == *key)
+        {
+            returns.push(position_return(open_trades, key, previous_price, price));
+        }
+        latest_marks.insert(key.clone(), (event.ts_ms, price));
     }
-    Ok(marks)
+    Ok(())
 }
 
 fn source_symbols(source_configs: &SourceConfigs) -> Vec<String> {
@@ -2090,18 +2067,34 @@ fn validate_script_protection(request: &ScriptTradeRequest, entry_price: f64) ->
     match request.position.position_direction() {
         crate::domain::execution::PositionDirection::Long => {
             if request.sl.is_some_and(|price| price >= entry_price) {
-                bail!("long ctx.trade sl must be below the entry price");
+                bail!(
+                    "long ctx.trade sl {} must be below entry price {}",
+                    request.sl.expect("checked stop loss"),
+                    entry_price
+                );
             }
             if request.tp.is_some_and(|price| price <= entry_price) {
-                bail!("long ctx.trade tp must be above the entry price");
+                bail!(
+                    "long ctx.trade tp {} must be above entry price {}",
+                    request.tp.expect("checked take profit"),
+                    entry_price
+                );
             }
         }
         crate::domain::execution::PositionDirection::Short => {
             if request.sl.is_some_and(|price| price <= entry_price) {
-                bail!("short ctx.trade sl must be above the entry price");
+                bail!(
+                    "short ctx.trade sl {} must be above entry price {}",
+                    request.sl.expect("checked stop loss"),
+                    entry_price
+                );
             }
             if request.tp.is_some_and(|price| price >= entry_price) {
-                bail!("short ctx.trade tp must be below the entry price");
+                bail!(
+                    "short ctx.trade tp {} must be below entry price {}",
+                    request.tp.expect("checked take profit"),
+                    entry_price
+                );
             }
         }
     }
@@ -2913,7 +2906,7 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_marks_include_every_symbol_before_the_first_hook_runs() {
+    fn reference_marks_advance_only_when_the_source_event_is_visible() {
         let configs = parse_source_configs(&[
             "btc@candles@binancef@mmt:timeframe=60".to_string(),
             "zec@candles@binancef@mmt:timeframe=60".to_string(),
@@ -2935,13 +2928,32 @@ mod tests {
         let references =
             resolve_reference_sources(&data, &configs).expect("resolve reference sources");
 
-        let timestamp_marks =
-            reference_marks_at_timestamp(&events, 0, &data, &configs, &references)
-                .expect("prepare timestamp marks");
-
         assert_eq!(events[0].selector, "btc@candles@binancef@mmt");
-        assert_eq!(timestamp_marks["btc"].1, 100.0);
-        assert_eq!(timestamp_marks["zec"].1, 50.0);
+        let mut marks = BTreeMap::new();
+        let mut returns = Vec::new();
+        advance_reference_marks(
+            &events[0],
+            &data.series[&events[0].selector],
+            &references,
+            &[],
+            &mut marks,
+            &mut returns,
+        )
+        .expect("advance first source mark");
+        assert_eq!(marks["btc"].1, 100.0);
+        assert!(!marks.contains_key("zec"));
+
+        advance_reference_marks(
+            &events[1],
+            &data.series[&events[1].selector],
+            &references,
+            &[],
+            &mut marks,
+            &mut returns,
+        )
+        .expect("advance second source mark");
+        assert_eq!(marks["zec"].1, 50.0);
+        assert!(returns.is_empty());
     }
 
     #[test]
@@ -3143,6 +3155,29 @@ export function onData(ctx, input, history) {
             simulation.closed_trades[0].exit.reason,
             "ctx.trade stop loss"
         );
+    }
+
+    #[test]
+    fn protection_errors_report_requested_and_entry_prices() {
+        let mut simulation = ScriptSimulationState::default();
+        let error = apply_script_execution_commands(
+            vec![script_trade(json!({
+                "key": "invalid-protection",
+                "position": "open-long",
+                "margin": 100,
+                "sl": 99.5,
+                "tp": 110
+            }))],
+            0,
+            1_000,
+            &marks(99.0),
+            &mut simulation,
+        )
+        .expect_err("stop loss above the actual entry must fail");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("sl 99.5"));
+        assert!(message.contains("entry price 99"));
     }
 
     #[test]

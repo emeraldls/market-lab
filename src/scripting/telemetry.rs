@@ -160,6 +160,10 @@ impl ScriptRuntimeReportBuilder {
         self.provider = provider;
     }
 
+    pub fn set_source(&mut self, source: impl Into<String>) {
+        self.script.source = source.into();
+    }
+
     pub fn set_progress(&mut self, phase: impl Into<String>, current: u64, total: u64) {
         self.phase = Some(phase.into());
         self.progress = Some(ScriptRuntimeProgress { current, total });

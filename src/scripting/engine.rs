@@ -180,6 +180,15 @@ impl Script {
         params: &JsonValue,
         execution: ScriptExecutionContext,
     ) -> Result<ScriptSession> {
+        self.start_session_with_execution_and_sources(params, execution, None)
+    }
+
+    pub fn start_session_with_execution_and_sources(
+        &self,
+        params: &JsonValue,
+        execution: ScriptExecutionContext,
+        configured_sources: Option<&[String]>,
+    ) -> Result<ScriptSession> {
         if self.language == ScriptLanguage::PythonV2 {
             return PythonSession::start(
                 &self.path,
@@ -188,6 +197,7 @@ impl Script {
                     .context("Python script has no resolved interpreter")?,
                 params,
                 self.history_capacity(params),
+                configured_sources,
                 execution,
             )
             .map(|session| ScriptSession {

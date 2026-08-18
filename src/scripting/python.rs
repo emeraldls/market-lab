@@ -113,6 +113,7 @@ impl PythonSession {
         runtime: &PythonRuntime,
         params: &Value,
         history_capacity: usize,
+        configured_sources: Option<&[String]>,
         execution: ScriptExecutionContext,
     ) -> Result<Self> {
         let artifact_dir = artifact_directory(&execution.job_id)?;
@@ -121,6 +122,7 @@ impl PythonSession {
             "type": "init",
             "params": params,
             "historyCapacity": history_capacity,
+            "configuredSources": configured_sources,
             "executionEnabled": execution.enabled,
             "artifactDir": artifact_dir,
         }))?;
@@ -910,10 +912,11 @@ def load_module():
 
 
 class History:
-    def __init__(self, capacity):
+    def __init__(self, capacity, configured_sources):
         self.capacity = max(2, int(capacity))
         self.records = {}
         self.identities = {}
+        self.configured_sources = None if configured_sources is None else set(configured_sources)
 
     def record(self, source, value, identity):
         records = self.records.setdefault(source, [])
@@ -930,6 +933,10 @@ class History:
     def source(self, name, offset=None):
         if not isinstance(name, str) or not name:
             raise TypeError("history.source name must be a non-empty string")
+        if self.configured_sources is not None and name not in self.configured_sources:
+            raise ValueError(
+                f"history.source `{name}` is not configured; add it with --source or TOML"
+            )
         records = self.records.get(name, [])
         if offset is None:
             return copy.deepcopy(list(reversed(records)))
@@ -1063,7 +1070,7 @@ try:
     init = json.loads(init_line)
     if init.get("type") != "init":
         raise RuntimeError("expected Python initialization message")
-    HISTORY = History(init["historyCapacity"])
+    HISTORY = History(init["historyCapacity"], init.get("configuredSources"))
     CTX = Context(init.get("params", {}), init.get("executionEnabled", False), init["artifactDir"])
     write_message({"type": "ready", "manifest": MANIFEST})
 
@@ -1215,7 +1222,6 @@ mod tests {
 script = {
     "name": "python-state",
     "version": "2",
-    "sources": ["candles"],
     "lookback": 3,
     "params": {"threshold": {"type": "number", "required": True}},
 }
@@ -1325,7 +1331,7 @@ def on_finish(ctx, history):
     fn python_v2_reports_tracebacks() {
         let path = write_python_script(
             r#"
-script = {"name": "python-error", "version": "2", "sources": ["candles"]}
+script = {"name": "python-error", "version": "2"}
 
 def on_data(ctx, event, history):
     raise ValueError("broken signal")
@@ -1350,10 +1356,48 @@ def on_data(ctx, event, history):
     }
 
     #[test]
+    fn python_v2_distinguishes_unconfigured_sources_from_empty_history() {
+        let path = write_python_script(
+            r#"
+script = {"name": "configured-history", "version": "2"}
+
+def on_data(history):
+    history.source("eth@candles@hyperliquidf@mmt", 0)
+"#,
+            "configured-history",
+        );
+        if !python_available(&path) {
+            let _ = fs::remove_file(path);
+            return;
+        }
+
+        let script = Script::load(&path).expect("load Python script");
+        let session = script
+            .start_session_with_execution_and_sources(
+                &json!({}),
+                ScriptExecutionContext {
+                    job_id: format!("python-test-{}", std::process::id()),
+                    enabled: false,
+                    request_routed: true,
+                },
+                Some(&["btc@candles@binancef@mmt".to_string()]),
+            )
+            .expect("start Python session");
+        let error = session
+            .run_event(candle_event(1_000, 100.0))
+            .expect_err("unconfigured history lookup must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("eth@candles@hyperliquidf@mmt"));
+        assert!(message.contains("is not configured"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn python_hooks_receive_only_the_parameters_they_declare() {
         let path = write_python_script(
             r#"
-script = {"name": "optional-hook-inputs", "version": "2", "sources": ["candles"]}
+script = {"name": "optional-hook-inputs", "version": "2"}
 
 def on_data(ctx):
     return {"metrics": {"has_params": hasattr(ctx, "params")}}
@@ -1398,7 +1442,7 @@ def on_finish():
     fn python_v2_exposes_every_v1_study_helper() {
         let path = write_python_script(
             r#"
-script = {"name": "study-parity", "version": "2", "sources": ["candles"]}
+script = {"name": "study-parity", "version": "2"}
 
 def on_data(ctx):
     rows = [{"c": 10.0}, {"c": 20.0}, {"c": 30.0}, {"c": 40.0}]
@@ -1478,7 +1522,7 @@ def on_data(ctx):
     fn python_v2_study_helpers_use_v1_validation() {
         let path = write_python_script(
             r#"
-script = {"name": "study-validation", "version": "2", "sources": ["candles"]}
+script = {"name": "study-validation", "version": "2"}
 
 def on_data(ctx):
     ctx.study.sma([{"c": 1.0}], {"field": "missing", "window": 1})
@@ -1529,7 +1573,7 @@ def on_data(ctx, event, history):
     fn python_finish_cannot_submit_orders() {
         let path = write_python_script(
             r#"
-script = {"name": "finish-order", "version": "2", "sources": ["candles"]}
+script = {"name": "finish-order", "version": "2"}
 
 def on_data(ctx, event, history):
     return None
@@ -1593,7 +1637,7 @@ while True:
     fn python_hook_infinite_loop_is_time_bounded() {
         let path = write_python_script(
             r#"
-script = {"name": "hook-timeout", "version": "2", "sources": ["candles"]}
+script = {"name": "hook-timeout", "version": "2"}
 
 def on_data(ctx, event, history):
     while True:
@@ -1610,6 +1654,7 @@ def on_data(ctx, event, history):
             &runtime,
             &json!({}),
             2,
+            None,
             ScriptExecutionContext::disabled(),
         )
         .expect("start timeout session");
@@ -1633,7 +1678,7 @@ def on_data(ctx, event, history):
     fn python_process_tree_memory_is_limited() {
         let path = write_python_script(
             r#"
-script = {"name": "memory-limit", "version": "2", "sources": ["candles"]}
+script = {"name": "memory-limit", "version": "2"}
 
 def on_data(ctx, event, history):
     global allocation
@@ -1684,7 +1729,7 @@ import sys
 import time
 from pathlib import Path
 
-script = {{"name": "process-limit", "version": "2", "sources": ["candles"]}}
+script = {{"name": "process-limit", "version": "2"}}
 
 def on_data(ctx, event, history):
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])

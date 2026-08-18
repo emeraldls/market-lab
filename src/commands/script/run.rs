@@ -39,9 +39,10 @@ use crate::providers::mmt::ws_client::MmtWsClient;
 use crate::scripting::engine::Script;
 use crate::scripting::execution::{ScriptExecutionCommand, ScriptExecutionContext};
 use crate::scripting::inputs::{
-    SourceConfig, SourceConfigs, parse_param_values, parse_source_configs, resolve_params,
-    source_config, source_configs_payload, source_exchange_label, source_provider_label,
-    source_provider_name, validate_source_configs_for_run,
+    SourceConfig, SourceConfigs, configured_source_selectors, parse_param_values,
+    parse_source_configs, resolve_params, source_config, source_configs_payload,
+    source_exchange_label, source_provider_label, source_provider_name, source_type_names,
+    validate_source_configs_for_run,
 };
 use crate::scripting::jobs::ScriptJobSubmission;
 use crate::scripting::language::ScriptLanguage;
@@ -303,6 +304,7 @@ async fn run(
     }
     let source_configs = parse_source_configs(&args.source)?;
     validate_source_configs_for_run(&script.manifest, &source_configs)?;
+    report.set_source(source_type_names(&source_configs).join(","));
     let raw_params = parse_param_values(&args.param)?;
     let resolved_params = resolve_params(&script.manifest, &raw_params)?;
 
@@ -336,13 +338,15 @@ async fn stream_sources(
     let mut stream_events =
         spawn_script_stream_supervisor(streams, source_configs.clone(), args.testnet);
 
-    let session = script.start_session_with_execution(
+    let configured_sources = configured_source_selectors(&source_configs);
+    let session = script.start_session_with_execution_and_sources(
         &resolved_params,
         ScriptExecutionContext {
             job_id: job_id.to_string(),
             enabled: script.language == ScriptLanguage::PythonV2 || args.venue.is_some(),
             request_routed: script.language == ScriptLanguage::PythonV2,
         },
+        Some(&configured_sources),
     )?;
     let cancel_handle = session.cancel_handle();
     let _cancel_task = tokio::spawn(async move {
@@ -488,12 +492,7 @@ async fn stream_sources(
             stream: true,
             script: ScriptDescriptor {
                 name: script.manifest.name.clone(),
-                sources: script
-                    .manifest
-                    .sources
-                    .iter()
-                    .map(|source| source.as_str().to_string())
-                    .collect(),
+                sources: source_type_names(&source_configs),
             },
             params: ScriptInputs {
                 values: resolved_params.clone(),
