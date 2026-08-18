@@ -332,6 +332,21 @@ pub(crate) async fn build_trade_plan(
     args: &TradeArgs,
     direction: PositionDirection,
 ) -> Result<TradePlan> {
+    build_trade_plan_with_price_normalization(args, direction, false).await
+}
+
+pub(crate) async fn build_automated_trade_plan(
+    args: &TradeArgs,
+    direction: PositionDirection,
+) -> Result<TradePlan> {
+    build_trade_plan_with_price_normalization(args, direction, true).await
+}
+
+async fn build_trade_plan_with_price_normalization(
+    args: &TradeArgs,
+    direction: PositionDirection,
+    normalize_prices: bool,
+) -> Result<TradePlan> {
     let venue = ExecutionVenue::from(args.venue);
     let outcome = if venue == ExecutionVenue::HyperliquidOutcomes {
         Some(
@@ -350,6 +365,10 @@ pub(crate) async fn build_trade_plan(
             Ok(crate::providers::hyperliquid::outcomes::market_from_instrument(instrument))
         },
     )?;
+    let normalized_args = normalize_prices
+        .then(|| normalize_automated_prices(args, venue, &market, direction))
+        .transpose()?;
+    let args = normalized_args.as_ref().unwrap_or(args);
     validate_market_rules(venue, &market, args)?;
     let leverage = match venue {
         ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidOutcomes => None,
@@ -529,6 +548,114 @@ pub(crate) async fn build_trade_plan(
         take_profit_price: args.tp,
         market_fingerprint: outcome.map(|instrument| instrument.metadata_fingerprint),
     })
+}
+
+#[derive(Clone, Copy)]
+enum PriceRounding {
+    Down,
+    Up,
+    Nearest,
+}
+
+fn normalize_automated_prices(
+    args: &TradeArgs,
+    venue: ExecutionVenue,
+    market: &Market,
+    direction: PositionDirection,
+) -> Result<TradeArgs> {
+    let rules = execution_rules(venue, args.testnet, market)?;
+    let mut normalized = args.clone();
+    if let Some(price) = args.price {
+        normalized.price = Some(normalize_price_to_rules(
+            venue,
+            price,
+            &rules,
+            match direction {
+                PositionDirection::Long => PriceRounding::Down,
+                PositionDirection::Short => PriceRounding::Up,
+            },
+        )?);
+    }
+    if let Some(price) = args.sl {
+        normalized.sl = Some(normalize_price_to_rules(
+            venue,
+            price,
+            &rules,
+            PriceRounding::Nearest,
+        )?);
+    }
+    if let Some(price) = args.tp {
+        normalized.tp = Some(normalize_price_to_rules(
+            venue,
+            price,
+            &rules,
+            PriceRounding::Nearest,
+        )?);
+    }
+    Ok(normalized)
+}
+
+fn normalize_price_to_rules(
+    venue: ExecutionVenue,
+    price: f64,
+    rules: &crate::markets::ExecutionRules,
+    rounding: PriceRounding,
+) -> Result<f64> {
+    if !price.is_finite() || price <= 0.0 {
+        bail!("automated order price must be finite and positive");
+    }
+    let normalized = match venue {
+        ExecutionVenue::Bulk => {
+            let units = price / rules.tick_size;
+            let units = match rounding {
+                PriceRounding::Down => (units + 1e-10).floor(),
+                PriceRounding::Up => (units - 1e-10).ceil(),
+                PriceRounding::Nearest => units.round(),
+            };
+            round_to_precision(units * rules.tick_size, rules.price_precision)
+        }
+        ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidXyz => {
+            normalize_hyperliquid_price(price, rules.size_precision, 6, rounding)
+        }
+        ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidOutcomes => {
+            normalize_hyperliquid_price(
+                price,
+                rules.size_precision,
+                rules.price_precision,
+                rounding,
+            )
+        }
+    };
+    if normalized <= 0.0 {
+        bail!("automated order price is below the venue's minimum price increment");
+    }
+    Ok(normalized)
+}
+
+fn normalize_hyperliquid_price(
+    price: f64,
+    size_precision: u8,
+    max_price_decimals: u8,
+    rounding: PriceRounding,
+) -> f64 {
+    let down = crate::providers::hyperliquid::execution::normalize_price_for(
+        price,
+        size_precision,
+        max_price_decimals,
+        false,
+    );
+    let up = crate::providers::hyperliquid::execution::normalize_price_for(
+        price,
+        size_precision,
+        max_price_decimals,
+        true,
+    );
+    match rounding {
+        PriceRounding::Down => down,
+        PriceRounding::Up => up,
+        PriceRounding::Nearest if price - down <= up - price => down,
+        PriceRounding::Nearest => up,
+    }
 }
 
 async fn validate_spot_funds(
@@ -1264,5 +1391,67 @@ mod tests {
         assert_eq!(format_decimal(0.000154, 8), "0.000154");
         assert_eq!(format_decimal(-0.004928, 2), "0");
         assert_eq!(format_decimal(9.9699138, 2), "9.97");
+    }
+
+    #[test]
+    fn normalizes_generated_hyperliquid_prices_without_exposing_wire_rules() {
+        let rules = crate::markets::ExecutionRules {
+            price_precision: 6,
+            size_precision: 4,
+            tick_size: 0.1,
+            lot_size: 0.0001,
+            min_notional: 10.0,
+            max_leverage: 50,
+            cross_margin: true,
+            order_types: vec!["MARKET".to_string(), "LIMIT".to_string()],
+            time_in_forces: vec!["GTC".to_string()],
+        };
+
+        assert_eq!(
+            normalize_price_to_rules(
+                ExecutionVenue::Hyperliquid,
+                1911.94355,
+                &rules,
+                PriceRounding::Nearest,
+            )
+            .unwrap(),
+            1911.9
+        );
+        assert_eq!(
+            normalize_price_to_rules(
+                ExecutionVenue::Hyperliquid,
+                1911.94355,
+                &rules,
+                PriceRounding::Up,
+            )
+            .unwrap(),
+            1912.0
+        );
+    }
+
+    #[test]
+    fn generated_limit_prices_round_away_from_crossing() {
+        let rules = crate::markets::ExecutionRules {
+            price_precision: 2,
+            size_precision: 6,
+            tick_size: 0.25,
+            lot_size: 0.000001,
+            min_notional: 1.0,
+            max_leverage: 50,
+            cross_margin: true,
+            order_types: vec!["MARKET".to_string(), "LIMIT".to_string()],
+            time_in_forces: vec!["GTC".to_string()],
+        };
+
+        assert_eq!(
+            normalize_price_to_rules(ExecutionVenue::Bulk, 100.13, &rules, PriceRounding::Down,)
+                .unwrap(),
+            100.0
+        );
+        assert_eq!(
+            normalize_price_to_rules(ExecutionVenue::Bulk, 100.13, &rules, PriceRounding::Up,)
+                .unwrap(),
+            100.25
+        );
     }
 }

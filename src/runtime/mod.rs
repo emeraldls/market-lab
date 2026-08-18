@@ -3362,7 +3362,8 @@ async fn execute_script_order(
             request.side.order_direction(),
         ),
     };
-    let plan = match crate::commands::execution::build_trade_plan(&args, direction).await {
+    let plan = match crate::commands::execution::build_automated_trade_plan(&args, direction).await
+    {
         Ok(plan) => plan,
         Err(error) => {
             fail_script_order(paths, state, job_id, &order.id, &error)?;
