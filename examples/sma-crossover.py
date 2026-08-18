@@ -17,8 +17,8 @@ script = {
 }
 
 
-def on_data(ctx, event, history):
-    if event["source"] != SOURCE:
+def on_data(ctx, history):
+    if ctx.source != SOURCE:
         return
 
     candles = history.source(SOURCE)
@@ -32,7 +32,7 @@ def on_data(ctx, event, history):
     previous = np.sign(fast.iloc[-2] - slow.iloc[-2])
     current = np.sign(fast.iloc[-1] - slow.iloc[-1])
 
-    positions = event["positions"]["open"]
+    positions = ctx.positions.open
     position = positions[0] if positions else None
     timestamp = candles[-1]["t"]
 

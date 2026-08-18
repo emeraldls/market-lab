@@ -501,13 +501,21 @@ impl ScriptSession {
         }
     }
 
-    pub fn run_event(&self, mut payload: JsonValue) -> Result<ScriptExecution> {
+    pub fn run_event(&self, payload: JsonValue) -> Result<ScriptExecution> {
+        self.run_event_with_pnl(payload, JsonValue::Array(Vec::new()))
+    }
+
+    pub(crate) fn run_event_with_pnl(
+        &self,
+        mut payload: JsonValue,
+        pnl_history: JsonValue,
+    ) -> Result<ScriptExecution> {
         match &self.inner {
             ScriptSessionInner::JavaScript(session) => session.run_event(payload),
             ScriptSessionInner::Python(session) => {
                 let (source, record, identity) = event_history_entry(&payload)?;
                 strip_source_data(&mut payload);
-                session.run_event(payload, source, record, identity)
+                session.run_event(payload, source, record, identity, pnl_history)
             }
         }
     }
@@ -537,9 +545,16 @@ impl ScriptSession {
     }
 
     pub fn run_finish(&self) -> Result<Option<ScriptExecution>> {
+        self.run_finish_with_pnl(JsonValue::Array(Vec::new()))
+    }
+
+    pub(crate) fn run_finish_with_pnl(
+        &self,
+        pnl_history: JsonValue,
+    ) -> Result<Option<ScriptExecution>> {
         match &self.inner {
             ScriptSessionInner::JavaScript(_) => Ok(None),
-            ScriptSessionInner::Python(session) => session.run_finish(),
+            ScriptSessionInner::Python(session) => session.run_finish(pnl_history),
         }
     }
 }

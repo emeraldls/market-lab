@@ -160,11 +160,13 @@ impl PythonSession {
         source: String,
         record: Value,
         identity: Option<u64>,
+        pnl_history: Value,
     ) -> Result<ScriptExecution> {
         self.run_hook(
             "on_data",
             json!({
                 "event": payload,
+                "pnlHistory": pnl_history,
                 "record": {
                     "source": source,
                     "value": record,
@@ -184,8 +186,12 @@ impl PythonSession {
         )
     }
 
-    pub(crate) fn run_finish(&self) -> Result<Option<ScriptExecution>> {
-        self.run_hook("on_finish", json!({}), PYTHON_FINISH_TIMEOUT)
+    pub(crate) fn run_finish(&self, pnl_history: Value) -> Result<Option<ScriptExecution>> {
+        self.run_hook(
+            "on_finish",
+            json!({ "pnlHistory": pnl_history }),
+            PYTHON_FINISH_TIMEOUT,
+        )
     }
 
     fn run_hook(
@@ -835,8 +841,8 @@ sys.stdout = sys.stderr
 
 HOOK_PARAMETERS = {}
 HOOK_INPUTS = {
-    "on_data": ("ctx", "event", "history"),
-    "on_execution": ("ctx", "event"),
+    "on_data": ("ctx", "history"),
+    "on_execution": ("ctx",),
     "on_finish": ("ctx", "history"),
 }
 
@@ -996,10 +1002,28 @@ class Studies:
         return self._call("vamp", book, options)
 
 
+class Positions:
+    def __init__(self):
+        self.open = []
+
+    def _replace(self, positions):
+        positions = positions if isinstance(positions, dict) else {}
+        self.open = copy.deepcopy(positions.get("open", []))
+
+
 class Context:
     def __init__(self, params, execution_enabled, execution_key_prefix, artifact_dir):
         self.params = copy.deepcopy(params)
         self.study = Studies(self)
+        self.source = None
+        self.source_type = None
+        self.provider = None
+        self.exchange = None
+        self.symbol = None
+        self.source_configs = {}
+        self.positions = Positions()
+        self.execution = None
+        self._pnl_history = []
         self._execution_enabled = execution_enabled
         self._execution_key_prefix = execution_key_prefix
         self._artifact_dir = Path(artifact_dir).resolve()
@@ -1009,6 +1033,44 @@ class Context:
     def _next_request_id(self):
         self._request_id += 1
         return self._request_id
+
+    def _set_market_state(self, event):
+        event = event if isinstance(event, dict) else {}
+        self.source = event.get("source")
+        self.source_type = event.get("source_type")
+        self.provider = event.get("provider")
+        self.exchange = event.get("exchange")
+        self.symbol = event.get("symbol")
+        self.source_configs = copy.deepcopy(event.get("source_configs", {}))
+        self.positions._replace(event.get("positions"))
+        self.execution = None
+
+    def _set_execution_state(self, event):
+        self.execution = copy.deepcopy(event)
+
+    def _set_pnl_history(self, values):
+        if not isinstance(values, list):
+            raise TypeError("MarketLab provided an invalid PnL history")
+        history = []
+        for value in values:
+            if not isinstance(value, dict):
+                raise TypeError("MarketLab provided an invalid PnL point")
+            timestamp = value.get("t")
+            pnl = value.get("pnl")
+            if isinstance(timestamp, bool) or not isinstance(timestamp, int):
+                raise TypeError("MarketLab provided an invalid PnL timestamp")
+            if isinstance(pnl, bool) or not isinstance(pnl, (int, float)):
+                raise TypeError("MarketLab provided an invalid PnL value")
+            history.append({"t": timestamp, "pnl": float(pnl)})
+        self._pnl_history = history
+
+    def pnl(self, index=None):
+        if index is None:
+            return copy.deepcopy(self._pnl_history)
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise ValueError("ctx.pnl index must be a non-negative integer")
+        position = len(self._pnl_history) - 1 - index
+        return copy.deepcopy(self._pnl_history[position]) if position >= 0 else None
 
     def _execution(self, operation, payload):
         if self._finishing:
@@ -1108,22 +1170,24 @@ try:
             if hook == "on_data":
                 record = request["record"]
                 HISTORY.record(record["source"], record["value"], record.get("identity"))
+                CTX._set_pnl_history(request.get("pnlHistory", []))
+                CTX._set_market_state(request["event"])
                 output = invoke_hook("on_data", MODULE.on_data, {
                     "ctx": CTX,
-                    "event": request["event"],
                     "history": HISTORY,
                 })
                 present = True
             elif hook == "on_execution":
                 function = getattr(MODULE, "on_execution", None)
                 present = callable(function)
+                CTX._set_execution_state(request["event"])
                 output = invoke_hook("on_execution", function, {
                     "ctx": CTX,
-                    "event": request["event"],
                 }) if present else None
             elif hook == "on_finish":
                 function = getattr(MODULE, "on_finish", None)
                 present = callable(function)
+                CTX._set_pnl_history(request.get("pnlHistory", []))
                 CTX._finishing = True
                 try:
                     output = invoke_hook("on_finish", function, {
@@ -1190,7 +1254,24 @@ mod tests {
         json!({
             "source": "btc@candles@binancef",
             "source_type": "candles",
+            "provider": "binancef",
+            "exchange": "binancef",
             "symbol": "BTC",
+            "source_configs": {
+                "btc@candles@binancef": {
+                    "symbol": "BTC",
+                    "type": "candles",
+                    "provider": "binancef",
+                    "exchange": "binancef",
+                    "timeframe_sec": 60
+                }
+            },
+            "positions": {
+                "open": [{
+                    "symbol": "BTC",
+                    "side": "long"
+                }]
+            },
             "data": {
                 "candle": {
                     "t": timestamp,
@@ -1248,7 +1329,7 @@ script = {
 
 calls = 0
 
-def on_data(ctx, event, history):
+def on_data(ctx, history):
     global calls
     calls += 1
     candles = history.source("btc@candles@binancef")
@@ -1269,17 +1350,28 @@ def on_data(ctx, event, history):
         "has_mode": hasattr(ctx, "mode"),
         "latest": latest["c"],
         "threshold": ctx.params["threshold"],
+        "source": ctx.source,
+        "source_type": ctx.source_type,
+        "provider": ctx.provider,
+        "exchange": ctx.exchange,
+        "symbol": ctx.symbol,
+        "source_exchange": ctx.source_configs[ctx.source]["exchange"],
+        "position_symbol": ctx.positions.open[0]["symbol"],
+        "pnl_history": ctx.pnl(),
+        "latest_pnl": ctx.pnl(0),
+        "previous_pnl": ctx.pnl(1),
+        "missing_pnl": ctx.pnl(99),
         "order": result,
     }}
 
-def on_execution(ctx, event):
-    return {"metrics": {"execution_status": event["status"]}}
+def on_execution(ctx):
+    return {"metrics": {"execution_status": ctx.execution["status"]}}
 
 def on_finish(ctx, history):
     path = ctx.artifact_path("summary.txt")
     with open(path, "w", encoding="utf-8") as output:
         output.write(str(len(history.source("btc@candles@binancef"))))
-    return {"meta": {"artifact": path}}
+    return {"meta": {"artifact": path, "pnl_history": ctx.pnl(), "latest_pnl": ctx.pnl(0)}}
 "#,
             "state",
         );
@@ -1302,7 +1394,10 @@ def on_finish(ctx, history):
             .expect("start Python session");
 
         let first = session
-            .run_event(candle_event(1_000, 100.0))
+            .run_event_with_pnl(
+                candle_event(1_000, 100.0),
+                json!([{ "t": 1_000, "pnl": 0.0 }]),
+            )
             .expect("first Python event");
         assert_eq!(first.output.metrics["calls"], 1);
         assert_eq!(first.output.metrics["count"], 1);
@@ -1310,12 +1405,41 @@ def on_finish(ctx, history):
         assert!(first.commands.is_empty());
 
         let second = session
-            .run_event(candle_event(2_000, 101.0))
+            .run_event_with_pnl(
+                candle_event(2_000, 101.0),
+                json!([
+                    { "t": 1_000, "pnl": 0.0 },
+                    { "t": 2_000, "pnl": 2.5 }
+                ]),
+            )
             .expect("second Python event");
         assert_eq!(second.output.metrics["calls"], 2);
         assert_eq!(second.output.metrics["count"], 2);
         assert_eq!(second.output.metrics["latest"], 101.0);
         assert_eq!(second.output.metrics["threshold"], 7);
+        assert_eq!(second.output.metrics["source"], "btc@candles@binancef");
+        assert_eq!(second.output.metrics["source_type"], "candles");
+        assert_eq!(second.output.metrics["provider"], "binancef");
+        assert_eq!(second.output.metrics["exchange"], "binancef");
+        assert_eq!(second.output.metrics["symbol"], "BTC");
+        assert_eq!(second.output.metrics["source_exchange"], "binancef");
+        assert_eq!(second.output.metrics["position_symbol"], "BTC");
+        assert_eq!(
+            second.output.metrics["pnl_history"],
+            json!([
+                { "t": 1_000, "pnl": 0.0 },
+                { "t": 2_000, "pnl": 2.5 }
+            ])
+        );
+        assert_eq!(
+            second.output.metrics["latest_pnl"],
+            json!({ "t": 2_000, "pnl": 2.5 })
+        );
+        assert_eq!(
+            second.output.metrics["previous_pnl"],
+            json!({ "t": 1_000, "pnl": 0.0 })
+        );
+        assert!(second.output.metrics["missing_pnl"].is_null());
         assert_eq!(second.commands.len(), 1);
         assert_eq!(second.output.metrics["order"]["key"], "bid-1");
         assert!(matches!(
@@ -1333,9 +1457,25 @@ def on_finish(ctx, history):
         assert_eq!(execution.output.metrics["execution_status"], "filled");
 
         let finish = session
-            .run_finish()
+            .run_finish_with_pnl(json!([
+                { "t": 1_000, "pnl": 0.0 },
+                { "t": 2_000, "pnl": 2.5 },
+                { "t": 3_000, "pnl": 3.0 }
+            ]))
             .expect("run Python finish hook")
             .expect("finish hook exists");
+        assert_eq!(
+            finish.output.meta["pnl_history"],
+            json!([
+                { "t": 1_000, "pnl": 0.0 },
+                { "t": 2_000, "pnl": 2.5 },
+                { "t": 3_000, "pnl": 3.0 }
+            ])
+        );
+        assert_eq!(
+            finish.output.meta["latest_pnl"],
+            json!({ "t": 3_000, "pnl": 3.0 })
+        );
         let artifact = PathBuf::from(
             finish.output.meta["artifact"]
                 .as_str()
@@ -1429,7 +1569,7 @@ def on_data(ctx):
             r#"
 script = {"name": "python-error", "version": "2"}
 
-def on_data(ctx, event, history):
+def on_data(ctx, history):
     raise ValueError("broken signal")
 "#,
             "error",
@@ -1498,8 +1638,8 @@ script = {"name": "optional-hook-inputs", "version": "2"}
 def on_data(ctx):
     return {"metrics": {"has_params": hasattr(ctx, "params")}}
 
-def on_execution(event):
-    return {"metrics": {"status": event["status"]}}
+def on_execution(ctx):
+    return {"metrics": {"status": ctx.execution["status"]}}
 
 def on_finish():
     return {"meta": {"finished": True}}
@@ -1530,6 +1670,33 @@ def on_finish():
             .expect("run zero-parameter finish hook")
             .expect("finish hook exists");
         assert_eq!(finish.output.meta["finished"], true);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn python_v2_rejects_the_removed_event_hook_parameter() {
+        let path = write_python_script(
+            r#"
+script = {"name": "removed-event-parameter", "version": "2"}
+
+def on_data(ctx, event, history):
+    return None
+"#,
+            "removed-event-parameter",
+        );
+        if !python_available(&path) {
+            let _ = fs::remove_file(path);
+            return;
+        }
+
+        let error = match Script::load(&path) {
+            Ok(_) => panic!("removed V2 event parameter should be rejected"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("does not provide `event`"));
+        assert!(message.contains("choose from ctx, history"));
 
         let _ = fs::remove_file(path);
     }
@@ -1646,7 +1813,7 @@ def on_data(ctx):
             r#"
 script = {"name": "wrong-version", "version": "1", "sources": ["candles"]}
 
-def on_data(ctx, event, history):
+def on_data(ctx, history):
     return None
 "#,
             "wrong-version",
@@ -1671,7 +1838,7 @@ def on_data(ctx, event, history):
             r#"
 script = {"name": "finish-order", "version": "2"}
 
-def on_data(ctx, event, history):
+def on_data(ctx, history):
     return None
 
 def on_finish(ctx, history):
@@ -1735,7 +1902,7 @@ while True:
             r#"
 script = {"name": "hook-timeout", "version": "2"}
 
-def on_data(ctx, event, history):
+def on_data(ctx, history):
     while True:
         pass
 "#,
@@ -1776,7 +1943,7 @@ def on_data(ctx, event, history):
             r#"
 script = {"name": "memory-limit", "version": "2"}
 
-def on_data(ctx, event, history):
+def on_data(ctx, history):
     global allocation
     allocation = bytearray(256 * 1024 * 1024)
 "#,
@@ -1827,7 +1994,7 @@ from pathlib import Path
 
 script = {{"name": "process-limit", "version": "2"}}
 
-def on_data(ctx, event, history):
+def on_data(ctx, history):
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     Path({pid_path:?}).write_text(str(child.pid))
     time.sleep(60)

@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 use crate::cli::{ExecutionVenueArg, OutputFormat, ScriptRunArgs, mmt_timeframe_from_seconds};
+use crate::commands::script::pnl::PnlHistory;
 use crate::commands::script::{
     ScriptDescriptor, ScriptInputs, report_builder, write_report_best_effort,
     write_running_report_best_effort,
@@ -17,7 +18,7 @@ use crate::commands::script::{
 use crate::commands::source::common::render_terminal;
 use crate::core::orderbook::OrderBookState;
 use crate::domain::enums::ProviderKind;
-use crate::domain::execution::Position;
+use crate::domain::execution::{ExecutionVenue, Position};
 use crate::domain::types::{
     OiCandle, OpenInterestSnapshot, OrderBookSnapshot, TradeTick, VdCandle, VolumeDeltaTick,
     VolumeProfile,
@@ -44,7 +45,7 @@ use crate::scripting::inputs::{
     source_exchange_label, source_provider_label, source_provider_name, source_type_names,
     validate_source_configs_for_run,
 };
-use crate::scripting::jobs::ScriptJobSubmission;
+use crate::scripting::jobs::{ScriptExecutionEvent, ScriptJobSubmission};
 use crate::scripting::language::ScriptLanguage;
 use crate::scripting::manifest::ScriptSource;
 use crate::scripting::market_data::{
@@ -131,6 +132,99 @@ enum ScriptStreamEvent {
 struct ScriptWorkerState<'a> {
     job_id: &'a str,
     initial_event_cursor: u64,
+}
+
+#[derive(Debug, Default)]
+struct LivePnlPosition {
+    quantity: f64,
+    average_price: f64,
+}
+
+#[derive(Debug)]
+struct LivePnlState {
+    positions: BTreeMap<String, LivePnlPosition>,
+    latest_marks: BTreeMap<String, f64>,
+    realized_pnl: f64,
+    fees: f64,
+    seen_fills: BTreeSet<String>,
+    history: PnlHistory,
+}
+
+impl LivePnlState {
+    fn new(capacity: usize) -> Self {
+        Self {
+            positions: BTreeMap::new(),
+            latest_marks: BTreeMap::new(),
+            realized_pnl: 0.0,
+            fees: 0.0,
+            seen_fills: BTreeSet::new(),
+            history: PnlHistory::new(capacity),
+        }
+    }
+
+    fn apply_market_update(&mut self, update: &LiveUpdate) {
+        let Some(mark) = live_reference_price(&update.record) else {
+            return;
+        };
+        self.latest_marks
+            .insert(live_pnl_key(&update.symbol, &update.exchange), mark);
+    }
+
+    fn apply_execution_event(&mut self, event: &ScriptExecutionEvent) {
+        if event.event_type != "order.fill" {
+            return;
+        }
+        let Some(fill) = live_fill(event) else {
+            return;
+        };
+        if !self.seen_fills.insert(fill.fingerprint) {
+            return;
+        }
+
+        self.fees += fill.fee;
+        let position = self.positions.entry(fill.key).or_default();
+        apply_live_fill(
+            position,
+            fill.signed_quantity,
+            fill.price,
+            &mut self.realized_pnl,
+        );
+    }
+
+    fn record(&mut self, ts_ms: u64) {
+        let Some(pnl) = self.current() else {
+            return;
+        };
+        self.history.record(ts_ms, pnl);
+    }
+
+    fn current(&self) -> Option<f64> {
+        let mut pnl = self.realized_pnl + self.fees;
+        for (key, position) in &self.positions {
+            if position.quantity.abs() <= f64::EPSILON {
+                continue;
+            }
+            let mark = self.latest_marks.get(key)?;
+            pnl += if position.quantity > 0.0 {
+                (*mark - position.average_price) * position.quantity
+            } else {
+                (position.average_price - *mark) * position.quantity.abs()
+            };
+        }
+        Some(pnl)
+    }
+
+    fn payload(&self) -> Value {
+        self.history.payload()
+    }
+}
+
+struct LiveFill {
+    key: String,
+    signed_quantity: f64,
+    price: f64,
+    fee: f64,
+    fingerprint: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -358,6 +452,8 @@ async fn stream_sources(
     let mut hooks = 0_u64;
     let mut summary = ScriptRunSummary::default();
     let mut event_cursor = worker.initial_event_cursor;
+    let mut pnl = LivePnlState::new(script.history_capacity(&resolved_params));
+    replay_execution_fills(job_id, &mut pnl).await?;
     let mut positions = crate::runtime::script_positions(job_id).await?;
     let mut execution_events = tokio::time::interval(std::time::Duration::from_millis(250));
     execution_events.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -382,7 +478,7 @@ async fn stream_sources(
 
     loop {
         if session.is_cancelled() {
-            finish_live_session(&session, job_id, report)?;
+            finish_live_session(&session, job_id, report, pnl.payload())?;
             report.set_phase("cancelled");
             render_run_summary(&summary, args.output, args.verbose)?;
             return Err(ScriptCancelled.into());
@@ -428,13 +524,13 @@ async fn stream_sources(
                 }
             }
             _ = tokio::signal::ctrl_c() => {
-                finish_live_session(&session, job_id, report)?;
+                finish_live_session(&session, job_id, report, pnl.payload())?;
                 report.set_phase("cancelled");
                 render_run_summary(&summary, args.output, args.verbose)?;
                 return Err(ScriptCancelled.into());
             }
             _ = terminate.recv() => {
-                finish_live_session(&session, job_id, report)?;
+                finish_live_session(&session, job_id, report, pnl.payload())?;
                 report.set_phase("cancelled");
                 render_run_summary(&summary, args.output, args.verbose)?;
                 return Err(ScriptCancelled.into());
@@ -444,21 +540,23 @@ async fn stream_sources(
                 continue;
             }
             _ = &mut duration_elapsed => {
-                finish_live_session(&session, job_id, report)?;
+                finish_live_session(&session, job_id, report, pnl.payload())?;
                 report.set_phase("duration_elapsed");
                 render_run_summary(&summary, args.output, args.verbose)?;
                 return Ok(());
             }
             _ = execution_events.tick() => {
-                dispatch_execution_events(&session, job_id, &mut event_cursor).await?;
+                dispatch_execution_events(&session, job_id, &mut event_cursor, &mut pnl).await?;
                 positions = crate::runtime::script_positions(job_id).await?;
                 continue;
             }
         };
 
         let ts_ms = update.ts_ms();
+        pnl.apply_market_update(&update);
+        pnl.record(ts_ms);
         let payload = live_stream_payload(&update, &source_configs, &positions)?;
-        let execution = match session.run_event(payload) {
+        let execution = match session.run_event_with_pnl(payload, pnl.payload()) {
             Ok(execution) => execution,
             Err(err) => {
                 report.record_hook_failure();
@@ -512,8 +610,9 @@ fn finish_live_session(
     session: &crate::scripting::engine::ScriptSession,
     job_id: &str,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
+    pnl_history: Value,
 ) -> Result<()> {
-    let Some(execution) = session.run_finish()? else {
+    let Some(execution) = session.run_finish_with_pnl(pnl_history)? else {
         return Ok(());
     };
     report.record_hook(&execution.stats);
@@ -593,10 +692,12 @@ async fn dispatch_execution_events(
     session: &crate::scripting::engine::ScriptSession,
     job_id: &str,
     cursor: &mut u64,
+    pnl: &mut LivePnlState,
 ) -> Result<()> {
     let events = crate::runtime::script_execution_events(job_id, *cursor, 100).await?;
     for event in events {
         let seq = event.seq;
+        pnl.apply_execution_event(&event);
         let event_value = serde_json::to_value(&event)?;
         let execution = session.run_execution_event(event_value.clone())?;
         let mut record = serde_json::json!({
@@ -616,6 +717,162 @@ async fn dispatch_execution_events(
         *cursor = (*cursor).max(seq);
     }
     Ok(())
+}
+
+async fn replay_execution_fills(job_id: &str, pnl: &mut LivePnlState) -> Result<()> {
+    let mut cursor = 0_u64;
+    loop {
+        let events = crate::runtime::script_execution_events(job_id, cursor, 1_000).await?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        for event in &events {
+            cursor = cursor.max(event.seq);
+            pnl.apply_execution_event(event);
+        }
+        if events.len() < 1_000 {
+            return Ok(());
+        }
+    }
+}
+
+fn live_reference_price(record: &LiveRecord) -> Option<f64> {
+    let price = match record {
+        LiveRecord::Candles(candle) => Some(candle.c),
+        LiveRecord::Orderbook(snapshot) => match (snapshot.bids.first(), snapshot.asks.first()) {
+            (Some(bid), Some(ask)) => Some((bid.price + ask.price) / 2.0),
+            _ => None,
+        },
+        LiveRecord::Trades(trade) => Some(trade.record.price),
+        LiveRecord::Oi(candle) => candle.mark_price,
+        LiveRecord::Volumes(profile) => profile.reference_price(),
+        LiveRecord::Vd(_) => None,
+    }?;
+    (price.is_finite() && price > 0.0).then_some(price)
+}
+
+fn live_fill(event: &ScriptExecutionEvent) -> Option<LiveFill> {
+    let venue = event.venue?;
+    let symbol = event.symbol.as_deref()?;
+    let data = event.data.as_object()?;
+    let price = json_number(data.get("price")?)?;
+    let quantity = data
+        .get("size")
+        .or_else(|| data.get("amount"))
+        .and_then(json_number)?
+        .abs();
+    if !price.is_finite() || price <= 0.0 || !quantity.is_finite() || quantity <= 0.0 {
+        return None;
+    }
+    let is_buy = data.get("isBuy").and_then(Value::as_bool).or_else(|| {
+        data.get("side").and_then(Value::as_str).and_then(|side| {
+            match side.to_ascii_lowercase().as_str() {
+                "b" | "buy" => Some(true),
+                "a" | "s" | "sell" => Some(false),
+                _ => None,
+            }
+        })
+    })?;
+    let raw_fee = data.get("fee").and_then(json_number).unwrap_or_default();
+    let fee = if venue != ExecutionVenue::Bulk && data.contains_key("raw") {
+        -raw_fee
+    } else {
+        raw_fee
+    };
+    let external_fill_id = data
+        .get("tradeId")
+        .or_else(|| data.get("tid"))
+        .or_else(|| data.get("hash"))
+        .or_else(|| data.get("raw").and_then(|raw| raw.get("tid")))
+        .or_else(|| data.get("raw").and_then(|raw| raw.get("hash")))
+        .map(Value::to_string);
+    let timestamp = data
+        .get("timestamp")
+        .or_else(|| data.get("time"))
+        .or_else(|| data.get("ts_ms"))
+        .or_else(|| data.get("tsMs"))
+        .map(Value::to_string)
+        .unwrap_or_else(|| event.ts_ms.to_string());
+    let fingerprint = external_fill_id.map_or_else(
+        || {
+            format!(
+                "{venue:?}:{}:{timestamp}:{is_buy}:{}:{}",
+                event.venue_order_id.as_deref().unwrap_or("-"),
+                price.to_bits(),
+                quantity.to_bits()
+            )
+        },
+        |id| format!("{venue:?}:{id}"),
+    );
+    Some(LiveFill {
+        key: live_pnl_key(symbol, live_execution_exchange(venue)),
+        signed_quantity: if is_buy { quantity } else { -quantity },
+        price,
+        fee,
+        fingerprint,
+    })
+}
+
+fn apply_live_fill(
+    position: &mut LivePnlPosition,
+    signed_quantity: f64,
+    price: f64,
+    realized_pnl: &mut f64,
+) {
+    if position.quantity.abs() <= f64::EPSILON {
+        position.quantity = signed_quantity;
+        position.average_price = price;
+        return;
+    }
+    if position.quantity.signum() == signed_quantity.signum() {
+        let total_quantity = position.quantity.abs() + signed_quantity.abs();
+        position.average_price = (position.average_price * position.quantity.abs()
+            + price * signed_quantity.abs())
+            / total_quantity;
+        position.quantity += signed_quantity;
+        return;
+    }
+
+    let closing_quantity = position.quantity.abs().min(signed_quantity.abs());
+    *realized_pnl += if position.quantity > 0.0 {
+        (price - position.average_price) * closing_quantity
+    } else {
+        (position.average_price - price) * closing_quantity
+    };
+    let remaining_quantity = position.quantity + signed_quantity;
+    if remaining_quantity.abs() <= f64::EPSILON {
+        position.quantity = 0.0;
+        position.average_price = 0.0;
+    } else {
+        if remaining_quantity.signum() != position.quantity.signum() {
+            position.average_price = price;
+        }
+        position.quantity = remaining_quantity;
+    }
+}
+
+fn json_number(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
+fn live_pnl_key(symbol: &str, exchange: &str) -> String {
+    format!(
+        "{}@{}",
+        symbol.to_ascii_lowercase(),
+        exchange.to_ascii_lowercase()
+    )
+}
+
+fn live_execution_exchange(venue: ExecutionVenue) -> &'static str {
+    match venue {
+        ExecutionVenue::Bulk => "bulkf",
+        ExecutionVenue::Hyperliquid => "hyperliquidf",
+        ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
+        ExecutionVenue::HyperliquidSpot => "hyperliquid",
+        ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
+    }
 }
 
 fn now_ms() -> u64 {
@@ -2038,6 +2295,57 @@ mod tests {
         );
         assert!(payload.get("sources").is_none());
         assert!(payload.get("candles").is_none());
+    }
+
+    #[test]
+    fn live_pnl_tracks_job_fills_fees_and_mark_to_market_value() {
+        fn fill(seq: u64, side: &str, price: f64, size: f64, fee: f64) -> ScriptExecutionEvent {
+            ScriptExecutionEvent {
+                seq,
+                job_id: "script_test".to_string(),
+                ts_ms: 1_780_000_000_000 + seq,
+                event_type: "order.fill".to_string(),
+                order_id: Some(format!("order-{seq}")),
+                key: None,
+                symbol: Some("ETH".to_string()),
+                venue: Some(ExecutionVenue::Hyperliquid),
+                venue_order_id: Some(format!("venue-order-{seq}")),
+                status: Some("filled".to_string()),
+                terminal: false,
+                data: json!({
+                    "price": price.to_string(),
+                    "size": size.to_string(),
+                    "side": side,
+                    "fee": fee.to_string(),
+                    "raw": { "tid": seq }
+                }),
+            }
+        }
+
+        let configs = parse_source_configs(&["eth@candles@hyperliquidf:timeframe=60".to_string()])
+            .expect("parse Hyperliquid source");
+        let update = LiveUpdate::new(
+            &configs["eth@candles@hyperliquidf"],
+            LiveRecord::Candles(candle(100.0)),
+        );
+        let mut pnl = LivePnlState::new(10);
+        pnl.apply_market_update(&update);
+
+        let buy = fill(1, "B", 90.0, 2.0, 0.1);
+        pnl.apply_execution_event(&buy);
+        pnl.apply_execution_event(&buy);
+        pnl.record(1_000);
+        assert!((pnl.payload()[0]["pnl"].as_f64().unwrap() - 19.9).abs() < 1e-9);
+
+        pnl.apply_execution_event(&fill(2, "A", 110.0, 1.0, 0.1));
+        pnl.record(2_000);
+        assert!((pnl.payload()[1]["pnl"].as_f64().unwrap() - 29.8).abs() < 1e-9);
+
+        pnl.apply_execution_event(&fill(3, "A", 95.0, 1.0, 0.1));
+        pnl.record(3_000);
+        let points = pnl.payload();
+        assert_eq!(points[2]["t"], 3_000);
+        assert!((points[2]["pnl"].as_f64().unwrap() - 24.7).abs() < 1e-9);
     }
 
     #[test]

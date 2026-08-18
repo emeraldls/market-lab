@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crate::cli::{OutputFormat, ScriptBacktestArgs, mmt_timeframe_from_seconds};
+use crate::commands::script::pnl::PnlHistory;
 use crate::commands::script::{
     ScriptDescriptor, ScriptInputs, report_builder, write_report_best_effort,
     write_running_report_best_effort,
@@ -383,6 +384,7 @@ async fn backtest_events(
     let provider_label = source_provider_label(&source_configs);
     let exchange_label = source_exchange_label(&source_configs);
     let mut latest_marks = BTreeMap::<String, (u64, f64)>::new();
+    let mut pnl_history = PnlHistory::new(lookback);
     eprintln!(
         "running script={} sources={} events={} references={} lookback={}",
         script.manifest.name,
@@ -450,6 +452,14 @@ async fn backtest_events(
             )?;
             peak_margin = peak_margin.max(open_position_margin(&simulation.open_trades));
         }
+        pnl_history.record(
+            event.ts_ms,
+            simulated_net_pnl(
+                &simulation.open_trades,
+                &simulation.closed_trades,
+                &latest_marks,
+            ),
+        );
         let payload = build_event_payload(EventPayloadContext {
             source_configs: &source_configs,
             config,
@@ -459,7 +469,7 @@ async fn backtest_events(
             latest_marks: &latest_marks,
             open_trades: &simulation.open_trades,
         })?;
-        let execution = match session.run_event(payload) {
+        let execution = match session.run_event_with_pnl(payload, pnl_history.payload()) {
             Ok(execution) => execution,
             Err(err) => {
                 report.record_hook_failure();
@@ -502,6 +512,14 @@ async fn backtest_events(
             &mut latest_output,
         )?;
         peak_margin = peak_margin.max(open_position_margin(&simulation.open_trades));
+        pnl_history.record(
+            event.ts_ms,
+            simulated_net_pnl(
+                &simulation.open_trades,
+                &simulation.closed_trades,
+                &latest_marks,
+            ),
+        );
 
         if (idx + 1) % 500 == 0 || idx + 1 == events.len() {
             eprintln!("processed {}/{} source events", idx + 1, events.len());
@@ -510,7 +528,7 @@ async fn backtest_events(
         }
     }
 
-    if let Some(execution) = session.run_finish()? {
+    if let Some(execution) = session.run_finish_with_pnl(pnl_history.payload())? {
         report.record_hook(&execution.stats);
         if !execution.commands.is_empty() {
             bail!("on_finish cannot submit execution commands");
@@ -1732,7 +1750,7 @@ fn fill_script_order(
         return Ok(());
     }
     let outcome = match &order.request {
-        ScriptManagedRequest::Trade(request) => SimulatedFillOutcome::Filled(fill_simulated_trade(
+        ScriptManagedRequest::Trade(request) => fill_simulated_trade(
             request,
             order.exchange,
             &order.order,
@@ -1740,7 +1758,7 @@ fn fill_script_order(
             ts_ms,
             price,
             simulation,
-        )?),
+        )?,
         ScriptManagedRequest::Order(request) => fill_simulated_raw_order(
             request,
             order.exchange,
@@ -1813,9 +1831,9 @@ fn fill_simulated_trade(
     ts_ms: u64,
     price: f64,
     simulation: &mut ScriptSimulationState,
-) -> Result<f64> {
-    validate_position_transition(request, exchange, &simulation.open_trades)?;
+) -> Result<SimulatedFillOutcome> {
     if request.position.is_open() {
+        validate_position_transition(request, exchange, &simulation.open_trades)?;
         let side = trade_side(request.position.position_direction());
         let leverage = request.leverage_or_default();
         let notional = request
@@ -1851,18 +1869,16 @@ fn fill_simulated_trade(
         } else {
             simulation.open_trades.push(opened);
         }
-        Ok(filled_qty)
+        Ok(SimulatedFillOutcome::Filled(filled_qty))
     } else {
         let side = trade_side(request.position.position_direction());
-        let open_index = simulation
-            .open_trades
-            .iter()
-            .position(|open| {
-                open.exchange == exchange
-                    && open.side == side
-                    && open.symbol.eq_ignore_ascii_case(&request.symbol)
-            })
-            .context("matching simulated position disappeared before the close filled")?;
+        let Some(open_index) = simulation.open_trades.iter().position(|open| {
+            open.exchange == exchange
+                && open.side == side
+                && open.symbol.eq_ignore_ascii_case(&request.symbol)
+        }) else {
+            return Ok(SimulatedFillOutcome::Cancelled);
+        };
         let close_qty = request
             .size
             .unwrap_or(simulation.open_trades[open_index].qty);
@@ -1878,7 +1894,7 @@ fn fill_simulated_trade(
                 reason: format!("ctx.trade {}", request.key),
             },
         )?;
-        Ok(close_qty)
+        Ok(SimulatedFillOutcome::Filled(close_qty))
     }
 }
 
@@ -2332,6 +2348,23 @@ fn open_trades_to_positions(
         .collect()
 }
 
+fn simulated_net_pnl(
+    open_trades: &[OpenTrade],
+    closed_trades: &[ScriptBacktestTrade],
+    latest_marks: &BTreeMap<String, (u64, f64)>,
+) -> f64 {
+    let realized = closed_trades.iter().map(|trade| trade.net_pnl).sum::<f64>();
+    let unrealized = open_trades
+        .iter()
+        .filter_map(|open| {
+            latest_marks
+                .get(&execution_mark_key(open.exchange, &open.symbol))
+                .map(|(_, mark)| trade_pnl(open.side, open.entry_price, *mark, open.qty))
+        })
+        .sum::<f64>();
+    realized + unrealized
+}
+
 fn margin_for_notional(notional: f64, leverage: f64) -> f64 {
     notional / leverage.max(f64::EPSILON)
 }
@@ -2777,6 +2810,54 @@ mod tests {
     }
 
     #[test]
+    fn simulated_pnl_combines_realized_and_mark_to_market_values() {
+        let mut simulation = ScriptSimulationState::default();
+        apply_script_execution_commands(
+            vec![script_order(json!({
+                "key": "buy",
+                "side": "buy",
+                "size": 1
+            }))],
+            0,
+            1_000,
+            &marks(100.0),
+            &mut simulation,
+        )
+        .expect("open simulated long");
+
+        assert_eq!(
+            simulated_net_pnl(
+                &simulation.open_trades,
+                &simulation.closed_trades,
+                &marks(105.0)
+            ),
+            5.0
+        );
+
+        apply_script_execution_commands(
+            vec![script_order(json!({
+                "key": "sell",
+                "side": "sell",
+                "size": 1
+            }))],
+            1,
+            2_000,
+            &marks(105.0),
+            &mut simulation,
+        )
+        .expect("close simulated long");
+        assert!(simulation.open_trades.is_empty());
+        assert_eq!(
+            simulated_net_pnl(
+                &simulation.open_trades,
+                &simulation.closed_trades,
+                &marks(105.0)
+            ),
+            5.0
+        );
+    }
+
+    #[test]
     fn request_routed_backtest_uses_exchange_prices_and_positions() {
         let mut simulation = ScriptSimulationState::default();
         let latest_marks = BTreeMap::from([
@@ -3215,6 +3296,76 @@ export function onData(ctx, input, history) {
         assert_eq!(simulation.closed_trades.len(), 1);
         assert_eq!(simulation.closed_trades[0].qty, 2.0);
         assert_eq!(simulation.closed_trades[0].net_pnl, 20.0);
+    }
+
+    #[test]
+    fn stale_pending_close_is_cancelled_after_another_close_flattens_the_position() {
+        let source = candle_source();
+        let data = candle_data(vec![
+            candle(0, 100.0, 100.0, 100.0, 100.0),
+            candle(1, 100.0, 120.0, 100.0, 115.0),
+        ]);
+        let mut simulation = ScriptSimulationState::default();
+
+        apply_script_execution_commands(
+            vec![script_trade(json!({
+                "key": "open-long",
+                "position": "open-long",
+                "margin": 100,
+            }))],
+            0,
+            1_000,
+            &marks(100.0),
+            &mut simulation,
+        )
+        .expect("open long");
+
+        let submitted = apply_script_execution_commands(
+            vec![
+                script_trade(json!({
+                    "key": "close-long-1",
+                    "position": "close-long",
+                    "order": { "type": "limit", "price": 110.0, "tif": "gtc" },
+                })),
+                script_trade(json!({
+                    "key": "close-long-2",
+                    "position": "close-long",
+                    "order": { "type": "limit", "price": 110.0, "tif": "gtc" },
+                })),
+            ],
+            1,
+            2_000,
+            &marks(100.0),
+            &mut simulation,
+        )
+        .expect("submit two close orders while the long is open");
+        assert_eq!(submitted, 2);
+
+        fill_pending_script_orders(&source, true, &data, 1, 2, &mut simulation)
+            .expect("stale sibling close should cancel instead of failing the backtest");
+
+        assert!(simulation.open_trades.is_empty());
+        assert_eq!(simulation.closed_trades.len(), 1);
+        let close_statuses = simulation
+            .orders
+            .values()
+            .filter(|order| order.request.key().starts_with("close-long-"))
+            .map(|order| order.status)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            close_statuses
+                .iter()
+                .filter(|status| **status == SimulatedOrderStatus::Filled)
+                .count(),
+            1
+        );
+        assert_eq!(
+            close_statuses
+                .iter()
+                .filter(|status| **status == SimulatedOrderStatus::Cancelled)
+                .count(),
+            1
+        );
     }
 
     #[test]
