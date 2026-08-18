@@ -718,7 +718,7 @@ async fn ensure_native_running() -> Result<RuntimeStatus> {
 }
 
 async fn ensure_docker_running(config: &DaemonConfig) -> Result<RuntimeStatus> {
-    if let Some(status) = try_status().await? {
+    if let Ok(Some(status)) = try_status().await {
         if status.version == RUNTIME_VERSION {
             return Ok(status);
         }
@@ -752,13 +752,17 @@ async fn ensure_docker_running(config: &DaemonConfig) -> Result<RuntimeStatus> {
 }
 
 async fn wait_for_runtime() -> Result<RuntimeStatus> {
+    let mut last_error = None;
     for _ in 0..60 {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        if let Some(status) = try_status().await?
-            && status.version == RUNTIME_VERSION
-        {
-            return Ok(status);
+        match try_status().await {
+            Ok(Some(status)) if status.version == RUNTIME_VERSION => return Ok(status),
+            Ok(_) => {}
+            Err(error) => last_error = Some(format!("{error:#}")),
         }
+    }
+    if let Some(error) = last_error {
+        bail!("mlabd did not become ready within 15 seconds; last connection error: {error}")
     }
     bail!("mlabd did not become ready within 15 seconds")
 }
