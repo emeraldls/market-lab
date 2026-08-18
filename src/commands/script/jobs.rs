@@ -298,11 +298,7 @@ fn format_terminal_log(value: &serde_json::Value, state: &mut TerminalLogState) 
                 state.orders.insert(
                     order_id.to_string(),
                     TerminalOrder {
-                        side: data
-                            .get("side")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("order")
-                            .to_ascii_uppercase(),
+                        side: request_side(data).unwrap_or("ORDER").to_string(),
                         price: data
                             .pointer("/order/price")
                             .and_then(serde_json::Value::as_f64),
@@ -477,6 +473,9 @@ fn order_amount(order: &TerminalOrder) -> String {
 }
 
 fn event_side(event: &serde_json::Value) -> Option<&'static str> {
+    if let Some(side) = event.get("data").and_then(request_side) {
+        return Some(side);
+    }
     let key = event.get("key").and_then(serde_json::Value::as_str)?;
     if key.contains("buy") || key.contains("bid") {
         Some("BUY")
@@ -484,6 +483,19 @@ fn event_side(event: &serde_json::Value) -> Option<&'static str> {
         Some("SELL")
     } else {
         None
+    }
+}
+
+fn request_side(request: &serde_json::Value) -> Option<&'static str> {
+    match request.get("side").and_then(serde_json::Value::as_str) {
+        Some(side) if side.eq_ignore_ascii_case("buy") => return Some("BUY"),
+        Some(side) if side.eq_ignore_ascii_case("sell") => return Some("SELL"),
+        _ => {}
+    }
+    match request.get("position").and_then(serde_json::Value::as_str) {
+        Some("open-long" | "close-short") => Some("BUY"),
+        Some("open-short" | "close-long") => Some("SELL"),
+        _ => None,
     }
 }
 
@@ -628,6 +640,32 @@ mod tests {
             "data": {}
         }));
         assert!(format_terminal_log(&late_resting, &mut state).is_none());
+    }
+
+    #[test]
+    fn terminal_logs_derive_managed_trade_side_without_a_semantic_key() {
+        let mut state = TerminalLogState::default();
+        let pending = event(serde_json::json!({
+            "type": "order.pending",
+            "tsMs": 1_780_000_000_000_u64,
+            "orderId": "ord_auto",
+            "key": "auto-open-long-aabbccdd-1",
+            "data": {
+                "position": "open-long",
+                "margin": 100.0,
+                "leverage": 5.0
+            }
+        }));
+        assert!(format_terminal_log(&pending, &mut state).is_none());
+
+        let submitted = event(serde_json::json!({
+            "type": "order.submitted",
+            "tsMs": 1_780_000_000_001_u64,
+            "orderId": "ord_auto",
+            "data": {}
+        }));
+        let line = format_terminal_log(&submitted, &mut state).expect("submitted line");
+        assert!(line.contains("submitted BUY margin=100 x5"));
     }
 
     #[test]

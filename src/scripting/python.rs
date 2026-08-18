@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
+use rand_core::{OsRng, RngCore};
 use serde_json::{Value, json};
 
 use super::engine::ScriptExecution;
@@ -117,6 +118,7 @@ impl PythonSession {
         execution: ScriptExecutionContext,
     ) -> Result<Self> {
         let artifact_dir = artifact_directory(&execution.job_id)?;
+        let execution_key_prefix = format!("{:016x}", OsRng.next_u64());
         let mut process = PythonProcess::spawn(path, runtime)?;
         process.send(&json!({
             "type": "init",
@@ -124,6 +126,7 @@ impl PythonSession {
             "historyCapacity": history_capacity,
             "configuredSources": configured_sources,
             "executionEnabled": execution.enabled,
+            "executionKeyPrefix": execution_key_prefix,
             "artifactDir": artifact_dir,
         }))?;
         let response = process.receive(PYTHON_STARTUP_TIMEOUT)?;
@@ -994,10 +997,11 @@ class Studies:
 
 
 class Context:
-    def __init__(self, params, execution_enabled, artifact_dir):
+    def __init__(self, params, execution_enabled, execution_key_prefix, artifact_dir):
         self.params = copy.deepcopy(params)
         self.study = Studies(self)
         self._execution_enabled = execution_enabled
+        self._execution_key_prefix = execution_key_prefix
         self._artifact_dir = Path(artifact_dir).resolve()
         self._request_id = 0
         self._finishing = False
@@ -1014,6 +1018,16 @@ class Context:
         if not isinstance(payload, dict):
             raise TypeError(f"ctx.{operation} requires a dictionary")
         request_id = self._next_request_id()
+        payload = copy.deepcopy(payload)
+        if payload.get("key") is None:
+            label = operation
+            if operation == "trade" and payload.get("position") in {
+                "open-long", "open-short", "close-long", "close-short"
+            }:
+                label = payload["position"]
+            elif operation == "order" and payload.get("side") in {"buy", "sell"}:
+                label = payload["side"]
+            payload["key"] = f"auto-{label}-{self._execution_key_prefix}-{request_id}"
         write_message({
             "type": "execution",
             "requestId": request_id,
@@ -1071,7 +1085,12 @@ try:
     if init.get("type") != "init":
         raise RuntimeError("expected Python initialization message")
     HISTORY = History(init["historyCapacity"], init.get("configuredSources"))
-    CTX = Context(init.get("params", {}), init.get("executionEnabled", False), init["artifactDir"])
+    CTX = Context(
+        init.get("params", {}),
+        init.get("executionEnabled", False),
+        init["executionKeyPrefix"],
+        init["artifactDir"],
+    )
     write_message({"type": "ready", "manifest": MANIFEST})
 
     while True:
@@ -1205,6 +1224,7 @@ mod tests {
                 "params": {},
                 "historyCapacity": 2,
                 "executionEnabled": false,
+                "executionKeyPrefix": "test-session",
                 "artifactDir": std::env::temp_dir(),
             }))
             .expect("initialize limited Python process");
@@ -1324,6 +1344,82 @@ def on_finish(ctx, history):
         assert_eq!(fs::read_to_string(&artifact).unwrap(), "2");
 
         let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn python_v2_generates_distinct_execution_keys_and_preserves_explicit_keys() {
+        let path = write_python_script(
+            r#"
+script = {"name": "automatic-execution-keys", "version": "2"}
+
+def on_data(ctx):
+    first = ctx.order({
+        "exchange": "hyperliquidf",
+        "symbol": "ETH",
+        "side": "buy",
+        "size": 0.1,
+    })
+    second = ctx.order({
+        "exchange": "hyperliquidf",
+        "symbol": "ETH",
+        "side": "buy",
+        "size": 0.1,
+    })
+    explicit = ctx.trade({
+        "key": "semantic-entry",
+        "exchange": "hyperliquidf",
+        "symbol": "ETH",
+        "position": "open-long",
+        "margin": 100,
+    })
+    cancel = ctx.cancel({"order": first["id"]})
+    return {"metrics": {
+        "first_key": first["key"],
+        "second_key": second["key"],
+        "explicit_key": explicit["key"],
+        "cancel_key": cancel["key"],
+    }}
+"#,
+            "automatic-execution-keys",
+        );
+        if !python_available(&path) {
+            let _ = fs::remove_file(path);
+            return;
+        }
+
+        let script = Script::load(&path).expect("load Python script");
+        let session = script
+            .start_session_with_execution(
+                &json!({}),
+                ScriptExecutionContext {
+                    job_id: format!("python-test-{}", std::process::id()),
+                    enabled: true,
+                    request_routed: true,
+                },
+            )
+            .expect("start Python session");
+        let execution = session
+            .run_event(candle_event(1_000, 100.0))
+            .expect("run Python event");
+
+        let first_key = execution.output.metrics["first_key"]
+            .as_str()
+            .expect("first automatic key");
+        let second_key = execution.output.metrics["second_key"]
+            .as_str()
+            .expect("second automatic key");
+        let cancel_key = execution.output.metrics["cancel_key"]
+            .as_str()
+            .expect("cancel automatic key");
+        assert!(first_key.starts_with("auto-"));
+        assert!(second_key.starts_with("auto-"));
+        assert!(cancel_key.starts_with("auto-"));
+        assert_ne!(first_key, second_key);
+        assert_ne!(second_key, cancel_key);
+        assert_eq!(execution.output.metrics["explicit_key"], "semantic-entry");
+        assert_eq!(execution.commands.len(), 4);
+
         let _ = fs::remove_file(path);
     }
 
