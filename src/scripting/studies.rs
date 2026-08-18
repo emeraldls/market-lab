@@ -39,6 +39,10 @@ fn calculate(name: &str, input: &str, options: &str) -> Result<Value> {
     let options: Value =
         serde_json::from_str(options).context("study options must be valid JSON")?;
 
+    calculate_value(name, input, options)
+}
+
+pub(crate) fn calculate_value(name: &str, input: Value, options: Value) -> Result<Value> {
     match name {
         "sma" | "ema" => {
             let field = option_str(&options, "field").unwrap_or("c");

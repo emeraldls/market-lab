@@ -25,6 +25,7 @@ use super::limits::{
 };
 use super::manifest::ScriptManifest;
 use super::output::ScriptOutput;
+use super::studies::calculate_value;
 use super::telemetry::ScriptHookStats;
 
 const PYTHON_STARTUP_TIMEOUT: Duration = Duration::from_millis(SCRIPT_PYTHON_STARTUP_TIMEOUT_MS);
@@ -225,6 +226,9 @@ impl PythonSession {
                 Some("execution") => {
                     self.handle_execution_request(&mut process, &response)?;
                 }
+                Some("study") => {
+                    self.handle_study_request(&mut process, &response)?;
+                }
                 Some("hook_result") => {
                     if response.get("id").and_then(Value::as_u64) != Some(request_id) {
                         self.clear_commands()?;
@@ -302,6 +306,40 @@ impl PythonSession {
             }),
             Err(error) => json!({
                 "type": "execution_result",
+                "requestId": request_id,
+                "ok": false,
+                "error": format!("{error:#}"),
+            }),
+        };
+        process.send(&reply)
+    }
+
+    fn handle_study_request(&self, process: &mut PythonProcess, response: &Value) -> Result<()> {
+        let request_id = response
+            .get("requestId")
+            .and_then(Value::as_u64)
+            .context("Python study request has no request id")?;
+        let name = response
+            .get("name")
+            .and_then(Value::as_str)
+            .context("Python study request has no function name")?;
+        let input = response
+            .get("input")
+            .cloned()
+            .context("Python study request has no input")?;
+        let options = response
+            .get("options")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let reply = match calculate_value(name, input, options) {
+            Ok(value) => json!({
+                "type": "study_result",
+                "requestId": request_id,
+                "ok": true,
+                "value": value,
+            }),
+            Err(error) => json!({
+                "type": "study_result",
                 "requestId": request_id,
                 "ok": false,
                 "error": format!("{error:#}"),
@@ -900,13 +938,66 @@ class History:
         return copy.deepcopy(records[offset]) if offset < len(records) else None
 
 
+class Studies:
+    def __init__(self, context):
+        self._context = context
+
+    def _call(self, name, input_value, options=None):
+        request_id = self._context._next_request_id()
+        write_message({
+            "type": "study",
+            "requestId": request_id,
+            "name": name,
+            "input": input_value,
+            "options": {} if options is None else options,
+        })
+        line = sys.stdin.readline()
+        if not line:
+            raise RuntimeError("MarketLab closed the Python study channel")
+        response = json.loads(line)
+        if response.get("type") != "study_result" or response.get("requestId") != request_id:
+            raise RuntimeError("MarketLab returned an invalid study response")
+        if not response.get("ok"):
+            raise RuntimeError(response.get("error", f"MarketLab rejected ctx.study.{name}"))
+        return response.get("value")
+
+    def sma(self, rows, options):
+        return self._call("sma", rows, options)
+
+    def ema(self, rows, options):
+        return self._call("ema", rows, options)
+
+    def cvd(self, rows, options):
+        return self._call("cvd", rows, options)
+
+    def spread(self, book):
+        return self._call("spread", book)
+
+    def depth(self, book, options=None):
+        return self._call("depth", book, options)
+
+    def imbalance(self, book, options=None):
+        return self._call("imbalance", book, options)
+
+    def slippage(self, book, options):
+        return self._call("slippage", book, options)
+
+    def vamp(self, book, options):
+        return self._call("vamp", book, options)
+
+
 class Context:
     def __init__(self, params, execution_enabled, artifact_dir):
         self.params = copy.deepcopy(params)
+        self.study = Studies(self)
         self._execution_enabled = execution_enabled
         self._artifact_dir = Path(artifact_dir).resolve()
         self._request_id = 0
         self._finishing = False
+
+    def _next_request_id(self):
+        self._request_id += 1
+        return self._request_id
 
     def _execution(self, operation, payload):
         if self._finishing:
@@ -915,10 +1006,10 @@ class Context:
             raise RuntimeError("script execution is disabled")
         if not isinstance(payload, dict):
             raise TypeError(f"ctx.{operation} requires a dictionary")
-        self._request_id += 1
+        request_id = self._next_request_id()
         write_message({
             "type": "execution",
-            "requestId": self._request_id,
+            "requestId": request_id,
             "operation": operation,
             "payload": payload,
         })
@@ -926,7 +1017,7 @@ class Context:
         if not line:
             raise RuntimeError("MarketLab closed the Python execution channel")
         response = json.loads(line)
-        if response.get("type") != "execution_result" or response.get("requestId") != self._request_id:
+        if response.get("type") != "execution_result" or response.get("requestId") != request_id:
             raise RuntimeError("MarketLab returned an invalid execution response")
         if not response.get("ok"):
             raise RuntimeError(response.get("error", "MarketLab rejected the execution request"))
@@ -1299,6 +1390,112 @@ def on_finish():
             .expect("run zero-parameter finish hook")
             .expect("finish hook exists");
         assert_eq!(finish.output.meta["finished"], true);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn python_v2_exposes_every_v1_study_helper() {
+        let path = write_python_script(
+            r#"
+script = {"name": "study-parity", "version": "2", "sources": ["candles"]}
+
+def on_data(ctx):
+    rows = [{"c": 10.0}, {"c": 20.0}, {"c": 30.0}, {"c": 40.0}]
+    vd = [
+        {"t": 1, "o": 100.0, "h": 115.0, "l": 95.0, "c": 110.0, "n": 10},
+        {"t": 2, "o": 110.0, "h": 135.0, "l": 108.0, "c": 130.0, "n": 20},
+        {"t": 3, "o": 130.0, "h": 140.0, "l": 120.0, "c": 125.0, "n": 30},
+    ]
+    book = {
+        "exchange": "test",
+        "symbol": "BTC",
+        "timestamp_ms": 1,
+        "bids": [
+            {"price": 99.0, "quantity": 1.0},
+            {"price": 98.0, "quantity": 2.0},
+        ],
+        "asks": [
+            {"price": 101.0, "quantity": 1.0},
+            {"price": 102.0, "quantity": 2.0},
+        ],
+    }
+    sma = ctx.study.sma(rows, {"field": "c", "window": 3})
+    ema = ctx.study.ema(rows, {"field": "c", "window": 3})
+    cvd = ctx.study.cvd(vd, {"bucket": 7})
+    spread = ctx.study.spread(book)
+    depth = ctx.study.depth(book, {"levels": 2})
+    imbalance = ctx.study.imbalance(book, {"depth": 2})
+    slippage = ctx.study.slippage(book, {"side": "buy", "notional": 150})
+    vamp = ctx.study.vamp(book, {"dollar_depth": 150})
+    return {"metrics": {
+        "sma_latest": sma["latest"],
+        "ema_latest": ema["latest"],
+        "cvd_latest": cvd["latest"],
+        "spread_bps": spread["spread_bps"],
+        "bid_quote": depth["bid_quote"],
+        "imbalance": imbalance["imbalance"],
+        "slippage_levels": slippage["levels_consumed"],
+        "vamp": vamp["vamp"],
+        "vamp_complete": vamp["complete"],
+    }}
+"#,
+            "study-parity",
+        );
+        if !python_available(&path) {
+            let _ = fs::remove_file(path);
+            return;
+        }
+
+        let script = Script::load(&path).expect("load Python script");
+        let session = script.start_session(&json!({})).expect("start session");
+        let execution = session
+            .run_event(candle_event(1_000, 100.0))
+            .expect("run Python studies");
+
+        assert_eq!(execution.output.metrics["sma_latest"], 30.0);
+        assert_eq!(execution.output.metrics["ema_latest"], 30.0);
+        assert_eq!(execution.output.metrics["cvd_latest"], 25.0);
+        assert_eq!(execution.output.metrics["bid_quote"], 295.0);
+        assert_eq!(execution.output.metrics["imbalance"], 0.0);
+        assert_eq!(execution.output.metrics["slippage_levels"], 2);
+        assert_eq!(execution.output.metrics["vamp_complete"], true);
+        assert!(
+            execution.output.metrics["spread_bps"]
+                .as_f64()
+                .is_some_and(|value| value > 0.0)
+        );
+        assert!(
+            execution.output.metrics["vamp"]
+                .as_f64()
+                .is_some_and(|value| value > 0.0)
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn python_v2_study_helpers_use_v1_validation() {
+        let path = write_python_script(
+            r#"
+script = {"name": "study-validation", "version": "2", "sources": ["candles"]}
+
+def on_data(ctx):
+    ctx.study.sma([{"c": 1.0}], {"field": "missing", "window": 1})
+"#,
+            "study-validation",
+        );
+        if !python_available(&path) {
+            let _ = fs::remove_file(path);
+            return;
+        }
+
+        let script = Script::load(&path).expect("load Python script");
+        let session = script.start_session(&json!({})).expect("start session");
+        let error = session
+            .run_event(candle_event(1_000, 100.0))
+            .expect_err("invalid study input should fail");
+        assert!(format!("{error:#}").contains("field missing"));
 
         let _ = fs::remove_file(path);
     }

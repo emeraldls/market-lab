@@ -385,11 +385,7 @@ async fn backtest_events(
         script.manifest.name,
         script.manifest.source_names(),
         events.len(),
-        reference_sources
-            .values()
-            .map(|config| config.selector.as_str())
-            .collect::<Vec<_>>()
-            .join(","),
+        unique_reference_selectors(&reference_sources).join(","),
         lookback
     );
     report.set_progress("executing_hooks", 0, events.len() as u64);
@@ -1138,6 +1134,21 @@ fn resolve_reference_sources<'a>(
         );
     }
     Ok(references)
+}
+
+fn unique_reference_selectors<'a>(
+    reference_sources: &BTreeMap<String, &'a SourceConfig>,
+) -> Vec<&'a str> {
+    let mut configs = reference_sources.values().copied().collect::<Vec<_>>();
+    configs.sort_by_key(|config| config.position);
+    let mut selectors = Vec::new();
+    for config in configs {
+        let selector = config.selector.as_str();
+        if !selectors.contains(&selector) {
+            selectors.push(selector);
+        }
+    }
+    selectors
 }
 
 fn reference_marks_at_timestamp(
@@ -2892,10 +2903,12 @@ mod tests {
             ]),
         };
 
+        let references =
+            resolve_reference_sources(&data, &configs).expect("resolve reference sources");
+        assert_eq!(references["btc"].selector, "btc@candles@binancef@mmt");
         assert_eq!(
-            resolve_reference_sources(&data, &configs).expect("resolve reference sources")["btc"]
-                .selector,
-            "btc@candles@binancef@mmt"
+            unique_reference_selectors(&references),
+            vec!["btc@candles@binancef@mmt"]
         );
     }
 
