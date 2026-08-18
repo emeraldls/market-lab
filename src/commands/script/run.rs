@@ -397,6 +397,36 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
     );
     let pid = std::process::id();
     crate::runtime::script_worker_started(job_id, pid).await?;
+    let python = job.definition.python_runtime.as_ref().map(|runtime| {
+        json!({
+            "version": runtime.version,
+            "managedFingerprint": runtime
+                .managed
+                .as_ref()
+                .map(|managed| managed.fingerprint.as_str()),
+            "packageCount": runtime
+                .managed
+                .as_ref()
+                .map(|managed| managed.package_count),
+        })
+    });
+    crate::runtime::append_script_output(
+        job_id,
+        &json!({
+            "type": "script.run.initializing",
+            "version": "1",
+            "ts_ms": now_ms(),
+            "jobId": job_id,
+            "script": job.definition.script_name,
+            "language": job.definition.language,
+            "python": python,
+            "providers": job.definition.providers,
+            "exchanges": job.definition.exchanges,
+            "sources": job.definition.sources,
+            "durationSeconds": job.definition.duration_seconds,
+            "testnet": job.definition.testnet,
+        }),
+    )?;
     let result = run(args, script, &mut report, job_id, job.worker_event_cursor).await;
     let error = result
         .as_ref()
@@ -473,6 +503,32 @@ async fn stream_sources(
         },
         Some(&configured_sources),
     )?;
+    let providers = source_provider_label(&source_configs)
+        .split(',')
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let exchanges = source_exchange_label(&source_configs)
+        .split(',')
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let symbols = source_configs
+        .values()
+        .map(|config| config.symbol.as_str())
+        .collect::<BTreeSet<_>>();
+    crate::runtime::append_script_output(
+        job_id,
+        &json!({
+            "type": "script.run.started",
+            "version": "1",
+            "ts_ms": now_ms(),
+            "providers": providers,
+            "exchanges": exchanges,
+            "symbols": symbols,
+            "sources": configured_sources,
+        }),
+    )?;
     let cancel_handle = session.cancel_handle();
     let _cancel_task = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -511,7 +567,14 @@ async fn stream_sources(
         if session.is_cancelled() {
             finish_live_session(&session, job_id, report, pnl.payload())?;
             report.set_phase("cancelled");
-            render_run_summary(&summary, args.output, args.verbose)?;
+            finish_run(
+                job_id,
+                &summary,
+                "stopped",
+                "cancelled",
+                args.output,
+                args.verbose,
+            )?;
             return Err(ScriptCancelled.into());
         }
 
@@ -557,13 +620,13 @@ async fn stream_sources(
             _ = tokio::signal::ctrl_c() => {
                 finish_live_session(&session, job_id, report, pnl.payload())?;
                 report.set_phase("cancelled");
-                render_run_summary(&summary, args.output, args.verbose)?;
+                finish_run(job_id, &summary, "stopped", "cancelled", args.output, args.verbose)?;
                 return Err(ScriptCancelled.into());
             }
             _ = terminate.recv() => {
                 finish_live_session(&session, job_id, report, pnl.payload())?;
                 report.set_phase("cancelled");
-                render_run_summary(&summary, args.output, args.verbose)?;
+                finish_run(job_id, &summary, "stopped", "cancelled", args.output, args.verbose)?;
                 return Err(ScriptCancelled.into());
             }
             _ = heartbeat.tick() => {
@@ -573,7 +636,14 @@ async fn stream_sources(
             _ = &mut duration_elapsed => {
                 finish_live_session(&session, job_id, report, pnl.payload())?;
                 report.set_phase("duration_elapsed");
-                render_run_summary(&summary, args.output, args.verbose)?;
+                finish_run(
+                    job_id,
+                    &summary,
+                    "completed",
+                    "duration_elapsed",
+                    args.output,
+                    args.verbose,
+                )?;
                 return Ok(());
             }
             _ = execution_events.tick() => {
@@ -594,7 +664,14 @@ async fn stream_sources(
                 summary.hook_failures += 1;
                 if session.is_cancelled() {
                     report.set_phase("cancelled");
-                    render_run_summary(&summary, args.output, args.verbose)?;
+                    finish_run(
+                        job_id,
+                        &summary,
+                        "stopped",
+                        "cancelled",
+                        args.output,
+                        args.verbose,
+                    )?;
                     return Err(ScriptCancelled.into());
                 }
                 return Err(err);
@@ -1923,17 +2000,31 @@ impl ScriptRunSummary {
     }
 }
 
-fn render_run_summary(
+fn finish_run(
+    job_id: &str,
     summary: &ScriptRunSummary,
+    status: &'static str,
+    reason: &'static str,
     output: OutputFormat,
     verbose: bool,
 ) -> Result<()> {
+    crate::runtime::append_script_output(
+        job_id,
+        &json!({
+            "type": format!("script.run.{status}"),
+            "version": "1",
+            "ts_ms": now_ms(),
+            "status": status,
+            "reason": reason,
+            "summary": summary,
+        }),
+    )?;
     match output {
         OutputFormat::Terminal => {
             println!();
             println!("script run summary");
             println!("------------------");
-            println!("status: cancelled");
+            println!("status: {status}");
             println!("updates: {}", summary.updates);
             println!("outputs: {}", summary.outputs);
             println!("hook failures: {}", summary.hook_failures);
@@ -1948,7 +2039,8 @@ fn render_run_summary(
             let value = json!({
                 "type": "script.run.summary",
                 "version": "1",
-                "status": "cancelled",
+                "status": status,
+                "reason": reason,
                 "summary": summary
             });
             if matches!(output, OutputFormat::Json) {

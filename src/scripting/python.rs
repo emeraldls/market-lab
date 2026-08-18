@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -7,6 +8,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -402,11 +405,13 @@ impl PythonProcess {
         mode: &str,
         limits: PythonProcessLimits,
     ) -> Result<Self> {
+        let matplotlib_config = matplotlib_config_directory()?;
         let mut command = Command::new(&runtime.interpreter);
         command
             .args(["-u", "-c", PYTHON_RUNNER])
             .arg(path)
             .arg(mode)
+            .env("MPLCONFIGDIR", matplotlib_config)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -553,6 +558,25 @@ impl PythonProcess {
             let _ = handle.join();
         }
     }
+}
+
+fn matplotlib_config_directory() -> Result<PathBuf> {
+    let market_lab_home = env::var_os("MLAB_HOME").map_or_else(
+        || {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".market-lab"))
+                .context("HOME or MLAB_HOME is required to configure the Python runtime cache")
+        },
+        |home| Ok(PathBuf::from(home)),
+    )?;
+    let directory = market_lab_home.join("cache").join("matplotlib");
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("failed to create {}", directory.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to secure {}", directory.display()))?;
+    Ok(directory)
 }
 
 impl Drop for PythonProcess {
@@ -1314,6 +1338,38 @@ mod tests {
             .expect("limited Python process should start");
         assert_eq!(ready["type"], "ready");
         process
+    }
+
+    #[test]
+    fn python_process_uses_writable_marketlab_matplotlib_cache() {
+        let path = write_python_script(
+            r#"
+import os
+
+script = {"name": "python-matplotlib-cache", "version": "2"}
+
+def on_data(ctx):
+    return {"metrics": {"mplconfigdir": os.environ["MPLCONFIGDIR"]}}
+"#,
+            "matplotlib-cache",
+        );
+        if !python_available(&path) {
+            let _ = fs::remove_file(path);
+            return;
+        }
+
+        let expected = matplotlib_config_directory().expect("Matplotlib cache directory");
+        let script = Script::load(&path).expect("load Python script");
+        let session = script.start_session(&json!({})).expect("start session");
+        let execution = session
+            .run_event(candle_event(1_000, 100.0))
+            .expect("run Python event");
+        assert_eq!(
+            execution.output.metrics["mplconfigdir"],
+            expected.display().to_string()
+        );
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]

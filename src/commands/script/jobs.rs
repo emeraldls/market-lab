@@ -235,6 +235,89 @@ struct TerminalOrder {
 
 fn format_terminal_log(value: &serde_json::Value, state: &mut TerminalLogState) -> Option<String> {
     let record_type = value.get("type")?.as_str()?;
+    if record_type == "script.run.initializing" {
+        let script = value
+            .get("script")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("script");
+        let python = value.get("python").filter(|value| !value.is_null());
+        let runtime = python.map_or_else(
+            || {
+                value
+                    .get("language")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown runtime")
+                    .to_string()
+            },
+            |python| {
+                let version = python
+                    .get("version")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let managed = python
+                    .get("managedFingerprint")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|fingerprint| {
+                        let short = fingerprint.get(..12).unwrap_or(fingerprint);
+                        let packages = python
+                            .get("packageCount")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or_default();
+                        format!(", managed {short}, {packages} packages")
+                    })
+                    .unwrap_or_default();
+                format!("Python {version}{managed}")
+            },
+        );
+        return Some(format!(
+            "[{}] initializing {script} ({runtime})",
+            log_time(value.get("ts_ms").and_then(serde_json::Value::as_u64)),
+        ));
+    }
+    if record_type == "script.run.started" {
+        let providers = string_list(value.get("providers"));
+        let exchanges = string_list(value.get("exchanges"));
+        let symbols = string_list(value.get("symbols"));
+        return Some(format!(
+            "[{}] script running; market data connected providers={} exchanges={} symbols={}",
+            log_time(value.get("ts_ms").and_then(serde_json::Value::as_u64)),
+            if providers.is_empty() {
+                "-"
+            } else {
+                &providers
+            },
+            if exchanges.is_empty() {
+                "-"
+            } else {
+                &exchanges
+            },
+            if symbols.is_empty() { "-" } else { &symbols },
+        ));
+    }
+    if matches!(record_type, "script.run.stopped" | "script.run.completed") {
+        let summary = value.get("summary").unwrap_or(&serde_json::Value::Null);
+        let updates = summary
+            .get("updates")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        let outputs = summary
+            .get("outputs")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        let failures = summary
+            .get("hook_failures")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        let status = if record_type == "script.run.completed" {
+            "completed"
+        } else {
+            "stopped"
+        };
+        return Some(format!(
+            "[{}] script {status} updates={updates} outputs={outputs} hook_failures={failures}",
+            log_time(value.get("ts_ms").and_then(serde_json::Value::as_u64)),
+        ));
+    }
     if record_type == "script.execution.error" {
         let error = value
             .get("error")
@@ -538,6 +621,19 @@ fn number(value: f64) -> String {
         .to_string()
 }
 
+fn string_list(value: Option<&serde_json::Value>) -> String {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default()
+}
+
 fn status_name(status: ScriptJobStatus) -> &'static str {
     match status {
         ScriptJobStatus::Starting => "starting",
@@ -590,6 +686,50 @@ mod tests {
             "ts_ms": 1_780_000_000_000_u64,
             "event": event,
         })
+    }
+
+    #[test]
+    fn terminal_logs_render_script_lifecycle() {
+        let mut state = TerminalLogState::default();
+        let initializing = serde_json::json!({
+            "type": "script.run.initializing",
+            "ts_ms": 1_780_000_000_000_u64,
+            "script": "python-strategy",
+            "language": "python_v2",
+            "python": {
+                "version": "3.11.2",
+                "managedFingerprint": "394af2a3f753ffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "packageCount": 80
+            }
+        });
+        let line = format_terminal_log(&initializing, &mut state).expect("initializing line");
+        assert!(line.contains("initializing python-strategy"));
+        assert!(line.contains("Python 3.11.2, managed 394af2a3f753, 80 packages"));
+
+        let started = serde_json::json!({
+            "type": "script.run.started",
+            "ts_ms": 1_780_000_000_001_u64,
+            "providers": ["mmt"],
+            "exchanges": ["binancef", "bybitf"],
+            "symbols": ["btc", "eth"]
+        });
+        let line = format_terminal_log(&started, &mut state).expect("started line");
+        assert!(line.contains("script running; market data connected"));
+        assert!(line.contains("providers=mmt"));
+        assert!(line.contains("exchanges=binancef,bybitf"));
+        assert!(line.contains("symbols=btc,eth"));
+
+        let stopped = serde_json::json!({
+            "type": "script.run.stopped",
+            "ts_ms": 1_780_000_000_002_u64,
+            "summary": {
+                "updates": 1663,
+                "outputs": 0,
+                "hook_failures": 0
+            }
+        });
+        let line = format_terminal_log(&stopped, &mut state).expect("stopped line");
+        assert!(line.contains("script stopped updates=1663 outputs=0 hook_failures=0"));
     }
 
     #[test]
