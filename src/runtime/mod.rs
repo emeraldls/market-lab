@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,6 +25,7 @@ use crate::providers::bulk::ws::BulkAccountStream;
 use crate::providers::hyperliquid::HyperliquidNetwork;
 use crate::providers::hyperliquid::exchange::UserOutcomeAction;
 use crate::providers::hyperliquid::ws::HyperliquidAccountStream;
+use crate::scripting::environment::PythonEnvironmentSnapshot;
 use crate::scripting::execution::{
     ScriptCancelRequest, ScriptManagedRequest, ScriptOrderRef, ScriptRawOrderRequest,
     ScriptTradeRequest, local_order_id,
@@ -39,7 +40,7 @@ use crate::strategies::jobs::{
 };
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-const RUNTIME_VERSION: u8 = 37;
+const RUNTIME_VERSION: u8 = 38;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -1043,6 +1044,7 @@ fn docker_create_args(config: &DaemonConfig, home: &Path, uid: u32, gid: u32) ->
         format!("io.marketlab.version={}", env!("CARGO_PKG_VERSION")),
         "--restart".to_string(),
         "unless-stopped".to_string(),
+        "--init".to_string(),
         "--stop-timeout".to_string(),
         "60".to_string(),
         "--read-only".to_string(),
@@ -1254,6 +1256,207 @@ pub async fn submit_script_job(submission: ScriptJobSubmission) -> Result<Script
     response
         .job
         .context("mlabd omitted the submitted script job")
+}
+
+#[derive(Clone, Debug)]
+pub struct PythonRuntimePreparation {
+    pub runtime: PythonRuntime,
+    pub managed: bool,
+    pub reused: bool,
+}
+
+pub async fn prepare_python_runtime(runtime: &PythonRuntime) -> Result<PythonRuntimePreparation> {
+    let config = daemon::load()?;
+    if config.backend == DaemonBackend::Native {
+        return Ok(PythonRuntimePreparation {
+            runtime: runtime.clone(),
+            managed: false,
+            reused: true,
+        });
+    }
+
+    ensure_docker_running(&config).await?;
+    let snapshot = PythonEnvironmentSnapshot::capture(runtime)
+        .context("failed to capture the selected Python environment for Docker deployment")?;
+    prepare_docker_python_runtime(&config, runtime, &snapshot).await
+}
+
+async fn prepare_docker_python_runtime(
+    config: &DaemonConfig,
+    source_runtime: &PythonRuntime,
+    snapshot: &PythonEnvironmentSnapshot,
+) -> Result<PythonRuntimePreparation> {
+    const CONTAINER_HOME: &str = "/home/marketlab/.market-lab";
+    let runtimes = daemon::market_lab_home()?.join("python-runtimes");
+    secure_managed_directory(&runtimes)?;
+    let runtime_directory = runtimes.join(&snapshot.managed.fingerprint);
+    let marker = runtime_directory.join("runtime.json");
+    let container_directory = PathBuf::from(CONTAINER_HOME)
+        .join("python-runtimes")
+        .join(&snapshot.managed.fingerprint);
+    let container_interpreter = container_directory.join(".venv/bin/python");
+
+    if marker.is_file() && docker_python_available(config, &container_interpreter).await? {
+        return Ok(PythonRuntimePreparation {
+            runtime: PythonRuntime {
+                interpreter: container_interpreter,
+                version: source_runtime.version.clone(),
+                managed: Some(snapshot.managed.clone()),
+            },
+            managed: true,
+            reused: true,
+        });
+    }
+
+    secure_managed_directory(&runtime_directory)?;
+    let requirements = runtime_directory.join("requirements.lock");
+    write_managed_file(&requirements, snapshot.requirements.as_bytes())?;
+    let venv = runtime_directory.join(".venv");
+    if venv.exists() {
+        fs::remove_dir_all(&venv)
+            .with_context(|| format!("failed to replace incomplete runtime {}", venv.display()))?;
+    }
+
+    let container_venv = container_directory.join(".venv");
+    run_docker_uv(
+        config,
+        &[
+            "venv".to_string(),
+            "--python".to_string(),
+            snapshot.python_request.clone(),
+            container_path(&container_venv)?,
+        ],
+        "create the isolated Python environment",
+        &runtime_directory,
+    )
+    .await?;
+
+    let container_requirements = container_directory.join("requirements.lock");
+    if snapshot.managed.package_count > 0 {
+        run_docker_uv(
+            config,
+            &[
+                "pip".to_string(),
+                "install".to_string(),
+                "--python".to_string(),
+                container_path(&container_interpreter)?,
+                "--requirements".to_string(),
+                container_path(&container_requirements)?,
+            ],
+            "install the selected Python dependencies",
+            &runtime_directory,
+        )
+        .await?;
+    }
+
+    let marker_value = serde_json::json!({
+        "version": 1,
+        "fingerprint": snapshot.managed.fingerprint,
+        "sourcePython": source_runtime.version,
+        "pythonRequest": snapshot.python_request,
+        "packageCount": snapshot.managed.package_count,
+        "interpreter": container_interpreter,
+    });
+    let encoded = serde_json::to_vec_pretty(&marker_value)
+        .context("failed to encode the managed Python runtime marker")?;
+    write_managed_file(&marker, &encoded)?;
+
+    Ok(PythonRuntimePreparation {
+        runtime: PythonRuntime {
+            interpreter: container_interpreter,
+            version: source_runtime.version.clone(),
+            managed: Some(snapshot.managed.clone()),
+        },
+        managed: true,
+        reused: false,
+    })
+}
+
+async fn docker_python_available(config: &DaemonConfig, interpreter: &Path) -> Result<bool> {
+    let interpreter = container_path(interpreter)?;
+    let status = tokio::process::Command::new("docker")
+        .args([
+            "exec",
+            &config.docker.container,
+            &interpreter,
+            "-c",
+            "import sys; assert sys.version_info >= (3, 9)",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .context("failed to validate the cached Docker Python runtime")?;
+    Ok(status.success())
+}
+
+fn secure_managed_directory(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to secure {}", path.display()))
+}
+
+fn write_managed_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temporary = path.with_extension("tmp");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)
+        .with_context(|| format!("failed to create {}", temporary.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", temporary.display()))?;
+    fs::rename(&temporary, path)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to secure {}", path.display()))
+}
+
+fn container_path(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(str::to_string)
+        .with_context(|| format!("container path {} is not valid UTF-8", path.display()))
+}
+
+async fn run_docker_uv(
+    config: &DaemonConfig,
+    uv_args: &[String],
+    action: &str,
+    runtime_directory: &Path,
+) -> Result<()> {
+    let mut args = vec![
+        "exec".to_string(),
+        "--env".to_string(),
+        "UV_CACHE_DIR=/home/marketlab/.market-lab/cache/uv".to_string(),
+        "--env".to_string(),
+        "UV_PYTHON_INSTALL_DIR=/home/marketlab/.market-lab/python".to_string(),
+        config.docker.container.clone(),
+        "/usr/local/bin/uv".to_string(),
+    ];
+    args.extend_from_slice(uv_args);
+    let output = tokio::process::Command::new("docker")
+        .args(&args)
+        .output()
+        .await
+        .with_context(|| format!("failed to ask Docker to {action}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() { stderr } else { stdout };
+    bail!(
+        "uv could not {action}{}; dependency snapshot: {}",
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        },
+        runtime_directory.join("requirements.lock").display()
+    )
 }
 
 pub async fn submit_strategy_job(submission: StrategyJobSubmission) -> Result<StrategyJob> {
@@ -1956,12 +2159,15 @@ fn create_script_job(
     if submission.language == ScriptLanguage::PythonV2
         && std::env::var_os("MLAB_DAEMON_TCP_ADDR").is_some()
     {
-        let interpreter = std::env::var_os("MLAB_PYTHON")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/usr/bin/python3"));
-        submission.python_runtime = Some(PythonRuntime::inspect(interpreter).context(
-            "Docker mlabd could not resolve its Python runtime; use a daemon image containing Python 3.9 or newer",
-        )?);
+        let requested = submission
+            .python_runtime
+            .as_ref()
+            .context("Docker Python jobs require a managed strategy runtime")?;
+        validate_managed_python_runtime(requested)?;
+        let mut inspected = PythonRuntime::inspect(requested.interpreter.clone())
+            .context("Docker mlabd could not start the strategy's managed Python runtime")?;
+        inspected.managed.clone_from(&requested.managed);
+        submission.python_runtime = Some(inspected);
     }
     submission.validate()?;
     if let Some(venue) = submission.venue {
@@ -2037,6 +2243,32 @@ fn create_script_job(
         .get(&job_id)
         .cloned()
         .context("script job disappeared after creation")
+}
+
+fn validate_managed_python_runtime(runtime: &PythonRuntime) -> Result<()> {
+    let managed = runtime
+        .managed
+        .as_ref()
+        .context("Docker Python jobs require a managed runtime fingerprint")?;
+    if managed.fingerprint.len() != 64
+        || !managed
+            .fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("Docker Python runtime fingerprint is invalid");
+    }
+    let expected = PathBuf::from("/home/marketlab/.market-lab/python-runtimes")
+        .join(&managed.fingerprint)
+        .join(".venv/bin/python");
+    if runtime.interpreter != expected {
+        bail!(
+            "Docker Python runtime interpreter must be {}; received {}",
+            expected.display(),
+            runtime.interpreter.display()
+        );
+    }
+    Ok(())
 }
 
 fn new_script_job_id(state: &RuntimeState) -> Result<String> {
@@ -5998,12 +6230,33 @@ mod tests {
         assert!(command.contains("--read-only"));
         assert!(command.contains("--cap-drop ALL"));
         assert!(command.contains("--security-opt no-new-privileges:true"));
-        assert!(!command.contains("--init"));
+        assert!(command.contains("--init"));
         assert!(
             command.contains("type=bind,source=/tmp/market lab,target=/home/marketlab/.market-lab")
         );
         assert!(command.contains("ghcr.io/emeraldls/market-lab-daemon:v1.2.3 serve"));
         assert!(!command.contains("docker.sock"));
+    }
+
+    #[test]
+    fn docker_python_runtime_is_confined_to_its_fingerprint_directory() {
+        let fingerprint = "a".repeat(64);
+        let runtime = PythonRuntime {
+            interpreter: PathBuf::from("/home/marketlab/.market-lab/python-runtimes")
+                .join(&fingerprint)
+                .join(".venv/bin/python"),
+            version: "3.12.8".to_string(),
+            managed: Some(crate::scripting::language::ManagedPythonRuntime {
+                fingerprint,
+                package_count: 2,
+            }),
+        };
+        validate_managed_python_runtime(&runtime).unwrap();
+
+        let mut escaped = runtime;
+        escaped.interpreter = PathBuf::from("/usr/bin/python3");
+        let error = validate_managed_python_runtime(&escaped).unwrap_err();
+        assert!(format!("{error:#}").contains("must be"));
     }
 
     #[test]
@@ -6083,8 +6336,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_protocol_v37_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 37);
+    fn runtime_protocol_v38_decodes_oiwap_submissions() {
+        assert_eq!(RUNTIME_VERSION, 38);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",

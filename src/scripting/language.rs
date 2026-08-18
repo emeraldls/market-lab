@@ -49,9 +49,18 @@ impl ScriptLanguage {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ManagedPythonRuntime {
+    pub fingerprint: String,
+    pub package_count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PythonRuntime {
     pub interpreter: PathBuf,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<ManagedPythonRuntime>,
 }
 
 impl PythonRuntime {
@@ -110,6 +119,7 @@ impl PythonRuntime {
         Ok(Self {
             interpreter,
             version,
+            managed: None,
         })
     }
 }

@@ -9,25 +9,22 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --locked --release --bin mlabd && \
     cp /src/target/release/mlabd /tmp/mlabd
 
-FROM debian:bookworm-slim
+FROM gcr.io/distroless/python3-debian12:nonroot
 
 LABEL org.opencontainers.image.source="https://github.com/emeraldls/market-lab"
 LABEL org.opencontainers.image.description="Isolated Market Lab daemon runtime"
 
-RUN apt-get update && \
-    apt-get install --yes --no-install-recommends ca-certificates python3 python3-venv tini && \
-    rm -rf /var/lib/apt/lists/* && \
-    groupadd --gid 10001 marketlab && \
-    useradd --uid 10001 --gid marketlab --create-home --shell /usr/sbin/nologin marketlab
-
 COPY --from=builder /tmp/mlabd /usr/local/bin/mlabd
+COPY --from=ghcr.io/astral-sh/uv:0.12.1 /uv /uvx /usr/local/bin/
 
-USER marketlab:marketlab
+USER nonroot:nonroot
 WORKDIR /home/marketlab
 ENV HOME=/home/marketlab
+ENV UV_CACHE_DIR=/home/marketlab/.market-lab/cache/uv
+ENV UV_PYTHON_INSTALL_DIR=/home/marketlab/.market-lab/python
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
     CMD ["/usr/local/bin/mlabd", "healthcheck"]
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/mlabd"]
+ENTRYPOINT ["/usr/local/bin/mlabd"]
 CMD ["serve"]

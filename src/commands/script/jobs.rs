@@ -120,6 +120,23 @@ fn render_job(job: &ScriptJob, output: OutputFormat) -> Result<()> {
                     .map_or_else(|| "-".to_string(), |pid| pid.to_string())
             );
             println!("  script:           {}", job.definition.script_name);
+            if let Some(runtime) = &job.definition.python_runtime {
+                println!("  python:           {}", runtime.version);
+                match &runtime.managed {
+                    Some(managed) => println!(
+                        "  runtime:          managed {} ({} packages)",
+                        managed
+                            .fingerprint
+                            .get(..12)
+                            .unwrap_or(&managed.fingerprint),
+                        managed.package_count
+                    ),
+                    None => println!(
+                        "  runtime:          local {}",
+                        runtime.interpreter.display()
+                    ),
+                }
+            }
             println!(
                 "  snapshot:         {}",
                 job.definition.snapshot_path.display()

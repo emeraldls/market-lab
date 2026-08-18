@@ -213,6 +213,7 @@ mod tests {
             python_runtime: Some(PythonRuntime {
                 interpreter: PathBuf::from("/usr/bin/python3"),
                 version: "3.12.0".to_string(),
+                managed: None,
             }),
             providers: vec!["bulkf".to_string()],
             exchanges: vec!["bulkf".to_string()],

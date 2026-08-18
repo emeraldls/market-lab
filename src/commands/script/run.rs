@@ -261,13 +261,44 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
         .split(',')
         .map(str::to_string)
         .collect();
+    let python_runtime = match script.python_runtime() {
+        Some(runtime) => {
+            let docker = crate::daemon::load()?.backend == crate::daemon::DaemonBackend::Docker;
+            if docker && matches!(args.output, OutputFormat::Terminal) {
+                eprintln!(
+                    "preparing isolated Python runtime from {}",
+                    runtime.interpreter.display()
+                );
+            }
+            let preparation = crate::runtime::prepare_python_runtime(runtime).await?;
+            if preparation.managed && matches!(args.output, OutputFormat::Terminal) {
+                let managed = preparation
+                    .runtime
+                    .managed
+                    .as_ref()
+                    .context("managed Python runtime omitted its fingerprint")?;
+                eprintln!(
+                    "Python runtime {} {} ({} packages)",
+                    &managed.fingerprint[..12],
+                    if preparation.reused {
+                        "reused"
+                    } else {
+                        "created"
+                    },
+                    managed.package_count
+                );
+            }
+            Some(preparation.runtime)
+        }
+        None => None,
+    };
 
     let submission = ScriptJobSubmission {
         script_name: script.manifest.name.clone(),
         original_path: script.path.display().to_string(),
         source: script.source().to_string(),
         language: script.language,
-        python_runtime: script.python_runtime().cloned(),
+        python_runtime,
         providers,
         exchanges,
         sources: args.source,
