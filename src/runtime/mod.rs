@@ -722,11 +722,15 @@ async fn ensure_docker_running(config: &DaemonConfig) -> Result<RuntimeStatus> {
         if status.version == RUNTIME_VERSION {
             return Ok(status);
         }
-        bail!(
+        return refresh_official_docker_runtime(
+            config,
+            format!(
             "Docker mlabd runtime version {} does not match CLI runtime version {}; run `mlab daemon backend docker` to replace it",
             status.version,
             RUNTIME_VERSION
-        );
+            ),
+        )
+        .await;
     }
     ensure_docker_available().await?;
     if !docker_container_exists(&config.docker.container).await? {
@@ -743,9 +747,45 @@ async fn ensure_docker_running(config: &DaemonConfig) -> Result<RuntimeStatus> {
         }
     }
     run_docker(&["start", &config.docker.container]).await?;
+    match wait_for_runtime().await {
+        Ok(status) => Ok(status),
+        Err(error) => {
+            refresh_official_docker_runtime(
+                config,
+                format!(
+                    "Docker mlabd did not become ready; inspect `docker logs {}`: {error:#}",
+                    config.docker.container
+                ),
+            )
+            .await
+        }
+    }
+}
+
+async fn refresh_official_docker_runtime(
+    config: &DaemonConfig,
+    initial_error: String,
+) -> Result<RuntimeStatus> {
+    if config.docker.image != daemon::docker_image_for_version(env!("CARGO_PKG_VERSION")) {
+        bail!("{initial_error}");
+    }
+    if let Some(status) = try_status().await?
+        && runtime_has_active_work(&status)
+    {
+        bail!(
+            "{initial_error}; cannot replace the Docker daemon while jobs or managed orders are active"
+        );
+    }
+    ensure_docker_available().await?;
+    pull_docker_image(&config.docker.image)
+        .await
+        .with_context(|| format!("{initial_error}; failed to refresh the official Docker image"))?;
+    replace_docker_container(config).await.with_context(|| {
+        format!("{initial_error}; failed to recreate the Docker daemon from the refreshed image")
+    })?;
     wait_for_runtime().await.with_context(|| {
         format!(
-            "Docker mlabd did not become ready; inspect `docker logs {}`",
+            "the refreshed Docker mlabd did not become ready; inspect `docker logs {}`",
             config.docker.container
         )
     })
@@ -757,6 +797,11 @@ async fn wait_for_runtime() -> Result<RuntimeStatus> {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         match try_status().await {
             Ok(Some(status)) if status.version == RUNTIME_VERSION => return Ok(status),
+            Ok(Some(status)) => bail!(
+                "Docker mlabd runtime version {} does not match CLI runtime version {}",
+                status.version,
+                RUNTIME_VERSION
+            ),
             Ok(_) => {}
             Err(error) => last_error = Some(format!("{error:#}")),
         }
@@ -988,6 +1033,11 @@ async fn ensure_docker_image_available(image: &str) -> Result<()> {
     if local.success() {
         return Ok(());
     }
+    pull_docker_image(image).await
+}
+
+async fn pull_docker_image(image: &str) -> Result<()> {
+    validate_docker_image_reference(image)?;
     let status = tokio::process::Command::new("docker")
         .args(["pull", image])
         .status()
