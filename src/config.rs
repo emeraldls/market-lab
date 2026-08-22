@@ -317,7 +317,16 @@ fn config_command(args: &[OsString]) -> Option<ConfigCommand<'_>> {
 
 fn has_script_positional(args: &[OsString], start: usize) -> bool {
     let value_flags = [
-        "--config", "--venue", "--from", "--to", "--source", "--param", "--output",
+        "--config",
+        "--python",
+        "--venue",
+        "--from",
+        "--to",
+        "--source",
+        "--param",
+        "--duration",
+        "--output",
+        "--remote",
     ];
     let mut skip_value = false;
     for arg in &args[start..] {
@@ -350,6 +359,7 @@ fn has_trade_symbol(args: &[OsString], start: usize) -> bool {
         "--sl",
         "--tp",
         "--output",
+        "--remote",
     ];
     let mut skip_value = false;
     for arg in &args[start..] {
@@ -669,5 +679,20 @@ format = "json"
             }
             _ => panic!("expected trade long"),
         }
+    }
+
+    #[test]
+    fn remote_selector_is_not_mistaken_for_a_script_or_trade_symbol() {
+        let script_args = ["mlab", "script", "run", "--remote", "tokyo"]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        assert!(!has_script_positional(&script_args, 3));
+
+        let trade_args = ["mlab", "trade", "long", "--remote", "tokyo"]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        assert!(!has_trade_symbol(&trade_args, 3));
     }
 }
