@@ -15,6 +15,10 @@ use crate::domain::requests::{
 #[command(version, about = "Deterministic market replay CLI", long_about = None)]
 #[command(args_override_self = true)]
 pub struct Cli {
+    /// Execute this command through `user@host` or a saved SSH target. Use
+    /// `local` to bypass the currently active remote.
+    #[arg(long, global = true, value_name = "TARGET")]
+    pub remote: Option<String>,
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -38,6 +42,16 @@ pub enum Commands {
     Daemon {
         #[command(subcommand)]
         command: DaemonCommands,
+    },
+    /// Choose and inspect MarketLab installations reached directly over SSH.
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommands,
+    },
+    #[command(hide = true)]
+    Transport {
+        #[command(subcommand)]
+        command: TransportCommands,
     },
     Inspect(InspectArgs),
     Replay(ReplayArgs),
@@ -86,6 +100,67 @@ pub enum DaemonCommands {
     Events(DaemonEventsArgs),
     /// Show or change where mlabd runs.
     Backend(DaemonBackendArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RemoteCommands {
+    /// Optionally save a short name or custom mlab path for an SSH target.
+    Add(RemoteAddArgs),
+    /// List remembered SSH targets.
+    List(RemoteOutputArgs),
+    /// Select the default `user@host` target, a saved name, or `local`.
+    Use(RemoteUseArgs),
+    /// Show the currently selected target.
+    Status(RemoteOutputArgs),
+    /// Verify SSH, MarketLab, and transport compatibility.
+    Test(RemoteNameArgs),
+    /// Remove a saved SSH target.
+    Remove(RemoteNameArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TransportCommands {
+    #[command(hide = true)]
+    Serve,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct RemoteAddArgs {
+    pub name: String,
+    /// Direct SSH destination, such as `trader@203.0.113.10`.
+    pub ssh: String,
+    /// Remote mlab executable. This must be one shell-safe path or command name.
+    #[arg(long, default_value = "mlab")]
+    pub mlab: String,
+    /// Select this target immediately after saving it.
+    #[arg(long, default_value_t = false)]
+    pub use_now: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct RemoteUseArgs {
+    /// SSH destination such as `trader@203.0.113.10`, a saved name, or `local`.
+    #[arg(value_name = "TARGET")]
+    pub name: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct RemoteNameArgs {
+    /// SSH destination such as `trader@203.0.113.10` or a saved name.
+    #[arg(value_name = "TARGET")]
+    pub name: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct RemoteOutputArgs {
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -2699,6 +2774,49 @@ mod tests {
             }
             _ => panic!("expected markets command"),
         }
+    }
+
+    #[test]
+    fn parses_remote_management_and_global_override() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "remote",
+            "add",
+            "tokyo",
+            "marketlab-tokyo",
+            "--mlab",
+            "/usr/local/bin/mlab",
+            "--use-now",
+            "--output",
+            "json",
+        ])
+        .expect("remote add should parse");
+        match cli.command {
+            Commands::Remote {
+                command: RemoteCommands::Add(args),
+            } => {
+                assert_eq!(args.name, "tokyo");
+                assert_eq!(args.ssh, "marketlab-tokyo");
+                assert_eq!(args.mlab, "/usr/local/bin/mlab");
+                assert!(args.use_now);
+                assert!(matches!(args.output, OutputFormat::Json));
+            }
+            _ => panic!("expected remote add command"),
+        }
+
+        let cli = Cli::try_parse_from(["mlab", "--remote", "tokyo", "bot", "jobs"])
+            .expect("global remote override should parse");
+        assert_eq!(cli.remote.as_deref(), Some("tokyo"));
+        assert!(matches!(
+            cli.command,
+            Commands::Bot {
+                command: BotCommands::Jobs(_)
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["mlab", "--remote", "trader@203.0.113.10", "bot", "jobs"])
+            .expect("direct SSH destination should parse as an override");
+        assert_eq!(cli.remote.as_deref(), Some("trader@203.0.113.10"));
     }
 
     #[test]

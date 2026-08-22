@@ -9,6 +9,7 @@ pub mod domain;
 pub mod functions;
 pub mod markets;
 pub mod providers;
+pub mod remote;
 pub mod runtime;
 pub mod scripting;
 pub mod strategies;

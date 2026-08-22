@@ -4,8 +4,8 @@ use mimalloc::MiMalloc;
 
 use market_lab::cli::{
     AuthCommands, BotCommands, BotRunCommands, Cli, Commands, DaemonCommands, OutcomeCommands,
-    ScriptCommands, ScriptRunHistoryCommands, SourceCommands, StrategyCommands,
-    StrategyRunCommands, StudyCommands, TradeCommands,
+    RemoteCommands, ScriptCommands, ScriptRunHistoryCommands, SourceCommands, StrategyCommands,
+    StrategyRunCommands, StudyCommands, TradeCommands, TransportCommands,
 };
 use market_lab::commands;
 use market_lab::config;
@@ -17,7 +17,23 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = config::expand_args(std::env::args_os())?;
+    let raw_args = std::env::args_os().collect::<Vec<_>>();
+    let args = if market_lab::remote::is_transport_child() {
+        raw_args
+    } else {
+        config::expand_args(raw_args)?
+    };
+    let args = match market_lab::remote::route_invocation(args)? {
+        market_lab::remote::InvocationRoute::Local(args) => args,
+        market_lab::remote::InvocationRoute::Remote {
+            name,
+            profile,
+            args,
+        } => {
+            let code = market_lab::remote::execute(&name, &profile, args).await?;
+            std::process::exit(code);
+        }
+    };
     let cli = Cli::parse_from(args);
 
     match cli.command {
@@ -49,6 +65,17 @@ async fn main() -> Result<()> {
             DaemonCommands::Stop(args) => commands::runtime::handle_stop(args).await?,
             DaemonCommands::Events(args) => commands::runtime::handle_events(args)?,
             DaemonCommands::Backend(args) => commands::runtime::handle_backend(args).await?,
+        },
+        Commands::Remote { command } => match command {
+            RemoteCommands::Add(args) => commands::remote::handle_add(args).await?,
+            RemoteCommands::List(args) => commands::remote::handle_list(args)?,
+            RemoteCommands::Use(args) => commands::remote::handle_use(args)?,
+            RemoteCommands::Status(args) => commands::remote::handle_status(args)?,
+            RemoteCommands::Test(args) => commands::remote::handle_test(args).await?,
+            RemoteCommands::Remove(args) => commands::remote::handle_remove(args)?,
+        },
+        Commands::Transport { command } => match command {
+            TransportCommands::Serve => market_lab::remote::serve().await?,
         },
         Commands::Inspect(args) => commands::market::inspect::handle(args).await?,
         Commands::Replay(args) => commands::market::replay::handle(args).await?,
