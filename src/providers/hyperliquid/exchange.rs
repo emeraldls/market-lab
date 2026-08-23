@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::HyperliquidNetwork;
+use super::client::HyperliquidClient;
 use super::signing::{HyperliquidWallet, WireSignature};
 use super::ws::HyperliquidTradingClient;
 
@@ -19,6 +20,7 @@ pub struct HyperliquidExchangeClient {
     trading: HyperliquidTradingClient,
     wallet: HyperliquidWallet,
     network: HyperliquidNetwork,
+    vault_address: Option<String>,
 }
 
 impl HyperliquidExchangeClient {
@@ -27,6 +29,21 @@ impl HyperliquidExchangeClient {
             trading: HyperliquidTradingClient::shared(network),
             wallet,
             network,
+            vault_address: None,
+        })
+    }
+
+    pub fn for_subaccount(
+        wallet: HyperliquidWallet,
+        network: HyperliquidNetwork,
+        vault_address: String,
+    ) -> Result<Self> {
+        let vault_address = super::signing::canonical_address(&vault_address)?;
+        Ok(Self {
+            trading: HyperliquidTradingClient::shared(network),
+            wallet,
+            network,
+            vault_address: Some(vault_address),
         })
     }
 
@@ -90,14 +107,19 @@ impl HyperliquidExchangeClient {
 
     async fn post_l1(&self, action: impl Serialize) -> Result<ExchangeResponseStatus> {
         let nonce = next_nonce()?;
-        let signature = self.wallet.sign_l1_action(&action, nonce, self.network)?;
+        let signature = self.wallet.sign_l1_action_for(
+            &action,
+            nonce,
+            self.network,
+            self.vault_address.as_deref(),
+        )?;
         let response = self
             .trading
             .post_action(&ExchangePayload {
                 action,
                 signature,
                 nonce,
-                vault_address: None,
+                vault_address: self.vault_address.clone(),
             })
             .await?;
         serde_json::from_value(response).context("invalid Hyperliquid WebSocket exchange response")
@@ -230,6 +252,70 @@ pub async fn approve_agent(
     Ok((agent, response))
 }
 
+pub async fn create_subaccount(
+    master: &HyperliquidWallet,
+    network: HyperliquidNetwork,
+    name: &str,
+) -> Result<String> {
+    let nonce = next_nonce()?;
+    let action = Action::CreateSubAccount {
+        name: name.to_string(),
+    };
+    let signature = master.sign_l1_action(&action, nonce, network)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .context("failed to construct Hyperliquid subaccount client")?;
+    let response = post_exchange_http(&client, network, action, signature, nonce).await?;
+    if let Some(error) = response_error(&response) {
+        bail!("Hyperliquid rejected subaccount creation: {error}");
+    }
+
+    for attempt in 0..10 {
+        let subaccounts: Vec<HyperliquidSubaccount> = HyperliquidClient::for_network(network)?
+            .info(&serde_json::json!({
+                "type": "subAccounts",
+                "user": master.address(),
+            }))
+            .await
+            .context("failed to query Hyperliquid subaccounts")?;
+        if let Some(subaccount) = subaccounts.into_iter().find(|account| account.name == name) {
+            return super::signing::canonical_address(&subaccount.sub_account_user)
+                .context("Hyperliquid returned an invalid subaccount address");
+        }
+        if attempt < 9 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+    bail!("Hyperliquid acknowledged subaccount creation but did not expose `{name}`")
+}
+
+pub async fn subaccounts(
+    account: &str,
+    network: HyperliquidNetwork,
+) -> Result<Vec<(String, String)>> {
+    let subaccounts: Vec<HyperliquidSubaccount> = HyperliquidClient::for_network(network)?
+        .info(&serde_json::json!({ "type": "subAccounts", "user": account }))
+        .await
+        .context("failed to query Hyperliquid subaccounts")?;
+    subaccounts
+        .into_iter()
+        .map(|subaccount| {
+            Ok((
+                subaccount.name,
+                super::signing::canonical_address(&subaccount.sub_account_user)?,
+            ))
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HyperliquidSubaccount {
+    name: String,
+    sub_account_user: String,
+}
+
 async fn post_exchange_http(
     client: &reqwest::Client,
     network: HyperliquidNetwork,
@@ -280,6 +366,9 @@ struct ExchangePayload<T> {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Action {
+    CreateSubAccount {
+        name: String,
+    },
     UpdateLeverage {
         asset: u32,
         #[serde(rename = "isCross")]

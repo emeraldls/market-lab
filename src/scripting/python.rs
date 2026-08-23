@@ -1026,13 +1026,36 @@ class Studies:
         return self._call("vamp", book, options)
 
 
+class PositionView:
+    def __init__(self, account):
+        self.account = account
+        self.open = []
+
+
 class Positions:
     def __init__(self):
-        self.open = []
+        self._accounts = {"main": PositionView("main")}
+
+    def __call__(self, account="main"):
+        if not isinstance(account, str) or not account.strip():
+            raise TypeError("ctx.positions account must be a non-empty string")
+        account = account.strip().lower()
+        return self._accounts.setdefault(account, PositionView(account))
 
     def _replace(self, positions):
         positions = positions if isinstance(positions, dict) else {}
-        self.open = copy.deepcopy(positions.get("open", []))
+        accounts = {}
+        for account, value in positions.items():
+            if not isinstance(account, str) or not isinstance(value, dict):
+                continue
+            account = account.strip().lower()
+            if not account:
+                continue
+            view = PositionView(account)
+            view.open = copy.deepcopy(value.get("open", []))
+            accounts[account] = view
+        accounts.setdefault("main", PositionView("main"))
+        self._accounts = accounts
 
 
 class Context:
@@ -1291,10 +1314,12 @@ mod tests {
                 }
             },
             "positions": {
-                "open": [{
-                    "symbol": "BTC",
-                    "side": "long"
-                }]
+                "main": {
+                    "open": [{
+                        "symbol": "BTC",
+                        "side": "long"
+                    }]
+                }
             },
             "data": {
                 "candle": {
@@ -1412,7 +1437,8 @@ def on_data(ctx, history):
         "exchange": ctx.exchange,
         "symbol": ctx.symbol,
         "source_exchange": ctx.source_configs[ctx.source]["exchange"],
-        "position_symbol": ctx.positions.open[0]["symbol"],
+        "position_symbol": ctx.positions().open[0]["symbol"],
+        "named_positions": len(ctx.positions("trading-2").open),
         "pnl_history": ctx.pnl(),
         "latest_pnl": ctx.pnl(0),
         "previous_pnl": ctx.pnl(1),
@@ -1480,6 +1506,7 @@ def on_finish(ctx, history):
         assert_eq!(second.output.metrics["symbol"], "BTC");
         assert_eq!(second.output.metrics["source_exchange"], "binancef");
         assert_eq!(second.output.metrics["position_symbol"], "BTC");
+        assert_eq!(second.output.metrics["named_positions"], 0);
         assert_eq!(
             second.output.metrics["pnl_history"],
             json!([
@@ -1565,6 +1592,7 @@ def on_data(ctx):
     explicit = ctx.trade({
         "key": "semantic-entry",
         "exchange": "hyperliquidf",
+        "account": "trading-2",
         "symbol": "ETH",
         "position": "open-long",
         "margin": 100,
@@ -1615,6 +1643,11 @@ def on_data(ctx):
         assert_ne!(second_key, cancel_key);
         assert_eq!(execution.output.metrics["explicit_key"], "semantic-entry");
         assert_eq!(execution.commands.len(), 4);
+        assert!(matches!(
+            &execution.commands[2],
+            crate::scripting::execution::ScriptExecutionCommand::Trade { request, .. }
+                if request.account == "trading-2"
+        ));
 
         let _ = fs::remove_file(path);
     }

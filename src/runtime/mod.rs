@@ -40,7 +40,7 @@ use crate::strategies::jobs::{
 };
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-pub const RUNTIME_VERSION: u8 = 38;
+pub const RUNTIME_VERSION: u8 = 39;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -308,7 +308,7 @@ struct RuntimeResponse {
     #[serde(default)]
     script_events: Option<Vec<ScriptExecutionEvent>>,
     #[serde(default)]
-    script_positions: Option<Vec<Position>>,
+    script_positions: Option<BTreeMap<String, Vec<Position>>>,
     #[serde(default)]
     strategy_job: Option<StrategyJob>,
     #[serde(default)]
@@ -2077,7 +2077,7 @@ pub async fn acknowledge_script_events(job_id: &str, through_seq: u64) -> Result
     Ok(())
 }
 
-pub async fn script_positions(job_id: &str) -> Result<Vec<Position>> {
+pub async fn script_positions(job_id: &str) -> Result<BTreeMap<String, Vec<Position>>> {
     let response = request(RuntimeRequest::ScriptPositions {
         job_id: job_id.to_string(),
     })
@@ -3227,6 +3227,20 @@ async fn execute_script_order(
             )?
         }
     };
+    let account_name = request.account().trim().to_string();
+    if job.definition.language == crate::scripting::language::ScriptLanguage::JavaScriptV1
+        && !account_name.eq_ignore_ascii_case("main")
+    {
+        bail!("named execution accounts are available only in Python Scripting V2");
+    }
+    let account = match crate::providers::execution::ExecutionAdapter::configured_account_for(
+        venue,
+        job.definition.testnet,
+        &account_name,
+    ) {
+        Ok(account) => account,
+        Err(error) => return Err(error),
+    };
     let expected_id = local_order_id(job_id, &key);
     if order.id != expected_id || order.key != key {
         bail!("script order reference does not match its job and idempotency key");
@@ -3245,6 +3259,8 @@ async fn execute_script_order(
         request: request.clone(),
         symbol: internal_symbol.clone(),
         venue,
+        account_name: account_name.clone(),
+        account: account.clone(),
         testnet: job.definition.testnet,
         status: "pending".to_string(),
         venue_order_id: None,
@@ -3276,23 +3292,19 @@ async fn execute_script_order(
         crate::scripting::execution::ScriptTimeInForce::Ioc => crate::cli::TradeTimeInForce::Ioc,
         crate::scripting::execution::ScriptTimeInForce::Alo => crate::cli::TradeTimeInForce::Alo,
     };
-    let account = match crate::providers::execution::ExecutionAdapter::configured_account(venue) {
-        Ok(account) => account,
+    let venue_adapter = match crate::providers::execution::ExecutionAdapter::new_for_account(
+        venue,
+        job.definition.testnet,
+        &account_name,
+    )
+    .await
+    {
+        Ok(adapter) => adapter,
         Err(error) => {
             fail_script_order(paths, state, job_id, &order.id, &error)?;
             return Err(error);
         }
     };
-    let venue_adapter =
-        match crate::providers::execution::ExecutionAdapter::new(venue, job.definition.testnet)
-            .await
-        {
-            Ok(adapter) => adapter,
-            Err(error) => {
-                fail_script_order(paths, state, job_id, &order.id, &error)?;
-                return Err(error);
-            }
-        };
     let venue_arg = match venue {
         ExecutionVenue::Bulk => crate::cli::ExecutionVenueArg::Bulk,
         ExecutionVenue::Hyperliquid => crate::cli::ExecutionVenueArg::Hyperliquid,
@@ -3412,7 +3424,10 @@ async fn execute_script_order(
             request.side.order_direction(),
         ),
     };
-    let plan = match crate::commands::execution::build_automated_trade_plan(&args, direction).await
+    let plan = match crate::commands::execution::build_automated_trade_plan_for_account(
+        &args, direction, &account,
+    )
+    .await
     {
         Ok(plan) => plan,
         Err(error) => {
@@ -3427,7 +3442,16 @@ async fn execute_script_order(
         account_tx,
         account_supervisors,
     );
-    let receipt = match execute_trade(paths, adapter, state, &plan, Some(order.id.clone())).await {
+    let receipt = match execute_trade(
+        paths,
+        adapter,
+        state,
+        &plan,
+        Some(order.id.clone()),
+        Some(&account_name),
+    )
+    .await
+    {
         Ok(receipt) => receipt,
         Err(error) => {
             fail_script_order(paths, state, job_id, &order.id, &error)?;
@@ -3570,32 +3594,33 @@ async fn execute_script_cancel(
         created_at_ms: now_ms()?,
         venue,
         testnet: current.testnet,
-        account: crate::providers::execution::ExecutionAdapter::configured_account(venue)?,
+        account: current.account.clone(),
         internal_symbol: market.symbol.clone(),
         venue_symbol: market.venue_symbol.clone(),
         order_id: venue_order_id,
     };
-    let receipt = match execute_cancel(paths, adapter, state, &plan).await {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            let managed = state
-                .script_orders
-                .get(&order_id)
-                .cloned()
-                .context("script order disappeared after failed cancellation")?;
-            emit_script_event(
-                paths,
-                state,
-                job_id,
-                "order.cancel_failed",
-                Some(&managed),
-                false,
-                serde_json::json!({ "error": format!("{error:#}") }),
-            )?;
-            persist_state(paths, state)?;
-            return Err(error);
-        }
-    };
+    let receipt =
+        match execute_cancel(paths, adapter, state, &plan, Some(&current.account_name)).await {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let managed = state
+                    .script_orders
+                    .get(&order_id)
+                    .cloned()
+                    .context("script order disappeared after failed cancellation")?;
+                emit_script_event(
+                    paths,
+                    state,
+                    job_id,
+                    "order.cancel_failed",
+                    Some(&managed),
+                    false,
+                    serde_json::json!({ "error": format!("{error:#}") }),
+                )?;
+                persist_state(paths, state)?;
+                return Err(error);
+            }
+        };
     let managed = {
         let managed = state
             .script_orders
@@ -3658,7 +3683,7 @@ async fn execute_strategy_trade(
         }
     }
 
-    let receipt = execute_trade(paths, adapter, state, plan, None).await?;
+    let receipt = execute_trade(paths, adapter, state, plan, None, None).await?;
     state
         .strategy_executions
         .insert(execution_key, receipt.clone());
@@ -3796,7 +3821,7 @@ async fn execute_strategy_cancel(
     if let Some(receipt) = state.strategy_cancellations.get(&cancellation_key) {
         return Ok(receipt.clone());
     }
-    let receipt = execute_cancel_with_priority(paths, adapter, state, plan, true).await?;
+    let receipt = execute_cancel_with_priority(paths, adapter, state, plan, true, None).await?;
     state
         .strategy_cancellations
         .insert(cancellation_key, receipt.clone());
@@ -3829,7 +3854,7 @@ async fn execute_bot_trade(
     if let Some(receipt) = state.bot_executions.get(&execution_key) {
         return Ok(receipt.clone());
     }
-    let receipt = execute_trade(paths, adapter, state, plan, None).await?;
+    let receipt = execute_trade(paths, adapter, state, plan, None, None).await?;
     state.bot_executions.insert(execution_key, receipt.clone());
     persist_state(paths, state)?;
     Ok(receipt)
@@ -3998,7 +4023,7 @@ async fn execute_bot_cancel(
     if let Some(receipt) = state.bot_cancellations.get(&cancellation_key) {
         return Ok(receipt.clone());
     }
-    let receipt = execute_cancel_with_priority(paths, adapter, state, plan, true).await?;
+    let receipt = execute_cancel_with_priority(paths, adapter, state, plan, true, None).await?;
     state
         .bot_cancellations
         .insert(cancellation_key, receipt.clone());
@@ -4294,7 +4319,7 @@ async fn handle_connection(
                 account_tx,
                 account_supervisors,
             );
-            match execute_trade(paths, adapter, state, &plan, None).await {
+            match execute_trade(paths, adapter, state, &plan, None, None).await {
                 Ok(receipt) => RuntimeResponse {
                     ok: true,
                     message: "order submitted".to_string(),
@@ -4319,7 +4344,7 @@ async fn handle_connection(
                 account_tx,
                 account_supervisors,
             );
-            match execute_cancel(paths, adapter, state, &plan).await {
+            match execute_cancel(paths, adapter, state, &plan, None).await {
                 Ok(receipt) => RuntimeResponse {
                     ok: true,
                     message: "cancellation submitted".to_string(),
@@ -4889,21 +4914,29 @@ async fn execute_trade(
     state: &mut RuntimeState,
     plan: &TradePlan,
     script_order_id: Option<String>,
+    account_name: Option<&str>,
 ) -> Result<ExecutionReceipt> {
     let receipt = match plan.venue {
         ExecutionVenue::Bulk => {
             adapter
-                .submit_trade(credentials::active_bulk_credential()?, plan)
+                .submit_trade(
+                    credentials::active_bulk_credential_for_account(&plan.account)?,
+                    plan,
+                )
                 .await?
         }
         ExecutionVenue::Hyperliquid
         | ExecutionVenue::HyperliquidSpot
         | ExecutionVenue::HyperliquidXyz
         | ExecutionVenue::HyperliquidOutcomes => {
-            crate::providers::execution::ExecutionAdapter::new(plan.venue, plan.testnet)
-                .await?
-                .submit_trade(plan)
-                .await?
+            crate::providers::execution::ExecutionAdapter::new_for_account(
+                plan.venue,
+                plan.testnet,
+                account_name.unwrap_or("main"),
+            )
+            .await?
+            .submit_trade(plan)
+            .await?
         }
     };
     record_trade_receipt(paths, state, plan, script_order_id, &receipt)?;
@@ -4962,8 +4995,9 @@ async fn execute_cancel(
     adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
     plan: &CancelPlan,
+    account_name: Option<&str>,
 ) -> Result<ExecutionReceipt> {
-    execute_cancel_with_priority(paths, adapter, state, plan, false).await
+    execute_cancel_with_priority(paths, adapter, state, plan, false, account_name).await
 }
 
 async fn execute_cancel_with_priority(
@@ -4972,6 +5006,7 @@ async fn execute_cancel_with_priority(
     state: &mut RuntimeState,
     plan: &CancelPlan,
     fast: bool,
+    account_name: Option<&str>,
 ) -> Result<ExecutionReceipt> {
     let expected_venue_symbol = if plan.venue == ExecutionVenue::HyperliquidOutcomes {
         crate::providers::hyperliquid::outcomes::resolve(
@@ -4997,7 +5032,11 @@ async fn execute_cancel_with_priority(
     if expected_venue_symbol != plan.venue_symbol {
         bail!("cancel plan symbol mapping does not match the installed market snapshot");
     }
-    let configured = crate::providers::execution::ExecutionAdapter::configured_account(plan.venue)?;
+    let configured = crate::providers::execution::ExecutionAdapter::configured_account_for(
+        plan.venue,
+        plan.testnet,
+        account_name.unwrap_or("main"),
+    )?;
     if !configured.eq_ignore_ascii_case(&plan.account) {
         bail!("cancel plan account no longer matches the configured venue account");
     }
@@ -5005,7 +5044,7 @@ async fn execute_cancel_with_priority(
         ExecutionVenue::Bulk => {
             adapter
                 .cancel_order(
-                    credentials::active_bulk_credential()?,
+                    credentials::active_bulk_credential_for_account(&plan.account)?,
                     &plan.venue_symbol,
                     &plan.order_id,
                 )
@@ -5015,9 +5054,12 @@ async fn execute_cancel_with_priority(
         | ExecutionVenue::HyperliquidSpot
         | ExecutionVenue::HyperliquidXyz
         | ExecutionVenue::HyperliquidOutcomes => {
-            let adapter =
-                crate::providers::execution::ExecutionAdapter::new(plan.venue, plan.testnet)
-                    .await?;
+            let adapter = crate::providers::execution::ExecutionAdapter::new_for_account(
+                plan.venue,
+                plan.testnet,
+                account_name.unwrap_or("main"),
+            )
+            .await?;
             if fast {
                 adapter.cancel_order_fast(plan).await?
             } else {
@@ -5359,13 +5401,28 @@ async fn script_positions_in_daemon(
     adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
     job_id: &str,
-) -> Result<Vec<Position>> {
+) -> Result<BTreeMap<String, Vec<Position>>> {
     let job = state
         .script_jobs
         .get(job_id)
         .cloned()
         .with_context(|| format!("script job `{job_id}` was not found"))?;
     let mut venues = job.definition.venue.into_iter().collect::<Vec<_>>();
+    for exchange in &job.definition.exchanges {
+        let venue = match exchange.as_str() {
+            "bulkf" => Some(ExecutionVenue::Bulk),
+            "hyperliquidf" => Some(ExecutionVenue::Hyperliquid),
+            "hyperliquidf-xyz" => Some(ExecutionVenue::HyperliquidXyz),
+            "hyperliquid" => Some(ExecutionVenue::HyperliquidSpot),
+            "hyperliquid-outcomes" => Some(ExecutionVenue::HyperliquidOutcomes),
+            _ => None,
+        };
+        if let Some(venue) = venue
+            && !venues.contains(&venue)
+        {
+            venues.push(venue);
+        }
+    }
     for venue in state
         .script_orders
         .values()
@@ -5377,37 +5434,43 @@ async fn script_positions_in_daemon(
         }
     }
     if venues.is_empty() {
-        return Ok(Vec::new());
+        return Ok(BTreeMap::new());
     }
     let source_symbols = crate::scripting::inputs::parse_source_configs(&job.definition.sources)?
         .values()
         .map(crate::scripting::inputs::SourceConfig::market_symbol)
         .collect::<HashSet<_>>();
-    let mut positions = Vec::new();
+    let mut positions = BTreeMap::<String, Vec<Position>>::new();
     for venue in venues {
-        let account = crate::providers::execution::ExecutionAdapter::configured_account(venue)?;
-        refresh_account_positions(
-            venue,
-            job.definition.testnet,
-            adapter,
-            state,
-            &account,
-            false,
-        )
-        .await?;
-        positions.extend(
-            state
-                .account_positions
-                .get(&account_cache_key(venue, job.definition.testnet, &account))
-                .into_iter()
-                .flatten()
-                .filter(|position| {
-                    source_symbols
-                        .iter()
-                        .any(|symbol| position.internal_symbol.eq_ignore_ascii_case(symbol))
-                })
-                .cloned(),
-        );
+        for (account_name, account) in
+            crate::providers::execution::ExecutionAdapter::configured_accounts(
+                venue,
+                job.definition.testnet,
+            )?
+        {
+            refresh_account_positions(
+                venue,
+                job.definition.testnet,
+                adapter,
+                state,
+                &account,
+                false,
+            )
+            .await?;
+            positions.entry(account_name).or_default().extend(
+                state
+                    .account_positions
+                    .get(&account_cache_key(venue, job.definition.testnet, &account))
+                    .into_iter()
+                    .flatten()
+                    .filter(|position| {
+                        source_symbols
+                            .iter()
+                            .any(|symbol| position.internal_symbol.eq_ignore_ascii_case(symbol))
+                    })
+                    .cloned(),
+            );
+        }
     }
     persist_state(paths, state)?;
     Ok(positions)
@@ -6391,8 +6454,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_protocol_v38_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 38);
+    fn runtime_protocol_v39_decodes_oiwap_submissions() {
+        assert_eq!(RUNTIME_VERSION, 39);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",

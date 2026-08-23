@@ -85,12 +85,30 @@ impl HyperliquidExecutionAdapter {
         .await
     }
 
+    pub async fn new_for_account(
+        product: HyperliquidProduct,
+        network: HyperliquidNetwork,
+        account_name: &str,
+    ) -> Result<Self> {
+        Self::with_credential(
+            credentials::active_hyperliquid_credential_for(network, account_name)?,
+            network,
+            product,
+        )
+        .await
+    }
+
     pub async fn with_credential(
         credential: ActiveHyperliquidCredential,
         network: HyperliquidNetwork,
         product: HyperliquidProduct,
     ) -> Result<Self> {
-        let exchange = HyperliquidExchangeClient::new(credential.agent, network)?;
+        let exchange = match credential.vault_address {
+            Some(vault_address) => {
+                HyperliquidExchangeClient::for_subaccount(credential.agent, network, vault_address)?
+            }
+            None => HyperliquidExchangeClient::new(credential.agent, network)?,
+        };
         Ok(Self {
             exchange,
             account: credential.account,
@@ -100,7 +118,6 @@ impl HyperliquidExecutionAdapter {
     }
 
     pub async fn account_snapshot(&self, account: &str) -> Result<AccountSnapshot> {
-        ensure_account(account, &self.account)?;
         if self.product == HyperliquidProduct::Spot {
             return self.spot_account_snapshot(account).await;
         }
@@ -318,7 +335,6 @@ impl HyperliquidExecutionAdapter {
     }
 
     pub async fn open_orders(&self, account: &str) -> Result<Vec<OpenOrder>> {
-        ensure_account(account, &self.account)?;
         let mut request = serde_json::json!({
             "type": "frontendOpenOrders",
             "user": account
@@ -333,7 +349,6 @@ impl HyperliquidExecutionAdapter {
     }
 
     pub async fn fills(&self, account: &str) -> Result<Vec<Fill>> {
-        ensure_account(account, &self.account)?;
         let raw: Vec<HyperliquidFill> = HyperliquidClient::for_network(self.network)?
             .info(&user_fills_request(account))
             .await?;

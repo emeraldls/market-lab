@@ -639,6 +639,9 @@ pub struct AuthSetArgs {
     /// Replace remote execution credentials after their replacements are confirmed.
     #[arg(long, default_value_t = false)]
     pub reauthorize: bool,
+    /// Create a named execution subaccount under the configured main account.
+    #[arg(long, value_name = "NAME")]
+    pub subaccount: Option<String>,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -3449,7 +3452,8 @@ mod tests {
             Commands::Auth {
                 command: AuthCommands::Set(AuthSetArgs {
                     provider: AuthProvider::Mmt,
-                    reauthorize: false
+                    reauthorize: false,
+                    subaccount: None,
                 })
             }
         ));
@@ -3470,7 +3474,8 @@ mod tests {
             Commands::Auth {
                 command: AuthCommands::Set(AuthSetArgs {
                     provider: AuthProvider::Bulk,
-                    reauthorize: false
+                    reauthorize: false,
+                    subaccount: None,
                 })
             }
         ));
@@ -3483,9 +3488,30 @@ mod tests {
             Commands::Auth {
                 command: AuthCommands::Set(AuthSetArgs {
                     provider: AuthProvider::Bulk,
-                    reauthorize: true
+                    reauthorize: true,
+                    subaccount: None,
                 })
             }
+        ));
+
+        let subaccount = Cli::try_parse_from([
+            "mlab",
+            "auth",
+            "set",
+            "hyperliquid",
+            "--subaccount",
+            "trading-2",
+        ])
+        .expect("named subaccount should parse");
+        assert!(matches!(
+            subaccount.command,
+            Commands::Auth {
+                command: AuthCommands::Set(AuthSetArgs {
+                    provider: AuthProvider::Hyperliquid,
+                    reauthorize: false,
+                    subaccount: Some(name),
+                })
+            } if name == "trading-2"
         ));
     }
 

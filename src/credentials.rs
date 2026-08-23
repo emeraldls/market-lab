@@ -25,9 +25,11 @@ const CREDENTIAL_FILE_MODE: u32 = 0o600;
 const MMT_CREDENTIAL_FILE: &str = "mmt-api-key";
 const BULK_CREDENTIAL_FILE: &str = "bulk-agent.json";
 const HYPERLIQUID_CREDENTIAL_FILE: &str = "hyperliquid-agents.json";
-const BULK_CREDENTIAL_VERSION: u8 = 1;
+const LEGACY_BULK_CREDENTIAL_VERSION: u8 = 1;
+const BULK_CREDENTIAL_VERSION: u8 = 2;
 const LEGACY_HYPERLIQUID_CREDENTIAL_VERSION: u8 = 1;
-const HYPERLIQUID_CREDENTIAL_VERSION: u8 = 2;
+const LEGACY_NETWORKED_HYPERLIQUID_CREDENTIAL_VERSION: u8 = 2;
+const HYPERLIQUID_CREDENTIAL_VERSION: u8 = 3;
 
 static MMT_API_KEY: OnceLock<String> = OnceLock::new();
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -40,6 +42,31 @@ pub struct ActiveBulkCredential {
 pub struct ActiveHyperliquidCredential {
     pub account: String,
     pub agent: HyperliquidWallet,
+    pub vault_address: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct NamedSubaccount {
+    name: String,
+    account: String,
+}
+
+impl NamedSubaccount {
+    fn validate_hyperliquid(&self) -> Result<()> {
+        validate_subaccount_name(&self.name)?;
+        let account = parse_hyperliquid_address(&self.account, "subaccount")?;
+        if account != self.account.to_ascii_lowercase() {
+            bail!("stored Hyperliquid subaccount address is not canonical");
+        }
+        Ok(())
+    }
+
+    fn validate_bulk(&self) -> Result<()> {
+        validate_subaccount_name(&self.name)?;
+        Pubkey::from_base58(&self.account)
+            .context("stored BULK subaccount public key is invalid")?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -92,6 +119,10 @@ struct HyperliquidCredential {
     account: String,
     mainnet_agent: Option<HyperliquidAgentCredential>,
     testnet_agent: Option<HyperliquidAgentCredential>,
+    #[serde(default)]
+    mainnet_subaccounts: Vec<NamedSubaccount>,
+    #[serde(default)]
+    testnet_subaccounts: Vec<NamedSubaccount>,
 }
 
 impl HyperliquidCredential {
@@ -120,6 +151,14 @@ impl HyperliquidCredential {
         {
             bail!("stored Hyperliquid mainnet and testnet agents must have distinct names");
         }
+        validate_named_subaccounts(
+            &self.mainnet_subaccounts,
+            NamedSubaccount::validate_hyperliquid,
+        )?;
+        validate_named_subaccounts(
+            &self.testnet_subaccounts,
+            NamedSubaccount::validate_hyperliquid,
+        )?;
         Ok(())
     }
 
@@ -135,6 +174,13 @@ impl HyperliquidCredential {
         match network {
             HyperliquidNetwork::Mainnet => self.mainnet_agent.as_ref(),
             HyperliquidNetwork::Testnet => self.testnet_agent.as_ref(),
+        }
+    }
+
+    fn subaccounts(&self, network: HyperliquidNetwork) -> &[NamedSubaccount] {
+        match network {
+            HyperliquidNetwork::Mainnet => &self.mainnet_subaccounts,
+            HyperliquidNetwork::Testnet => &self.testnet_subaccounts,
         }
     }
 }
@@ -169,6 +215,8 @@ impl LegacyHyperliquidCredential {
                 address: std::mem::take(&mut self.agent_address),
                 private_key: std::mem::take(&mut self.agent_private_key),
             }),
+            mainnet_subaccounts: Vec::new(),
+            testnet_subaccounts: Vec::new(),
         };
         credential.validate()?;
         Ok(credential)
@@ -220,6 +268,8 @@ struct BulkCredential {
     account: Option<String>,
     agent_public_key: String,
     agent_private_key: String,
+    #[serde(default)]
+    subaccounts: Vec<NamedSubaccount>,
 }
 
 impl BulkCredential {
@@ -231,6 +281,7 @@ impl BulkCredential {
             account: None,
             agent_public_key: agent.pubkey().to_base58(),
             agent_private_key: agent.to_base58(),
+            subaccounts: Vec::new(),
         }
     }
 
@@ -253,6 +304,8 @@ impl BulkCredential {
             bail!("stored active BULK credential is missing its account public key");
         }
 
+        validate_named_subaccounts(&self.subaccounts, NamedSubaccount::validate_bulk)?;
+
         Ok(())
     }
 
@@ -269,18 +322,47 @@ impl Drop for BulkCredential {
 }
 
 pub fn active_bulk_credential() -> Result<ActiveBulkCredential> {
+    active_bulk_credential_for("main")
+}
+
+pub fn active_bulk_credential_for(name: &str) -> Result<ActiveBulkCredential> {
     let credential = load_bulk_credential()?
         .context("BULK credentials are not configured; run `mlab auth set bulk`")?;
     if credential.status != BulkCredentialStatus::Active {
         bail!("BULK agent registration is pending; run `mlab auth set bulk` to finish it");
     }
-    let account = credential
+    let main_account = credential
         .account
         .as_deref()
         .context("stored BULK credential is missing its account public key")?;
+    let account = resolve_named_account(main_account, &credential.subaccounts, name, "BULK")?;
     Ok(ActiveBulkCredential {
-        account: Pubkey::from_base58(account)
+        account: Pubkey::from_base58(&account)
             .context("stored BULK account public key is invalid")?,
+        agent: credential.agent_keypair()?,
+    })
+}
+
+pub fn active_bulk_credential_for_account(account: &str) -> Result<ActiveBulkCredential> {
+    let credential = load_bulk_credential()?
+        .context("BULK credentials are not configured; run `mlab auth set bulk`")?;
+    if credential.status != BulkCredentialStatus::Active {
+        bail!("BULK agent registration is pending; run `mlab auth set bulk` to finish it");
+    }
+    let main = credential
+        .account
+        .as_deref()
+        .context("stored BULK credential is missing its account public key")?;
+    let configured = main == account
+        || credential
+            .subaccounts
+            .iter()
+            .any(|subaccount| subaccount.account == account);
+    if !configured {
+        bail!("BULK account {account} is not configured in MarketLab");
+    }
+    Ok(ActiveBulkCredential {
+        account: Pubkey::from_base58(account).context("BULK account public key is invalid")?,
         agent: credential.agent_keypair()?,
     })
 }
@@ -289,8 +371,36 @@ pub fn bulk_account() -> Result<String> {
     Ok(active_bulk_credential()?.account.to_base58())
 }
 
+pub fn bulk_account_for(name: &str) -> Result<String> {
+    Ok(active_bulk_credential_for(name)?.account.to_base58())
+}
+
+pub fn bulk_accounts() -> Result<Vec<(String, String)>> {
+    let credential = load_bulk_credential()?
+        .context("BULK credentials are not configured; run `mlab auth set bulk`")?;
+    let main = credential
+        .account
+        .clone()
+        .context("stored BULK credential is missing its account public key")?;
+    Ok(std::iter::once(("main".to_string(), main))
+        .chain(
+            credential
+                .subaccounts
+                .iter()
+                .map(|subaccount| (subaccount.name.clone(), subaccount.account.clone())),
+        )
+        .collect())
+}
+
 pub fn active_hyperliquid_credential(
     network: HyperliquidNetwork,
+) -> Result<ActiveHyperliquidCredential> {
+    active_hyperliquid_credential_for(network, "main")
+}
+
+pub fn active_hyperliquid_credential_for(
+    network: HyperliquidNetwork,
+    name: &str,
 ) -> Result<ActiveHyperliquidCredential> {
     let credential = load_hyperliquid_credential()?
         .context("Hyperliquid credentials are not configured; run `mlab auth set hyperliquid`")?;
@@ -300,8 +410,15 @@ pub fn active_hyperliquid_credential(
             network.label()
         )
     })?;
+    let account = resolve_named_account(
+        &credential.account,
+        credential.subaccounts(network),
+        name,
+        "Hyperliquid",
+    )?;
     Ok(ActiveHyperliquidCredential {
-        account: credential.account.clone(),
+        vault_address: (account != credential.account).then(|| account.clone()),
+        account,
         agent: agent.wallet()?,
     })
 }
@@ -312,9 +429,34 @@ pub fn hyperliquid_account() -> Result<String> {
     Ok(credential.account)
 }
 
+pub fn hyperliquid_account_for(network: HyperliquidNetwork, name: &str) -> Result<String> {
+    Ok(active_hyperliquid_credential_for(network, name)?.account)
+}
+
+pub fn hyperliquid_accounts(network: HyperliquidNetwork) -> Result<Vec<(String, String)>> {
+    let credential = load_hyperliquid_credential()?
+        .context("Hyperliquid credentials are not configured; run `mlab auth set hyperliquid`")?;
+    Ok(
+        std::iter::once(("main".to_string(), credential.account.clone()))
+            .chain(
+                credential
+                    .subaccounts(network)
+                    .iter()
+                    .map(|subaccount| (subaccount.name.clone(), subaccount.account.clone())),
+            )
+            .collect(),
+    )
+}
+
 pub async fn handle_set(args: AuthSetArgs) -> Result<()> {
+    if args.reauthorize && args.subaccount.is_some() {
+        bail!("`--reauthorize` and `--subaccount` cannot be used together");
+    }
     match args.provider {
         AuthProvider::Mmt => {
+            if args.subaccount.is_some() {
+                bail!("MMT does not support execution subaccounts");
+            }
             if args.reauthorize {
                 bail!("`--reauthorize` is only supported for execution venues");
             }
@@ -328,8 +470,10 @@ pub async fn handle_set(args: AuthSetArgs) -> Result<()> {
             println!("mmt: configured");
             print_credential_location(MMT_CREDENTIAL_FILE)?;
         }
-        AuthProvider::Bulk => handle_set_bulk(args.reauthorize).await?,
-        AuthProvider::Hyperliquid => handle_set_hyperliquid(args.reauthorize).await?,
+        AuthProvider::Bulk => handle_set_bulk(args.reauthorize, args.subaccount.as_deref()).await?,
+        AuthProvider::Hyperliquid => {
+            handle_set_hyperliquid(args.reauthorize, args.subaccount.as_deref()).await?
+        }
     }
     Ok(())
 }
@@ -362,6 +506,8 @@ fn print_hyperliquid_status() -> Result<()> {
             } else {
                 println!("  testnet agent: not configured");
             }
+            print_subaccounts("mainnet subaccounts", &credential.mainnet_subaccounts);
+            print_subaccounts("testnet subaccounts", &credential.testnet_subaccounts);
         }
         None => println!("hyperliquid: not configured"),
     }
@@ -395,9 +541,206 @@ fn print_bulk_status() -> Result<()> {
                 println!("  account: {account}");
             }
             println!("  agent: {}", credential.agent_public_key);
+            print_subaccounts("subaccounts", &credential.subaccounts);
         }
         None => println!("bulk: not configured"),
     }
+    Ok(())
+}
+
+fn print_subaccounts(label: &str, subaccounts: &[NamedSubaccount]) {
+    if subaccounts.is_empty() {
+        return;
+    }
+    println!("  {label}:");
+    for subaccount in subaccounts {
+        println!("    {}: {}", subaccount.name, subaccount.account);
+    }
+}
+
+fn validate_subaccount_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 32 {
+        bail!("subaccount name must contain 1 to 32 characters");
+    }
+    if name.eq_ignore_ascii_case("main") {
+        bail!("`main` is reserved for the main account");
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("subaccount name may contain only letters, numbers, `-`, and `_`");
+    }
+    Ok(name)
+}
+
+fn validate_named_subaccounts(
+    subaccounts: &[NamedSubaccount],
+    validate: fn(&NamedSubaccount) -> Result<()>,
+) -> Result<()> {
+    let mut names = std::collections::HashSet::new();
+    let mut accounts = std::collections::HashSet::new();
+    for subaccount in subaccounts {
+        validate(subaccount)?;
+        if !names.insert(subaccount.name.to_ascii_lowercase()) {
+            bail!(
+                "stored credential contains duplicate subaccount name `{}`",
+                subaccount.name
+            );
+        }
+        if !accounts.insert(subaccount.account.to_ascii_lowercase()) {
+            bail!(
+                "stored credential contains duplicate subaccount address `{}`",
+                subaccount.account
+            );
+        }
+    }
+    Ok(())
+}
+
+fn resolve_named_account(
+    main_account: &str,
+    subaccounts: &[NamedSubaccount],
+    name: &str,
+    venue: &str,
+) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() || name.eq_ignore_ascii_case("main") {
+        return Ok(main_account.to_string());
+    }
+    subaccounts
+        .iter()
+        .find(|subaccount| subaccount.name.eq_ignore_ascii_case(name))
+        .map(|subaccount| subaccount.account.clone())
+        .with_context(|| {
+            format!(
+                "{venue} subaccount `{name}` is not configured; create it with `mlab auth set {} --subaccount {name}`",
+                venue.to_ascii_lowercase()
+            )
+        })
+}
+
+async fn handle_create_hyperliquid_subaccount(name: &str) -> Result<()> {
+    let name = validate_subaccount_name(name)?.to_string();
+    let mut credential = load_hyperliquid_credential()?.context(
+        "configure the Hyperliquid main account before creating a subaccount with `mlab auth set hyperliquid`",
+    )?;
+    credential.validate_complete()?;
+    if credential
+        .mainnet_subaccounts
+        .iter()
+        .chain(&credential.testnet_subaccounts)
+        .any(|subaccount| subaccount.name.eq_ignore_ascii_case(&name))
+    {
+        bail!("Hyperliquid subaccount `{name}` already exists; use another name");
+    }
+    for network in [HyperliquidNetwork::Mainnet, HyperliquidNetwork::Testnet] {
+        let remote =
+            crate::providers::hyperliquid::exchange::subaccounts(&credential.account, network)
+                .await?;
+        if remote
+            .iter()
+            .any(|(remote_name, _)| remote_name.eq_ignore_ascii_case(&name))
+        {
+            bail!(
+                "Hyperliquid {} subaccount `{name}` already exists; use another name",
+                network.label()
+            );
+        }
+    }
+
+    println!(
+        "The main wallet private key is used only to create the subaccount and is never stored."
+    );
+    let master = {
+        let private_key = Zeroizing::new(rpassword::prompt_password(
+            "Hyperliquid main wallet private key (hidden): ",
+        )?);
+        HyperliquidWallet::from_private_key(private_key.trim())
+            .context("invalid Hyperliquid main wallet private key")?
+    };
+    if master.address() != credential.account {
+        bail!(
+            "the supplied key belongs to {}, but the configured Hyperliquid main account is {}",
+            master.address(),
+            credential.account
+        );
+    }
+    println!("hyperliquid: creating mainnet subaccount `{name}`");
+    let mainnet = crate::providers::hyperliquid::exchange::create_subaccount(
+        &master,
+        HyperliquidNetwork::Mainnet,
+        &name,
+    )
+    .await?;
+    println!("hyperliquid: creating testnet subaccount `{name}`");
+    let testnet = crate::providers::hyperliquid::exchange::create_subaccount(
+        &master,
+        HyperliquidNetwork::Testnet,
+        &name,
+    )
+    .await?;
+    credential.mainnet_subaccounts.push(NamedSubaccount {
+        name: name.clone(),
+        account: mainnet.clone(),
+    });
+    credential.testnet_subaccounts.push(NamedSubaccount {
+        name: name.clone(),
+        account: testnet.clone(),
+    });
+    save_hyperliquid_credential(&credential)?;
+    println!("hyperliquid: subaccount created");
+    println!("  name: {name}");
+    println!("  mainnet: {mainnet}");
+    println!("  testnet: {testnet}");
+    Ok(())
+}
+
+async fn handle_create_bulk_subaccount(name: &str) -> Result<()> {
+    let name = validate_subaccount_name(name)?.to_string();
+    let mut credential = load_bulk_credential()?.context(
+        "configure the BULK main account before creating a subaccount with `mlab auth set bulk`",
+    )?;
+    if credential.status != BulkCredentialStatus::Active {
+        bail!("finish BULK main-account authorization before creating a subaccount");
+    }
+    if credential
+        .subaccounts
+        .iter()
+        .any(|subaccount| subaccount.name.eq_ignore_ascii_case(&name))
+    {
+        bail!("BULK subaccount `{name}` already exists; use another name");
+    }
+    println!(
+        "The main wallet private key is used only to create the subaccount and is never stored."
+    );
+    let master = {
+        let private_key = Zeroizing::new(rpassword::prompt_password(
+            "BULK main wallet private key (hidden): ",
+        )?);
+        Keypair::from_base58(private_key.trim()).context("invalid BULK main wallet private key")?
+    };
+    let main_account = credential
+        .account
+        .as_deref()
+        .context("stored BULK credential is missing its main account")?;
+    if master.pubkey().to_base58() != main_account {
+        bail!(
+            "the supplied key belongs to {}, but the configured BULK main account is {main_account}",
+            master.pubkey().to_base58()
+        );
+    }
+    println!("bulk: creating subaccount `{name}`");
+    let account = bulk::create_subaccount(master, &name).await?;
+    credential.subaccounts.push(NamedSubaccount {
+        name: name.clone(),
+        account: account.clone(),
+    });
+    save_bulk_credential(&credential)?;
+    println!("bulk: subaccount created");
+    println!("  name: {name}");
+    println!("  account: {account}");
     Ok(())
 }
 
@@ -413,7 +756,10 @@ pub async fn handle_remove(args: AuthProviderArgs) -> Result<()> {
     Ok(())
 }
 
-async fn handle_set_hyperliquid(reauthorize: bool) -> Result<()> {
+async fn handle_set_hyperliquid(reauthorize: bool, subaccount: Option<&str>) -> Result<()> {
+    if let Some(name) = subaccount {
+        return handle_create_hyperliquid_subaccount(name).await;
+    }
     let mut existing = load_hyperliquid_credential()?;
     let replacing_existing = reauthorize && existing.is_some();
     if existing
@@ -508,6 +854,12 @@ async fn handle_set_hyperliquid(reauthorize: bool) -> Result<()> {
         account: account.clone(),
         mainnet_agent: Some(mainnet_agent),
         testnet_agent: Some(testnet_agent),
+        mainnet_subaccounts: existing.as_mut().map_or_else(Vec::new, |credential| {
+            std::mem::take(&mut credential.mainnet_subaccounts)
+        }),
+        testnet_subaccounts: existing.as_mut().map_or_else(Vec::new, |credential| {
+            std::mem::take(&mut credential.testnet_subaccounts)
+        }),
     };
     credential.validate_complete()?;
     save_hyperliquid_credential(&credential)?;
@@ -616,7 +968,10 @@ fn ensure_hyperliquid_exchange_ok(
     Ok(())
 }
 
-async fn handle_set_bulk(reauthorize: bool) -> Result<()> {
+async fn handle_set_bulk(reauthorize: bool, subaccount: Option<&str>) -> Result<()> {
+    if let Some(name) = subaccount {
+        return handle_create_bulk_subaccount(name).await;
+    }
     let mut credential = match load_bulk_credential()? {
         Some(credential) if credential.status == BulkCredentialStatus::Active && !reauthorize => {
             println!("bulk: already configured");
@@ -771,8 +1126,11 @@ fn load_bulk_credential() -> Result<Option<BulkCredential>> {
         return Ok(None);
     };
 
-    let credential: BulkCredential = serde_json::from_str(encoded.as_str())
+    let mut credential: BulkCredential = serde_json::from_str(encoded.as_str())
         .context("stored BULK agent credential is malformed")?;
+    if credential.version == LEGACY_BULK_CREDENTIAL_VERSION {
+        credential.version = BULK_CREDENTIAL_VERSION;
+    }
     credential.validate()?;
     Ok(Some(credential))
 }
@@ -798,9 +1156,11 @@ fn load_hyperliquid_credential() -> Result<Option<HyperliquidCredential>> {
                 .context("stored legacy Hyperliquid agent credential is malformed")?
                 .upgrade()?
         }
-        HYPERLIQUID_CREDENTIAL_VERSION => {
-            serde_json::from_str::<HyperliquidCredential>(encoded.as_str())
-                .context("stored Hyperliquid agent credential is malformed")?
+        LEGACY_NETWORKED_HYPERLIQUID_CREDENTIAL_VERSION | HYPERLIQUID_CREDENTIAL_VERSION => {
+            let mut credential = serde_json::from_str::<HyperliquidCredential>(encoded.as_str())
+                .context("stored Hyperliquid agent credential is malformed")?;
+            credential.version = HYPERLIQUID_CREDENTIAL_VERSION;
+            credential
         }
         version => bail!("unsupported stored Hyperliquid credential version {version}"),
     };
@@ -1201,6 +1561,8 @@ mod tests {
                 TESTNET_API_WALLET_NAME,
                 &testnet,
             )),
+            mainnet_subaccounts: Vec::new(),
+            testnet_subaccounts: Vec::new(),
         };
 
         credential
@@ -1219,6 +1581,35 @@ mod tests {
                 .expect("testnet agent")
                 .address,
             testnet.address()
+        );
+    }
+
+    #[test]
+    fn named_account_resolution_keeps_main_explicit_and_rejects_unknown_names() {
+        let subaccounts = vec![NamedSubaccount {
+            name: "trading-2".to_string(),
+            account: "0x1111111111111111111111111111111111111111".to_string(),
+        }];
+        assert_eq!(
+            resolve_named_account(
+                "0x2222222222222222222222222222222222222222",
+                &subaccounts,
+                "main",
+                "Hyperliquid",
+            )
+            .expect("main resolves"),
+            "0x2222222222222222222222222222222222222222"
+        );
+        assert_eq!(
+            resolve_named_account("main", &subaccounts, "TRADING-2", "Hyperliquid")
+                .expect("named account resolves"),
+            "0x1111111111111111111111111111111111111111"
+        );
+        assert!(
+            resolve_named_account("main", &subaccounts, "missing", "Hyperliquid")
+                .expect_err("unknown account must fail")
+                .to_string()
+                .contains("not configured")
         );
     }
 }

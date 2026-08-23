@@ -51,6 +51,27 @@ fn default_tif() -> ScriptTimeInForce {
     ScriptTimeInForce::Gtc
 }
 
+fn default_account_name() -> String {
+    "main".to_string()
+}
+
+fn validate_account_name(value: &str, operation: &str) -> Result<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("{operation} account must be a non-empty string");
+    }
+    if value.len() > 32 {
+        bail!("{operation} account must be at most 32 bytes");
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("{operation} account may contain only letters, numbers, `-`, and `_`");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ScriptOrderRequest {
@@ -148,6 +169,8 @@ impl ScriptPositionOperation {
 pub struct ScriptTradeRequest {
     pub key: String,
     pub symbol: String,
+    #[serde(default = "default_account_name")]
+    pub account: String,
     pub position: ScriptPositionOperation,
     #[serde(default)]
     pub size: Option<f64>,
@@ -170,6 +193,7 @@ impl ScriptTradeRequest {
 
     pub fn validate(&self) -> Result<()> {
         validate_key(&self.key)?;
+        validate_account_name(&self.account, "ctx.trade")?;
         crate::scripting::inputs::normalize_script_symbol(&self.symbol)
             .context("ctx.trade symbol is invalid")?;
         if self.position.is_open() {
@@ -244,6 +268,8 @@ impl ScriptTradeRequest {
 pub struct ScriptRawOrderRequest {
     pub key: String,
     pub symbol: String,
+    #[serde(default = "default_account_name")]
+    pub account: String,
     pub side: ScriptOrderSide,
     #[serde(default)]
     pub size: Option<f64>,
@@ -264,6 +290,7 @@ impl ScriptRawOrderRequest {
 
     pub fn validate(&self) -> Result<()> {
         validate_key(&self.key)?;
+        validate_account_name(&self.account, "ctx.order")?;
         crate::scripting::inputs::normalize_script_symbol(&self.symbol)
             .context("ctx.order symbol is invalid")?;
         match (self.size, self.margin) {
@@ -338,6 +365,13 @@ impl ScriptManagedRequest {
         match self {
             Self::Trade(request) => &request.symbol,
             Self::Order(request) => &request.symbol,
+        }
+    }
+
+    pub fn account(&self) -> &str {
+        match self {
+            Self::Trade(request) => &request.account,
+            Self::Order(request) => &request.account,
         }
     }
 
@@ -646,6 +680,22 @@ mod tests {
         .expect("decode request");
         request.validate().expect("valid request");
         assert_eq!(request.order.kind, ScriptOrderKind::Limit);
+        assert_eq!(request.account, "main");
+    }
+
+    #[test]
+    fn named_account_is_part_of_the_managed_request() {
+        let request: ScriptTradeRequest = serde_json::from_value(json!({
+            "key": "entry-subaccount",
+            "account": "trading-2",
+            "symbol": "btc",
+            "position": "open-long",
+            "margin": 100,
+            "leverage": 5
+        }))
+        .expect("decode request");
+        request.validate().expect("named account is valid");
+        assert_eq!(request.account, "trading-2");
     }
 
     #[test]

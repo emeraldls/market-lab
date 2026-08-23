@@ -16,33 +16,45 @@ pub enum ExecutionAdapter {
 
 impl ExecutionAdapter {
     pub async fn new(venue: ExecutionVenue, testnet: bool) -> Result<Self> {
+        Self::new_for_account(venue, testnet, "main").await
+    }
+
+    pub async fn new_for_account(
+        venue: ExecutionVenue,
+        testnet: bool,
+        account_name: &str,
+    ) -> Result<Self> {
         match venue {
             ExecutionVenue::Bulk => Ok(Self::Bulk(BulkExecutionAdapter::new()?)),
             ExecutionVenue::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidExecutionAdapter::new_for(
+                HyperliquidExecutionAdapter::new_for_account(
                     HyperliquidProduct::Perpetual,
                     HyperliquidNetwork::from_testnet(testnet),
+                    account_name,
                 )
                 .await?,
             )),
             ExecutionVenue::HyperliquidXyz => Ok(Self::Hyperliquid(
-                HyperliquidExecutionAdapter::new_for(
+                HyperliquidExecutionAdapter::new_for_account(
                     HyperliquidProduct::XyzPerpetual,
                     HyperliquidNetwork::from_testnet(testnet),
+                    account_name,
                 )
                 .await?,
             )),
             ExecutionVenue::HyperliquidSpot => Ok(Self::Hyperliquid(
-                HyperliquidExecutionAdapter::new_for(
+                HyperliquidExecutionAdapter::new_for_account(
                     HyperliquidProduct::Spot,
                     HyperliquidNetwork::from_testnet(testnet),
+                    account_name,
                 )
                 .await?,
             )),
             ExecutionVenue::HyperliquidOutcomes => Ok(Self::Hyperliquid(
-                HyperliquidExecutionAdapter::new_for(
+                HyperliquidExecutionAdapter::new_for_account(
                     HyperliquidProduct::Outcome,
                     HyperliquidNetwork::from_testnet(testnet),
+                    account_name,
                 )
                 .await?,
             )),
@@ -66,12 +78,38 @@ impl ExecutionAdapter {
     }
 
     pub fn configured_account(venue: ExecutionVenue) -> Result<String> {
+        Self::configured_account_for(venue, false, "main")
+    }
+
+    pub fn configured_account_for(
+        venue: ExecutionVenue,
+        testnet: bool,
+        account_name: &str,
+    ) -> Result<String> {
         match venue {
-            ExecutionVenue::Bulk => credentials::bulk_account(),
-            ExecutionVenue::Hyperliquid => credentials::hyperliquid_account(),
-            ExecutionVenue::HyperliquidXyz => credentials::hyperliquid_account(),
-            ExecutionVenue::HyperliquidSpot => credentials::hyperliquid_account(),
-            ExecutionVenue::HyperliquidOutcomes => credentials::hyperliquid_account(),
+            ExecutionVenue::Bulk => credentials::bulk_account_for(account_name),
+            ExecutionVenue::Hyperliquid
+            | ExecutionVenue::HyperliquidXyz
+            | ExecutionVenue::HyperliquidSpot
+            | ExecutionVenue::HyperliquidOutcomes => credentials::hyperliquid_account_for(
+                HyperliquidNetwork::from_testnet(testnet),
+                account_name,
+            ),
+        }
+    }
+
+    pub fn configured_accounts(
+        venue: ExecutionVenue,
+        testnet: bool,
+    ) -> Result<Vec<(String, String)>> {
+        match venue {
+            ExecutionVenue::Bulk => credentials::bulk_accounts(),
+            ExecutionVenue::Hyperliquid
+            | ExecutionVenue::HyperliquidXyz
+            | ExecutionVenue::HyperliquidSpot
+            | ExecutionVenue::HyperliquidOutcomes => {
+                credentials::hyperliquid_accounts(HyperliquidNetwork::from_testnet(testnet))
+            }
         }
     }
 
@@ -100,7 +138,10 @@ impl ExecutionAdapter {
         match self {
             Self::Bulk(adapter) => {
                 adapter
-                    .submit_trade(credentials::active_bulk_credential()?, plan)
+                    .submit_trade(
+                        credentials::active_bulk_credential_for_account(&plan.account)?,
+                        plan,
+                    )
                     .await
             }
             Self::Hyperliquid(adapter) => adapter.submit_trade(plan).await,
@@ -122,7 +163,7 @@ impl ExecutionAdapter {
             Self::Bulk(adapter) => {
                 adapter
                     .cancel_order(
-                        credentials::active_bulk_credential()?,
+                        credentials::active_bulk_credential_for_account(&plan.account)?,
                         &plan.venue_symbol,
                         &plan.order_id,
                     )
@@ -141,7 +182,7 @@ impl ExecutionAdapter {
             Self::Bulk(adapter) => {
                 adapter
                     .cancel_order(
-                        credentials::active_bulk_credential()?,
+                        credentials::active_bulk_credential_for_account(&plan.account)?,
                         &plan.venue_symbol,
                         &plan.order_id,
                     )
@@ -156,10 +197,16 @@ impl ExecutionAdapter {
     }
 
     pub async fn submit_trades(&self, plans: &[TradePlan]) -> Result<Vec<ExecutionOutcome>> {
+        let Some(first) = plans.first() else {
+            return Ok(Vec::new());
+        };
         match self {
             Self::Bulk(adapter) => {
                 adapter
-                    .submit_trades(credentials::active_bulk_credential()?, plans)
+                    .submit_trades(
+                        credentials::active_bulk_credential_for_account(&first.account)?,
+                        plans,
+                    )
                     .await
             }
             Self::Hyperliquid(adapter) => adapter.submit_trades(plans).await,
@@ -167,10 +214,16 @@ impl ExecutionAdapter {
     }
 
     pub async fn cancel_orders(&self, plans: &[CancelPlan]) -> Result<Vec<ExecutionOutcome>> {
+        let Some(first) = plans.first() else {
+            return Ok(Vec::new());
+        };
         match self {
             Self::Bulk(adapter) => {
                 adapter
-                    .cancel_orders(credentials::active_bulk_credential()?, plans)
+                    .cancel_orders(
+                        credentials::active_bulk_credential_for_account(&first.account)?,
+                        plans,
+                    )
                     .await
             }
             Self::Hyperliquid(adapter) => adapter.cancel_orders(plans).await,
@@ -178,10 +231,16 @@ impl ExecutionAdapter {
     }
 
     pub async fn cancel_orders_fast(&self, plans: &[CancelPlan]) -> Result<Vec<ExecutionOutcome>> {
+        let Some(first) = plans.first() else {
+            return Ok(Vec::new());
+        };
         match self {
             Self::Bulk(adapter) => {
                 adapter
-                    .cancel_orders(credentials::active_bulk_credential()?, plans)
+                    .cancel_orders(
+                        credentials::active_bulk_credential_for_account(&first.account)?,
+                        plans,
+                    )
                     .await
             }
             Self::Hyperliquid(adapter) => adapter.cancel_orders_fast(plans).await,

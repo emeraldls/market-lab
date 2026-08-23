@@ -332,20 +332,22 @@ pub(crate) async fn build_trade_plan(
     args: &TradeArgs,
     direction: PositionDirection,
 ) -> Result<TradePlan> {
-    build_trade_plan_with_price_normalization(args, direction, false).await
+    build_trade_plan_with_price_normalization(args, direction, false, None).await
 }
 
-pub(crate) async fn build_automated_trade_plan(
+pub(crate) async fn build_automated_trade_plan_for_account(
     args: &TradeArgs,
     direction: PositionDirection,
+    account: &str,
 ) -> Result<TradePlan> {
-    build_trade_plan_with_price_normalization(args, direction, true).await
+    build_trade_plan_with_price_normalization(args, direction, true, Some(account)).await
 }
 
 async fn build_trade_plan_with_price_normalization(
     args: &TradeArgs,
     direction: PositionDirection,
     normalize_prices: bool,
+    account: Option<&str>,
 ) -> Result<TradePlan> {
     let venue = ExecutionVenue::from(args.venue);
     let outcome = if venue == ExecutionVenue::HyperliquidOutcomes {
@@ -378,7 +380,10 @@ async fn build_trade_plan_with_price_normalization(
     };
     let sizing_leverage = leverage.unwrap_or(1.0);
     let rules = execution_rules(venue, args.testnet, &market)?;
-    let account = ExecutionAdapter::configured_account(venue)?;
+    let account = account.map_or_else(
+        || ExecutionAdapter::configured_account(venue),
+        |account| Ok(account.to_string()),
+    )?;
     let reference_price = match args.order_kind {
         TradeOrderKind::Limit => args
             .price

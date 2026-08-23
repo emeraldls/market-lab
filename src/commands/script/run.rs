@@ -2057,7 +2057,7 @@ fn finish_run(
 fn live_stream_payload(
     update: &LiveUpdate,
     source_configs: &SourceConfigs,
-    positions: &[Position],
+    positions: &BTreeMap<String, Vec<Position>>,
 ) -> Result<Value> {
     let mut payload = serde_json::Map::new();
     payload.insert("source".to_string(), Value::String(update.selector.clone()));
@@ -2088,9 +2088,19 @@ fn live_stream_payload(
     );
     payload.insert(
         "positions".to_string(),
-        json!({
-            "open": positions.iter().map(live_position_payload).collect::<Vec<_>>()
-        }),
+        Value::Object(
+            positions
+                .iter()
+                .map(|(account, open)| {
+                    (
+                        account.clone(),
+                        json!({
+                            "open": open.iter().map(live_position_payload).collect::<Vec<_>>()
+                        }),
+                    )
+                })
+                .collect(),
+        ),
     );
 
     Ok(Value::Object(payload))
@@ -2100,6 +2110,8 @@ fn live_position_payload(position: &Position) -> Value {
     let margin = position.notional / position.leverage.max(f64::EPSILON);
     json!({
         "id": format!("{}:{:?}", position.venue_symbol, position.direction).to_lowercase(),
+        "exchange": position.venue,
+        "symbol": position.internal_symbol,
         "side": position.direction,
         "entry_price": position.entry_price,
         "mark_price": position.mark_price,
@@ -2383,7 +2395,8 @@ mod tests {
             }),
         );
 
-        let payload = live_stream_payload(&update, &configs, &[]).expect("build payload");
+        let payload =
+            live_stream_payload(&update, &configs, &BTreeMap::new()).expect("build payload");
 
         assert_eq!(payload["source_type"], "trades");
         assert_eq!(payload["symbol"], "btc");
@@ -2401,7 +2414,8 @@ mod tests {
             LiveRecord::Candles(candle(20.0)),
         );
 
-        let payload = live_stream_payload(&okx, &configs, &[]).expect("build live payload");
+        let payload =
+            live_stream_payload(&okx, &configs, &BTreeMap::new()).expect("build live payload");
 
         assert_eq!(payload["source"], "btc/usdt@candles@okx@mmt");
         assert_eq!(payload["symbol"], "btc/usdt");
