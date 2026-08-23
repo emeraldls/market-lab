@@ -1817,7 +1817,7 @@ mod tests {
         );
 
         let off_tick = TradePlan {
-            reference_price: 65_000.0004,
+            reference_price: 65_000.000_4,
             max_slippage: Some(0.0),
             ..plan.clone()
         };
