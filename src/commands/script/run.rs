@@ -121,10 +121,17 @@ struct LiveUpdate {
     provider: ProviderKind,
     exchange: String,
     record: LiveRecord,
+    execution_reference: Option<LiveExecutionReference>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveExecutionReference {
+    price: f64,
+    timestamp_ms: u64,
 }
 
 enum ScriptStreamEvent {
-    Update(LiveUpdate),
+    Update(Box<LiveUpdate>),
     Disconnected { error: String, retry_seconds: u64 },
     Reconnected,
 }
@@ -486,6 +493,21 @@ async fn stream_sources(
     worker: ScriptWorkerState<'_>,
 ) -> Result<()> {
     let job_id = worker.job_id;
+    if script.language == ScriptLanguage::PythonV2 || args.venue.is_some() {
+        report.set_phase("connecting_execution");
+        write_running_report_best_effort(report);
+        let readiness = crate::runtime::prepare_script_execution(job_id).await?;
+        crate::runtime::append_script_output(
+            job_id,
+            &json!({
+                "type": "script.execution.connected",
+                "version": "1",
+                "ts_ms": now_ms(),
+                "connected": readiness.connected,
+                "failed": readiness.failed,
+            }),
+        )?;
+    }
     report.set_phase("connecting_streams");
     write_running_report_best_effort(report);
 
@@ -542,6 +564,7 @@ async fn stream_sources(
     let mut pnl = LivePnlState::new(script.history_capacity(&resolved_params));
     replay_execution_fills(job_id, &mut pnl).await?;
     let mut positions = crate::runtime::script_positions(job_id).await?;
+    let mut execution_references = BTreeMap::<String, LiveExecutionReference>::new();
     let mut execution_events = tokio::time::interval(std::time::Duration::from_millis(250));
     execution_events.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -581,8 +604,9 @@ async fn stream_sources(
         let update = tokio::select! {
             event = stream_events.recv() => {
                 match event.context("script market-data supervisor stopped unexpectedly")? {
-                    ScriptStreamEvent::Update(update) => update,
+                    ScriptStreamEvent::Update(update) => *update,
                     ScriptStreamEvent::Disconnected { error, retry_seconds } => {
+                        execution_references.clear();
                         let cleanup_error = if script.language == ScriptLanguage::PythonV2
                             || args.venue.is_some()
                         {
@@ -647,13 +671,26 @@ async fn stream_sources(
                 return Ok(());
             }
             _ = execution_events.tick() => {
-                dispatch_execution_events(&session, job_id, &mut event_cursor, &mut pnl).await?;
+                dispatch_execution_events(
+                    &session,
+                    job_id,
+                    &mut event_cursor,
+                    &mut pnl,
+                    &execution_references,
+                )
+                .await?;
                 positions = crate::runtime::script_positions(job_id).await?;
                 continue;
             }
         };
 
         let ts_ms = update.ts_ms();
+        if let Some(reference) = update.execution_reference.clone() {
+            execution_references.insert(
+                execution_reference_key(&update.exchange, &update.symbol),
+                reference,
+            );
+        }
         pnl.apply_market_update(&update);
         pnl.record(ts_ms);
         let payload = live_stream_payload(&update, &source_configs, &positions)?;
@@ -677,7 +714,7 @@ async fn stream_sources(
                 return Err(err);
             }
         };
-        dispatch_execution_commands(job_id, execution.commands).await?;
+        dispatch_execution_commands(job_id, execution.commands, &execution_references).await?;
         hooks += 1;
         summary.record_update(ts_ms);
         report.record_hook(&execution.stats);
@@ -744,6 +781,7 @@ fn finish_live_session(
 async fn dispatch_execution_commands(
     job_id: &str,
     commands: Vec<ScriptExecutionCommand>,
+    execution_references: &BTreeMap<String, LiveExecutionReference>,
 ) -> Result<()> {
     for command in commands {
         let result = match command {
@@ -751,16 +789,28 @@ async fn dispatch_execution_commands(
                 order,
                 exchange,
                 request,
-            } => crate::runtime::submit_script_trade(job_id, order, exchange, request)
-                .await
-                .map(|_| ()),
+            } => crate::runtime::submit_script_trade(
+                job_id,
+                order,
+                exchange,
+                script_execution_reference(exchange, &request.symbol, execution_references),
+                request,
+            )
+            .await
+            .map(|_| ()),
             ScriptExecutionCommand::Order {
                 order,
                 exchange,
                 request,
-            } => crate::runtime::submit_script_order(job_id, order, exchange, request)
-                .await
-                .map(|_| ()),
+            } => crate::runtime::submit_script_order(
+                job_id,
+                order,
+                exchange,
+                script_execution_reference(exchange, &request.symbol, execution_references),
+                request,
+            )
+            .await
+            .map(|_| ()),
             ScriptExecutionCommand::Cancel { request } => {
                 crate::runtime::submit_script_cancellation(job_id, request)
                     .await
@@ -782,6 +832,19 @@ async fn dispatch_execution_commands(
     Ok(())
 }
 
+fn script_execution_reference(
+    exchange: Option<ExecutionVenue>,
+    symbol: &str,
+    references: &BTreeMap<String, LiveExecutionReference>,
+) -> Option<f64> {
+    let exchange = exchange.map(live_execution_exchange)?;
+    let symbol = crate::scripting::inputs::script_symbol_to_market(symbol);
+    references
+        .get(&execution_reference_key(exchange, &symbol))
+        .filter(|reference| reference.timestamp_ms > 0)
+        .map(|reference| reference.price)
+}
+
 fn validate_execution_routing(args: &ScriptRunArgs, language: ScriptLanguage) -> Result<()> {
     match language {
         ScriptLanguage::PythonV2 if args.venue.is_some() => {
@@ -801,6 +864,7 @@ async fn dispatch_execution_events(
     job_id: &str,
     cursor: &mut u64,
     pnl: &mut LivePnlState,
+    execution_references: &BTreeMap<String, LiveExecutionReference>,
 ) -> Result<()> {
     let events = crate::runtime::script_execution_events(job_id, *cursor, 100).await?;
     for event in events {
@@ -815,7 +879,7 @@ async fn dispatch_execution_events(
             "event": event_value,
         });
         if let Some(execution) = execution {
-            dispatch_execution_commands(job_id, execution.commands).await?;
+            dispatch_execution_commands(job_id, execution.commands, execution_references).await?;
             if !execution.output.is_empty() {
                 record["output"] = serde_json::to_value(execution.output)?;
             }
@@ -1002,6 +1066,7 @@ struct MmtScriptStreams {
     source_configs: SourceConfigs,
     orderbook_states: BTreeMap<String, OrderBookState>,
     candle_aggregators: BTreeMap<String, TradeCandleAggregator>,
+    latest_trades: BTreeMap<String, LiveExecutionReference>,
     pending: VecDeque<LiveUpdate>,
 }
 
@@ -1023,6 +1088,7 @@ impl ScriptLiveStreams {
                 source_configs: mmt_configs,
                 orderbook_states,
                 candle_aggregators,
+                latest_trades: BTreeMap::new(),
                 pending: VecDeque::new(),
             })
         };
@@ -1127,7 +1193,7 @@ async fn supervise_script_streams(
             Ok(Some(update)) => {
                 retry_seconds = 1;
                 if sender
-                    .send(ScriptStreamEvent::Update(update))
+                    .send(ScriptStreamEvent::Update(Box::new(update)))
                     .await
                     .is_err()
                 {
@@ -1187,7 +1253,10 @@ fn next_stream_reconnect_delay(current: u64) -> u64 {
 impl MmtScriptStreams {
     async fn next_update(&mut self) -> Result<Option<LiveUpdate>> {
         if let Some(update) = self.pending.pop_front() {
-            return Ok(Some(update));
+            return Ok(Some(attach_execution_reference(
+                update,
+                &self.latest_trades,
+            )));
         }
         self.pending.extend(
             next_mmt_updates(
@@ -1195,10 +1264,14 @@ impl MmtScriptStreams {
                 &self.source_configs,
                 &mut self.orderbook_states,
                 &mut self.candle_aggregators,
+                &mut self.latest_trades,
             )
             .await?,
         );
-        Ok(self.pending.pop_front())
+        Ok(self
+            .pending
+            .pop_front()
+            .map(|update| attach_execution_reference(update, &self.latest_trades)))
     }
 }
 
@@ -1444,6 +1517,7 @@ struct DirectScriptStreams {
     orderbook: Option<DirectOrderBookStream>,
     oi: Option<DirectTickerStream>,
     volumes: Option<DirectCandleStream>,
+    latest_trade: Option<LiveExecutionReference>,
     cumulative_delta: f64,
     pending: VecDeque<LiveUpdate>,
 }
@@ -1526,6 +1600,7 @@ impl DirectScriptStreams {
             orderbook,
             oi,
             volumes,
+            latest_trade: None,
             cumulative_delta: 0.0,
             pending: VecDeque::new(),
         })
@@ -1534,7 +1609,7 @@ impl DirectScriptStreams {
     async fn next_update(&mut self) -> Result<LiveUpdate> {
         loop {
             if let Some(update) = self.pending.pop_front() {
-                return Ok(update);
+                return Ok(update.with_execution_reference(self.latest_trade.clone()));
             }
 
             let has_trades = self.trades.is_some();
@@ -1546,6 +1621,7 @@ impl DirectScriptStreams {
             let orderbook = &mut self.orderbook;
             let oi = &mut self.oi;
             let volumes = &mut self.volumes;
+            let latest_trade = &mut self.latest_trade;
             let cumulative_delta = &mut self.cumulative_delta;
             let pending = &mut self.pending;
             let candles_config = source_config(&self.source_configs, &ScriptSource::Candles)
@@ -1569,10 +1645,22 @@ impl DirectScriptStreams {
 
             tokio::select! {
                 snapshot = async { orderbook.as_mut().expect("guarded orderbook stream").next_snapshot().await }, if has_orderbook => {
-                    return Ok(LiveUpdate::new(orderbook_config.as_ref().expect("configured orderbook source"), LiveRecord::Orderbook(snapshot?)));
+                    return Ok(LiveUpdate::new(orderbook_config.as_ref().expect("configured orderbook source"), LiveRecord::Orderbook(snapshot?))
+                        .with_execution_reference(latest_trade.clone()));
                 }
                 batch = async { trades.as_mut().expect("guarded trades stream").next_trades().await }, if has_trades => {
                     let batch = batch?;
+                    if let Some(reference) = batch
+                        .iter()
+                        .filter(|trade| trade.price.is_finite() && trade.price > 0.0)
+                        .max_by_key(|trade| trade.timestamp_ms)
+                        .map(|trade| LiveExecutionReference {
+                            price: trade.price,
+                            timestamp_ms: trade.timestamp_ms,
+                        })
+                    {
+                        *latest_trade = Some(reference);
+                    }
                     if let Some(config) = trades_config.as_ref() {
                         pending.extend(batch.iter().map(|trade| {
                             LiveUpdate::new(
@@ -1603,7 +1691,7 @@ impl DirectScriptStreams {
                         pending.push_back(LiveUpdate::new(config, LiveRecord::Vd(update)));
                     }
                     if let Some(update) = pending.pop_front() {
-                        return Ok(update);
+                        return Ok(update.with_execution_reference(latest_trade.clone()));
                     }
                 }
                 ticker = async { oi.as_mut().expect("guarded ticker stream").next_ticker().await }, if has_oi => {
@@ -1615,10 +1703,11 @@ impl DirectScriptStreams {
                         open_interest: ticker.open_interest,
                         mark_price: ticker.mark_price,
                         notional: ticker.open_interest * ticker.mark_price,
-                    }))));
+                    }))).with_execution_reference(latest_trade.clone()));
                 }
                 candle = async { volumes.as_mut().expect("guarded volume stream").next_candle().await }, if has_volumes => {
-                    return Ok(LiveUpdate::new(volumes_config.as_ref().expect("configured volumes source"), LiveRecord::Volumes(ScriptVolume::from_bulk_candle(candle?))));
+                    return Ok(LiveUpdate::new(volumes_config.as_ref().expect("configured volumes source"), LiveRecord::Volumes(ScriptVolume::from_bulk_candle(candle?)))
+                        .with_execution_reference(latest_trade.clone()));
                 }
                 else => bail!(
                     "{} script has no live source streams",
@@ -1757,6 +1846,7 @@ async fn next_mmt_updates(
     source_configs: &SourceConfigs,
     orderbook_states: &mut BTreeMap<String, OrderBookState>,
     candle_aggregators: &mut BTreeMap<String, TradeCandleAggregator>,
+    latest_trades: &mut BTreeMap<String, LiveExecutionReference>,
 ) -> Result<Vec<LiveUpdate>> {
     let Some(value) = ws.next_json().await? else {
         bail!("websocket closed by server");
@@ -1773,7 +1863,7 @@ async fn next_mmt_updates(
 
     let source = match value.get("channel").and_then(Value::as_str) {
         Some("trades") => {
-            return mmt_trade_updates(&value, source_configs, candle_aggregators);
+            return mmt_trade_updates(&value, source_configs, candle_aggregators, latest_trades);
         }
         Some("depth") => ScriptSource::Orderbook,
         Some("vd") => ScriptSource::Vd,
@@ -1837,12 +1927,29 @@ fn mmt_trade_updates(
     value: &Value,
     source_configs: &SourceConfigs,
     candle_aggregators: &mut BTreeMap<String, TradeCandleAggregator>,
+    latest_trades: &mut BTreeMap<String, LiveExecutionReference>,
 ) -> Result<Vec<LiveUpdate>> {
     let payload = value.get("data").context("trade payload missing data")?;
     let raw: MmtTrade =
         serde_json::from_value(payload.clone()).context("invalid MMT trade shape")?;
     let timestamp_ms = normalize_to_ms(raw.t);
     let mut updates = Vec::with_capacity(2);
+
+    let reference_config = mmt_update_config(value, source_configs, &ScriptSource::Trades)?.or(
+        mmt_update_config(value, source_configs, &ScriptSource::Candles)?,
+    );
+    if let Some(config) = reference_config
+        && raw.p.is_finite()
+        && raw.p > 0.0
+    {
+        latest_trades.insert(
+            execution_reference_key(&config.exchange, &config.symbol),
+            LiveExecutionReference {
+                price: raw.p,
+                timestamp_ms,
+            },
+        );
+    }
 
     if let Some(config) = mmt_update_config(value, source_configs, &ScriptSource::Trades)? {
         updates.push(LiveUpdate::new(
@@ -1973,7 +2080,13 @@ impl LiveUpdate {
             provider: config.provider,
             exchange: config.exchange.clone(),
             record,
+            execution_reference: None,
         }
+    }
+
+    fn with_execution_reference(mut self, reference: Option<LiveExecutionReference>) -> Self {
+        self.execution_reference = reference;
+        self
     }
 
     fn ts_ms(&self) -> u64 {
@@ -1986,6 +2099,24 @@ impl LiveUpdate {
             LiveRecord::Volumes(profile) => profile.t,
         }
     }
+}
+
+fn execution_reference_key(exchange: &str, symbol: &str) -> String {
+    format!(
+        "{}@{}",
+        symbol.to_ascii_lowercase(),
+        exchange.to_ascii_lowercase()
+    )
+}
+
+fn attach_execution_reference(
+    update: LiveUpdate,
+    latest_trades: &BTreeMap<String, LiveExecutionReference>,
+) -> LiveUpdate {
+    let reference = latest_trades
+        .get(&execution_reference_key(&update.exchange, &update.symbol))
+        .cloned();
+    update.with_execution_reference(reference)
 }
 
 impl ScriptRunSummary {
@@ -2335,6 +2466,7 @@ mod tests {
         .expect("parse trade source configs");
         let mut aggregators =
             trade_candle_aggregators(&configs, 60_000).expect("create aggregators");
+        let mut latest_trades = BTreeMap::new();
         let provider_symbol =
             normalize_symbol_for_mmt("binancef", "BTC").expect("resolve provider symbol");
 
@@ -2352,7 +2484,8 @@ mod tests {
             }
         });
         let first_updates =
-            mmt_trade_updates(&first, &configs, &mut aggregators).expect("route first trade");
+            mmt_trade_updates(&first, &configs, &mut aggregators, &mut latest_trades)
+                .expect("route first trade");
         assert_eq!(first_updates.len(), 1);
         assert!(matches!(first_updates[0].record, LiveRecord::Trades(_)));
 
@@ -2370,7 +2503,8 @@ mod tests {
             }
         });
         let second_updates =
-            mmt_trade_updates(&second, &configs, &mut aggregators).expect("route second trade");
+            mmt_trade_updates(&second, &configs, &mut aggregators, &mut latest_trades)
+                .expect("route second trade");
         assert_eq!(second_updates.len(), 2);
         assert!(matches!(second_updates[0].record, LiveRecord::Trades(_)));
         let LiveRecord::Candles(candle) = &second_updates[1].record else {
@@ -2378,6 +2512,15 @@ mod tests {
         };
         assert_eq!(candle.vb, Some(0.0));
         assert_eq!(candle.vs, Some(0.5));
+        assert_eq!(latest_trades["btc@binancef"].price, 101.0);
+        let candle_update = attach_execution_reference(second_updates[1].clone(), &latest_trades);
+        assert_eq!(
+            candle_update
+                .execution_reference
+                .expect("candle carries latest raw trade")
+                .price,
+            101.0
+        );
     }
 
     #[test]

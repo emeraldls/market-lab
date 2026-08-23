@@ -72,6 +72,10 @@ impl HyperliquidTradingClient {
             .clone()
     }
 
+    pub async fn connect(&self) -> Result<()> {
+        self.sender().await.map(|_| ())
+    }
+
     pub async fn post_action(&self, payload: &impl Serialize) -> Result<Value> {
         let payload = serde_json::to_value(payload)
             .context("failed to encode Hyperliquid WebSocket action payload")?;

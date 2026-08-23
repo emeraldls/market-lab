@@ -84,6 +84,10 @@ pub struct TradePlan {
     pub size: f64,
     pub price: Option<f64>,
     pub reference_price: f64,
+    /// Optional market-order execution boundary as a decimal fraction.
+    /// When omitted, the execution venue applies its default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_slippage: Option<f64>,
     pub requested_margin: Option<f64>,
     pub estimated_margin: f64,
     pub estimated_exposure: f64,
@@ -370,6 +374,7 @@ mod tests {
             size: 1.0,
             price: None,
             reference_price: 44.0,
+            max_slippage: None,
             requested_margin: Some(44.0),
             estimated_margin: 44.0,
             estimated_exposure: 44.0,

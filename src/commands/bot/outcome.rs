@@ -2075,6 +2075,7 @@ fn sell_plan(
         size,
         price,
         reference_price,
+        max_slippage: None,
         requested_margin: None,
         estimated_margin: size * reference_price,
         estimated_exposure: size * reference_price,

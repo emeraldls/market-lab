@@ -294,6 +294,41 @@ fn format_terminal_log(value: &serde_json::Value, state: &mut TerminalLogState) 
             if symbols.is_empty() { "-" } else { &symbols },
         ));
     }
+    if record_type == "script.execution.connected" {
+        let connected = string_list(value.get("connected"));
+        let failed = value
+            .get("failed")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|failure| {
+                let transport = failure
+                    .get("transport")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let error = failure
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("connection failed");
+                format!("{transport}: {error}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let readiness = if connected.is_empty() {
+            "no execution WebSockets connected".to_string()
+        } else {
+            format!("execution WebSockets connected={connected}")
+        };
+        let failures = if failed.is_empty() {
+            String::new()
+        } else {
+            format!("; unavailable={failed}")
+        };
+        return Some(format!(
+            "[{}] {readiness}{failures}",
+            log_time(value.get("ts_ms").and_then(serde_json::Value::as_u64)),
+        ));
+    }
     if matches!(record_type, "script.run.stopped" | "script.run.completed") {
         let summary = value.get("summary").unwrap_or(&serde_json::Value::Null);
         let updates = summary
@@ -718,6 +753,15 @@ mod tests {
         assert!(line.contains("providers=mmt"));
         assert!(line.contains("exchanges=binancef,bybitf"));
         assert!(line.contains("symbols=btc,eth"));
+
+        let execution = serde_json::json!({
+            "type": "script.execution.connected",
+            "ts_ms": 1_780_000_000_001_u64,
+            "connected": ["bulkf", "hyperliquid(mainnet)"],
+            "failed": []
+        });
+        let line = format_terminal_log(&execution, &mut state).expect("execution line");
+        assert!(line.contains("execution WebSockets connected=bulkf,hyperliquid(mainnet)"));
 
         let stopped = serde_json::json!({
             "type": "script.run.stopped",

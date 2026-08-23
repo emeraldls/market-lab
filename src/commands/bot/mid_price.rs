@@ -1925,6 +1925,7 @@ pub(super) fn quote_plan(
         size,
         price: Some(price),
         reference_price: price,
+        max_slippage: None,
         requested_margin: None,
         estimated_margin: exposure
             / parent
@@ -1962,6 +1963,7 @@ pub(super) fn inventory_unwind_plan(
         size,
         price: None,
         reference_price: price,
+        max_slippage: None,
         requested_margin: None,
         estimated_margin: exposure
             / parent
@@ -2894,6 +2896,7 @@ mod tests {
             size: 1.0,
             price: None,
             reference_price: 100.0,
+            max_slippage: None,
             requested_margin: Some(10.0),
             estimated_margin: 10.0,
             estimated_exposure: 100.0,

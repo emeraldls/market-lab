@@ -40,7 +40,7 @@ use crate::strategies::jobs::{
 };
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-pub const RUNTIME_VERSION: u8 = 39;
+pub const RUNTIME_VERSION: u8 = 41;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -139,6 +139,9 @@ enum RuntimeRequest {
         job_id: String,
         pid: u32,
     },
+    ScriptPrepareExecution {
+        job_id: String,
+    },
     ScriptWorkerHeartbeat {
         job_id: String,
         pid: u32,
@@ -152,12 +155,16 @@ enum RuntimeRequest {
         job_id: String,
         order: ScriptOrderRef,
         exchange: Option<ExecutionVenue>,
+        #[serde(default)]
+        reference_price: Option<f64>,
         request: ScriptTradeRequest,
     },
     ScriptExecuteOrder {
         job_id: String,
         order: ScriptOrderRef,
         exchange: Option<ExecutionVenue>,
+        #[serde(default)]
+        reference_price: Option<f64>,
         request: ScriptRawOrderRequest,
     },
     ScriptCancel {
@@ -319,6 +326,20 @@ struct RuntimeResponse {
     bot_jobs: Option<Vec<BotJob>>,
     #[serde(default)]
     action_response: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptExecutionReadiness {
+    pub connected: Vec<String>,
+    pub failed: Vec<ScriptExecutionTransportFailure>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptExecutionTransportFailure {
+    pub transport: String,
+    pub error: String,
 }
 
 impl RuntimeResponse {
@@ -1941,6 +1962,25 @@ pub async fn script_worker_started(job_id: &str, pid: u32) -> Result<ScriptJob> 
     response.job.context("mlabd omitted the script worker job")
 }
 
+pub async fn prepare_script_execution(job_id: &str) -> Result<ScriptExecutionReadiness> {
+    let response = request(RuntimeRequest::ScriptPrepareExecution {
+        job_id: job_id.to_string(),
+    })
+    .await?;
+    if !response.ok {
+        bail!(
+            "mlabd could not prepare script execution: {}",
+            response.message
+        );
+    }
+    serde_json::from_value(
+        response
+            .action_response
+            .context("mlabd omitted script execution readiness")?,
+    )
+    .context("mlabd returned malformed script execution readiness")
+}
+
 pub async fn script_worker_heartbeat(job_id: &str, pid: u32) -> Result<ScriptJob> {
     let response = request(RuntimeRequest::ScriptWorkerHeartbeat {
         job_id: job_id.to_string(),
@@ -1977,12 +2017,14 @@ pub async fn submit_script_trade(
     job_id: &str,
     order: ScriptOrderRef,
     exchange: Option<ExecutionVenue>,
+    reference_price: Option<f64>,
     request_value: ScriptTradeRequest,
 ) -> Result<ScriptManagedOrder> {
     let response = request(RuntimeRequest::ScriptExecuteTrade {
         job_id: job_id.to_string(),
         order,
         exchange,
+        reference_price,
         request: request_value,
     })
     .await?;
@@ -1998,12 +2040,14 @@ pub async fn submit_script_order(
     job_id: &str,
     order: ScriptOrderRef,
     exchange: Option<ExecutionVenue>,
+    reference_price: Option<f64>,
     request_value: ScriptRawOrderRequest,
 ) -> Result<ScriptManagedOrder> {
     let response = request(RuntimeRequest::ScriptExecuteOrder {
         job_id: job_id.to_string(),
         order,
         exchange,
+        reference_price,
         request: request_value,
     })
     .await?;
@@ -3166,7 +3210,69 @@ struct ScriptOrderOperation<'a> {
     job_id: &'a str,
     order: ScriptOrderRef,
     exchange: Option<ExecutionVenue>,
+    reference_price: Option<f64>,
     request: ScriptManagedRequest,
+}
+
+async fn prepare_script_execution_transports(
+    adapter: &BulkExecutionAdapter,
+    job: &ScriptJob,
+) -> Result<ScriptExecutionReadiness> {
+    let mut readiness = ScriptExecutionReadiness {
+        connected: Vec::new(),
+        failed: Vec::new(),
+    };
+    let network =
+        crate::providers::hyperliquid::HyperliquidNetwork::from_testnet(job.definition.testnet);
+    let hyperliquid = crate::providers::hyperliquid::ws::HyperliquidTradingClient::shared(network);
+    let hyperliquid_label = format!("hyperliquid({})", network.label());
+
+    match job.definition.language {
+        crate::scripting::language::ScriptLanguage::PythonV2 => {
+            let (bulk_result, hyperliquid_result) =
+                tokio::join!(adapter.connect_trading(), hyperliquid.connect());
+            record_execution_transport(&mut readiness, "bulkf", bulk_result);
+            record_execution_transport(&mut readiness, &hyperliquid_label, hyperliquid_result);
+        }
+        crate::scripting::language::ScriptLanguage::JavaScriptV1 => match job.definition.venue {
+            Some(ExecutionVenue::Bulk) => {
+                record_execution_transport(
+                    &mut readiness,
+                    "bulkf",
+                    adapter.connect_trading().await,
+                );
+            }
+            Some(
+                ExecutionVenue::Hyperliquid
+                | ExecutionVenue::HyperliquidSpot
+                | ExecutionVenue::HyperliquidXyz
+                | ExecutionVenue::HyperliquidOutcomes,
+            ) => {
+                record_execution_transport(
+                    &mut readiness,
+                    &hyperliquid_label,
+                    hyperliquid.connect().await,
+                );
+            }
+            None => {}
+        },
+    }
+
+    Ok(readiness)
+}
+
+fn record_execution_transport(
+    readiness: &mut ScriptExecutionReadiness,
+    transport: &str,
+    result: Result<()>,
+) {
+    match result {
+        Ok(()) => readiness.connected.push(transport.to_string()),
+        Err(error) => readiness.failed.push(ScriptExecutionTransportFailure {
+            transport: transport.to_string(),
+            error: format!("{error:#}"),
+        }),
+    }
 }
 
 async fn execute_script_order(
@@ -3181,6 +3287,7 @@ async fn execute_script_order(
         job_id,
         order,
         exchange,
+        reference_price,
         request,
     } = operation;
     let operation_name = match &request {
@@ -3227,6 +3334,9 @@ async fn execute_script_order(
             )?
         }
     };
+    if reference_price.is_some_and(|price| !price.is_finite() || price <= 0.0) {
+        bail!("script execution reference price must be > 0");
+    }
     let account_name = request.account().trim().to_string();
     if job.definition.language == crate::scripting::language::ScriptLanguage::JavaScriptV1
         && !account_name.eq_ignore_ascii_case("main")
@@ -3424,8 +3534,12 @@ async fn execute_script_order(
             request.side.order_direction(),
         ),
     };
-    let plan = match crate::commands::execution::build_automated_trade_plan_for_account(
-        &args, direction, &account,
+    let plan = match crate::commands::execution::build_script_trade_plan_for_account(
+        &args,
+        direction,
+        &account,
+        reference_price,
+        request.max_slippage_fraction(),
     )
     .await
     {
@@ -4438,6 +4552,25 @@ async fn handle_connection(
                 Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
             }
         }
+        RuntimeRequest::ScriptPrepareExecution { job_id } => {
+            let result = match state.script_jobs.get(&job_id).cloned() {
+                Some(job) if job.status.is_active() => {
+                    prepare_script_execution_transports(adapter, &job).await
+                }
+                Some(_) => Err(anyhow::anyhow!("script job `{job_id}` is not running")),
+                None => Err(anyhow::anyhow!("script job `{job_id}` was not found")),
+            };
+            match result {
+                Ok(readiness) => RuntimeResponse {
+                    ok: true,
+                    message: "script execution transports prepared".to_string(),
+                    status: Some(runtime_status(state)),
+                    action_response: Some(serde_json::to_value(readiness)?),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
         RuntimeRequest::ScriptWorkerHeartbeat { job_id, pid } => {
             match mark_script_worker_heartbeat(paths, state, &job_id, pid) {
                 Ok(job) => RuntimeResponse {
@@ -4466,6 +4599,7 @@ async fn handle_connection(
             job_id,
             order,
             exchange,
+            reference_price,
             request,
         } => match execute_script_order(
             paths,
@@ -4477,6 +4611,7 @@ async fn handle_connection(
                 job_id: &job_id,
                 order,
                 exchange,
+                reference_price,
                 request: ScriptManagedRequest::Trade(request),
             },
         )
@@ -4495,6 +4630,7 @@ async fn handle_connection(
             job_id,
             order,
             exchange,
+            reference_price,
             request,
         } => match execute_script_order(
             paths,
@@ -4506,6 +4642,7 @@ async fn handle_connection(
                 job_id: &job_id,
                 order,
                 exchange,
+                reference_price,
                 request: ScriptManagedRequest::Order(request),
             },
         )
@@ -4579,7 +4716,7 @@ async fn handle_connection(
             Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
         },
         RuntimeRequest::ScriptPositions { job_id } => {
-            match script_positions_in_daemon(paths, adapter, state, &job_id).await {
+            match script_positions_in_daemon(state, &job_id) {
                 Ok(positions) => RuntimeResponse {
                     ok: true,
                     message: "script positions".to_string(),
@@ -5396,9 +5533,7 @@ async fn refresh_account_positions(
     Ok(())
 }
 
-async fn script_positions_in_daemon(
-    paths: &RuntimePaths,
-    adapter: &BulkExecutionAdapter,
+fn script_positions_in_daemon(
     state: &mut RuntimeState,
     job_id: &str,
 ) -> Result<BTreeMap<String, Vec<Position>>> {
@@ -5408,21 +5543,6 @@ async fn script_positions_in_daemon(
         .cloned()
         .with_context(|| format!("script job `{job_id}` was not found"))?;
     let mut venues = job.definition.venue.into_iter().collect::<Vec<_>>();
-    for exchange in &job.definition.exchanges {
-        let venue = match exchange.as_str() {
-            "bulkf" => Some(ExecutionVenue::Bulk),
-            "hyperliquidf" => Some(ExecutionVenue::Hyperliquid),
-            "hyperliquidf-xyz" => Some(ExecutionVenue::HyperliquidXyz),
-            "hyperliquid" => Some(ExecutionVenue::HyperliquidSpot),
-            "hyperliquid-outcomes" => Some(ExecutionVenue::HyperliquidOutcomes),
-            _ => None,
-        };
-        if let Some(venue) = venue
-            && !venues.contains(&venue)
-        {
-            venues.push(venue);
-        }
-    }
     for venue in state
         .script_orders
         .values()
@@ -5448,15 +5568,6 @@ async fn script_positions_in_daemon(
                 job.definition.testnet,
             )?
         {
-            refresh_account_positions(
-                venue,
-                job.definition.testnet,
-                adapter,
-                state,
-                &account,
-                false,
-            )
-            .await?;
             positions.entry(account_name).or_default().extend(
                 state
                     .account_positions
@@ -5472,7 +5583,6 @@ async fn script_positions_in_daemon(
             );
         }
     }
-    persist_state(paths, state)?;
     Ok(positions)
 }
 
@@ -5511,6 +5621,30 @@ fn apply_bulk_account_event(
     data: &serde_json::Value,
     received_at_ms: u64,
 ) -> Result<()> {
+    if let Some(positions) = BulkExecutionAdapter::account_event_positions(data)? {
+        let cache_key = account_cache_key(ExecutionVenue::Bulk, false, account);
+        if data.get("type").and_then(serde_json::Value::as_str) == Some("positionUpdate") {
+            let cached = state
+                .account_positions
+                .entry(cache_key.clone())
+                .or_default();
+            for position in positions {
+                cached.retain(|existing| {
+                    !existing
+                        .internal_symbol
+                        .eq_ignore_ascii_case(&position.internal_symbol)
+                });
+                if position.size > f64::EPSILON {
+                    cached.push(position);
+                }
+            }
+        } else {
+            state.account_positions.insert(cache_key.clone(), positions);
+        }
+        state
+            .account_positions_refreshed_at_ms
+            .insert(cache_key, received_at_ms);
+    }
     match data.get("type").and_then(serde_json::Value::as_str) {
         Some("accountSnapshot") => {
             if let Some(open_orders) = data.get("openOrders").and_then(serde_json::Value::as_array)
@@ -6454,8 +6588,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_protocol_v39_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 39);
+    fn runtime_protocol_v41_decodes_oiwap_submissions() {
+        assert_eq!(RUNTIME_VERSION, 41);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",
@@ -6533,6 +6667,7 @@ mod tests {
             "job_id": "script_python_1",
             "order": { "id": "ord_1", "key": "ask-1" },
             "exchange": "hyperliquidf",
+            "reference_price": 65_010.0,
             "request": {
                 "key": "ask-1",
                 "symbol": "BTC",
@@ -6547,6 +6682,7 @@ mod tests {
             request,
             RuntimeRequest::ScriptExecuteOrder {
                 exchange: Some(ExecutionVenue::Hyperliquid),
+                reference_price: Some(65_010.0),
                 ..
             }
         ));

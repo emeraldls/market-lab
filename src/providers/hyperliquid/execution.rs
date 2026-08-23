@@ -377,10 +377,11 @@ impl HyperliquidExecutionAdapter {
 
         let entry_price = match plan.order_kind {
             OrderKind::Market => {
+                let max_slippage = market_order_slippage(plan.max_slippage)?;
                 let guarded = if plan.side == OrderSide::Buy {
-                    plan.reference_price * (1.0 + MARKET_ORDER_SLIPPAGE)
+                    plan.reference_price * (1.0 + max_slippage)
                 } else {
-                    plan.reference_price * (1.0 - MARKET_ORDER_SLIPPAGE)
+                    plan.reference_price * (1.0 - max_slippage)
                 };
                 normalize_price_for(
                     guarded,
@@ -477,10 +478,11 @@ impl HyperliquidExecutionAdapter {
             }
             let entry_price = match plan.order_kind {
                 OrderKind::Market => {
+                    let max_slippage = market_order_slippage(plan.max_slippage)?;
                     let guarded = if plan.side == OrderSide::Buy {
-                        plan.reference_price * (1.0 + MARKET_ORDER_SLIPPAGE)
+                        plan.reference_price * (1.0 + max_slippage)
                     } else {
-                        plan.reference_price * (1.0 - MARKET_ORDER_SLIPPAGE)
+                        plan.reference_price * (1.0 - max_slippage)
                     };
                     normalize_price_for(
                         guarded,
@@ -1142,6 +1144,14 @@ fn ensure_account(account: &str, configured: &str) -> Result<()> {
     }
 }
 
+fn market_order_slippage(requested: Option<f64>) -> Result<f64> {
+    let value = requested.unwrap_or(MARKET_ORDER_SLIPPAGE);
+    if !value.is_finite() || !(0.0..1.0).contains(&value) {
+        bail!("trade plan max slippage must be between 0 (inclusive) and 1 (exclusive)");
+    }
+    Ok(value)
+}
+
 const fn venue_for_product(product: HyperliquidProduct) -> ExecutionVenue {
     match product {
         HyperliquidProduct::Spot => ExecutionVenue::HyperliquidSpot,
@@ -1584,6 +1594,18 @@ mod tests {
     fn maps_hyperliquid_sides() {
         assert_eq!(side("B").expect("buy"), OrderSide::Buy);
         assert_eq!(side("A").expect("sell"), OrderSide::Sell);
+    }
+
+    #[test]
+    fn market_order_slippage_uses_script_override_or_venue_default() {
+        assert_eq!(
+            market_order_slippage(Some(0.0005)).expect("valid override"),
+            0.0005
+        );
+        assert_eq!(
+            market_order_slippage(None).expect("valid venue default"),
+            MARKET_ORDER_SLIPPAGE
+        );
     }
 
     #[test]

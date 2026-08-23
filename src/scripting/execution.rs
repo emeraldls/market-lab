@@ -184,11 +184,20 @@ pub struct ScriptTradeRequest {
     pub sl: Option<f64>,
     #[serde(default, alias = "takeProfit", alias = "take_profit")]
     pub tp: Option<f64>,
+    #[serde(default, alias = "max_slippage")]
+    pub max_slippage: Option<f64>,
+    #[serde(default, alias = "max_slippage_bps")]
+    pub max_slippage_bps: Option<f64>,
 }
 
 impl ScriptTradeRequest {
     pub fn leverage_or_default(&self) -> f64 {
         self.leverage.unwrap_or(1.0)
+    }
+
+    pub fn max_slippage_fraction(&self) -> Option<f64> {
+        self.max_slippage
+            .or_else(|| self.max_slippage_bps.map(|bps| bps / 10_000.0))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -259,6 +268,12 @@ impl ScriptTradeRequest {
         if (self.sl.is_some() || self.tp.is_some()) && self.sl == self.tp {
             bail!("ctx.trade sl and tp must use different prices");
         }
+        validate_max_slippage(
+            "ctx.trade",
+            self.order.kind,
+            self.max_slippage,
+            self.max_slippage_bps,
+        )?;
         Ok(())
     }
 }
@@ -281,11 +296,20 @@ pub struct ScriptRawOrderRequest {
     pub reduce_only: bool,
     #[serde(default)]
     pub order: ScriptOrderRequest,
+    #[serde(default, alias = "max_slippage")]
+    pub max_slippage: Option<f64>,
+    #[serde(default, alias = "max_slippage_bps")]
+    pub max_slippage_bps: Option<f64>,
 }
 
 impl ScriptRawOrderRequest {
     pub fn leverage_or_default(&self) -> f64 {
         self.leverage.unwrap_or(1.0)
+    }
+
+    pub fn max_slippage_fraction(&self) -> Option<f64> {
+        self.max_slippage
+            .or_else(|| self.max_slippage_bps.map(|bps| bps / 10_000.0))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -335,8 +359,41 @@ impl ScriptRawOrderRequest {
             }
             ScriptOrderKind::Market => {}
         }
+        validate_max_slippage(
+            "ctx.order",
+            self.order.kind,
+            self.max_slippage,
+            self.max_slippage_bps,
+        )?;
         Ok(())
     }
+}
+
+fn validate_max_slippage(
+    operation: &str,
+    order_kind: ScriptOrderKind,
+    max_slippage: Option<f64>,
+    max_slippage_bps: Option<f64>,
+) -> Result<()> {
+    if max_slippage.is_some() && max_slippage_bps.is_some() {
+        bail!("{operation} accepts only one of max_slippage or max_slippage_bps");
+    }
+    if (max_slippage.is_some() || max_slippage_bps.is_some())
+        && order_kind != ScriptOrderKind::Market
+    {
+        bail!("{operation} max slippage is only valid for market orders");
+    }
+    if let Some(value) = max_slippage
+        && (!value.is_finite() || !(0.0..1.0).contains(&value))
+    {
+        bail!("{operation} max_slippage must be between 0 (inclusive) and 1 (exclusive)");
+    }
+    if let Some(value) = max_slippage_bps
+        && (!value.is_finite() || !(0.0..10_000.0).contains(&value))
+    {
+        bail!("{operation} max_slippage_bps must be between 0 (inclusive) and 10000 (exclusive)");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -379,6 +436,13 @@ impl ScriptManagedRequest {
         match self {
             Self::Trade(request) => request.position.order_direction(),
             Self::Order(request) => request.side.order_direction(),
+        }
+    }
+
+    pub fn max_slippage_fraction(&self) -> Option<f64> {
+        match self {
+            Self::Trade(request) => request.max_slippage_fraction(),
+            Self::Order(request) => request.max_slippage_fraction(),
         }
     }
 }
@@ -681,6 +745,69 @@ mod tests {
         request.validate().expect("valid request");
         assert_eq!(request.order.kind, ScriptOrderKind::Limit);
         assert_eq!(request.account, "main");
+    }
+
+    #[test]
+    fn scripting_market_orders_accept_decimal_or_bps_slippage() {
+        let decimal: ScriptTradeRequest = serde_json::from_value(json!({
+            "key": "entry-decimal",
+            "symbol": "btc",
+            "position": "open-long",
+            "size": 0.01,
+            "max_slippage": 0.0005
+        }))
+        .expect("decode decimal slippage");
+        let bps: ScriptRawOrderRequest = serde_json::from_value(json!({
+            "key": "entry-bps",
+            "symbol": "btc",
+            "side": "buy",
+            "size": 0.01,
+            "max_slippage_bps": 5
+        }))
+        .expect("decode bps slippage");
+
+        decimal.validate().expect("decimal slippage validates");
+        bps.validate().expect("bps slippage validates");
+        assert_eq!(decimal.max_slippage_fraction(), Some(0.0005));
+        assert_eq!(bps.max_slippage_fraction(), Some(0.0005));
+    }
+
+    #[test]
+    fn scripting_market_orders_reject_two_slippage_units() {
+        let request: ScriptTradeRequest = serde_json::from_value(json!({
+            "key": "entry-ambiguous",
+            "symbol": "btc",
+            "position": "open-long",
+            "size": 0.01,
+            "max_slippage": 0.0005,
+            "max_slippage_bps": 5
+        }))
+        .expect("decode request");
+
+        let error = request.validate().expect_err("units must be exclusive");
+        assert!(
+            error
+                .to_string()
+                .contains("only one of max_slippage or max_slippage_bps")
+        );
+    }
+
+    #[test]
+    fn limit_orders_reject_market_slippage_controls() {
+        let request: ScriptRawOrderRequest = serde_json::from_value(json!({
+            "key": "limit-with-slippage",
+            "symbol": "btc",
+            "side": "buy",
+            "size": 0.01,
+            "max_slippage_bps": 5,
+            "order": { "type": "limit", "price": 64000, "tif": "gtc" }
+        }))
+        .expect("decode request");
+
+        let error = request
+            .validate()
+            .expect_err("limit order must define its own price only");
+        assert!(error.to_string().contains("only valid for market orders"));
     }
 
     #[test]
