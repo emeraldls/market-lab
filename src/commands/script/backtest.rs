@@ -303,7 +303,12 @@ pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
 
     let script = Script::load_with_python(&args.script, args.python.as_deref())?;
     let mut report = report_builder("script.backtest", &script, None, None, None);
-    let source_configs = match parse_source_configs(&args.source) {
+    let source_values = if script.language == crate::scripting::language::ScriptLanguage::PythonV2 {
+        script.source_declarations()
+    } else {
+        &args.source
+    };
+    let source_configs = match parse_source_configs(source_values) {
         Ok(configs) => configs,
         Err(err) => {
             let runtime_report = report.finish_error(&err);

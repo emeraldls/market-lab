@@ -49,10 +49,7 @@ impl SourceConfig {
 
     pub fn require_timeframe(&self, source: &ScriptSource) -> Result<u32> {
         self.timeframe.ok_or_else(|| {
-            anyhow::anyhow!(
-                "--source {}:timeframe=<seconds> is required",
-                source.as_str()
-            )
+            anyhow::anyhow!("source {}:timeframe=<seconds> is required", source.as_str())
         })
     }
 
@@ -62,7 +59,7 @@ impl SourceConfig {
 
     pub fn require_bucket(&self, source: &ScriptSource) -> Result<u8> {
         self.bucket.ok_or_else(|| {
-            anyhow::anyhow!("--source {}:bucket=<1..=11> is required", source.as_str())
+            anyhow::anyhow!("source {}:bucket=<1..=11> is required", source.as_str())
         })
     }
 }
@@ -89,7 +86,7 @@ pub fn parse_source_configs(values: &[String]) -> Result<SourceConfigs> {
         });
         if config.provider != provider || config.exchange != exchange {
             bail!(
-                "--source `{selector}` cannot bind both {} and {exchange}",
+                "source `{selector}` cannot bind both {} and {exchange}",
                 config.exchange
             );
         }
@@ -98,10 +95,10 @@ pub fn parse_source_configs(values: &[String]) -> Result<SourceConfigs> {
         }
         for option in options.split(',') {
             let Some((key, raw_value)) = option.split_once('=') else {
-                bail!("--source option must use key=value, got `{option}` in `{value}`");
+                bail!("source option must use key=value, got `{option}` in `{value}`");
             };
             if key.trim().is_empty() {
-                bail!("--source key cannot be empty");
+                bail!("source key cannot be empty");
             }
             let duplicate = match (source.clone(), key) {
                 (ScriptSource::Candles, "timeframe")
@@ -119,10 +116,10 @@ pub fn parse_source_configs(values: &[String]) -> Result<SourceConfigs> {
                 (ScriptSource::Vd, "bucket") => {
                     config.bucket.replace(parse_bucket(raw_value)?).is_some()
                 }
-                _ => bail!("unknown --source {selector}:{key}"),
+                _ => bail!("unknown source {selector}:{key}"),
             };
             if duplicate {
-                bail!("duplicate --source {selector}:{key}");
+                bail!("duplicate source {selector}:{key}");
             }
         }
     }
@@ -259,25 +256,20 @@ pub fn source_configs_payload(configs: &SourceConfigs) -> Value {
 fn validate_source_requirements(manifest: &ScriptManifest, configs: &SourceConfigs) -> Result<()> {
     if manifest.version.trim() == "2" {
         if configs.is_empty() {
-            bail!(
-                "Python Scripting V2 requires at least one --source or TOML source configuration"
-            );
+            bail!("Python Scripting V2 requires at least one literal history.source selector");
         }
         return Ok(());
     }
 
     for config in configs.values() {
         if !manifest.sources.contains(&config.source) {
-            bail!(
-                "--source {} is not listed in script.sources",
-                config.selector
-            );
+            bail!("source {} is not listed in script.sources", config.selector);
         }
     }
 
     for source in &manifest.sources {
         if !configs.values().any(|config| &config.source == source) {
-            bail!("missing --source config for {}", source.as_str());
+            bail!("missing source config for {}", source.as_str());
         }
     }
     Ok(())
@@ -310,7 +302,7 @@ fn validate_source_config(config: &SourceConfig, historical: bool) -> Result<()>
     if config.source == ScriptSource::Oi && !crate::markets::is_futures_exchange(&config.exchange)?
     {
         bail!(
-            "--source {} requires a futures exchange; `{}` is spot",
+            "source {} requires a futures exchange; `{}` is spot",
             config.selector,
             config.exchange
         );
@@ -333,7 +325,7 @@ fn validate_source_config(config: &SourceConfig, historical: bool) -> Result<()>
                     config.require_timeframe(&config.source)?;
                 }
                 if config.depth_or_default() == 0 {
-                    bail!("--source {}:depth must be >= 1", config.selector);
+                    bail!("source {}:depth must be >= 1", config.selector);
                 }
             }
             ScriptSource::Vd => {
@@ -494,7 +486,7 @@ fn parse_source_selector(
             (*symbol, *source, *exchange, provider)
         }
         _ => bail!(
-            "--source `{raw}` must use symbol@source@provider or symbol@source@exchange@provider"
+            "source `{raw}` must use symbol@source@provider or symbol@source@exchange@provider"
         ),
     };
     let symbol = normalize_script_symbol(symbol_raw)?;
@@ -782,7 +774,7 @@ mod tests {
 
         let error = validate_source_configs(&python_manifest, &SourceConfigs::new())
             .expect_err("Python must receive at least one source");
-        assert!(format!("{error:#}").contains("at least one --source or TOML"));
+        assert!(format!("{error:#}").contains("literal history.source selector"));
     }
 
     #[test]

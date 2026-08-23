@@ -249,14 +249,14 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
         bail!("scripts currently support only --output terminal|json|jsonl");
     }
 
-    if args.from.is_some() || args.to.is_some() {
-        bail!(
-            "--from/--to are not allowed with script run; use script backtest for historical data"
-        );
-    }
     let script = Script::load_with_python(&args.script, args.python.as_deref())?;
     validate_execution_routing(&args, script.language)?;
-    let source_configs = parse_source_configs(&args.source)?;
+    let source_values = if script.language == ScriptLanguage::PythonV2 {
+        script.source_declarations()
+    } else {
+        &args.source
+    };
+    let source_configs = parse_source_configs(source_values)?;
     validate_source_configs_for_run(&script.manifest, &source_configs)?;
     let raw_params = parse_param_values(&args.param)?;
     resolve_params(&script.manifest, &raw_params)?;
@@ -308,7 +308,7 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
         python_runtime,
         providers,
         exchanges,
-        sources: args.source,
+        sources: source_values.to_vec(),
         params: args.param,
         venue: args.venue.map(Into::into),
         testnet: args.testnet,
@@ -387,8 +387,6 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
             .map(|runtime| runtime.interpreter.clone()),
         venue,
         testnet: job.definition.testnet,
-        from: None,
-        to: None,
         source: job.definition.sources.clone(),
         param: job.definition.params.clone(),
         duration: job.definition.duration_seconds,
@@ -459,11 +457,6 @@ async fn run(
     job_id: &str,
     initial_event_cursor: u64,
 ) -> Result<()> {
-    if args.from.is_some() || args.to.is_some() {
-        bail!(
-            "--from/--to are not allowed with script run; use script backtest for historical data"
-        );
-    }
     let source_configs = parse_source_configs(&args.source)?;
     validate_source_configs_for_run(&script.manifest, &source_configs)?;
     report.set_source(source_type_names(&source_configs).join(","));
