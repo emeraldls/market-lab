@@ -21,6 +21,7 @@ use super::markets;
 
 const BULK_WS_URL: &str = "wss://exchange-ws1.bulk.trade";
 const BULK_TRADING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const BULK_TRADING_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -42,6 +43,10 @@ struct TradingCommand {
 impl BulkTradingClient {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub async fn connect(&self) -> Result<()> {
+        self.sender().await.map(|_| ())
     }
 
     pub async fn post(&self, payload: &impl Serialize) -> Result<Value> {
@@ -96,6 +101,9 @@ async fn run_trading_connection(
     let (mut sink, mut source) = stream.split();
     let mut next_id = 1_u64;
     let mut pending = HashMap::<u64, oneshot::Sender<Result<Value>>>::new();
+    let start = tokio::time::Instant::now() + BULK_TRADING_HEARTBEAT_INTERVAL;
+    let mut heartbeat = tokio::time::interval_at(start, BULK_TRADING_HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let failure = loop {
         tokio::select! {
             command = commands.recv() => {
@@ -135,6 +143,11 @@ async fn run_trading_connection(
                     }
                     Ok(Message::Pong(_) | Message::Frame(_)) => {}
                     Err(error) => break format!("BULK trading WebSocket read failed: {error}"),
+                }
+            }
+            _ = heartbeat.tick() => {
+                if let Err(error) = sink.send(Message::Ping(Vec::new().into())).await {
+                    break format!("failed to heartbeat BULK trading WebSocket: {error}");
                 }
             }
         }

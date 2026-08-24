@@ -49,8 +49,8 @@ struct ScriptConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BacktestConfig {
-    from: Option<u64>,
-    to: Option<u64>,
+    from: Option<String>,
+    to: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,8 +203,8 @@ fn append_script_config_flags(
     if mode == "backtest"
         && let Some(backtest) = &config.backtest
     {
-        append_optional_owned(args, "--from", backtest.from.map(|value| value.to_string()));
-        append_optional_owned(args, "--to", backtest.to.map(|value| value.to_string()));
+        append_optional(args, "--from", backtest.from.as_deref());
+        append_optional(args, "--to", backtest.to.as_deref());
     }
 
     if mode == "run"
@@ -456,8 +456,8 @@ timeframe = 60
 fast = 20
 
 [backtest]
-from = 1000
-to = 2000
+from = "2026-08-01"
+to = "2026-08-02"
 "#,
         )
         .expect("write config");
@@ -483,6 +483,8 @@ to = 2000
                 assert_eq!(args.source, vec!["btc@candles@bybitf@mmt:timeframe=60"]);
                 assert_eq!(args.param, vec!["fast=20"]);
                 assert!(args.script.ends_with("strategy.js"));
+                assert_eq!(args.from, 1_785_542_400_000);
+                assert_eq!(args.to, 1_785_628_800_000);
             }
             _ => panic!("expected script backtest"),
         }
@@ -502,12 +504,9 @@ version = 1
 path = "strategy.py"
 python = ".venv/bin/python"
 
-[sources."btc@candles@hyperliquidf"]
-timeframe = 60
-
 [backtest]
-from = 1000
-to = 2000
+from = "2026-08-01 12:00:00"
+to = "2026-08-01 13:00:00"
 "#,
         )
         .expect("write config");
@@ -531,6 +530,8 @@ to = 2000
             } => {
                 assert!(args.script.ends_with("strategy.py"));
                 assert_eq!(args.python, Some(dir.join(".venv/bin/python")));
+                assert_eq!(args.from, 1_785_585_600_000);
+                assert_eq!(args.to, 1_785_589_200_000);
             }
             _ => panic!("expected Python script backtest"),
         }

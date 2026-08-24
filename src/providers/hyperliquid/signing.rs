@@ -60,11 +60,28 @@ impl HyperliquidWallet {
         nonce: u64,
         network: HyperliquidNetwork,
     ) -> Result<WireSignature> {
+        self.sign_l1_action_for(action, nonce, network, None)
+    }
+
+    pub fn sign_l1_action_for<T: Serialize>(
+        &self,
+        action: &T,
+        nonce: u64,
+        network: HyperliquidNetwork,
+        vault_address: Option<&str>,
+    ) -> Result<WireSignature> {
         let mut bytes = rmp_serde::to_vec_named(action)
             .context("failed to encode Hyperliquid action for signing")?;
         bytes.extend(nonce.to_be_bytes());
-        // Market Lab does not submit for vaults or subaccounts.
-        bytes.push(0);
+        if let Some(address) = vault_address {
+            bytes.push(1);
+            let canonical = canonical_address(address)?;
+            let raw = hex::decode(canonical.trim_start_matches("0x"))
+                .context("failed to encode Hyperliquid subaccount address")?;
+            bytes.extend(raw);
+        } else {
+            bytes.push(0);
+        }
         let connection_id = keccak(bytes);
         let digest = typed_data_digest(
             exchange_domain_separator(),
@@ -247,6 +264,31 @@ mod tests {
 
         assert_ne!(mainnet.r, testnet.r);
         assert_ne!(mainnet.s, testnet.s);
+    }
+
+    #[test]
+    fn subaccount_address_is_bound_into_the_l1_signature() {
+        let wallet = HyperliquidWallet::from_private_key(
+            "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+        )
+        .expect("wallet parses");
+        let action = serde_json::json!({
+            "type": "cancel",
+            "cancels": [{ "a": 3, "o": 42 }]
+        });
+        let main = wallet
+            .sign_l1_action(&action, 1_713_825_891_591, HyperliquidNetwork::Mainnet)
+            .expect("main account action signs");
+        let subaccount = wallet
+            .sign_l1_action_for(
+                &action,
+                1_713_825_891_591,
+                HyperliquidNetwork::Mainnet,
+                Some("0x1111111111111111111111111111111111111111"),
+            )
+            .expect("subaccount action signs");
+        assert_ne!(main.r, subaccount.r);
+        assert_ne!(main.s, subaccount.s);
     }
 
     #[test]

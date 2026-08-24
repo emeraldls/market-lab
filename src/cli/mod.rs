@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use chrono::{NaiveDate, NaiveDateTime};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -639,6 +640,9 @@ pub struct AuthSetArgs {
     /// Replace remote execution credentials after their replacements are confirmed.
     #[arg(long, default_value_t = false)]
     pub reauthorize: bool,
+    /// Create a named execution subaccount under the configured main account.
+    #[arg(long, value_name = "NAME")]
+    pub subaccount: Option<String>,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -748,10 +752,7 @@ pub struct ScriptRunArgs {
     /// Route all Hyperliquid execution and data in this job through testnet.
     #[arg(long, default_value_t = false)]
     pub testnet: bool,
-    #[arg(long)]
-    pub from: Option<u64>,
-    #[arg(long)]
-    pub to: Option<u64>,
+    /// JavaScript Scripting V1 source declaration. Python V2 uses history.source literals.
     #[arg(long = "source")]
     pub source: Vec<String>,
     #[arg(long = "param")]
@@ -824,17 +825,6 @@ impl ScriptRunArgs {
         if self.script.trim().is_empty() {
             bail!("script path is required");
         }
-        if let Some(from) = self.from {
-            validate_millisecond_timestamp(from, "--from")?;
-        }
-        if let Some(to) = self.to {
-            validate_millisecond_timestamp(to, "--to")?;
-        }
-        if let (Some(from), Some(to)) = (self.from, self.to)
-            && from >= to
-        {
-            bail!("--from must be less than --to");
-        }
         if self.duration == Some(0) {
             bail!("--duration must be at least 1 second");
         }
@@ -845,6 +835,11 @@ impl ScriptRunArgs {
             if self.venue.is_some() {
                 bail!(
                     "Python Scripting V2 routes execution through ctx.trade/ctx.order exchange; remove --venue"
+                );
+            }
+            if !self.source.is_empty() {
+                bail!(
+                    "Python Scripting V2 derives data from literal history.source calls; remove --source and [sources] from marketlab.toml"
                 );
             }
         } else if self.testnet
@@ -872,10 +867,13 @@ pub struct ScriptBacktestArgs {
     /// Python interpreter for a .py script. Defaults to an adjacent .venv, then python3.
     #[arg(long)]
     pub python: Option<PathBuf>,
-    #[arg(long)]
+    /// UTC start: YYYY-MM-DD or "YYYY-MM-DD HH:MM:SS".
+    #[arg(long, value_parser = parse_datetime_ms, value_name = "UTC_DATETIME")]
     pub from: u64,
-    #[arg(long)]
+    /// UTC end: YYYY-MM-DD or "YYYY-MM-DD HH:MM:SS".
+    #[arg(long, value_parser = parse_datetime_ms, value_name = "UTC_DATETIME")]
     pub to: u64,
+    /// JavaScript Scripting V1 source declaration. Python V2 uses history.source literals.
     #[arg(long = "source")]
     pub source: Vec<String>,
     #[arg(long = "param")]
@@ -895,6 +893,16 @@ impl ScriptBacktestArgs {
         validate_millisecond_timestamp(self.to, "--to")?;
         if self.from >= self.to {
             bail!("--from must be less than --to");
+        }
+        let language = crate::scripting::language::ScriptLanguage::from_path(
+            std::path::Path::new(&self.script),
+        )?;
+        if language == crate::scripting::language::ScriptLanguage::PythonV2
+            && !self.source.is_empty()
+        {
+            bail!(
+                "Python Scripting V2 derives data from literal history.source calls; remove --source and [sources] from marketlab.toml"
+            );
         }
         Ok(())
     }
@@ -945,9 +953,11 @@ pub struct SourceVdArgs {
     pub symbol: String,
     #[arg(long)]
     pub timeframe: Option<u32>,
-    #[arg(long)]
+    /// UTC start: YYYY-MM-DD or "YYYY-MM-DD HH:MM:SS".
+    #[arg(long, value_parser = parse_datetime_ms, value_name = "UTC_DATETIME")]
     pub from: Option<u64>,
-    #[arg(long)]
+    /// UTC end: YYYY-MM-DD or "YYYY-MM-DD HH:MM:SS".
+    #[arg(long, value_parser = parse_datetime_ms, value_name = "UTC_DATETIME")]
     pub to: Option<u64>,
     #[arg(long, default_value_t = 1)]
     pub bucket: u8,
@@ -1042,9 +1052,11 @@ pub struct CvdArgs {
     pub symbol: String,
     #[arg(long)]
     pub timeframe: u32,
-    #[arg(long)]
+    /// UTC start: YYYY-MM-DD or "YYYY-MM-DD HH:MM:SS".
+    #[arg(long, value_parser = parse_datetime_ms, value_name = "UTC_DATETIME")]
     pub from: Option<u64>,
-    #[arg(long)]
+    /// UTC end: YYYY-MM-DD or "YYYY-MM-DD HH:MM:SS".
+    #[arg(long, value_parser = parse_datetime_ms, value_name = "UTC_DATETIME")]
     pub to: Option<u64>,
     #[arg(long, default_value_t = 1)]
     pub bucket: u8,
@@ -1070,9 +1082,11 @@ pub struct SourceCandlesArgs {
     pub symbol: String,
     #[arg(long)]
     pub timeframe: u32,
-    #[arg(long)]
+    /// UTC start: YYYY-MM-DD or "YYYY-MM-DD HH:MM:SS".
+    #[arg(long, value_parser = parse_datetime_ms, value_name = "UTC_DATETIME")]
     pub from: Option<u64>,
-    #[arg(long)]
+    /// UTC end: YYYY-MM-DD or "YYYY-MM-DD HH:MM:SS".
+    #[arg(long, value_parser = parse_datetime_ms, value_name = "UTC_DATETIME")]
     pub to: Option<u64>,
     #[arg(long, default_value_t = false)]
     pub stream: bool,
@@ -1123,9 +1137,11 @@ pub struct SourceOiArgs {
     pub symbol: String,
     #[arg(long)]
     pub timeframe: Option<u32>,
-    #[arg(long)]
+    /// UTC start: YYYY-MM-DD or "YYYY-MM-DD HH:MM:SS".
+    #[arg(long, value_parser = parse_datetime_ms, value_name = "UTC_DATETIME")]
     pub from: Option<u64>,
-    #[arg(long)]
+    /// UTC end: YYYY-MM-DD or "YYYY-MM-DD HH:MM:SS".
+    #[arg(long, value_parser = parse_datetime_ms, value_name = "UTC_DATETIME")]
     pub to: Option<u64>,
     #[arg(long, default_value_t = false)]
     pub stream: bool,
@@ -1207,9 +1223,11 @@ pub struct SourceVolumesArgs {
     pub symbol: String,
     #[arg(long)]
     pub timeframe: u32,
-    #[arg(long)]
+    /// UTC start: YYYY-MM-DD or "YYYY-MM-DD HH:MM:SS".
+    #[arg(long, value_parser = parse_datetime_ms, value_name = "UTC_DATETIME")]
     pub from: Option<u64>,
-    #[arg(long)]
+    /// UTC end: YYYY-MM-DD or "YYYY-MM-DD HH:MM:SS".
+    #[arg(long, value_parser = parse_datetime_ms, value_name = "UTC_DATETIME")]
     pub to: Option<u64>,
     #[arg(long, default_value_t = false)]
     pub stream: bool,
@@ -1576,9 +1594,11 @@ pub struct ReplayArgs {
     pub exchange: String,
     #[arg(long)]
     pub symbol: String,
-    #[arg(long)]
+    /// UTC start: YYYY-MM-DD or "YYYY-MM-DD HH:MM:SS".
+    #[arg(long, value_parser = parse_datetime_ms, value_name = "UTC_DATETIME")]
     pub from: u64,
-    #[arg(long)]
+    /// UTC end: YYYY-MM-DD or "YYYY-MM-DD HH:MM:SS".
+    #[arg(long, value_parser = parse_datetime_ms, value_name = "UTC_DATETIME")]
     pub to: u64,
     #[arg(long, default_value_t = 1)]
     pub speed: u32,
@@ -2647,6 +2667,30 @@ fn validate_stream_controls(buffer_size: u16, interval_ms: u64) -> Result<()> {
     Ok(())
 }
 
+fn parse_datetime_ms(raw: &str) -> std::result::Result<u64, String> {
+    let raw = raw.trim();
+    let datetime = if let Ok(value) = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S") {
+        value
+    } else if let Ok(value) = NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S") {
+        value
+    } else if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        date.and_hms_opt(0, 0, 0)
+            .expect("midnight must be a valid time")
+    } else {
+        return Err(format!(
+            "invalid UTC date-time `{raw}`; expected YYYY-MM-DD or YYYY-MM-DD HH:MM:SS"
+        ));
+    };
+    let timestamp = u64::try_from(datetime.and_utc().timestamp_millis())
+        .map_err(|_| format!("UTC date-time `{raw}` is outside the supported range"))?;
+    if !(10_000_000_000..10_000_000_000_000).contains(&timestamp) {
+        return Err(format!(
+            "UTC date-time `{raw}` is outside the supported range"
+        ));
+    }
+    Ok(timestamp)
+}
+
 fn validate_millisecond_timestamp(timestamp: u64, flag: &str) -> Result<()> {
     if !(10_000_000_000..10_000_000_000_000).contains(&timestamp) {
         bail!("{flag} must be a millisecond timestamp");
@@ -3449,7 +3493,8 @@ mod tests {
             Commands::Auth {
                 command: AuthCommands::Set(AuthSetArgs {
                     provider: AuthProvider::Mmt,
-                    reauthorize: false
+                    reauthorize: false,
+                    subaccount: None,
                 })
             }
         ));
@@ -3470,7 +3515,8 @@ mod tests {
             Commands::Auth {
                 command: AuthCommands::Set(AuthSetArgs {
                     provider: AuthProvider::Bulk,
-                    reauthorize: false
+                    reauthorize: false,
+                    subaccount: None,
                 })
             }
         ));
@@ -3483,9 +3529,30 @@ mod tests {
             Commands::Auth {
                 command: AuthCommands::Set(AuthSetArgs {
                     provider: AuthProvider::Bulk,
-                    reauthorize: true
+                    reauthorize: true,
+                    subaccount: None,
                 })
             }
+        ));
+
+        let subaccount = Cli::try_parse_from([
+            "mlab",
+            "auth",
+            "set",
+            "hyperliquid",
+            "--subaccount",
+            "trading-2",
+        ])
+        .expect("named subaccount should parse");
+        assert!(matches!(
+            subaccount.command,
+            Commands::Auth {
+                command: AuthCommands::Set(AuthSetArgs {
+                    provider: AuthProvider::Hyperliquid,
+                    reauthorize: false,
+                    subaccount: Some(name),
+                })
+            } if name == "trading-2"
         ));
     }
 
@@ -3526,9 +3593,9 @@ mod tests {
             "--timeframe",
             "60",
             "--from",
-            "1704067200000",
+            "2024-01-01",
             "--to",
-            "1704067800000",
+            "2024-01-01 00:10:00",
             "--bucket",
             "1",
             "--output",
@@ -3562,9 +3629,9 @@ mod tests {
             "--timeframe",
             "60",
             "--from",
-            "1704067200000",
+            "2024-01-01",
             "--to",
-            "1704067800000",
+            "2024-01-01 00:10:00",
             "--bucket",
             "1",
             "--output",
@@ -3603,9 +3670,9 @@ mod tests {
             "1",
             "--stream",
             "--from",
-            "1704067200000",
+            "2024-01-01",
             "--to",
-            "1704067800000",
+            "2024-01-01 00:10:00",
         ])
         .expect("parse should succeed");
 
@@ -3638,9 +3705,9 @@ mod tests {
             "--timeframe",
             "60",
             "--from",
-            "1704067200000",
+            "2024-01-01",
             "--to",
-            "1704067800000",
+            "2024-01-01 00:10:00",
             "--output",
             "json",
         ])
@@ -3673,9 +3740,9 @@ mod tests {
             "--timeframe",
             "60",
             "--from",
-            "1704067200000",
+            "2024-01-01",
             "--to",
-            "1704067800000",
+            "2024-01-01 00:10:00",
             "--output",
             "json",
         ])
@@ -3738,9 +3805,9 @@ mod tests {
             "--timeframe",
             "60",
             "--from",
-            "1704067200000",
+            "2024-01-01",
             "--to",
-            "1704067800000",
+            "2024-01-01 00:10:00",
             "--output",
             "json",
         ])
@@ -3774,9 +3841,9 @@ mod tests {
             "60",
             "--stream",
             "--from",
-            "1704067200000",
+            "2024-01-01",
             "--to",
-            "1704067800000",
+            "2024-01-01 00:10:00",
         ])
         .expect("parse should succeed");
 
@@ -3963,9 +4030,9 @@ mod tests {
             "--timeframe",
             "60",
             "--from",
-            "1704067200000",
+            "2024-01-01",
             "--to",
-            "1704067800000",
+            "2024-01-01 00:10:00",
         ])
         .expect("standalone BULK candles should parse");
         match candles.command {
@@ -4144,8 +4211,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_seconds_at_the_market_lab_boundary() {
-        let cli = Cli::try_parse_from([
+    fn rejects_numeric_timestamps_at_the_cli_boundary() {
+        let error = Cli::try_parse_from([
             "mlab",
             "source",
             "candles",
@@ -4160,16 +4227,8 @@ mod tests {
             "--to",
             "1704067800",
         ])
-        .expect("syntax should parse before unit validation");
-        match cli.command {
-            Commands::Source {
-                command: SourceCommands::Candles(args),
-            } => {
-                let error = args.validate().expect_err("seconds must be rejected");
-                assert!(error.to_string().contains("millisecond timestamp"));
-            }
-            _ => panic!("expected BULK candles command"),
-        }
+        .expect_err("numeric timestamps must be rejected during CLI parsing");
+        assert!(error.to_string().contains("expected YYYY-MM-DD"));
     }
 
     #[test]
@@ -4765,8 +4824,6 @@ mod tests {
             "strategy.py",
             "--python",
             ".venv/bin/python",
-            "--source",
-            "btc@candles@hyperliquidf:timeframe=60",
         ])
         .expect("Python script run should parse");
         match run.command {
@@ -4775,6 +4832,8 @@ mod tests {
             } => {
                 assert_eq!(args.script, "strategy.py");
                 assert_eq!(args.python, Some(PathBuf::from(".venv/bin/python")));
+                assert!(args.source.is_empty());
+                args.validate().expect("Python V2 command validates");
             }
             _ => panic!("expected Python script run"),
         }
@@ -4787,9 +4846,9 @@ mod tests {
             "--python",
             ".venv/bin/python",
             "--from",
-            "1704067200000",
+            "2024-01-01",
             "--to",
-            "1704067800000",
+            "2024-01-01 00:10:00",
         ])
         .expect("Python script backtest should parse");
         match backtest.command {
@@ -4810,8 +4869,6 @@ mod tests {
                 command: ScriptCommands::Run(args),
             } => {
                 assert_eq!(args.script, "test/buy-pressure.js");
-                assert!(args.from.is_none());
-                assert!(args.to.is_none());
                 assert!(args.duration.is_none());
                 args.validate().expect("base validate should succeed");
             }
@@ -4850,9 +4907,9 @@ mod tests {
             "backtest",
             "./scripts/sma-cross.js",
             "--from",
-            "1704067200000",
+            "2024-01-01",
             "--to",
-            "1704067800000",
+            "2024-01-01 00:10:00",
             "--source",
             "btc@candles@bybitf@mmt:timeframe=60",
             "--param",
@@ -4883,9 +4940,9 @@ mod tests {
             "backtest",
             "./scripts/cross-exchange.js",
             "--from",
-            "1704067200000",
+            "2024-01-01",
             "--to",
-            "1704067800000",
+            "2024-01-01 00:10:00",
             "--source",
             "btc@candles@binancef@mmt:timeframe=60",
             "--source",
@@ -4934,9 +4991,9 @@ mod tests {
             "backtest",
             "./examples/sma-cross.js",
             "--from",
-            "1704067200000",
+            "2024-01-01",
             "--to",
-            "1704067800000",
+            "2024-01-01 00:10:00",
             "--source",
             "btc@candles@bulkf:timeframe=60",
         ])
@@ -5059,6 +5116,28 @@ mod tests {
         };
         args.validate()
             .expect("Python --testnet does not require --venue");
+
+        let source = Cli::try_parse_from([
+            "mlab",
+            "script",
+            "run",
+            "strategy.py",
+            "--source",
+            "btc@candles@hyperliquidf:timeframe=60",
+        ])
+        .expect("legacy source syntax parses before semantic validation");
+        let Commands::Script {
+            command: ScriptCommands::Run(args),
+        } = source.command
+        else {
+            panic!("expected script run command");
+        };
+        assert!(
+            args.validate()
+                .expect_err("Python --source must fail")
+                .to_string()
+                .contains("history.source")
+        );
     }
 
     #[test]
@@ -5068,5 +5147,19 @@ mod tests {
                 .expect_err("script --symbol must remain removed");
 
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn parses_readable_utc_time_boundaries() {
+        assert_eq!(parse_datetime_ms("2024-01-01").unwrap(), 1_704_067_200_000);
+        assert_eq!(
+            parse_datetime_ms("2024-01-01 00:10:00").unwrap(),
+            1_704_067_800_000
+        );
+        assert_eq!(
+            parse_datetime_ms("2024-01-01T00:10:00").unwrap(),
+            1_704_067_800_000
+        );
+        assert!(parse_datetime_ms("1704067200000").is_err());
     }
 }

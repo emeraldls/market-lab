@@ -61,6 +61,35 @@ impl BulkExecutionAdapter {
         })
     }
 
+    pub async fn connect_trading(&self) -> Result<()> {
+        self.trading.connect().await
+    }
+
+    pub(crate) fn account_event_positions(value: &Value) -> Result<Option<Vec<Position>>> {
+        match value.get("type").and_then(Value::as_str) {
+            Some("accountSnapshot") => value
+                .get("positions")
+                .cloned()
+                .map(serde_json::from_value::<Vec<BulkPosition>>)
+                .transpose()
+                .context("BULK account snapshot returned invalid positions")?
+                .map(|positions| {
+                    positions
+                        .into_iter()
+                        .filter(|position| position.size != 0.0)
+                        .map(Position::try_from)
+                        .collect()
+                })
+                .transpose(),
+            Some("positionUpdate") => {
+                let position: BulkPosition = serde_json::from_value(value.clone())
+                    .context("BULK account stream returned an invalid position update")?;
+                Ok(Some(vec![Position::try_from(position)?]))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub async fn account_snapshot(&self, account: &str) -> Result<AccountSnapshot> {
         let response: Vec<FullAccountEnvelope> = self
             .client
@@ -608,11 +637,20 @@ fn sign_trade_order(
 
 fn order_from_plan(plan: &TradePlan) -> Result<Order> {
     let mut order = match plan.order_kind {
-        OrderKind::Market => Order::market(
-            plan.venue_symbol.clone(),
-            plan.side == OrderSide::Buy,
-            plan.size,
-        ),
+        OrderKind::Market => match plan.max_slippage {
+            Some(max_slippage) => Order::limit(
+                plan.venue_symbol.clone(),
+                plan.side == OrderSide::Buy,
+                bulk_slippage_limit_price(plan, max_slippage)?,
+                plan.size,
+                TimeInForce::Ioc,
+            ),
+            None => Order::market(
+                plan.venue_symbol.clone(),
+                plan.side == OrderSide::Buy,
+                plan.size,
+            ),
+        },
         OrderKind::Limit => Order::limit(
             plan.venue_symbol.clone(),
             plan.side == OrderSide::Buy,
@@ -629,6 +667,33 @@ fn order_from_plan(plan: &TradePlan) -> Result<Order> {
         order = order.reduce_only();
     }
     Ok(order)
+}
+
+fn bulk_slippage_limit_price(plan: &TradePlan, max_slippage: f64) -> Result<f64> {
+    if !max_slippage.is_finite() || !(0.0..1.0).contains(&max_slippage) {
+        bail!("trade plan max slippage must be between 0 (inclusive) and 1 (exclusive)");
+    }
+    let market = markets::market(&plan.internal_symbol)?;
+    let rules = market.execution_rules()?;
+    let raw_price = match plan.side {
+        OrderSide::Buy => plan.reference_price * (1.0 + max_slippage),
+        OrderSide::Sell => plan.reference_price * (1.0 - max_slippage),
+    };
+    let units = raw_price / rules.tick_size;
+    let units = match plan.side {
+        OrderSide::Buy => (units + 1e-10).floor(),
+        OrderSide::Sell => (units - 1e-10).ceil(),
+    };
+    let price = round_to_precision(units * rules.tick_size, rules.price_precision);
+    if !price.is_finite() || price <= 0.0 {
+        bail!("BULK slippage limit price must be positive");
+    }
+    Ok(price)
+}
+
+fn round_to_precision(value: f64, precision: u8) -> f64 {
+    let scale = 10_f64.powi(i32::from(precision));
+    (value * scale).round() / scale
 }
 
 fn signed_order_ids(signed: &SignedTransaction, expected: usize) -> Result<Vec<String>> {
@@ -702,8 +767,34 @@ fn validate_trade_plan(plan: &TradePlan) -> Result<()> {
             if plan.price.is_some() || plan.time_in_force.is_some() {
                 bail!("market trade plan cannot include price or time in force");
             }
+            if let Some(max_slippage) = plan.max_slippage
+                && (!max_slippage.is_finite() || !(0.0..1.0).contains(&max_slippage))
+            {
+                bail!("trade plan max slippage must be between 0 (inclusive) and 1 (exclusive)");
+            }
+            if plan.max_slippage.is_some() {
+                if !market.supports_order_type("LIMIT") {
+                    bail!(
+                        "BULK market `{}` cannot enforce max slippage because it does not support limit orders",
+                        market.venue_symbol
+                    );
+                }
+                if !rules
+                    .time_in_forces
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case("IOC"))
+                {
+                    bail!(
+                        "BULK market `{}` cannot enforce max slippage because it does not support IOC",
+                        market.venue_symbol
+                    );
+                }
+            }
         }
         OrderKind::Limit => {
+            if plan.max_slippage.is_some() {
+                bail!("limit trade plan cannot include max slippage");
+            }
             if !market.supports_order_type("LIMIT") {
                 bail!(
                     "BULK market `{}` does not support limit orders",
@@ -1038,7 +1129,9 @@ struct BulkFullAccount {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BulkMargin {
+    #[serde(alias = "totalMargin")]
     total_balance: f64,
+    #[serde(alias = "availableMargin")]
     available_balance: f64,
     margin_used: f64,
     notional: f64,
@@ -1355,6 +1448,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decodes_current_bulk_margin_shape() {
+        let margin: BulkMargin = serde_json::from_value(serde_json::json!({
+            "totalMargin": 1_000.0,
+            "availableMargin": 975.0,
+            "executionImpact": 0.0,
+            "transferableBalance": 975.0,
+            "marginUsed": 25.0,
+            "marginBufferRate": 0.05,
+            "bufferedMargin": 0.0,
+            "notional": 250.0,
+            "realizedPnl": 2.0,
+            "unrealizedPnl": 3.0,
+            "fees": -0.5,
+            "funding": -0.1
+        }))
+        .expect("current BULK margin shape decodes");
+
+        let summary = MarginSummary::from(margin);
+        assert_eq!(summary.total_balance, 1_000.0);
+        assert_eq!(summary.available_balance, 975.0);
+        assert_eq!(summary.margin_used, 25.0);
+    }
+
+    #[test]
+    fn decodes_positions_from_bulk_account_websocket_events() {
+        let update = serde_json::json!({
+            "type": "positionUpdate",
+            "symbol": "BTC-USD",
+            "size": -0.002,
+            "price": 64_000.0,
+            "fairPrice": 64_001.0,
+            "notional": -128.002,
+            "realizedPnl": 1.0,
+            "unrealizedPnl": -0.002,
+            "leverage": 5.0,
+            "liquidationPrice": 80_000.0,
+            "fees": -0.1,
+            "funding": -0.01,
+            "maintenanceMargin": 2.5
+        });
+
+        let positions = BulkExecutionAdapter::account_event_positions(&update)
+            .expect("position update decodes")
+            .expect("position update contains positions");
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].internal_symbol, "BTC");
+        assert_eq!(positions[0].direction, PositionDirection::Short);
+        assert_eq!(positions[0].size, 0.002);
+
+        let snapshot = serde_json::json!({
+            "type": "accountSnapshot",
+            "positions": []
+        });
+        assert!(
+            BulkExecutionAdapter::account_event_positions(&snapshot)
+                .expect("snapshot decodes")
+                .expect("snapshot contains positions")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn rejected_status_keeps_its_name_when_bulk_only_returns_an_order_id() {
         let error = status_error(&serde_json::json!({
             "rejectedCrossing": { "oid": "order-id" }
@@ -1613,6 +1768,79 @@ mod tests {
     }
 
     #[test]
+    fn bounded_market_orders_use_ioc_limits_on_both_sides() {
+        let plan = TradePlan {
+            created_at_ms: 1_784_158_000_000,
+            venue: ExecutionVenue::Bulk,
+            testnet: false,
+            account: "account".to_string(),
+            internal_symbol: "BTC".to_string(),
+            venue_symbol: "BTC-USD".to_string(),
+            direction: PositionDirection::Long,
+            side: OrderSide::Buy,
+            order_kind: OrderKind::Market,
+            time_in_force: None,
+            requested_size: Some(0.001),
+            size: 0.001,
+            price: None,
+            reference_price: 65_000.0,
+            max_slippage: Some(0.0005),
+            requested_margin: None,
+            estimated_margin: 13.0,
+            estimated_exposure: 65.0,
+            projected_liquidation_price: None,
+            leverage: Some(5.0),
+            reduce_only: false,
+            stop_loss_price: None,
+            take_profit_price: None,
+            market_fingerprint: None,
+        };
+
+        validate_trade_plan(&plan).expect("bounded market plan validates");
+        let buy = order_from_plan(&plan).expect("bounded buy order");
+        assert_eq!(buy.price, 65_032.5);
+        assert_eq!(
+            buy.order_type,
+            bulk_keychain::OrderType::limit(TimeInForce::Ioc)
+        );
+
+        let sell = order_from_plan(&TradePlan {
+            direction: PositionDirection::Short,
+            side: OrderSide::Sell,
+            ..plan.clone()
+        })
+        .expect("bounded sell order");
+        assert_eq!(sell.price, 64_967.5);
+        assert_eq!(
+            sell.order_type,
+            bulk_keychain::OrderType::limit(TimeInForce::Ioc)
+        );
+
+        let off_tick = TradePlan {
+            reference_price: 65_000.000_4,
+            max_slippage: Some(0.0),
+            ..plan.clone()
+        };
+        let bounded_buy = order_from_plan(&off_tick).expect("strict bounded buy order");
+        assert_eq!(bounded_buy.price, 65_000.0);
+        let bounded_sell = order_from_plan(&TradePlan {
+            direction: PositionDirection::Short,
+            side: OrderSide::Sell,
+            ..off_tick
+        })
+        .expect("strict bounded sell order");
+        assert_eq!(bounded_sell.price, 65_000.001);
+
+        let native = order_from_plan(&TradePlan {
+            max_slippage: None,
+            ..plan
+        })
+        .expect("native market order");
+        assert_eq!(native.price, 0.0);
+        assert_eq!(native.order_type, bulk_keychain::OrderType::market());
+    }
+
+    #[test]
     fn agent_signs_trade_for_main_account() {
         let master = bulk_keychain::Keypair::generate();
         let account = master.pubkey();
@@ -1634,6 +1862,7 @@ mod tests {
             size: 0.001,
             price: Some(65_000.0),
             reference_price: 65_000.0,
+            max_slippage: None,
             requested_margin: None,
             estimated_margin: 13.0,
             estimated_exposure: 65.0,

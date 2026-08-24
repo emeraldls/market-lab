@@ -121,6 +121,7 @@ struct ScriptBacktestTrade {
     order_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     exchange: Option<crate::domain::execution::ExecutionVenue>,
+    account: String,
     symbol: String,
     side: TradeSide,
     entry: ScriptBacktestTradeLeg,
@@ -151,6 +152,7 @@ struct ScriptBacktestOpenPosition {
     order_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     exchange: Option<crate::domain::execution::ExecutionVenue>,
+    account: String,
     symbol: String,
     side: TradeSide,
     entry_ts_ms: u64,
@@ -182,6 +184,7 @@ struct OpenTrade {
     id: String,
     order_id: Option<String>,
     exchange: Option<crate::domain::execution::ExecutionVenue>,
+    account: String,
     symbol: String,
     side: TradeSide,
     entry_idx: usize,
@@ -251,6 +254,7 @@ struct TradeEvent {
 struct TradeEntry {
     symbol: String,
     exchange: Option<crate::domain::execution::ExecutionVenue>,
+    account: String,
     side: TradeSide,
     idx: usize,
     ts_ms: u64,
@@ -299,7 +303,12 @@ pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
 
     let script = Script::load_with_python(&args.script, args.python.as_deref())?;
     let mut report = report_builder("script.backtest", &script, None, None, None);
-    let source_configs = match parse_source_configs(&args.source) {
+    let source_values = if script.language == crate::scripting::language::ScriptLanguage::PythonV2 {
+        script.source_declarations()
+    } else {
+        &args.source
+    };
+    let source_configs = match parse_source_configs(source_values) {
         Ok(configs) => configs,
         Err(err) => {
             let runtime_report = report.finish_error(&err);
@@ -1082,9 +1091,27 @@ fn build_event_payload(ctx: EventPayloadContext<'_>) -> Result<Value> {
         source_configs_payload(ctx.source_configs),
     );
     let open_positions = open_trades_to_positions(ctx.open_trades, ctx.event_idx, ctx.latest_marks);
-    root.insert("positions".to_string(), json!({ "open": open_positions }));
+    root.insert("positions".to_string(), positions_payload(&open_positions));
 
     Ok(Value::Object(root))
+}
+
+fn positions_payload(positions: &[ScriptBacktestOpenPosition]) -> Value {
+    let mut accounts = serde_json::Map::new();
+    for position in positions {
+        let entry = accounts
+            .entry(position.account.clone())
+            .or_insert_with(|| json!({ "open": [] }));
+        entry
+            .get_mut("open")
+            .and_then(Value::as_array_mut)
+            .expect("position account payload is initialized with an array")
+            .push(json!(position));
+    }
+    accounts
+        .entry("main".to_string())
+        .or_insert_with(|| json!({ "open": [] }));
+    Value::Object(accounts)
 }
 
 fn build_event_timeline(
@@ -1848,6 +1875,7 @@ fn fill_simulated_trade(
             TradeEntry {
                 symbol: request.symbol.to_ascii_lowercase(),
                 exchange,
+                account: request.account.clone(),
                 side,
                 idx,
                 ts_ms,
@@ -1863,7 +1891,9 @@ fn fill_simulated_trade(
         );
         let filled_qty = opened.qty;
         if let Some(existing) = simulation.open_trades.iter_mut().find(|open| {
-            open.exchange == exchange && open.symbol.eq_ignore_ascii_case(&request.symbol)
+            open.exchange == exchange
+                && open.account.eq_ignore_ascii_case(&request.account)
+                && open.symbol.eq_ignore_ascii_case(&request.symbol)
         }) {
             add_to_open_position(existing, opened);
         } else {
@@ -1874,6 +1904,7 @@ fn fill_simulated_trade(
         let side = trade_side(request.position.position_direction());
         let Some(open_index) = simulation.open_trades.iter().position(|open| {
             open.exchange == exchange
+                && open.account.eq_ignore_ascii_case(&request.account)
                 && open.side == side
                 && open.symbol.eq_ignore_ascii_case(&request.symbol)
         }) else {
@@ -1916,7 +1947,9 @@ fn fill_simulated_raw_order(
         .context("ctx.order simulation could not determine order notional")?;
     let quantity = notional / price;
     let existing_index = simulation.open_trades.iter().position(|open| {
-        open.exchange == exchange && open.symbol.eq_ignore_ascii_case(&request.symbol)
+        open.exchange == exchange
+            && open.account.eq_ignore_ascii_case(&request.account)
+            && open.symbol.eq_ignore_ascii_case(&request.symbol)
     });
     let existing = existing_index.map(|index| simulation.open_trades[index].side);
 
@@ -1953,6 +1986,7 @@ fn fill_simulated_raw_order(
             TradeEntry {
                 symbol: request.symbol.to_ascii_lowercase(),
                 exchange,
+                account: request.account.clone(),
                 side,
                 idx,
                 ts_ms,
@@ -1967,7 +2001,9 @@ fn fill_simulated_raw_order(
             },
         );
         if let Some(existing) = simulation.open_trades.iter_mut().find(|open| {
-            open.exchange == exchange && open.symbol.eq_ignore_ascii_case(&request.symbol)
+            open.exchange == exchange
+                && open.account.eq_ignore_ascii_case(&request.account)
+                && open.symbol.eq_ignore_ascii_case(&request.symbol)
         }) {
             add_to_open_position(existing, opened);
         } else {
@@ -1984,7 +2020,9 @@ fn validate_position_transition(
 ) -> Result<()> {
     let target = trade_side(request.position.position_direction());
     let Some(open) = open_trades.iter().find(|open| {
-        open.exchange == exchange && open.symbol.eq_ignore_ascii_case(&request.symbol)
+        open.exchange == exchange
+            && open.account.eq_ignore_ascii_case(&request.account)
+            && open.symbol.eq_ignore_ascii_case(&request.symbol)
     }) else {
         if request.position.is_close() {
             bail!(
@@ -2224,6 +2262,7 @@ fn open_trade_from_entry(next_position_id: &mut usize, entry: TradeEntry) -> Ope
         id,
         order_id: entry.order_id,
         exchange: entry.exchange,
+        account: entry.account,
         symbol: entry.symbol,
         side: entry.side,
         entry_idx: entry.idx,
@@ -2260,6 +2299,7 @@ fn close_open_trade(
         position_id: open.id,
         order_id: open.order_id,
         exchange: open.exchange,
+        account: open.account,
         symbol: open.symbol,
         side: open.side,
         entry: ScriptBacktestTradeLeg {
@@ -2328,6 +2368,7 @@ fn open_trades_to_positions(
                 id: open.id.clone(),
                 order_id: open.order_id.clone(),
                 exchange: open.exchange,
+                account: open.account.clone(),
                 symbol: open.symbol.clone(),
                 side: open.side,
                 entry_ts_ms: open.entry_ts_ms,

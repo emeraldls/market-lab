@@ -75,7 +75,7 @@ impl ScriptManifest {
         }
         if self.version.trim() == "2" && !self.sources.is_empty() {
             bail!(
-                "Python Scripting V2 derives sources from --source or TOML; remove script.sources"
+                "Python Scripting V2 derives sources from history.source calls; remove script.sources"
             );
         }
         if matches!(self.lookback, Some(0)) {

@@ -268,6 +268,7 @@ mod tests {
             size: 1.0,
             price: None,
             reference_price: 100.0,
+            max_slippage: None,
             requested_margin: None,
             estimated_margin: 100.0,
             estimated_exposure: 100.0,

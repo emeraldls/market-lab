@@ -1,7 +1,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use bulk_keychain::{Keypair, Pubkey, SignatureDomain, SignedTransaction, Signer};
+use bulk_keychain::{
+    CreateSubAccount, Keypair, Pubkey, SignatureDomain, SignedTransaction, Signer,
+};
 use serde_json::Value;
 
 use self::client::BulkClient;
@@ -33,6 +35,71 @@ pub async fn register_agent(master: Keypair, agent: Pubkey) -> Result<AgentRegis
 
 pub async fn revoke_agent(master: Keypair, agent: Pubkey) -> Result<AgentRegistration> {
     set_agent_authorization(master, agent, true).await
+}
+
+pub async fn create_subaccount(master: Keypair, name: &str) -> Result<String> {
+    let main_account = master.pubkey().to_base58();
+    let mut signer = signer(master).without_order_id();
+    let signed = signer
+        .sign_create_sub_account(CreateSubAccount::new(name), Some(unique_nonce()?))
+        .context("failed to sign BULK subaccount creation")?;
+    let body = submit_transaction(&signed)
+        .await
+        .context("failed to submit BULK subaccount creation")?;
+    if body.get("status").and_then(Value::as_str) != Some("ok") {
+        bail!(
+            "BULK rejected subaccount creation: {}",
+            response_message(&body)
+        );
+    }
+    extract_created_subaccount(&body, &main_account)
+        .context("BULK confirmed subaccount creation without returning its public key")
+}
+
+fn extract_created_subaccount(body: &Value, main_account: &str) -> Result<String> {
+    const ADDRESS_KEYS: &[&str] = &[
+        "sub",
+        "subAccount",
+        "sub_account",
+        "subAccountUser",
+        "account",
+        "pubkey",
+        "address",
+    ];
+    if let Some(statuses) = body
+        .pointer("/response/data/statuses")
+        .and_then(Value::as_array)
+    {
+        for status in statuses {
+            if let Some(failure) = status
+                .get("createSubAccountFailed")
+                .or_else(|| status.get("create_sub_account_failed"))
+            {
+                bail!(
+                    "BULK rejected subaccount creation: {}",
+                    response_message(failure)
+                );
+            }
+        }
+    }
+    fn visit(value: &Value, main_account: &str) -> Option<String> {
+        match value {
+            Value::Object(object) => {
+                for key in ADDRESS_KEYS {
+                    if let Some(candidate) = object.get(*key).and_then(Value::as_str)
+                        && candidate != main_account
+                        && Pubkey::from_base58(candidate).is_ok()
+                    {
+                        return Some(candidate.to_string());
+                    }
+                }
+                object.values().find_map(|value| visit(value, main_account))
+            }
+            Value::Array(values) => values.iter().find_map(|value| visit(value, main_account)),
+            _ => None,
+        }
+    }
+    visit(body, main_account).context("missing created subaccount public key")
 }
 
 async fn set_agent_authorization(
@@ -288,5 +355,51 @@ mod tests {
             agent_authorization_matches(&revoked, "agent-public-key", true)
                 .expect("revocation state parses")
         );
+    }
+
+    #[test]
+    fn extracts_created_subaccount_from_the_documented_status() {
+        let master = Keypair::generate().pubkey().to_base58();
+        let subaccount = Keypair::generate().pubkey().to_base58();
+        let body = json!({
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [{
+                        "createSubAccount": {
+                            "master": master,
+                            "sub": subaccount,
+                            "name": "trading-2",
+                            "margin": 0.0
+                        }
+                    }]
+                }
+            }
+        });
+
+        assert_eq!(
+            extract_created_subaccount(&body, &master).expect("subaccount parses"),
+            subaccount
+        );
+    }
+
+    #[test]
+    fn surfaces_subaccount_creation_failure_status() {
+        let master = Keypair::generate().pubkey().to_base58();
+        let body = json!({
+            "status": "ok",
+            "response": {
+                "data": {
+                    "statuses": [{
+                        "createSubAccountFailed": {"message": "duplicate name"}
+                    }]
+                }
+            }
+        });
+
+        let error = extract_created_subaccount(&body, &master)
+            .expect_err("failure status must be rejected");
+        assert!(error.to_string().contains("duplicate name"));
     }
 }

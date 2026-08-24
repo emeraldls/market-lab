@@ -332,20 +332,34 @@ pub(crate) async fn build_trade_plan(
     args: &TradeArgs,
     direction: PositionDirection,
 ) -> Result<TradePlan> {
-    build_trade_plan_with_price_normalization(args, direction, false).await
+    build_trade_plan_with_price_normalization(args, direction, false, None, None, None).await
 }
 
-pub(crate) async fn build_automated_trade_plan(
+pub(crate) async fn build_script_trade_plan_for_account(
     args: &TradeArgs,
     direction: PositionDirection,
+    account: &str,
+    reference_price: Option<f64>,
+    max_slippage: Option<f64>,
 ) -> Result<TradePlan> {
-    build_trade_plan_with_price_normalization(args, direction, true).await
+    build_trade_plan_with_price_normalization(
+        args,
+        direction,
+        true,
+        Some(account),
+        reference_price,
+        max_slippage,
+    )
+    .await
 }
 
 async fn build_trade_plan_with_price_normalization(
     args: &TradeArgs,
     direction: PositionDirection,
     normalize_prices: bool,
+    account: Option<&str>,
+    market_reference_price: Option<f64>,
+    max_slippage: Option<f64>,
 ) -> Result<TradePlan> {
     let venue = ExecutionVenue::from(args.venue);
     let outcome = if venue == ExecutionVenue::HyperliquidOutcomes {
@@ -378,11 +392,17 @@ async fn build_trade_plan_with_price_normalization(
     };
     let sizing_leverage = leverage.unwrap_or(1.0);
     let rules = execution_rules(venue, args.testnet, &market)?;
-    let account = ExecutionAdapter::configured_account(venue)?;
+    let account = account.map_or_else(
+        || ExecutionAdapter::configured_account(venue),
+        |account| Ok(account.to_string()),
+    )?;
     let reference_price = match args.order_kind {
         TradeOrderKind::Limit => args
             .price
             .context("--price is required with --type limit")?,
+        TradeOrderKind::Market if market_reference_price.is_some() => {
+            market_reference_price.expect("guarded script market reference")
+        }
         TradeOrderKind::Market => match venue {
             ExecutionVenue::Bulk => BulkProvider::ticker(&market.symbol).await?.mark_price,
             ExecutionVenue::Hyperliquid => {
@@ -431,6 +451,7 @@ async fn build_trade_plan_with_price_normalization(
     }
     validate_protection_prices(venue, &market, args, direction, reference_price)?;
 
+    let market_slippage = max_slippage.unwrap_or(MARKET_ORDER_SLIPPAGE);
     let size = if let Some(size) = args.size {
         if !is_step_aligned(size, rules.lot_size) {
             bail!(
@@ -451,7 +472,7 @@ async fn build_trade_plan_with_price_normalization(
         ) && direction == PositionDirection::Long
             && matches!(args.order_kind, TradeOrderKind::Market)
         {
-            reference_price * (1.0 + MARKET_ORDER_SLIPPAGE)
+            reference_price * (1.0 + market_slippage)
         } else {
             reference_price
         };
@@ -496,7 +517,7 @@ async fn build_trade_plan_with_price_normalization(
             size,
             match args.order_kind {
                 TradeOrderKind::Market if direction == PositionDirection::Long => {
-                    reference_price * (1.0 + MARKET_ORDER_SLIPPAGE)
+                    reference_price * (1.0 + market_slippage)
                 }
                 TradeOrderKind::Market | TradeOrderKind::Limit => reference_price,
             },
@@ -514,7 +535,7 @@ async fn build_trade_plan_with_price_normalization(
             size,
             match args.order_kind {
                 TradeOrderKind::Market if direction == PositionDirection::Long => {
-                    reference_price * (1.0 + MARKET_ORDER_SLIPPAGE)
+                    reference_price * (1.0 + market_slippage)
                 }
                 TradeOrderKind::Market | TradeOrderKind::Limit => reference_price,
             },
@@ -538,6 +559,7 @@ async fn build_trade_plan_with_price_normalization(
         size,
         price: args.price,
         reference_price,
+        max_slippage,
         requested_margin: args.margin,
         estimated_margin,
         estimated_exposure,
@@ -1453,5 +1475,41 @@ mod tests {
                 .unwrap(),
             100.25
         );
+    }
+
+    #[tokio::test]
+    async fn script_plan_uses_cached_market_reference_and_slippage() {
+        let args = TradeArgs {
+            symbol: "BTC".to_string(),
+            symbol_flag: None,
+            config: None,
+            venue: crate::cli::ExecutionVenueArg::Bulk,
+            testnet: false,
+            size: Some(0.001),
+            margin: None,
+            order_kind: TradeOrderKind::Market,
+            price: None,
+            tif: TradeTimeInForce::Gtc,
+            leverage: Some(5.0),
+            reduce_only: false,
+            sl: None,
+            tp: None,
+            dry_run: false,
+            yes: true,
+            output: OutputFormat::Json,
+        };
+
+        let plan = build_script_trade_plan_for_account(
+            &args,
+            PositionDirection::Long,
+            "account",
+            Some(65_123.0),
+            Some(0.0005),
+        )
+        .await
+        .expect("cached reference should avoid a ticker lookup");
+
+        assert_eq!(plan.reference_price, 65_123.0);
+        assert_eq!(plan.max_slippage, Some(0.0005));
     }
 }

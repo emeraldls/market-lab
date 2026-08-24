@@ -40,7 +40,7 @@ use crate::strategies::jobs::{
 };
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-pub const RUNTIME_VERSION: u8 = 38;
+pub const RUNTIME_VERSION: u8 = 41;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -139,6 +139,9 @@ enum RuntimeRequest {
         job_id: String,
         pid: u32,
     },
+    ScriptPrepareExecution {
+        job_id: String,
+    },
     ScriptWorkerHeartbeat {
         job_id: String,
         pid: u32,
@@ -152,12 +155,16 @@ enum RuntimeRequest {
         job_id: String,
         order: ScriptOrderRef,
         exchange: Option<ExecutionVenue>,
+        #[serde(default)]
+        reference_price: Option<f64>,
         request: ScriptTradeRequest,
     },
     ScriptExecuteOrder {
         job_id: String,
         order: ScriptOrderRef,
         exchange: Option<ExecutionVenue>,
+        #[serde(default)]
+        reference_price: Option<f64>,
         request: ScriptRawOrderRequest,
     },
     ScriptCancel {
@@ -308,7 +315,7 @@ struct RuntimeResponse {
     #[serde(default)]
     script_events: Option<Vec<ScriptExecutionEvent>>,
     #[serde(default)]
-    script_positions: Option<Vec<Position>>,
+    script_positions: Option<BTreeMap<String, Vec<Position>>>,
     #[serde(default)]
     strategy_job: Option<StrategyJob>,
     #[serde(default)]
@@ -319,6 +326,20 @@ struct RuntimeResponse {
     bot_jobs: Option<Vec<BotJob>>,
     #[serde(default)]
     action_response: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptExecutionReadiness {
+    pub connected: Vec<String>,
+    pub failed: Vec<ScriptExecutionTransportFailure>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptExecutionTransportFailure {
+    pub transport: String,
+    pub error: String,
 }
 
 impl RuntimeResponse {
@@ -1941,6 +1962,25 @@ pub async fn script_worker_started(job_id: &str, pid: u32) -> Result<ScriptJob> 
     response.job.context("mlabd omitted the script worker job")
 }
 
+pub async fn prepare_script_execution(job_id: &str) -> Result<ScriptExecutionReadiness> {
+    let response = request(RuntimeRequest::ScriptPrepareExecution {
+        job_id: job_id.to_string(),
+    })
+    .await?;
+    if !response.ok {
+        bail!(
+            "mlabd could not prepare script execution: {}",
+            response.message
+        );
+    }
+    serde_json::from_value(
+        response
+            .action_response
+            .context("mlabd omitted script execution readiness")?,
+    )
+    .context("mlabd returned malformed script execution readiness")
+}
+
 pub async fn script_worker_heartbeat(job_id: &str, pid: u32) -> Result<ScriptJob> {
     let response = request(RuntimeRequest::ScriptWorkerHeartbeat {
         job_id: job_id.to_string(),
@@ -1977,12 +2017,14 @@ pub async fn submit_script_trade(
     job_id: &str,
     order: ScriptOrderRef,
     exchange: Option<ExecutionVenue>,
+    reference_price: Option<f64>,
     request_value: ScriptTradeRequest,
 ) -> Result<ScriptManagedOrder> {
     let response = request(RuntimeRequest::ScriptExecuteTrade {
         job_id: job_id.to_string(),
         order,
         exchange,
+        reference_price,
         request: request_value,
     })
     .await?;
@@ -1998,12 +2040,14 @@ pub async fn submit_script_order(
     job_id: &str,
     order: ScriptOrderRef,
     exchange: Option<ExecutionVenue>,
+    reference_price: Option<f64>,
     request_value: ScriptRawOrderRequest,
 ) -> Result<ScriptManagedOrder> {
     let response = request(RuntimeRequest::ScriptExecuteOrder {
         job_id: job_id.to_string(),
         order,
         exchange,
+        reference_price,
         request: request_value,
     })
     .await?;
@@ -2077,7 +2121,7 @@ pub async fn acknowledge_script_events(job_id: &str, through_seq: u64) -> Result
     Ok(())
 }
 
-pub async fn script_positions(job_id: &str) -> Result<Vec<Position>> {
+pub async fn script_positions(job_id: &str) -> Result<BTreeMap<String, Vec<Position>>> {
     let response = request(RuntimeRequest::ScriptPositions {
         job_id: job_id.to_string(),
     })
@@ -3166,7 +3210,69 @@ struct ScriptOrderOperation<'a> {
     job_id: &'a str,
     order: ScriptOrderRef,
     exchange: Option<ExecutionVenue>,
+    reference_price: Option<f64>,
     request: ScriptManagedRequest,
+}
+
+async fn prepare_script_execution_transports(
+    adapter: &BulkExecutionAdapter,
+    job: &ScriptJob,
+) -> Result<ScriptExecutionReadiness> {
+    let mut readiness = ScriptExecutionReadiness {
+        connected: Vec::new(),
+        failed: Vec::new(),
+    };
+    let network =
+        crate::providers::hyperliquid::HyperliquidNetwork::from_testnet(job.definition.testnet);
+    let hyperliquid = crate::providers::hyperliquid::ws::HyperliquidTradingClient::shared(network);
+    let hyperliquid_label = format!("hyperliquid({})", network.label());
+
+    match job.definition.language {
+        crate::scripting::language::ScriptLanguage::PythonV2 => {
+            let (bulk_result, hyperliquid_result) =
+                tokio::join!(adapter.connect_trading(), hyperliquid.connect());
+            record_execution_transport(&mut readiness, "bulkf", bulk_result);
+            record_execution_transport(&mut readiness, &hyperliquid_label, hyperliquid_result);
+        }
+        crate::scripting::language::ScriptLanguage::JavaScriptV1 => match job.definition.venue {
+            Some(ExecutionVenue::Bulk) => {
+                record_execution_transport(
+                    &mut readiness,
+                    "bulkf",
+                    adapter.connect_trading().await,
+                );
+            }
+            Some(
+                ExecutionVenue::Hyperliquid
+                | ExecutionVenue::HyperliquidSpot
+                | ExecutionVenue::HyperliquidXyz
+                | ExecutionVenue::HyperliquidOutcomes,
+            ) => {
+                record_execution_transport(
+                    &mut readiness,
+                    &hyperliquid_label,
+                    hyperliquid.connect().await,
+                );
+            }
+            None => {}
+        },
+    }
+
+    Ok(readiness)
+}
+
+fn record_execution_transport(
+    readiness: &mut ScriptExecutionReadiness,
+    transport: &str,
+    result: Result<()>,
+) {
+    match result {
+        Ok(()) => readiness.connected.push(transport.to_string()),
+        Err(error) => readiness.failed.push(ScriptExecutionTransportFailure {
+            transport: transport.to_string(),
+            error: format!("{error:#}"),
+        }),
+    }
 }
 
 async fn execute_script_order(
@@ -3181,6 +3287,7 @@ async fn execute_script_order(
         job_id,
         order,
         exchange,
+        reference_price,
         request,
     } = operation;
     let operation_name = match &request {
@@ -3227,6 +3334,23 @@ async fn execute_script_order(
             )?
         }
     };
+    if reference_price.is_some_and(|price| !price.is_finite() || price <= 0.0) {
+        bail!("script execution reference price must be > 0");
+    }
+    let account_name = request.account().trim().to_string();
+    if job.definition.language == crate::scripting::language::ScriptLanguage::JavaScriptV1
+        && !account_name.eq_ignore_ascii_case("main")
+    {
+        bail!("named execution accounts are available only in Python Scripting V2");
+    }
+    let account = match crate::providers::execution::ExecutionAdapter::configured_account_for(
+        venue,
+        job.definition.testnet,
+        &account_name,
+    ) {
+        Ok(account) => account,
+        Err(error) => return Err(error),
+    };
     let expected_id = local_order_id(job_id, &key);
     if order.id != expected_id || order.key != key {
         bail!("script order reference does not match its job and idempotency key");
@@ -3245,6 +3369,8 @@ async fn execute_script_order(
         request: request.clone(),
         symbol: internal_symbol.clone(),
         venue,
+        account_name: account_name.clone(),
+        account: account.clone(),
         testnet: job.definition.testnet,
         status: "pending".to_string(),
         venue_order_id: None,
@@ -3276,23 +3402,19 @@ async fn execute_script_order(
         crate::scripting::execution::ScriptTimeInForce::Ioc => crate::cli::TradeTimeInForce::Ioc,
         crate::scripting::execution::ScriptTimeInForce::Alo => crate::cli::TradeTimeInForce::Alo,
     };
-    let account = match crate::providers::execution::ExecutionAdapter::configured_account(venue) {
-        Ok(account) => account,
+    let venue_adapter = match crate::providers::execution::ExecutionAdapter::new_for_account(
+        venue,
+        job.definition.testnet,
+        &account_name,
+    )
+    .await
+    {
+        Ok(adapter) => adapter,
         Err(error) => {
             fail_script_order(paths, state, job_id, &order.id, &error)?;
             return Err(error);
         }
     };
-    let venue_adapter =
-        match crate::providers::execution::ExecutionAdapter::new(venue, job.definition.testnet)
-            .await
-        {
-            Ok(adapter) => adapter,
-            Err(error) => {
-                fail_script_order(paths, state, job_id, &order.id, &error)?;
-                return Err(error);
-            }
-        };
     let venue_arg = match venue {
         ExecutionVenue::Bulk => crate::cli::ExecutionVenueArg::Bulk,
         ExecutionVenue::Hyperliquid => crate::cli::ExecutionVenueArg::Hyperliquid,
@@ -3412,7 +3534,14 @@ async fn execute_script_order(
             request.side.order_direction(),
         ),
     };
-    let plan = match crate::commands::execution::build_automated_trade_plan(&args, direction).await
+    let plan = match crate::commands::execution::build_script_trade_plan_for_account(
+        &args,
+        direction,
+        &account,
+        reference_price,
+        request.max_slippage_fraction(),
+    )
+    .await
     {
         Ok(plan) => plan,
         Err(error) => {
@@ -3427,7 +3556,16 @@ async fn execute_script_order(
         account_tx,
         account_supervisors,
     );
-    let receipt = match execute_trade(paths, adapter, state, &plan, Some(order.id.clone())).await {
+    let receipt = match execute_trade(
+        paths,
+        adapter,
+        state,
+        &plan,
+        Some(order.id.clone()),
+        Some(&account_name),
+    )
+    .await
+    {
         Ok(receipt) => receipt,
         Err(error) => {
             fail_script_order(paths, state, job_id, &order.id, &error)?;
@@ -3570,32 +3708,33 @@ async fn execute_script_cancel(
         created_at_ms: now_ms()?,
         venue,
         testnet: current.testnet,
-        account: crate::providers::execution::ExecutionAdapter::configured_account(venue)?,
+        account: current.account.clone(),
         internal_symbol: market.symbol.clone(),
         venue_symbol: market.venue_symbol.clone(),
         order_id: venue_order_id,
     };
-    let receipt = match execute_cancel(paths, adapter, state, &plan).await {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            let managed = state
-                .script_orders
-                .get(&order_id)
-                .cloned()
-                .context("script order disappeared after failed cancellation")?;
-            emit_script_event(
-                paths,
-                state,
-                job_id,
-                "order.cancel_failed",
-                Some(&managed),
-                false,
-                serde_json::json!({ "error": format!("{error:#}") }),
-            )?;
-            persist_state(paths, state)?;
-            return Err(error);
-        }
-    };
+    let receipt =
+        match execute_cancel(paths, adapter, state, &plan, Some(&current.account_name)).await {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let managed = state
+                    .script_orders
+                    .get(&order_id)
+                    .cloned()
+                    .context("script order disappeared after failed cancellation")?;
+                emit_script_event(
+                    paths,
+                    state,
+                    job_id,
+                    "order.cancel_failed",
+                    Some(&managed),
+                    false,
+                    serde_json::json!({ "error": format!("{error:#}") }),
+                )?;
+                persist_state(paths, state)?;
+                return Err(error);
+            }
+        };
     let managed = {
         let managed = state
             .script_orders
@@ -3658,7 +3797,7 @@ async fn execute_strategy_trade(
         }
     }
 
-    let receipt = execute_trade(paths, adapter, state, plan, None).await?;
+    let receipt = execute_trade(paths, adapter, state, plan, None, None).await?;
     state
         .strategy_executions
         .insert(execution_key, receipt.clone());
@@ -3796,7 +3935,7 @@ async fn execute_strategy_cancel(
     if let Some(receipt) = state.strategy_cancellations.get(&cancellation_key) {
         return Ok(receipt.clone());
     }
-    let receipt = execute_cancel_with_priority(paths, adapter, state, plan, true).await?;
+    let receipt = execute_cancel_with_priority(paths, adapter, state, plan, true, None).await?;
     state
         .strategy_cancellations
         .insert(cancellation_key, receipt.clone());
@@ -3829,7 +3968,7 @@ async fn execute_bot_trade(
     if let Some(receipt) = state.bot_executions.get(&execution_key) {
         return Ok(receipt.clone());
     }
-    let receipt = execute_trade(paths, adapter, state, plan, None).await?;
+    let receipt = execute_trade(paths, adapter, state, plan, None, None).await?;
     state.bot_executions.insert(execution_key, receipt.clone());
     persist_state(paths, state)?;
     Ok(receipt)
@@ -3998,7 +4137,7 @@ async fn execute_bot_cancel(
     if let Some(receipt) = state.bot_cancellations.get(&cancellation_key) {
         return Ok(receipt.clone());
     }
-    let receipt = execute_cancel_with_priority(paths, adapter, state, plan, true).await?;
+    let receipt = execute_cancel_with_priority(paths, adapter, state, plan, true, None).await?;
     state
         .bot_cancellations
         .insert(cancellation_key, receipt.clone());
@@ -4294,7 +4433,7 @@ async fn handle_connection(
                 account_tx,
                 account_supervisors,
             );
-            match execute_trade(paths, adapter, state, &plan, None).await {
+            match execute_trade(paths, adapter, state, &plan, None, None).await {
                 Ok(receipt) => RuntimeResponse {
                     ok: true,
                     message: "order submitted".to_string(),
@@ -4319,7 +4458,7 @@ async fn handle_connection(
                 account_tx,
                 account_supervisors,
             );
-            match execute_cancel(paths, adapter, state, &plan).await {
+            match execute_cancel(paths, adapter, state, &plan, None).await {
                 Ok(receipt) => RuntimeResponse {
                     ok: true,
                     message: "cancellation submitted".to_string(),
@@ -4413,6 +4552,25 @@ async fn handle_connection(
                 Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
             }
         }
+        RuntimeRequest::ScriptPrepareExecution { job_id } => {
+            let result = match state.script_jobs.get(&job_id).cloned() {
+                Some(job) if job.status.is_active() => {
+                    prepare_script_execution_transports(adapter, &job).await
+                }
+                Some(_) => Err(anyhow::anyhow!("script job `{job_id}` is not running")),
+                None => Err(anyhow::anyhow!("script job `{job_id}` was not found")),
+            };
+            match result {
+                Ok(readiness) => RuntimeResponse {
+                    ok: true,
+                    message: "script execution transports prepared".to_string(),
+                    status: Some(runtime_status(state)),
+                    action_response: Some(serde_json::to_value(readiness)?),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
         RuntimeRequest::ScriptWorkerHeartbeat { job_id, pid } => {
             match mark_script_worker_heartbeat(paths, state, &job_id, pid) {
                 Ok(job) => RuntimeResponse {
@@ -4441,6 +4599,7 @@ async fn handle_connection(
             job_id,
             order,
             exchange,
+            reference_price,
             request,
         } => match execute_script_order(
             paths,
@@ -4452,6 +4611,7 @@ async fn handle_connection(
                 job_id: &job_id,
                 order,
                 exchange,
+                reference_price,
                 request: ScriptManagedRequest::Trade(request),
             },
         )
@@ -4470,6 +4630,7 @@ async fn handle_connection(
             job_id,
             order,
             exchange,
+            reference_price,
             request,
         } => match execute_script_order(
             paths,
@@ -4481,6 +4642,7 @@ async fn handle_connection(
                 job_id: &job_id,
                 order,
                 exchange,
+                reference_price,
                 request: ScriptManagedRequest::Order(request),
             },
         )
@@ -4554,7 +4716,7 @@ async fn handle_connection(
             Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
         },
         RuntimeRequest::ScriptPositions { job_id } => {
-            match script_positions_in_daemon(paths, adapter, state, &job_id).await {
+            match script_positions_in_daemon(state, &job_id) {
                 Ok(positions) => RuntimeResponse {
                     ok: true,
                     message: "script positions".to_string(),
@@ -4889,21 +5051,29 @@ async fn execute_trade(
     state: &mut RuntimeState,
     plan: &TradePlan,
     script_order_id: Option<String>,
+    account_name: Option<&str>,
 ) -> Result<ExecutionReceipt> {
     let receipt = match plan.venue {
         ExecutionVenue::Bulk => {
             adapter
-                .submit_trade(credentials::active_bulk_credential()?, plan)
+                .submit_trade(
+                    credentials::active_bulk_credential_for_account(&plan.account)?,
+                    plan,
+                )
                 .await?
         }
         ExecutionVenue::Hyperliquid
         | ExecutionVenue::HyperliquidSpot
         | ExecutionVenue::HyperliquidXyz
         | ExecutionVenue::HyperliquidOutcomes => {
-            crate::providers::execution::ExecutionAdapter::new(plan.venue, plan.testnet)
-                .await?
-                .submit_trade(plan)
-                .await?
+            crate::providers::execution::ExecutionAdapter::new_for_account(
+                plan.venue,
+                plan.testnet,
+                account_name.unwrap_or("main"),
+            )
+            .await?
+            .submit_trade(plan)
+            .await?
         }
     };
     record_trade_receipt(paths, state, plan, script_order_id, &receipt)?;
@@ -4962,8 +5132,9 @@ async fn execute_cancel(
     adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
     plan: &CancelPlan,
+    account_name: Option<&str>,
 ) -> Result<ExecutionReceipt> {
-    execute_cancel_with_priority(paths, adapter, state, plan, false).await
+    execute_cancel_with_priority(paths, adapter, state, plan, false, account_name).await
 }
 
 async fn execute_cancel_with_priority(
@@ -4972,6 +5143,7 @@ async fn execute_cancel_with_priority(
     state: &mut RuntimeState,
     plan: &CancelPlan,
     fast: bool,
+    account_name: Option<&str>,
 ) -> Result<ExecutionReceipt> {
     let expected_venue_symbol = if plan.venue == ExecutionVenue::HyperliquidOutcomes {
         crate::providers::hyperliquid::outcomes::resolve(
@@ -4997,7 +5169,11 @@ async fn execute_cancel_with_priority(
     if expected_venue_symbol != plan.venue_symbol {
         bail!("cancel plan symbol mapping does not match the installed market snapshot");
     }
-    let configured = crate::providers::execution::ExecutionAdapter::configured_account(plan.venue)?;
+    let configured = crate::providers::execution::ExecutionAdapter::configured_account_for(
+        plan.venue,
+        plan.testnet,
+        account_name.unwrap_or("main"),
+    )?;
     if !configured.eq_ignore_ascii_case(&plan.account) {
         bail!("cancel plan account no longer matches the configured venue account");
     }
@@ -5005,7 +5181,7 @@ async fn execute_cancel_with_priority(
         ExecutionVenue::Bulk => {
             adapter
                 .cancel_order(
-                    credentials::active_bulk_credential()?,
+                    credentials::active_bulk_credential_for_account(&plan.account)?,
                     &plan.venue_symbol,
                     &plan.order_id,
                 )
@@ -5015,9 +5191,12 @@ async fn execute_cancel_with_priority(
         | ExecutionVenue::HyperliquidSpot
         | ExecutionVenue::HyperliquidXyz
         | ExecutionVenue::HyperliquidOutcomes => {
-            let adapter =
-                crate::providers::execution::ExecutionAdapter::new(plan.venue, plan.testnet)
-                    .await?;
+            let adapter = crate::providers::execution::ExecutionAdapter::new_for_account(
+                plan.venue,
+                plan.testnet,
+                account_name.unwrap_or("main"),
+            )
+            .await?;
             if fast {
                 adapter.cancel_order_fast(plan).await?
             } else {
@@ -5354,12 +5533,10 @@ async fn refresh_account_positions(
     Ok(())
 }
 
-async fn script_positions_in_daemon(
-    paths: &RuntimePaths,
-    adapter: &BulkExecutionAdapter,
+fn script_positions_in_daemon(
     state: &mut RuntimeState,
     job_id: &str,
-) -> Result<Vec<Position>> {
+) -> Result<BTreeMap<String, Vec<Position>>> {
     let job = state
         .script_jobs
         .get(job_id)
@@ -5377,39 +5554,35 @@ async fn script_positions_in_daemon(
         }
     }
     if venues.is_empty() {
-        return Ok(Vec::new());
+        return Ok(BTreeMap::new());
     }
     let source_symbols = crate::scripting::inputs::parse_source_configs(&job.definition.sources)?
         .values()
         .map(crate::scripting::inputs::SourceConfig::market_symbol)
         .collect::<HashSet<_>>();
-    let mut positions = Vec::new();
+    let mut positions = BTreeMap::<String, Vec<Position>>::new();
     for venue in venues {
-        let account = crate::providers::execution::ExecutionAdapter::configured_account(venue)?;
-        refresh_account_positions(
-            venue,
-            job.definition.testnet,
-            adapter,
-            state,
-            &account,
-            false,
-        )
-        .await?;
-        positions.extend(
-            state
-                .account_positions
-                .get(&account_cache_key(venue, job.definition.testnet, &account))
-                .into_iter()
-                .flatten()
-                .filter(|position| {
-                    source_symbols
-                        .iter()
-                        .any(|symbol| position.internal_symbol.eq_ignore_ascii_case(symbol))
-                })
-                .cloned(),
-        );
+        for (account_name, account) in
+            crate::providers::execution::ExecutionAdapter::configured_accounts(
+                venue,
+                job.definition.testnet,
+            )?
+        {
+            positions.entry(account_name).or_default().extend(
+                state
+                    .account_positions
+                    .get(&account_cache_key(venue, job.definition.testnet, &account))
+                    .into_iter()
+                    .flatten()
+                    .filter(|position| {
+                        source_symbols
+                            .iter()
+                            .any(|symbol| position.internal_symbol.eq_ignore_ascii_case(symbol))
+                    })
+                    .cloned(),
+            );
+        }
     }
-    persist_state(paths, state)?;
     Ok(positions)
 }
 
@@ -5448,6 +5621,30 @@ fn apply_bulk_account_event(
     data: &serde_json::Value,
     received_at_ms: u64,
 ) -> Result<()> {
+    if let Some(positions) = BulkExecutionAdapter::account_event_positions(data)? {
+        let cache_key = account_cache_key(ExecutionVenue::Bulk, false, account);
+        if data.get("type").and_then(serde_json::Value::as_str) == Some("positionUpdate") {
+            let cached = state
+                .account_positions
+                .entry(cache_key.clone())
+                .or_default();
+            for position in positions {
+                cached.retain(|existing| {
+                    !existing
+                        .internal_symbol
+                        .eq_ignore_ascii_case(&position.internal_symbol)
+                });
+                if position.size > f64::EPSILON {
+                    cached.push(position);
+                }
+            }
+        } else {
+            state.account_positions.insert(cache_key.clone(), positions);
+        }
+        state
+            .account_positions_refreshed_at_ms
+            .insert(cache_key, received_at_ms);
+    }
     match data.get("type").and_then(serde_json::Value::as_str) {
         Some("accountSnapshot") => {
             if let Some(open_orders) = data.get("openOrders").and_then(serde_json::Value::as_array)
@@ -6391,8 +6588,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_protocol_v38_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 38);
+    fn runtime_protocol_v41_decodes_oiwap_submissions() {
+        assert_eq!(RUNTIME_VERSION, 41);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",
@@ -6470,6 +6667,7 @@ mod tests {
             "job_id": "script_python_1",
             "order": { "id": "ord_1", "key": "ask-1" },
             "exchange": "hyperliquidf",
+            "reference_price": 65_010.0,
             "request": {
                 "key": "ask-1",
                 "symbol": "BTC",
@@ -6484,6 +6682,7 @@ mod tests {
             request,
             RuntimeRequest::ScriptExecuteOrder {
                 exchange: Some(ExecutionVenue::Hyperliquid),
+                reference_price: Some(65_010.0),
                 ..
             }
         ));

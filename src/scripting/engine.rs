@@ -82,6 +82,7 @@ pub struct Script {
     pub manifest: ScriptManifest,
     pub language: ScriptLanguage,
     source: String,
+    source_declarations: Vec<String>,
     python_runtime: Option<PythonRuntime>,
 }
 
@@ -130,14 +131,17 @@ impl Script {
         language: ScriptLanguage,
         python_runtime: Option<PythonRuntime>,
     ) -> Result<Self> {
-        let manifest = match language {
-            ScriptLanguage::JavaScriptV1 => inspect_manifest(path, &source)?,
-            ScriptLanguage::PythonV2 => inspect_python_script(
-                path,
-                python_runtime
-                    .as_ref()
-                    .context("Python script has no resolved interpreter")?,
-            )?,
+        let (manifest, source_declarations) = match language {
+            ScriptLanguage::JavaScriptV1 => (inspect_manifest(path, &source)?, Vec::new()),
+            ScriptLanguage::PythonV2 => {
+                let inspection = inspect_python_script(
+                    path,
+                    python_runtime
+                        .as_ref()
+                        .context("Python script has no resolved interpreter")?,
+                )?;
+                (inspection.manifest, inspection.sources)
+            }
         };
         manifest.validate_for_version(language.manifest_version())?;
         Ok(Self {
@@ -145,12 +149,17 @@ impl Script {
             manifest,
             language,
             source,
+            source_declarations,
             python_runtime,
         })
     }
 
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    pub fn source_declarations(&self) -> &[String] {
+        &self.source_declarations
     }
 
     pub fn python_runtime(&self) -> Option<&PythonRuntime> {

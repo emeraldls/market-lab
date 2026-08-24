@@ -240,6 +240,8 @@ pub struct ScriptManagedOrder {
     pub request: ScriptManagedRequest,
     pub symbol: String,
     pub venue: ExecutionVenue,
+    pub account_name: String,
+    pub account: String,
     #[serde(default = "legacy_hyperliquid_testnet")]
     pub testnet: bool,
     pub status: String,

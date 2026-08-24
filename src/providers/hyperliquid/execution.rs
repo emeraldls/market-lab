@@ -85,12 +85,30 @@ impl HyperliquidExecutionAdapter {
         .await
     }
 
+    pub async fn new_for_account(
+        product: HyperliquidProduct,
+        network: HyperliquidNetwork,
+        account_name: &str,
+    ) -> Result<Self> {
+        Self::with_credential(
+            credentials::active_hyperliquid_credential_for(network, account_name)?,
+            network,
+            product,
+        )
+        .await
+    }
+
     pub async fn with_credential(
         credential: ActiveHyperliquidCredential,
         network: HyperliquidNetwork,
         product: HyperliquidProduct,
     ) -> Result<Self> {
-        let exchange = HyperliquidExchangeClient::new(credential.agent, network)?;
+        let exchange = match credential.vault_address {
+            Some(vault_address) => {
+                HyperliquidExchangeClient::for_subaccount(credential.agent, network, vault_address)?
+            }
+            None => HyperliquidExchangeClient::new(credential.agent, network)?,
+        };
         Ok(Self {
             exchange,
             account: credential.account,
@@ -100,7 +118,6 @@ impl HyperliquidExecutionAdapter {
     }
 
     pub async fn account_snapshot(&self, account: &str) -> Result<AccountSnapshot> {
-        ensure_account(account, &self.account)?;
         if self.product == HyperliquidProduct::Spot {
             return self.spot_account_snapshot(account).await;
         }
@@ -318,7 +335,6 @@ impl HyperliquidExecutionAdapter {
     }
 
     pub async fn open_orders(&self, account: &str) -> Result<Vec<OpenOrder>> {
-        ensure_account(account, &self.account)?;
         let mut request = serde_json::json!({
             "type": "frontendOpenOrders",
             "user": account
@@ -333,7 +349,6 @@ impl HyperliquidExecutionAdapter {
     }
 
     pub async fn fills(&self, account: &str) -> Result<Vec<Fill>> {
-        ensure_account(account, &self.account)?;
         let raw: Vec<HyperliquidFill> = HyperliquidClient::for_network(self.network)?
             .info(&user_fills_request(account))
             .await?;
@@ -362,10 +377,11 @@ impl HyperliquidExecutionAdapter {
 
         let entry_price = match plan.order_kind {
             OrderKind::Market => {
+                let max_slippage = market_order_slippage(plan.max_slippage)?;
                 let guarded = if plan.side == OrderSide::Buy {
-                    plan.reference_price * (1.0 + MARKET_ORDER_SLIPPAGE)
+                    plan.reference_price * (1.0 + max_slippage)
                 } else {
-                    plan.reference_price * (1.0 - MARKET_ORDER_SLIPPAGE)
+                    plan.reference_price * (1.0 - max_slippage)
                 };
                 normalize_price_for(
                     guarded,
@@ -462,10 +478,11 @@ impl HyperliquidExecutionAdapter {
             }
             let entry_price = match plan.order_kind {
                 OrderKind::Market => {
+                    let max_slippage = market_order_slippage(plan.max_slippage)?;
                     let guarded = if plan.side == OrderSide::Buy {
-                        plan.reference_price * (1.0 + MARKET_ORDER_SLIPPAGE)
+                        plan.reference_price * (1.0 + max_slippage)
                     } else {
-                        plan.reference_price * (1.0 - MARKET_ORDER_SLIPPAGE)
+                        plan.reference_price * (1.0 - max_slippage)
                     };
                     normalize_price_for(
                         guarded,
@@ -1127,6 +1144,14 @@ fn ensure_account(account: &str, configured: &str) -> Result<()> {
     }
 }
 
+fn market_order_slippage(requested: Option<f64>) -> Result<f64> {
+    let value = requested.unwrap_or(MARKET_ORDER_SLIPPAGE);
+    if !value.is_finite() || !(0.0..1.0).contains(&value) {
+        bail!("trade plan max slippage must be between 0 (inclusive) and 1 (exclusive)");
+    }
+    Ok(value)
+}
+
 const fn venue_for_product(product: HyperliquidProduct) -> ExecutionVenue {
     match product {
         HyperliquidProduct::Spot => ExecutionVenue::HyperliquidSpot,
@@ -1569,6 +1594,18 @@ mod tests {
     fn maps_hyperliquid_sides() {
         assert_eq!(side("B").expect("buy"), OrderSide::Buy);
         assert_eq!(side("A").expect("sell"), OrderSide::Sell);
+    }
+
+    #[test]
+    fn market_order_slippage_uses_script_override_or_venue_default() {
+        assert_eq!(
+            market_order_slippage(Some(0.0005)).expect("valid override"),
+            0.0005
+        );
+        assert_eq!(
+            market_order_slippage(None).expect("valid venue default"),
+            MARKET_ORDER_SLIPPAGE
+        );
     }
 
     #[test]

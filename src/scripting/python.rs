@@ -59,7 +59,7 @@ impl Default for PythonProcessLimits {
 pub(crate) fn inspect_python_script(
     path: &Path,
     runtime: &PythonRuntime,
-) -> Result<ScriptManifest> {
+) -> Result<PythonScriptInspection> {
     inspect_python_script_with_limits(
         path,
         runtime,
@@ -73,7 +73,7 @@ fn inspect_python_script_with_limits(
     runtime: &PythonRuntime,
     timeout: Duration,
     limits: PythonProcessLimits,
-) -> Result<ScriptManifest> {
+) -> Result<PythonScriptInspection> {
     let mut process =
         PythonProcess::spawn_mode(path, runtime, "describe", limits).with_context(|| {
             format!(
@@ -101,7 +101,20 @@ fn inspect_python_script_with_limits(
             .context("Python script has no `script` manifest")?,
     )
     .context("failed to decode Python `script` manifest")?;
-    Ok(manifest)
+    let sources = serde_json::from_value(
+        response
+            .get("sources")
+            .cloned()
+            .context("Python script inspection omitted source selectors")?,
+    )
+    .context("failed to decode Python source selectors")?;
+    Ok(PythonScriptInspection { manifest, sources })
+}
+
+#[derive(Debug)]
+pub(crate) struct PythonScriptInspection {
+    pub(crate) manifest: ScriptManifest,
+    pub(crate) sources: Vec<String>,
 }
 
 pub(crate) struct PythonSession {
@@ -850,6 +863,7 @@ fn python_error_message(response: &Value) -> String {
 
 const PYTHON_RUNNER: &str = r#"
 import copy
+import ast
 import importlib.util
 import inspect
 import json
@@ -944,6 +958,69 @@ def load_module():
     return module, manifest
 
 
+def inspect_source_selectors():
+    tree = ast.parse(SCRIPT_PATH.read_text(encoding="utf-8"), filename=str(SCRIPT_PATH))
+    constants = {}
+    for statement in tree.body:
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str)
+        ):
+            constants[statement.targets[0].id] = statement.value.value
+        elif (
+            isinstance(statement, ast.AnnAssign)
+            and isinstance(statement.target, ast.Name)
+            and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str)
+        ):
+            constants[statement.target.id] = statement.value.value
+    selectors = []
+    seen = set()
+    dynamic_lines = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function = node.func
+        if not (
+            isinstance(function, ast.Attribute)
+            and function.attr == "source"
+            and isinstance(function.value, ast.Name)
+            and function.value.id == "history"
+        ):
+            continue
+        if not node.args:
+            raise TypeError(f"history.source on line {node.lineno} requires a selector")
+        selector = node.args[0]
+        if isinstance(selector, ast.Constant) and isinstance(selector.value, str):
+            value = selector.value
+        elif isinstance(selector, ast.Name) and selector.id in constants:
+            value = constants[selector.id]
+        else:
+            dynamic_lines.append(node.lineno)
+            continue
+        if not value:
+            raise TypeError(f"history.source on line {node.lineno} selector cannot be empty")
+        if value not in seen:
+            seen.add(value)
+            selectors.append(value)
+    if dynamic_lines and not selectors:
+        line = dynamic_lines[0]
+        raise TypeError(
+            f"history.source on line {line} cannot declare a source dynamically; "
+            "add at least one call with a literal selector or module-level string constant"
+        )
+    return selectors
+
+
+def selector_without_options(name):
+    last_at = name.rfind("@")
+    option = name.find(":", last_at) if last_at >= 0 else -1
+    return name if option < 0 else name[:option]
+
+
 class History:
     def __init__(self, capacity, configured_sources):
         self.capacity = max(2, int(capacity))
@@ -966,11 +1043,12 @@ class History:
     def source(self, name, offset=None):
         if not isinstance(name, str) or not name:
             raise TypeError("history.source name must be a non-empty string")
-        if self.configured_sources is not None and name not in self.configured_sources:
+        selector = selector_without_options(name)
+        if self.configured_sources is not None and selector not in self.configured_sources:
             raise ValueError(
-                f"history.source `{name}` is not configured; add it with --source or TOML"
+                f"history.source `{name}` is not configured for this script"
             )
-        records = self.records.get(name, [])
+        records = self.records.get(selector, [])
         if offset is None:
             return copy.deepcopy(list(reversed(records)))
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
@@ -1026,13 +1104,36 @@ class Studies:
         return self._call("vamp", book, options)
 
 
+class PositionView:
+    def __init__(self, account):
+        self.account = account
+        self.open = []
+
+
 class Positions:
     def __init__(self):
-        self.open = []
+        self._accounts = {"main": PositionView("main")}
+
+    def __call__(self, account="main"):
+        if not isinstance(account, str) or not account.strip():
+            raise TypeError("ctx.positions account must be a non-empty string")
+        account = account.strip().lower()
+        return self._accounts.setdefault(account, PositionView(account))
 
     def _replace(self, positions):
         positions = positions if isinstance(positions, dict) else {}
-        self.open = copy.deepcopy(positions.get("open", []))
+        accounts = {}
+        for account, value in positions.items():
+            if not isinstance(account, str) or not isinstance(value, dict):
+                continue
+            account = account.strip().lower()
+            if not account:
+                continue
+            view = PositionView(account)
+            view.open = copy.deepcopy(value.get("open", []))
+            accounts[account] = view
+        accounts.setdefault("main", PositionView("main"))
+        self._accounts = accounts
 
 
 class Context:
@@ -1153,10 +1254,12 @@ class Context:
 
 try:
     MODULE, MANIFEST = load_module()
+    SOURCE_SELECTORS = inspect_source_selectors()
     if MODE == "describe":
         write_message({
             "type": "ready",
             "manifest": MANIFEST,
+            "sources": SOURCE_SELECTORS,
             "hooks": {
                 "onExecution": callable(getattr(MODULE, "on_execution", None)),
                 "onFinish": callable(getattr(MODULE, "on_finish", None)),
@@ -1291,10 +1394,12 @@ mod tests {
                 }
             },
             "positions": {
-                "open": [{
-                    "symbol": "BTC",
-                    "side": "long"
-                }]
+                "main": {
+                    "open": [{
+                        "symbol": "BTC",
+                        "side": "long"
+                    }]
+                }
             },
             "data": {
                 "candle": {
@@ -1412,7 +1517,8 @@ def on_data(ctx, history):
         "exchange": ctx.exchange,
         "symbol": ctx.symbol,
         "source_exchange": ctx.source_configs[ctx.source]["exchange"],
-        "position_symbol": ctx.positions.open[0]["symbol"],
+        "position_symbol": ctx.positions().open[0]["symbol"],
+        "named_positions": len(ctx.positions("trading-2").open),
         "pnl_history": ctx.pnl(),
         "latest_pnl": ctx.pnl(0),
         "previous_pnl": ctx.pnl(1),
@@ -1480,6 +1586,7 @@ def on_finish(ctx, history):
         assert_eq!(second.output.metrics["symbol"], "BTC");
         assert_eq!(second.output.metrics["source_exchange"], "binancef");
         assert_eq!(second.output.metrics["position_symbol"], "BTC");
+        assert_eq!(second.output.metrics["named_positions"], 0);
         assert_eq!(
             second.output.metrics["pnl_history"],
             json!([
@@ -1565,6 +1672,7 @@ def on_data(ctx):
     explicit = ctx.trade({
         "key": "semantic-entry",
         "exchange": "hyperliquidf",
+        "account": "trading-2",
         "symbol": "ETH",
         "position": "open-long",
         "margin": 100,
@@ -1615,6 +1723,11 @@ def on_data(ctx):
         assert_ne!(second_key, cancel_key);
         assert_eq!(execution.output.metrics["explicit_key"], "semantic-entry");
         assert_eq!(execution.commands.len(), 4);
+        assert!(matches!(
+            &execution.commands[2],
+            crate::scripting::execution::ScriptExecutionCommand::Trade { request, .. }
+                if request.account == "trading-2"
+        ));
 
         let _ = fs::remove_file(path);
     }
@@ -1884,6 +1997,82 @@ def on_data(ctx, history):
             Err(error) => error,
         };
         assert!(format!("{error:#}").contains("script.version must be \"2\""));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn python_inspection_derives_literal_history_sources() {
+        let path = write_python_script(
+            r#"
+script = {"name": "literal-sources", "version": "2"}
+CANDLES = "btc@candles@binancef:timeframe=60"
+
+def on_data(ctx, history):
+    candles = history.source(CANDLES)
+    history.source(ctx.source, 0)
+    history.source("eth@orderbook@bybitf@mmt:depth=20")
+    return {"metrics": {"close": candles[-1]["c"]}}
+
+def on_finish(ctx, history):
+    history.source(CANDLES)
+"#,
+            "literal-sources",
+        );
+        if !python_available(&path) {
+            let _ = fs::remove_file(path);
+            return;
+        }
+
+        let script = Script::load(&path).expect("load Python script");
+        assert_eq!(
+            script.source_declarations(),
+            [
+                "btc@candles@binancef:timeframe=60",
+                "eth@orderbook@bybitf@mmt:depth=20",
+            ]
+        );
+        let configured = [
+            "btc@candles@binancef".to_string(),
+            "eth@orderbook@bybitf@mmt".to_string(),
+        ];
+        let session = script
+            .start_session_with_execution_and_sources(
+                &json!({}),
+                ScriptExecutionContext::disabled(),
+                Some(&configured),
+            )
+            .expect("start Python session");
+        let execution = session
+            .run_event(candle_event(1_000, 100.0))
+            .expect("read a configured source with inline options");
+        assert_eq!(execution.output.metrics["close"], 100.0);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn python_inspection_rejects_dynamic_history_sources() {
+        let path = write_python_script(
+            r#"
+script = {"name": "dynamic-source", "version": "2"}
+
+def on_data(ctx, history):
+    symbol = "btc"
+    history.source(f"{symbol}@candles@hyperliquidf:timeframe=60")
+"#,
+            "dynamic-source",
+        );
+        if !python_available(&path) {
+            let _ = fs::remove_file(path);
+            return;
+        }
+
+        let error = match Script::load(&path) {
+            Ok(_) => panic!("dynamic source selector should be rejected"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("cannot declare a source dynamically"));
 
         let _ = fs::remove_file(path);
     }
