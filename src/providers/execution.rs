@@ -34,9 +34,28 @@ impl ExecutionAdapter {
                 )
                 .await?,
             )),
+            ExecutionVenue::Hyperlink => {
+                if testnet {
+                    anyhow::bail!("HyperLink does not support testnet");
+                }
+                if !account_name.trim().is_empty() && !account_name.eq_ignore_ascii_case("main") {
+                    anyhow::bail!("HyperLink subaccounts are not supported");
+                }
+                Ok(Self::Hyperliquid(
+                    HyperliquidExecutionAdapter::new_hyperlink().await?,
+                ))
+            }
             ExecutionVenue::HyperliquidXyz => Ok(Self::Hyperliquid(
                 HyperliquidExecutionAdapter::new_for_account(
                     HyperliquidProduct::XyzPerpetual,
+                    HyperliquidNetwork::from_testnet(testnet),
+                    account_name,
+                )
+                .await?,
+            )),
+            ExecutionVenue::HyperliquidIo => Ok(Self::Hyperliquid(
+                HyperliquidExecutionAdapter::new_for_account(
+                    HyperliquidProduct::IoPerpetual,
                     HyperliquidNetwork::from_testnet(testnet),
                     account_name,
                 )
@@ -65,8 +84,15 @@ impl ExecutionAdapter {
         match venue {
             ExecutionVenue::Bulk => BulkExecutionAdapter::capabilities(),
             ExecutionVenue::Hyperliquid => HyperliquidExecutionAdapter::capabilities(),
+            ExecutionVenue::Hyperlink => VenueCapabilities {
+                venue: ExecutionVenue::Hyperlink,
+                ..HyperliquidExecutionAdapter::capabilities()
+            },
             ExecutionVenue::HyperliquidXyz => {
                 HyperliquidExecutionAdapter::capabilities_for(HyperliquidProduct::XyzPerpetual)
+            }
+            ExecutionVenue::HyperliquidIo => {
+                HyperliquidExecutionAdapter::capabilities_for(HyperliquidProduct::IoPerpetual)
             }
             ExecutionVenue::HyperliquidSpot => {
                 HyperliquidExecutionAdapter::capabilities_for(HyperliquidProduct::Spot)
@@ -90,11 +116,18 @@ impl ExecutionAdapter {
             ExecutionVenue::Bulk => credentials::bulk_account_for(account_name),
             ExecutionVenue::Hyperliquid
             | ExecutionVenue::HyperliquidXyz
+            | ExecutionVenue::HyperliquidIo
             | ExecutionVenue::HyperliquidSpot
             | ExecutionVenue::HyperliquidOutcomes => credentials::hyperliquid_account_for(
                 HyperliquidNetwork::from_testnet(testnet),
                 account_name,
             ),
+            ExecutionVenue::Hyperlink => {
+                if testnet {
+                    anyhow::bail!("HyperLink does not support testnet");
+                }
+                credentials::hyperlink_account_for(account_name)
+            }
         }
     }
 
@@ -106,9 +139,16 @@ impl ExecutionAdapter {
             ExecutionVenue::Bulk => credentials::bulk_accounts(),
             ExecutionVenue::Hyperliquid
             | ExecutionVenue::HyperliquidXyz
+            | ExecutionVenue::HyperliquidIo
             | ExecutionVenue::HyperliquidSpot
             | ExecutionVenue::HyperliquidOutcomes => {
                 credentials::hyperliquid_accounts(HyperliquidNetwork::from_testnet(testnet))
+            }
+            ExecutionVenue::Hyperlink => {
+                if testnet {
+                    anyhow::bail!("HyperLink does not support testnet");
+                }
+                credentials::hyperlink_accounts()
             }
         }
     }
@@ -117,6 +157,20 @@ impl ExecutionAdapter {
         match self {
             Self::Bulk(adapter) => adapter.account_snapshot(account).await,
             Self::Hyperliquid(adapter) => adapter.account_snapshot(account).await,
+        }
+    }
+
+    pub async fn max_leverage(&self, symbol: &str) -> Result<u32> {
+        match self {
+            Self::Hyperliquid(adapter) => adapter.max_leverage(symbol).await,
+            Self::Bulk(_) => anyhow::bail!("BULK does not expose leverage through this adapter"),
+        }
+    }
+
+    pub async fn configure_leverage(&self, symbol: &str, leverage: f64) -> Result<()> {
+        match self {
+            Self::Hyperliquid(adapter) => adapter.configure_leverage(symbol, leverage).await,
+            Self::Bulk(_) => anyhow::bail!("BULK leverage is configured during order execution"),
         }
     }
 

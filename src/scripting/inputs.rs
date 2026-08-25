@@ -541,9 +541,11 @@ fn parse_source_provider(raw: &str) -> Result<ProviderKind> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "mmt" => Ok(ProviderKind::Mmt),
         "bulkf" => Ok(ProviderKind::Bulk),
-        "hyperliquid" | "hyperliquidf" | "hyperliquidf-xyz" | "hyperliquid-outcomes" => {
-            Ok(ProviderKind::Hyperliquid)
-        }
+        "hyperliquid"
+        | "hyperliquidf"
+        | "hyperliquidf-xyz"
+        | "hyperliquidf-io"
+        | "hyperliquid-outcomes" => Ok(ProviderKind::Hyperliquid),
         "binance" => Ok(ProviderKind::Binance),
         "binancef" => Ok(ProviderKind::BinanceFutures),
         other => bail!("unsupported script source provider `{other}`"),

@@ -7,8 +7,12 @@ pub enum ExecutionVenue {
     Bulk,
     #[serde(rename = "hyperliquidf")]
     Hyperliquid,
+    #[serde(rename = "hyperlinkf")]
+    Hyperlink,
     #[serde(rename = "hyperliquidf-xyz")]
     HyperliquidXyz,
+    #[serde(rename = "hyperliquidf-io")]
+    HyperliquidIo,
     #[serde(rename = "hyperliquid")]
     HyperliquidSpot,
     #[serde(rename = "hyperliquid-outcomes")]
@@ -345,12 +349,20 @@ mod tests {
         let encoded = serde_json::to_value(ExecutionVenue::Hyperliquid).expect("venue serializes");
         assert_eq!(encoded, serde_json::json!("hyperliquidf"));
 
+        let hyperlink =
+            serde_json::to_value(ExecutionVenue::Hyperlink).expect("HyperLink venue serializes");
+        assert_eq!(hyperlink, serde_json::json!("hyperlinkf"));
+
         let spot = serde_json::to_value(ExecutionVenue::HyperliquidSpot).expect("venue serializes");
         assert_eq!(spot, serde_json::json!("hyperliquid"));
 
         let xyz =
             serde_json::to_value(ExecutionVenue::HyperliquidXyz).expect("XYZ venue serializes");
         assert_eq!(xyz, serde_json::json!("hyperliquidf-xyz"));
+
+        let io = serde_json::to_value(ExecutionVenue::HyperliquidIo)
+            .expect("EntropyIO venue serializes");
+        assert_eq!(io, serde_json::json!("hyperliquidf-io"));
 
         let outcomes = serde_json::to_value(ExecutionVenue::HyperliquidOutcomes)
             .expect("outcome venue serializes");

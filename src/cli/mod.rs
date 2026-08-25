@@ -444,8 +444,12 @@ pub enum ExecutionVenueArg {
     Bulk,
     #[value(name = "hyperliquidf")]
     Hyperliquid,
+    #[value(name = "hyperlinkf")]
+    Hyperlink,
     #[value(name = "hyperliquidf-xyz")]
     HyperliquidXyz,
+    #[value(name = "hyperliquidf-io")]
+    HyperliquidIo,
     #[value(name = "hyperliquid")]
     HyperliquidSpot,
     #[value(name = "hyperliquid-outcomes")]
@@ -453,11 +457,15 @@ pub enum ExecutionVenueArg {
 }
 
 fn validate_execution_network(venue: ExecutionVenueArg, testnet: bool) -> Result<()> {
+    if testnet && venue == ExecutionVenueArg::Hyperlink {
+        bail!("--testnet is not supported by HyperLink");
+    }
     if testnet
         && !matches!(
             venue,
             ExecutionVenueArg::Hyperliquid
                 | ExecutionVenueArg::HyperliquidXyz
+                | ExecutionVenueArg::HyperliquidIo
                 | ExecutionVenueArg::HyperliquidSpot
                 | ExecutionVenueArg::HyperliquidOutcomes
         )
@@ -472,7 +480,9 @@ impl From<ExecutionVenueArg> for ExecutionVenue {
         match value {
             ExecutionVenueArg::Bulk => ExecutionVenue::Bulk,
             ExecutionVenueArg::Hyperliquid => ExecutionVenue::Hyperliquid,
+            ExecutionVenueArg::Hyperlink => ExecutionVenue::Hyperlink,
             ExecutionVenueArg::HyperliquidXyz => ExecutionVenue::HyperliquidXyz,
+            ExecutionVenueArg::HyperliquidIo => ExecutionVenue::HyperliquidIo,
             ExecutionVenueArg::HyperliquidSpot => ExecutionVenue::HyperliquidSpot,
             ExecutionVenueArg::HyperliquidOutcomes => ExecutionVenue::HyperliquidOutcomes,
         }
@@ -656,6 +666,7 @@ pub enum AuthProvider {
     Mmt,
     Bulk,
     Hyperliquid,
+    Hyperlink,
 }
 
 #[derive(Subcommand, Debug)]
@@ -848,6 +859,7 @@ impl ScriptRunArgs {
                 Some(
                     ExecutionVenueArg::Hyperliquid
                         | ExecutionVenueArg::HyperliquidXyz
+                        | ExecutionVenueArg::HyperliquidIo
                         | ExecutionVenueArg::HyperliquidSpot
                         | ExecutionVenueArg::HyperliquidOutcomes
                 )
@@ -2240,7 +2252,9 @@ impl RunVwapArgs {
         let execution_venue = match self.venue {
             ExecutionVenueArg::Bulk => "bulkf",
             ExecutionVenueArg::Hyperliquid => "hyperliquidf",
+            ExecutionVenueArg::Hyperlink => "hyperliquidf",
             ExecutionVenueArg::HyperliquidXyz => "hyperliquidf-xyz",
+            ExecutionVenueArg::HyperliquidIo => "hyperliquidf-io",
             ExecutionVenueArg::HyperliquidSpot => {
                 bail!("VWAP does not support spot execution yet")
             }
@@ -2529,7 +2543,9 @@ fn validate_execution_symbol(venue: ExecutionVenueArg, symbol: &str) -> Result<(
     let market_type = match venue {
         ExecutionVenueArg::Bulk
         | ExecutionVenueArg::Hyperliquid
-        | ExecutionVenueArg::HyperliquidXyz => crate::markets::MarketType::Futures,
+        | ExecutionVenueArg::Hyperlink
+        | ExecutionVenueArg::HyperliquidXyz
+        | ExecutionVenueArg::HyperliquidIo => crate::markets::MarketType::Futures,
         ExecutionVenueArg::HyperliquidSpot => crate::markets::MarketType::Spot,
         ExecutionVenueArg::HyperliquidOutcomes => unreachable!("handled above"),
     };
@@ -2583,6 +2599,7 @@ fn resolve_source_provider(
     }
     if exchange.eq_ignore_ascii_case("hyperliquidf")
         || exchange.eq_ignore_ascii_case("hyperliquidf-xyz")
+        || exchange.eq_ignore_ascii_case("hyperliquidf-io")
         || exchange.eq_ignore_ascii_case("hyperliquid")
         || exchange.eq_ignore_ascii_case("hyperliquid-outcomes")
     {
@@ -2620,6 +2637,9 @@ fn resolve_system_provider(
             Ok(ProviderKind::Hyperliquid)
         }
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquidf-xyz") => {
+            Ok(ProviderKind::Hyperliquid)
+        }
+        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquidf-io") => {
             Ok(ProviderKind::Hyperliquid)
         }
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquid") => {
@@ -3024,6 +3044,57 @@ mod tests {
             _ => panic!("expected XYZ trade long command"),
         }
 
+        let io_source = Cli::try_parse_from([
+            "mlab",
+            "source",
+            "orderbook",
+            "--exchange",
+            "hyperliquidf-io",
+            "--symbol",
+            "ANTH",
+            "--depth",
+            "20",
+        ])
+        .expect("EntropyIO source command should parse");
+        match io_source.command {
+            Commands::Source {
+                command: SourceCommands::Orderbook(args),
+            } => {
+                args.validate()
+                    .expect("standalone EntropyIO source validates");
+                assert_eq!(
+                    args.provider_kind().expect("EntropyIO provider resolves"),
+                    CliProviderKind::Hyperliquid
+                );
+            }
+            _ => panic!("expected EntropyIO source orderbook command"),
+        }
+
+        let io_trade = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "long",
+            "ANTH",
+            "--venue",
+            "hyperliquidf-io",
+            "--margin",
+            "100",
+            "--leverage",
+            "3",
+            "--dry-run",
+        ])
+        .expect("EntropyIO trade command should parse");
+        match io_trade.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => {
+                args.validate_shape()
+                    .expect("EntropyIO trade shape validates");
+                assert!(matches!(args.venue, ExecutionVenueArg::HyperliquidIo));
+            }
+            _ => panic!("expected EntropyIO trade long command"),
+        }
+
         let spot_trade = Cli::try_parse_from([
             "mlab",
             "trade",
@@ -3061,6 +3132,72 @@ mod tests {
             .is_ok(),
             "`hyperliquid` must resolve deterministically to spot execution"
         );
+    }
+
+    #[test]
+    fn parses_hyperlink_execution_and_rejects_testnet() {
+        let trade = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "long",
+            "BTC",
+            "--venue",
+            "hyperlinkf",
+            "--margin",
+            "100",
+            "--leverage",
+            "5",
+            "--dry-run",
+        ])
+        .expect("HyperLink trade should parse");
+        match trade.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => {
+                args.validate_shape().expect("HyperLink trade validates");
+                assert_eq!(args.venue, ExecutionVenueArg::Hyperlink);
+            }
+            _ => panic!("expected HyperLink trade command"),
+        }
+
+        let testnet = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "long",
+            "BTC",
+            "--venue",
+            "hyperlinkf",
+            "--margin",
+            "100",
+            "--leverage",
+            "5",
+            "--testnet",
+            "--dry-run",
+        ])
+        .expect("HyperLink testnet shape parses before semantic validation");
+        match testnet.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => assert!(
+                args.validate_shape()
+                    .expect_err("HyperLink testnet must fail")
+                    .to_string()
+                    .contains("not supported")
+            ),
+            _ => panic!("expected HyperLink trade command"),
+        }
+
+        let auth = Cli::try_parse_from(["mlab", "auth", "set", "hyperlink"])
+            .expect("HyperLink auth should parse");
+        assert!(matches!(
+            auth.command,
+            Commands::Auth {
+                command: AuthCommands::Set(AuthSetArgs {
+                    provider: AuthProvider::Hyperlink,
+                    ..
+                })
+            }
+        ));
     }
 
     #[test]

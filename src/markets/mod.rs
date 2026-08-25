@@ -833,6 +833,9 @@ pub async fn refresh_route(provider: Option<&str>, exchange: &str) -> Result<Mar
         None if exchange.eq_ignore_ascii_case("hyperliquidf-xyz") => {
             fetch_hyperliquid_xyz_snapshot().await?
         }
+        None if exchange.eq_ignore_ascii_case("hyperliquidf-io") => {
+            fetch_hyperliquid_io_snapshot().await?
+        }
         None if exchange.eq_ignore_ascii_case("hyperliquid") => {
             fetch_hyperliquid_spot_snapshot().await?
         }
@@ -859,6 +862,10 @@ pub async fn refresh_hyperliquid_spot() -> Result<MarketSnapshot> {
 
 pub async fn refresh_hyperliquid_xyz() -> Result<MarketSnapshot> {
     refresh_route(None, "hyperliquidf-xyz").await
+}
+
+pub async fn refresh_hyperliquid_io() -> Result<MarketSnapshot> {
+    refresh_route(None, "hyperliquidf-io").await
 }
 
 pub async fn refresh_binance() -> Result<MarketSnapshot> {
@@ -1219,22 +1226,48 @@ struct BuiltHyperliquidPerpMarket {
 }
 
 async fn fetch_hyperliquid_xyz_snapshot() -> Result<MarketSnapshot> {
-    let (mainnet, testnet) = tokio::join!(
-        fetch_hyperliquid_xyz_network(HYPERLIQUID_INFO_URL, "mainnet"),
-        fetch_hyperliquid_xyz_network(HYPERLIQUID_TESTNET_INFO_URL, "testnet"),
-    );
-    let mainnet = mainnet?;
-    let testnet = match testnet {
-        Ok(markets) => markets,
-        Err(error) => {
-            eprintln!(
-                "warning: Hyperliquid testnet XYZ metadata is unavailable; saved mainnet markets only: {error:#}"
-            );
-            BTreeMap::new()
-        }
+    fetch_hyperliquid_hip3_snapshot("hyperliquidf-xyz", "xyz", "XYZ", true).await
+}
+
+async fn fetch_hyperliquid_io_snapshot() -> Result<MarketSnapshot> {
+    fetch_hyperliquid_hip3_snapshot("hyperliquidf-io", "io", "EntropyIO", false).await
+}
+
+async fn fetch_hyperliquid_hip3_snapshot(
+    exchange: &str,
+    dex: &str,
+    display_name: &str,
+    include_testnet: bool,
+) -> Result<MarketSnapshot> {
+    let (mainnet, testnet) = if include_testnet {
+        let (mainnet, testnet) = tokio::join!(
+            fetch_hyperliquid_hip3_network(HYPERLIQUID_INFO_URL, "mainnet", dex, display_name,),
+            fetch_hyperliquid_hip3_network(
+                HYPERLIQUID_TESTNET_INFO_URL,
+                "testnet",
+                dex,
+                display_name,
+            ),
+        );
+        let testnet = match testnet {
+            Ok(markets) => markets,
+            Err(error) => {
+                eprintln!(
+                    "warning: Hyperliquid testnet {display_name} metadata is unavailable; saved mainnet markets only: {error:#}"
+                );
+                BTreeMap::new()
+            }
+        };
+        (mainnet?, testnet)
+    } else {
+        (
+            fetch_hyperliquid_hip3_network(HYPERLIQUID_INFO_URL, "mainnet", dex, display_name)
+                .await?,
+            BTreeMap::new(),
+        )
     };
     if mainnet.is_empty() {
-        bail!("Hyperliquid returned no active mainnet XYZ perpetual markets");
+        bail!("Hyperliquid returned no active mainnet {display_name} perpetual markets");
     }
 
     let mut markets = Vec::with_capacity(mainnet.len());
@@ -1265,14 +1298,14 @@ async fn fetch_hyperliquid_xyz_snapshot() -> Result<MarketSnapshot> {
 
     let snapshot = MarketSnapshot {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
-        provider: "hyperliquidf-xyz".to_string(),
+        provider: exchange.to_string(),
         provider_type: ProviderType::Standalone,
         source_url: HYPERLIQUID_INFO_URL.to_string(),
         fetched_at: fetched_at(),
         exchanges: vec![ExchangeMarkets {
-            exchange: "hyperliquidf-xyz".to_string(),
+            exchange: exchange.to_string(),
             provider_exchange: None,
-            name: "Hyperliquid XYZ Perpetuals".to_string(),
+            name: format!("Hyperliquid {display_name} Perpetuals"),
             market_type: MarketType::Futures,
             markets,
         }],
@@ -1281,9 +1314,11 @@ async fn fetch_hyperliquid_xyz_snapshot() -> Result<MarketSnapshot> {
     Ok(snapshot)
 }
 
-async fn fetch_hyperliquid_xyz_network(
+async fn fetch_hyperliquid_hip3_network(
     url: &str,
     network: &str,
+    dex: &str,
+    display_name: &str,
 ) -> Result<BTreeMap<String, BuiltHyperliquidPerpMarket>> {
     let client = Client::new();
     let dexes = fetch_hyperliquid_info(
@@ -1297,16 +1332,19 @@ async fn fetch_hyperliquid_xyz_network(
         .with_context(|| format!("invalid Hyperliquid {network} perpetual DEX list"))?;
     let dex_index = dexes
         .iter()
-        .position(|dex| {
-            dex.as_ref()
-                .is_some_and(|dex| dex.name.eq_ignore_ascii_case("xyz"))
+        .position(|entry| {
+            entry
+                .as_ref()
+                .is_some_and(|entry| entry.name.eq_ignore_ascii_case(dex))
         })
-        .with_context(|| format!("Hyperliquid {network} does not expose the XYZ perpetual DEX"))?;
+        .with_context(|| {
+            format!("Hyperliquid {network} does not expose the {display_name} perpetual DEX")
+        })?;
     let metadata = fetch_hyperliquid_info(
         &client,
         url,
-        serde_json::json!({ "type": "metaAndAssetCtxs", "dex": "xyz" }),
-        &format!("Hyperliquid {network} XYZ markets"),
+        serde_json::json!({ "type": "metaAndAssetCtxs", "dex": dex }),
+        &format!("Hyperliquid {network} {display_name} markets"),
     )
     .await?;
     let spot_meta = fetch_hyperliquid_info(
@@ -1316,7 +1354,7 @@ async fn fetch_hyperliquid_xyz_network(
         &format!("Hyperliquid {network} spot metadata"),
     )
     .await?;
-    decode_hyperliquid_xyz_network(metadata, spot_meta, dex_index, network)
+    decode_hyperliquid_hip3_network(metadata, spot_meta, dex_index, network, dex, display_name)
 }
 
 async fn fetch_hyperliquid_info(
@@ -1343,24 +1381,38 @@ async fn fetch_hyperliquid_info(
     serde_json::from_str(&body).with_context(|| format!("failed to decode {description} response"))
 }
 
+#[cfg(test)]
 fn decode_hyperliquid_xyz_network(
     body: Value,
     spot_meta: Value,
     dex_index: usize,
     network: &str,
 ) -> Result<BTreeMap<String, BuiltHyperliquidPerpMarket>> {
-    let entries = body
-        .as_array()
-        .with_context(|| format!("invalid Hyperliquid {network} XYZ metaAndAssetCtxs response"))?;
+    decode_hyperliquid_hip3_network(body, spot_meta, dex_index, network, "xyz", "XYZ")
+}
+
+fn decode_hyperliquid_hip3_network(
+    body: Value,
+    spot_meta: Value,
+    dex_index: usize,
+    network: &str,
+    dex: &str,
+    display_name: &str,
+) -> Result<BTreeMap<String, BuiltHyperliquidPerpMarket>> {
+    let entries = body.as_array().with_context(|| {
+        format!("invalid Hyperliquid {network} {display_name} metaAndAssetCtxs response")
+    })?;
     if entries.len() != 2 {
-        bail!("Hyperliquid {network} XYZ metadata must contain metadata and asset contexts");
+        bail!(
+            "Hyperliquid {network} {display_name} metadata must contain metadata and asset contexts"
+        );
     }
     let metadata = serde_json::from_value::<HyperliquidPerpMetadata>(entries[0].clone())
-        .with_context(|| format!("invalid Hyperliquid {network} XYZ metadata"))?;
+        .with_context(|| format!("invalid Hyperliquid {network} {display_name} metadata"))?;
     let contexts = serde_json::from_value::<Vec<HyperliquidAssetContext>>(entries[1].clone())
-        .with_context(|| format!("invalid Hyperliquid {network} XYZ asset contexts"))?;
+        .with_context(|| format!("invalid Hyperliquid {network} {display_name} asset contexts"))?;
     if metadata.universe.len() != contexts.len() {
-        bail!("Hyperliquid {network} XYZ metadata and asset contexts are out of sync");
+        bail!("Hyperliquid {network} {display_name} metadata and asset contexts are out of sync");
     }
     let spot = serde_json::from_value::<HyperliquidSpotMetadata>(spot_meta)
         .with_context(|| format!("invalid Hyperliquid {network} spot metadata"))?;
@@ -1370,19 +1422,18 @@ fn decode_hyperliquid_xyz_network(
         .find(|token| token.index == metadata.collateral_token)
         .with_context(|| {
             format!(
-                "Hyperliquid {network} XYZ references missing collateral token {}",
+                "Hyperliquid {network} {display_name} references missing collateral token {}",
                 metadata.collateral_token
             )
         })?;
     let quote_asset = collateral.name.to_ascii_uppercase();
-    let dex_index = u32::try_from(dex_index).context("Hyperliquid XYZ DEX index exceeds u32")?;
+    let dex_index = u32::try_from(dex_index)
+        .with_context(|| format!("Hyperliquid {display_name} DEX index exceeds u32"))?;
     let base_asset_id = 100_000_u32
-        .checked_add(
-            dex_index
-                .checked_mul(10_000)
-                .context("Hyperliquid XYZ DEX index exceeds the asset ID range")?,
-        )
-        .context("Hyperliquid XYZ asset ID base overflowed")?;
+        .checked_add(dex_index.checked_mul(10_000).with_context(|| {
+            format!("Hyperliquid {display_name} DEX index exceeds the asset ID range")
+        })?)
+        .with_context(|| format!("Hyperliquid {display_name} asset ID base overflowed"))?;
     let mut markets = BTreeMap::new();
     for (asset_index, (market, context)) in metadata.universe.into_iter().zip(contexts).enumerate()
     {
@@ -1390,22 +1441,25 @@ fn decode_hyperliquid_xyz_network(
             continue;
         }
         let wire_symbol = market.name;
+        let prefix = format!("{dex}:");
         let symbol = wire_symbol
-            .strip_prefix("xyz:")
+            .strip_prefix(&prefix)
             .with_context(|| {
-                format!("Hyperliquid {network} XYZ market `{wire_symbol}` omitted the xyz: prefix")
+                format!(
+                    "Hyperliquid {network} {display_name} market `{wire_symbol}` omitted the {prefix} prefix"
+                )
             })?
             .to_ascii_uppercase();
         let mark_price = context.mark_px.parse::<f64>().with_context(|| {
-            format!("invalid Hyperliquid {network} XYZ mark price for {wire_symbol}")
+            format!("invalid Hyperliquid {network} {display_name} mark price for {wire_symbol}")
         })?;
         let tick_size = hyperliquid_price_increment(mark_price, market.sz_decimals, 6)?;
         let lot_size = 10_f64.powi(-i32::from(market.sz_decimals));
-        let asset_index =
-            u32::try_from(asset_index).context("Hyperliquid XYZ market index exceeds u32")?;
+        let asset_index = u32::try_from(asset_index)
+            .with_context(|| format!("Hyperliquid {display_name} market index exceeds u32"))?;
         let venue_id = base_asset_id
             .checked_add(asset_index)
-            .context("Hyperliquid XYZ asset ID overflowed")?;
+            .with_context(|| format!("Hyperliquid {display_name} asset ID overflowed"))?;
         let cross_margin = !market.only_isolated
             && !market.margin_mode.as_deref().is_some_and(|mode| {
                 mode.eq_ignore_ascii_case("noCross") || mode.eq_ignore_ascii_case("strictIsolated")
@@ -1440,7 +1494,7 @@ fn decode_hyperliquid_xyz_network(
             },
         };
         if markets.insert(symbol.clone(), built).is_some() {
-            bail!("Hyperliquid {network} XYZ returned duplicate market {symbol}");
+            bail!("Hyperliquid {network} {display_name} returned duplicate market {symbol}");
         }
     }
     Ok(markets)
@@ -2668,6 +2722,69 @@ mod tests {
         assert_eq!(market.variant.venue_id, 110_001);
         assert_eq!(market.quote_asset, "USDC");
         assert!(!market.variant.execution.cross_margin);
+    }
+
+    #[test]
+    fn hyperliquid_io_decode_preserves_entropy_asset_indices_and_rules() {
+        let decoded = decode_hyperliquid_hip3_network(
+            serde_json::json!([
+                {
+                    "universe": [
+                        {
+                            "name": "io:OAI",
+                            "szDecimals": 3,
+                            "maxLeverage": 3,
+                            "isDelisted": true
+                        },
+                        {
+                            "name": "io:ANTH",
+                            "szDecimals": 3,
+                            "maxLeverage": 3,
+                            "marginMode": "strictIsolated"
+                        },
+                        {
+                            "name": "io:SNDK",
+                            "szDecimals": 4,
+                            "maxLeverage": 10,
+                            "marginMode": "strictIsolated"
+                        }
+                    ],
+                    "collateralToken": 0
+                },
+                [
+                    { "markPx": "1" },
+                    { "markPx": "100.25" },
+                    { "markPx": "18.125" }
+                ]
+            ]),
+            serde_json::json!({
+                "tokens": [
+                    {
+                        "name": "USDC",
+                        "szDecimals": 8,
+                        "index": 0,
+                        "tokenId": "0x0"
+                    }
+                ],
+                "universe": []
+            }),
+            10,
+            "mainnet",
+            "io",
+            "EntropyIO",
+        )
+        .expect("EntropyIO metadata decodes");
+
+        assert!(!decoded.contains_key("OAI"));
+        let anth = decoded.get("ANTH").expect("active ANTH market");
+        assert_eq!(anth.variant.venue_symbol, "io:ANTH");
+        assert_eq!(anth.variant.venue_id, 200_001);
+        assert_eq!(anth.variant.execution.max_leverage, 3);
+        assert!(!anth.variant.execution.cross_margin);
+
+        let sndk = decoded.get("SNDK").expect("active SNDK market");
+        assert_eq!(sndk.variant.venue_id, 200_002);
+        assert_eq!(sndk.variant.execution.max_leverage, 10);
     }
 
     #[test]

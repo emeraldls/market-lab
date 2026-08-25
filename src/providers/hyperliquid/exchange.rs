@@ -14,6 +14,14 @@ static LAST_NONCE: AtomicU64 = AtomicU64::new(0);
 pub const MAINNET_API_WALLET_NAME: &str = "mlab-mainnet";
 pub const TESTNET_API_WALLET_NAME: &str = "mlab-testnet";
 pub const LEGACY_TESTNET_API_WALLET_NAME: &str = "marketlab";
+pub const HYPERLINK_API_WALLET_NAME: &str = "mlab";
+const HYPERLINK_SIGNATURE_CHAIN_ID: u64 = 42_161;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExchangeBackend {
+    Hyperliquid,
+    Hyperlink,
+}
 
 #[derive(Clone)]
 pub struct HyperliquidExchangeClient {
@@ -21,6 +29,7 @@ pub struct HyperliquidExchangeClient {
     wallet: HyperliquidWallet,
     network: HyperliquidNetwork,
     vault_address: Option<String>,
+    backend: ExchangeBackend,
 }
 
 impl HyperliquidExchangeClient {
@@ -30,6 +39,7 @@ impl HyperliquidExchangeClient {
             wallet,
             network,
             vault_address: None,
+            backend: ExchangeBackend::Hyperliquid,
         })
     }
 
@@ -44,6 +54,17 @@ impl HyperliquidExchangeClient {
             wallet,
             network,
             vault_address: Some(vault_address),
+            backend: ExchangeBackend::Hyperliquid,
+        })
+    }
+
+    pub fn for_hyperlink(wallet: HyperliquidWallet) -> Result<Self> {
+        Ok(Self {
+            trading: HyperliquidTradingClient::shared_hyperlink(),
+            wallet,
+            network: HyperliquidNetwork::Mainnet,
+            vault_address: None,
+            backend: ExchangeBackend::Hyperlink,
         })
     }
 
@@ -93,6 +114,14 @@ impl HyperliquidExchangeClient {
         self.cancel_many_with_priority(cancels, true).await
     }
 
+    pub async fn signed_read(&self, action: serde_json::Value) -> Result<serde_json::Value> {
+        if self.backend != ExchangeBackend::Hyperlink {
+            bail!("signed private reads are only available through HyperLink");
+        }
+        let response = self.post_l1_raw(action).await?;
+        hyperlink_read_data(response)
+    }
+
     async fn cancel_many_with_priority(
         &self,
         cancels: Vec<CancelRequest>,
@@ -106,6 +135,19 @@ impl HyperliquidExchangeClient {
     }
 
     async fn post_l1(&self, action: impl Serialize) -> Result<ExchangeResponseStatus> {
+        let response = self.post_l1_raw(action).await?;
+        serde_json::from_value(response).with_context(|| {
+            format!(
+                "invalid {} WebSocket exchange response",
+                match self.backend {
+                    ExchangeBackend::Hyperliquid => "Hyperliquid",
+                    ExchangeBackend::Hyperlink => "HyperLink",
+                }
+            )
+        })
+    }
+
+    async fn post_l1_raw(&self, action: impl Serialize) -> Result<serde_json::Value> {
         let nonce = next_nonce()?;
         let signature = self.wallet.sign_l1_action_for(
             &action,
@@ -113,17 +155,47 @@ impl HyperliquidExchangeClient {
             self.network,
             self.vault_address.as_deref(),
         )?;
-        let response = self
-            .trading
+        self.trading
             .post_action(&ExchangePayload {
                 action,
                 signature,
                 nonce,
                 vault_address: self.vault_address.clone(),
             })
-            .await?;
-        serde_json::from_value(response).context("invalid Hyperliquid WebSocket exchange response")
+            .await
     }
+}
+
+fn hyperlink_read_data(response: serde_json::Value) -> Result<serde_json::Value> {
+    match response.get("status").and_then(serde_json::Value::as_str) {
+        Some("ok") => {}
+        Some("error") => {
+            let error = response
+                .pointer("/response/data")
+                .or_else(|| response.get("response"))
+                .unwrap_or(&response);
+            bail!("HyperLink rejected private read: {error}");
+        }
+        Some(_) => bail!("HyperLink private read returned an unexpected payload: {response}"),
+        None => {
+            if response.get("type").and_then(serde_json::Value::as_str) == Some("error")
+                || response.get("error").is_some()
+            {
+                bail!("HyperLink rejected private read: {response}");
+            }
+            if response.is_object() || response.is_array() {
+                return Ok(response);
+            }
+            bail!("HyperLink private read returned an unexpected payload: {response}");
+        }
+    }
+    let inner = response
+        .get("response")
+        .context("HyperLink private read omitted its response")?;
+    if inner.get("type").and_then(serde_json::Value::as_str) == Some("error") {
+        bail!("HyperLink rejected private read: {inner}");
+    }
+    Ok(inner.get("data").cloned().unwrap_or_else(|| inner.clone()))
 }
 
 fn user_outcome_request(action: UserOutcomeAction) -> UserOutcomeRequest {
@@ -252,6 +324,69 @@ pub async fn approve_agent(
     Ok((agent, response))
 }
 
+pub async fn approve_hyperlink_agent(
+    master: &HyperliquidWallet,
+    agent: &HyperliquidWallet,
+    agent_name: &str,
+) -> Result<ExchangeResponseStatus> {
+    let nonce = next_nonce()?;
+    let action = Action::ApproveAgent {
+        signature_chain_id: format!("0x{HYPERLINK_SIGNATURE_CHAIN_ID:x}"),
+        hyperliquid_chain: HyperliquidNetwork::Mainnet.approval_chain().to_string(),
+        agent_address: agent.address(),
+        agent_name: Some(agent_name.to_string()),
+        nonce,
+    };
+    let signature = master.sign_approve_agent_with_chain(
+        agent.address_bytes(),
+        agent_name,
+        nonce,
+        HyperliquidNetwork::Mainnet,
+        HYPERLINK_SIGNATURE_CHAIN_ID,
+    )?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .context("failed to construct HyperLink authorization client")?;
+    let response = post_exchange_http_to(
+        &client,
+        crate::providers::hyperlink::HTTP_URL,
+        action,
+        signature,
+        nonce,
+    )
+    .await?;
+    validate_hyperlink_agent_approval(&response, &agent.address())?;
+    Ok(response)
+}
+
+fn validate_hyperlink_agent_approval(
+    response: &ExchangeResponseStatus,
+    expected_agent: &str,
+) -> Result<()> {
+    if let Some(error) = response_error(response) {
+        bail!("HyperLink rejected API-wallet authorization: {error}");
+    }
+    let ExchangeResponseStatus::Ok(response) = response else {
+        unreachable!("error responses are handled above");
+    };
+    let approval = response
+        .data
+        .as_ref()
+        .and_then(|data| data.approve_agent.as_ref())
+        .context("HyperLink authorization response omitted approveAgent confirmation")?;
+    if !approval.success {
+        bail!("HyperLink did not confirm API-wallet authorization");
+    }
+    if !approval.agent_address.eq_ignore_ascii_case(expected_agent) {
+        bail!(
+            "HyperLink confirmed API wallet {}, but Market Lab authorized {expected_agent}",
+            approval.agent_address
+        );
+    }
+    Ok(())
+}
+
 pub async fn create_subaccount(
     master: &HyperliquidWallet,
     network: HyperliquidNetwork,
@@ -323,8 +458,18 @@ async fn post_exchange_http(
     signature: WireSignature,
     nonce: u64,
 ) -> Result<ExchangeResponseStatus> {
+    post_exchange_http_to(client, network.http_url(), action, signature, nonce).await
+}
+
+async fn post_exchange_http_to(
+    client: &reqwest::Client,
+    base_url: &str,
+    action: Action,
+    signature: WireSignature,
+    nonce: u64,
+) -> Result<ExchangeResponseStatus> {
     let response = client
-        .post(format!("{}/exchange", network.http_url()))
+        .post(format!("{base_url}/exchange"))
         .json(&ExchangePayload {
             action,
             signature,
@@ -333,22 +478,14 @@ async fn post_exchange_http(
         })
         .send()
         .await
-        .with_context(|| {
-            format!(
-                "failed to call Hyperliquid {} exchange API",
-                network.label()
-            )
-        })?;
+        .with_context(|| format!("failed to call exchange API at {base_url}"))?;
     let status = response.status();
     let body = response
         .text()
         .await
         .context("failed to read Hyperliquid exchange response")?;
     if !status.is_success() {
-        bail!(
-            "Hyperliquid {} exchange returned HTTP {status}: {body}",
-            network.label()
-        );
+        bail!("exchange API at {base_url} returned HTTP {status}: {body}");
     }
     serde_json::from_str(&body)
         .with_context(|| format!("invalid Hyperliquid exchange response: {body}"))
@@ -418,6 +555,8 @@ pub struct OrderRequest {
     pub size: String,
     #[serde(rename = "r")]
     pub reduce_only: bool,
+    #[serde(rename = "c", skip_serializing_if = "Option::is_none")]
+    pub client_order_id: Option<String>,
     #[serde(rename = "t")]
     pub order_type: WireOrder,
 }
@@ -462,7 +601,17 @@ pub struct ExchangeResponse {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExchangeDataStatuses {
+    #[serde(default)]
     pub statuses: Vec<ExchangeDataStatus>,
+    #[serde(default, rename = "approveAgent")]
+    pub approve_agent: Option<ApproveAgentResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApproveAgentResponse {
+    pub success: bool,
+    pub agent_address: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -504,7 +653,7 @@ pub fn wire_number(value: f64) -> String {
     }
 }
 
-fn next_nonce() -> Result<u64> {
+pub(crate) fn next_nonce() -> Result<u64> {
     let now = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
     let mut previous = LAST_NONCE.load(Ordering::Relaxed);
     loop {
@@ -553,6 +702,7 @@ mod tests {
                 limit_px: "65000".to_string(),
                 size: "0.001".to_string(),
                 reduce_only: false,
+                client_order_id: None,
                 order_type: WireOrder::Limit {
                     tif: "Alo".to_string(),
                 },
@@ -564,6 +714,85 @@ mod tests {
         assert_eq!(value["orders"][0]["a"], 0);
         assert_eq!(value["orders"][0]["t"]["limit"]["tif"], "Alo");
         assert_eq!(value["grouping"], "na");
+    }
+
+    #[test]
+    fn hyperlink_cloid_uses_the_required_short_wire_field() {
+        let action = Action::Order {
+            orders: vec![OrderRequest {
+                asset: 0,
+                is_buy: true,
+                limit_px: "65000".to_string(),
+                size: "0.001".to_string(),
+                reduce_only: false,
+                client_order_id: Some("0x1234567890abcdef1234567890abcdef".to_string()),
+                order_type: WireOrder::Limit {
+                    tif: "Gtc".to_string(),
+                },
+            }],
+            grouping: OrderGrouping::None,
+        };
+        let value = serde_json::to_value(action).expect("serializes");
+
+        assert_eq!(
+            value["orders"][0]["c"],
+            "0x1234567890abcdef1234567890abcdef"
+        );
+    }
+
+    #[test]
+    fn hyperlink_approve_agent_confirmation_matches_the_live_wire_shape() {
+        let expected = "0x0fcb98f0ea7b23f414be67c14bfab7fb2196d24b";
+        let response: ExchangeResponseStatus = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "response": {
+                "type": "approveAgent",
+                "data": {
+                    "approveAgent": {
+                        "success": true,
+                        "agentAddress": expected,
+                        "permission": "trade",
+                        "ipWhitelist": [],
+                        "validUntil": 1795391248185_u64
+                    }
+                }
+            }
+        }))
+        .expect("live HyperLink approval response parses");
+
+        validate_hyperlink_agent_approval(&response, expected)
+            .expect("matching successful approval is accepted");
+        assert!(
+            validate_hyperlink_agent_approval(
+                &response,
+                "0x0000000000000000000000000000000000000001"
+            )
+            .expect_err("another agent must be rejected")
+            .to_string()
+            .contains("but Market Lab authorized")
+        );
+    }
+
+    #[test]
+    fn hyperlink_private_reads_accept_raw_objects_and_arrays() {
+        let asset = serde_json::json!({
+            "availableToTrade": ["0.0", "0.0"],
+            "coin": "ETH",
+            "leverage": { "type": "cross", "value": 15 },
+            "markPx": "0.0",
+            "maxTradeSzs": ["0.0", "0.0"],
+            "user": "0xfdc6319fa33aa3b2178ca196963f7a5a06cd0852"
+        });
+        assert_eq!(
+            hyperlink_read_data(asset.clone()).expect("raw asset data is accepted"),
+            asset
+        );
+
+        let orders = serde_json::json!([]);
+        assert_eq!(
+            hyperlink_read_data(orders.clone()).expect("raw order arrays are accepted"),
+            orders
+        );
     }
 
     #[test]

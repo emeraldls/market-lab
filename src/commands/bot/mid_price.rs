@@ -28,6 +28,7 @@ use crate::domain::types::{OrderBookSnapshot, TopOfBook};
 use crate::providers::bulk::market_data::{BulkProvider, normalize_timestamp_ms};
 use crate::providers::bulk::ws::{BulkAccountStream, BulkOrderBookStream};
 use crate::providers::execution::ExecutionAdapter;
+use crate::providers::hyperlink::ws::HyperlinkAccountStream;
 use crate::providers::hyperliquid::HyperliquidNetwork;
 use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 use crate::providers::hyperliquid::ws::{HyperliquidAccountStream, HyperliquidOrderBookStream};
@@ -305,7 +306,9 @@ fn worker_trade_args(definition: &MidPriceJobDefinition) -> TradeArgs {
         venue: match definition.venue {
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
             ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
+            ExecutionVenue::Hyperlink => ExecutionVenueArg::Hyperlink,
             ExecutionVenue::HyperliquidXyz => ExecutionVenueArg::HyperliquidXyz,
+            ExecutionVenue::HyperliquidIo => ExecutionVenueArg::HyperliquidIo,
             ExecutionVenue::HyperliquidSpot => ExecutionVenueArg::HyperliquidSpot,
             ExecutionVenue::HyperliquidOutcomes => ExecutionVenueArg::HyperliquidOutcomes,
         },
@@ -472,8 +475,11 @@ fn execution_venue_label(venue: ExecutionVenue, testnet: bool) -> &'static str {
         (ExecutionVenue::Bulk, _) => "BULK testnet",
         (ExecutionVenue::Hyperliquid, true) => "Hyperliquid testnet",
         (ExecutionVenue::Hyperliquid, false) => "Hyperliquid mainnet",
+        (ExecutionVenue::Hyperlink, _) => "HyperLink mainnet",
         (ExecutionVenue::HyperliquidXyz, true) => "Hyperliquid XYZ testnet",
         (ExecutionVenue::HyperliquidXyz, false) => "Hyperliquid XYZ mainnet",
+        (ExecutionVenue::HyperliquidIo, true) => "Hyperliquid EntropyIO testnet",
+        (ExecutionVenue::HyperliquidIo, false) => "Hyperliquid EntropyIO mainnet",
         (ExecutionVenue::HyperliquidSpot, true) => "Hyperliquid Spot testnet",
         (ExecutionVenue::HyperliquidSpot, false) => "Hyperliquid Spot mainnet",
         (ExecutionVenue::HyperliquidOutcomes, true) => "Hyperliquid Outcomes testnet",
@@ -485,7 +491,9 @@ pub(super) fn venue_key(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "bulkf",
         ExecutionVenue::Hyperliquid => "hyperliquidf",
+        ExecutionVenue::Hyperlink => "hyperlinkf",
         ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
+        ExecutionVenue::HyperliquidIo => "hyperliquidf-io",
         ExecutionVenue::HyperliquidSpot => "hyperliquid",
         ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
     }
@@ -495,7 +503,9 @@ pub(super) fn venue_label(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "BULK",
         ExecutionVenue::Hyperliquid => "Hyperliquid",
+        ExecutionVenue::Hyperlink => "HyperLink",
         ExecutionVenue::HyperliquidXyz => "Hyperliquid XYZ",
+        ExecutionVenue::HyperliquidIo => "Hyperliquid EntropyIO",
         ExecutionVenue::HyperliquidSpot => "Hyperliquid Spot",
         ExecutionVenue::HyperliquidOutcomes => "Hyperliquid Outcomes",
     }
@@ -505,7 +515,14 @@ pub(super) fn execution_market(
     venue: ExecutionVenue,
     symbol: &str,
 ) -> Result<std::sync::Arc<crate::markets::Market>> {
-    crate::markets::exchange_market(venue_key(venue), symbol)
+    crate::markets::exchange_market(
+        if venue == ExecutionVenue::Hyperlink {
+            "hyperliquidf"
+        } else {
+            venue_key(venue)
+        },
+        symbol,
+    )
 }
 
 pub(super) async fn live_orderbook(
@@ -524,9 +541,28 @@ pub(super) async fn live_orderbook(
             )
             .await
         }
+        ExecutionVenue::Hyperlink => {
+            HyperliquidProvider::live_orderbook_on(
+                symbol,
+                BOOK_DEPTH,
+                None,
+                HyperliquidNetwork::Mainnet,
+            )
+            .await
+        }
         ExecutionVenue::HyperliquidXyz => {
             HyperliquidProvider::live_orderbook_for(
                 crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual,
+                symbol,
+                BOOK_DEPTH,
+                None,
+                HyperliquidNetwork::from_testnet(testnet),
+            )
+            .await
+        }
+        ExecutionVenue::HyperliquidIo => {
+            HyperliquidProvider::live_orderbook_for(
+                crate::providers::hyperliquid::HyperliquidProduct::IoPerpetual,
                 symbol,
                 BOOK_DEPTH,
                 None,
@@ -882,9 +918,26 @@ impl BotOrderBookStream {
                 )
                 .await?,
             )),
+            ExecutionVenue::Hyperlink => Ok(Self::Hyperliquid(
+                HyperliquidOrderBookStream::connect_on(
+                    symbol,
+                    BOOK_DEPTH,
+                    HyperliquidNetwork::Mainnet,
+                )
+                .await?,
+            )),
             ExecutionVenue::HyperliquidXyz => Ok(Self::Hyperliquid(
                 HyperliquidOrderBookStream::connect_for(
                     crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual,
+                    symbol,
+                    BOOK_DEPTH,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
+            )),
+            ExecutionVenue::HyperliquidIo => Ok(Self::Hyperliquid(
+                HyperliquidOrderBookStream::connect_for(
+                    crate::providers::hyperliquid::HyperliquidProduct::IoPerpetual,
                     symbol,
                     BOOK_DEPTH,
                     HyperliquidNetwork::from_testnet(testnet),
@@ -987,6 +1040,7 @@ pub(super) fn spawn_book_feed(
 enum BotAccountStream {
     Bulk(BulkAccountStream),
     Hyperliquid(HyperliquidAccountStream),
+    Hyperlink(HyperlinkAccountStream),
 }
 
 impl BotAccountStream {
@@ -1000,7 +1054,23 @@ impl BotAccountStream {
                 )
                 .await?,
             )),
+            ExecutionVenue::Hyperlink => {
+                let credential = crate::credentials::active_hyperlink_credential()?;
+                if !credential.account.eq_ignore_ascii_case(account) {
+                    bail!("HyperLink stream account does not match the configured account");
+                }
+                Ok(Self::Hyperlink(
+                    HyperlinkAccountStream::connect(account, &credential.agent).await?,
+                ))
+            }
             ExecutionVenue::HyperliquidXyz => Ok(Self::Hyperliquid(
+                HyperliquidAccountStream::connect_on(
+                    account,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
+            )),
+            ExecutionVenue::HyperliquidIo => Ok(Self::Hyperliquid(
                 HyperliquidAccountStream::connect_on(
                     account,
                     HyperliquidNetwork::from_testnet(testnet),
@@ -1030,6 +1100,7 @@ impl BotAccountStream {
             Self::Hyperliquid(stream) => {
                 normalize_hyperliquid_account_events(stream.next_event().await?)
             }
+            Self::Hyperlink(stream) => Ok(vec![stream.next_event().await?]),
         }
     }
 }

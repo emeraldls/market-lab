@@ -411,15 +411,20 @@ async fn fetch_directional_price_window(
     let series = match venue {
         ExecutionVenue::Bulk => BulkProvider::candles(symbol, "1m", from_ms, to_ms).await?,
         ExecutionVenue::Hyperliquid
+        | ExecutionVenue::Hyperlink
         | ExecutionVenue::HyperliquidXyz
+        | ExecutionVenue::HyperliquidIo
         | ExecutionVenue::HyperliquidSpot
         | ExecutionVenue::HyperliquidOutcomes => {
             let product = match venue {
-                ExecutionVenue::Hyperliquid => {
+                ExecutionVenue::Hyperliquid | ExecutionVenue::Hyperlink => {
                     crate::providers::hyperliquid::HyperliquidProduct::Perpetual
                 }
                 ExecutionVenue::HyperliquidXyz => {
                     crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual
+                }
+                ExecutionVenue::HyperliquidIo => {
+                    crate::providers::hyperliquid::HyperliquidProduct::IoPerpetual
                 }
                 ExecutionVenue::HyperliquidSpot => {
                     crate::providers::hyperliquid::HyperliquidProduct::Spot

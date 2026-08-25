@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 pub const EXCHANGE: &str = "hyperliquidf";
 pub const XYZ_EXCHANGE: &str = "hyperliquidf-xyz";
 pub const XYZ_DEX: &str = "xyz";
+pub const IO_EXCHANGE: &str = "hyperliquidf-io";
+pub const IO_DEX: &str = "io";
 pub const SPOT_EXCHANGE: &str = "hyperliquid";
 pub const OUTCOMES_EXCHANGE: &str = "hyperliquid-outcomes";
 pub const MAINNET_HTTP_URL: &str = "https://api.hyperliquid.xyz";
@@ -34,6 +36,7 @@ pub enum HyperliquidProduct {
     Outcome,
     Perpetual,
     XyzPerpetual,
+    IoPerpetual,
 }
 
 impl HyperliquidProduct {
@@ -43,8 +46,9 @@ impl HyperliquidProduct {
             OUTCOMES_EXCHANGE => Ok(Self::Outcome),
             EXCHANGE => Ok(Self::Perpetual),
             XYZ_EXCHANGE => Ok(Self::XyzPerpetual),
+            IO_EXCHANGE => Ok(Self::IoPerpetual),
             _ => anyhow::bail!(
-                "Hyperliquid exchange must be `hyperliquid` (spot), `hyperliquid-outcomes` (HIP-4 outcomes), `hyperliquidf` (native perpetuals), or `hyperliquidf-xyz` (XYZ perpetuals)"
+                "Hyperliquid exchange must be `hyperliquid` (spot), `hyperliquid-outcomes` (HIP-4 outcomes), `hyperliquidf` (native perpetuals), `hyperliquidf-xyz` (XYZ perpetuals), or `hyperliquidf-io` (EntropyIO perpetuals)"
             ),
         }
     }
@@ -55,24 +59,29 @@ impl HyperliquidProduct {
             Self::Outcome => OUTCOMES_EXCHANGE,
             Self::Perpetual => EXCHANGE,
             Self::XyzPerpetual => XYZ_EXCHANGE,
+            Self::IoPerpetual => IO_EXCHANGE,
         }
     }
 
     pub const fn dex(self) -> Option<&'static str> {
         match self {
             Self::XyzPerpetual => Some(XYZ_DEX),
+            Self::IoPerpetual => Some(IO_DEX),
             Self::Spot | Self::Outcome | Self::Perpetual => None,
         }
     }
 
     pub const fn is_perpetual(self) -> bool {
-        matches!(self, Self::Perpetual | Self::XyzPerpetual)
+        matches!(
+            self,
+            Self::Perpetual | Self::XyzPerpetual | Self::IoPerpetual
+        )
     }
 
     pub const fn max_price_decimals(self) -> u8 {
         match self {
             Self::Spot | Self::Outcome => 8,
-            Self::Perpetual | Self::XyzPerpetual => 6,
+            Self::Perpetual | Self::XyzPerpetual | Self::IoPerpetual => 6,
         }
     }
 }

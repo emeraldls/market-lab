@@ -14,8 +14,8 @@ use crate::cli::{AuthProvider, AuthProviderArgs, AuthSetArgs};
 use crate::providers::bulk;
 use crate::providers::hyperliquid::HyperliquidNetwork;
 use crate::providers::hyperliquid::exchange::{
-    LEGACY_TESTNET_API_WALLET_NAME, MAINNET_API_WALLET_NAME, TESTNET_API_WALLET_NAME,
-    approve_agent, response_error,
+    HYPERLINK_API_WALLET_NAME, LEGACY_TESTNET_API_WALLET_NAME, MAINNET_API_WALLET_NAME,
+    TESTNET_API_WALLET_NAME, approve_agent, approve_hyperlink_agent, response_error,
 };
 use crate::providers::hyperliquid::signing::{HyperliquidWallet, canonical_address};
 
@@ -25,11 +25,13 @@ const CREDENTIAL_FILE_MODE: u32 = 0o600;
 const MMT_CREDENTIAL_FILE: &str = "mmt-api-key";
 const BULK_CREDENTIAL_FILE: &str = "bulk-agent.json";
 const HYPERLIQUID_CREDENTIAL_FILE: &str = "hyperliquid-agents.json";
+const HYPERLINK_CREDENTIAL_FILE: &str = "hyperlink-agent.json";
 const LEGACY_BULK_CREDENTIAL_VERSION: u8 = 1;
 const BULK_CREDENTIAL_VERSION: u8 = 2;
 const LEGACY_HYPERLIQUID_CREDENTIAL_VERSION: u8 = 1;
 const LEGACY_NETWORKED_HYPERLIQUID_CREDENTIAL_VERSION: u8 = 2;
 const HYPERLIQUID_CREDENTIAL_VERSION: u8 = 3;
+const HYPERLINK_CREDENTIAL_VERSION: u8 = 1;
 
 static MMT_API_KEY: OnceLock<String> = OnceLock::new();
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -123,6 +125,37 @@ struct HyperliquidCredential {
     mainnet_subaccounts: Vec<NamedSubaccount>,
     #[serde(default)]
     testnet_subaccounts: Vec<NamedSubaccount>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct HyperlinkCredential {
+    version: u8,
+    status: HyperlinkCredentialStatus,
+    account: String,
+    agent: HyperliquidAgentCredential,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum HyperlinkCredentialStatus {
+    Pending,
+    Active,
+}
+
+impl HyperlinkCredential {
+    fn validate(&self) -> Result<()> {
+        if self.version != HYPERLINK_CREDENTIAL_VERSION {
+            bail!(
+                "unsupported stored HyperLink credential version {}",
+                self.version
+            );
+        }
+        let account = parse_hyperliquid_address(&self.account, "account")?;
+        if account != self.account.to_ascii_lowercase() {
+            bail!("stored HyperLink account address is not canonical");
+        }
+        self.agent.validate()
+    }
 }
 
 impl HyperliquidCredential {
@@ -448,6 +481,32 @@ pub fn hyperliquid_accounts(network: HyperliquidNetwork) -> Result<Vec<(String, 
     )
 }
 
+pub fn active_hyperlink_credential() -> Result<ActiveHyperliquidCredential> {
+    let credential = load_hyperlink_credential()?
+        .context("HyperLink credentials are not configured; run `mlab auth set hyperlink`")?;
+    if credential.status != HyperlinkCredentialStatus::Active {
+        bail!(
+            "HyperLink API-wallet authorization is pending; run `mlab auth set hyperlink` to finish it"
+        );
+    }
+    Ok(ActiveHyperliquidCredential {
+        account: credential.account,
+        agent: credential.agent.wallet()?,
+        vault_address: None,
+    })
+}
+
+pub fn hyperlink_account_for(name: &str) -> Result<String> {
+    if !name.trim().is_empty() && !name.eq_ignore_ascii_case("main") {
+        bail!("HyperLink subaccounts are not supported; use account `main`");
+    }
+    Ok(active_hyperlink_credential()?.account)
+}
+
+pub fn hyperlink_accounts() -> Result<Vec<(String, String)>> {
+    Ok(vec![("main".to_string(), hyperlink_account_for("main")?)])
+}
+
 pub async fn handle_set(args: AuthSetArgs) -> Result<()> {
     if args.reauthorize && args.subaccount.is_some() {
         bail!("`--reauthorize` and `--subaccount` cannot be used together");
@@ -474,6 +533,9 @@ pub async fn handle_set(args: AuthSetArgs) -> Result<()> {
         AuthProvider::Hyperliquid => {
             handle_set_hyperliquid(args.reauthorize, args.subaccount.as_deref()).await?
         }
+        AuthProvider::Hyperlink => {
+            handle_set_hyperlink(args.reauthorize, args.subaccount.as_deref()).await?
+        }
     }
     Ok(())
 }
@@ -482,6 +544,28 @@ pub fn handle_status() -> Result<()> {
     print_mmt_status()?;
     print_bulk_status()?;
     print_hyperliquid_status()?;
+    print_hyperlink_status()?;
+    Ok(())
+}
+
+fn print_hyperlink_status() -> Result<()> {
+    match load_hyperlink_credential()? {
+        Some(credential) => {
+            println!(
+                "hyperlink: {} in local credential store",
+                match credential.status {
+                    HyperlinkCredentialStatus::Pending => "pending authorization",
+                    HyperlinkCredentialStatus::Active => "configured",
+                }
+            );
+            println!("  account: {}", credential.account);
+            println!(
+                "  agent: {} ({})",
+                credential.agent.address, credential.agent.name
+            );
+        }
+        None => println!("hyperlink: not configured"),
+    }
     Ok(())
 }
 
@@ -752,7 +836,137 @@ pub async fn handle_remove(args: AuthProviderArgs) -> Result<()> {
         }
         AuthProvider::Bulk => handle_remove_bulk().await?,
         AuthProvider::Hyperliquid => handle_remove_hyperliquid().await?,
+        AuthProvider::Hyperlink => handle_remove_hyperlink().await?,
     }
+    Ok(())
+}
+
+async fn handle_set_hyperlink(reauthorize: bool, subaccount: Option<&str>) -> Result<()> {
+    if subaccount.is_some() {
+        bail!("HyperLink subaccounts are not supported");
+    }
+    let existing = load_hyperlink_credential()?;
+    if let Some(credential) = &existing
+        && credential.status == HyperlinkCredentialStatus::Active
+        && !reauthorize
+    {
+        println!("hyperlink: already configured");
+        println!("  account: {}", credential.account);
+        println!(
+            "  agent: {} ({})",
+            credential.agent.address, credential.agent.name
+        );
+        println!("  use `mlab auth set hyperlink --reauthorize` to replace the API wallet");
+        return Ok(());
+    }
+
+    println!("HyperLink mainnet API-wallet setup.");
+    println!("The main wallet private key is used only for approval and is never stored.");
+    let master = {
+        let private_key = Zeroizing::new(rpassword::prompt_password(
+            "HyperLink main wallet private key (hidden): ",
+        )?);
+        HyperliquidWallet::from_private_key(private_key.trim())
+            .context("invalid HyperLink main wallet private key")?
+    };
+    let account = master.address();
+    if let Some(existing) = &existing
+        && existing.account != account
+    {
+        bail!(
+            "this HyperLink credential belongs to {}, but the supplied key belongs to {account}",
+            existing.account
+        );
+    }
+
+    let mut credential = match existing {
+        Some(credential) => {
+            println!(
+                "hyperlink: {} API wallet `{HYPERLINK_API_WALLET_NAME}`",
+                if credential.status == HyperlinkCredentialStatus::Pending {
+                    "retrying authorization for pending"
+                } else {
+                    "reauthorizing"
+                }
+            );
+            credential
+        }
+        None => {
+            let wallet = HyperliquidWallet::random();
+            let credential = HyperlinkCredential {
+                version: HYPERLINK_CREDENTIAL_VERSION,
+                status: HyperlinkCredentialStatus::Pending,
+                account: account.clone(),
+                agent: HyperliquidAgentCredential::from_wallet(HYPERLINK_API_WALLET_NAME, &wallet),
+            };
+            save_hyperlink_credential(&credential)?;
+            println!("hyperlink: generated and stored a pending API wallet");
+            println!("  agent: {}", credential.agent.address);
+            credential
+        }
+    };
+    let wallet = credential.agent.wallet()?;
+    let response = approve_hyperlink_agent(&master, &wallet, HYPERLINK_API_WALLET_NAME)
+        .await
+        .with_context(|| {
+            if credential.status == HyperlinkCredentialStatus::Pending {
+                "HyperLink API-wallet authorization was not confirmed; the pending API wallet remains stored and `mlab auth set hyperlink` can safely retry it"
+            } else {
+                "HyperLink API-wallet reauthorization was not confirmed; the existing API wallet remains stored"
+            }
+        })?;
+    if let Some(error) = response_error(&response) {
+        bail!("HyperLink rejected API-wallet authorization: {error}");
+    }
+    credential.status = HyperlinkCredentialStatus::Active;
+    save_hyperlink_credential(&credential).context(
+        "HyperLink authorized the API wallet, but Market Lab could not mark the stored credential active; rerun `mlab auth set hyperlink` to retry safely",
+    )?;
+    println!("hyperlink: configured");
+    println!("  account: {account}");
+    println!(
+        "  agent: {} ({})",
+        credential.agent.address, credential.agent.name
+    );
+    print_credential_location(HYPERLINK_CREDENTIAL_FILE)
+}
+
+async fn handle_remove_hyperlink() -> Result<()> {
+    let Some(credential) = load_hyperlink_credential()? else {
+        println!("hyperlink: not configured");
+        return Ok(());
+    };
+    if credential.status == HyperlinkCredentialStatus::Pending {
+        bail!(
+            "this HyperLink API wallet has an unconfirmed authorization; retry `mlab auth set hyperlink` before removing it so Market Lab does not discard a potentially authorized key"
+        );
+    }
+    println!(
+        "The main wallet private key is used once to replace the stored HyperLink API wallet."
+    );
+    let master = {
+        let private_key = Zeroizing::new(rpassword::prompt_password(
+            "HyperLink main wallet private key (hidden): ",
+        )?);
+        HyperliquidWallet::from_private_key(private_key.trim())
+            .context("invalid HyperLink main wallet private key")?
+    };
+    if master.address() != credential.account {
+        bail!(
+            "the supplied key belongs to {}, but the stored HyperLink agent belongs to {}",
+            master.address(),
+            credential.account
+        );
+    }
+    let replacement = HyperliquidWallet::random();
+    let response = approve_hyperlink_agent(&master, &replacement, &credential.agent.name)
+        .await
+        .context("failed to replace the stored HyperLink API wallet")?;
+    if let Some(error) = response_error(&response) {
+        bail!("HyperLink rejected API-wallet replacement: {error}");
+    }
+    delete_credential_file(HYPERLINK_CREDENTIAL_FILE, "HyperLink agent")?;
+    println!("hyperlink: revoked and removed");
     Ok(())
 }
 
@@ -1185,6 +1399,28 @@ fn delete_hyperliquid_credential() -> Result<()> {
     delete_credential_file(HYPERLIQUID_CREDENTIAL_FILE, "Hyperliquid agent")
 }
 
+fn load_hyperlink_credential() -> Result<Option<HyperlinkCredential>> {
+    let Some(encoded) = load_credential_file(HYPERLINK_CREDENTIAL_FILE, "HyperLink agent")? else {
+        return Ok(None);
+    };
+    let credential: HyperlinkCredential = serde_json::from_str(encoded.as_str())
+        .context("stored HyperLink agent credential is malformed")?;
+    credential.validate()?;
+    Ok(Some(credential))
+}
+
+fn save_hyperlink_credential(credential: &HyperlinkCredential) -> Result<()> {
+    credential.validate()?;
+    let encoded = Zeroizing::new(
+        serde_json::to_string(credential).context("failed to encode HyperLink agent credential")?,
+    );
+    save_credential_file(
+        HYPERLINK_CREDENTIAL_FILE,
+        encoded.as_bytes(),
+        "HyperLink agent",
+    )
+}
+
 fn credential_directory() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("HOME is required for the credential directory")?;
     Ok(PathBuf::from(home).join(".market-lab").join("credentials"))
@@ -1582,6 +1818,24 @@ mod tests {
                 .address,
             testnet.address()
         );
+    }
+
+    #[test]
+    fn hyperlink_credential_is_separate_and_self_consistent() {
+        let master = HyperliquidWallet::random();
+        let agent = HyperliquidWallet::random();
+        let credential = HyperlinkCredential {
+            version: HYPERLINK_CREDENTIAL_VERSION,
+            status: HyperlinkCredentialStatus::Active,
+            account: master.address(),
+            agent: HyperliquidAgentCredential::from_wallet(HYPERLINK_API_WALLET_NAME, &agent),
+        };
+
+        credential
+            .validate()
+            .expect("HyperLink credential is valid");
+        assert_eq!(credential.agent.address, agent.address());
+        assert_eq!(credential.agent.name, HYPERLINK_API_WALLET_NAME);
     }
 
     #[test]

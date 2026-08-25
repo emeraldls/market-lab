@@ -1545,7 +1545,9 @@ fn execution_venue_name(exchange: crate::domain::execution::ExecutionVenue) -> &
     match exchange {
         crate::domain::execution::ExecutionVenue::Bulk => "bulkf",
         crate::domain::execution::ExecutionVenue::Hyperliquid => "hyperliquidf",
+        crate::domain::execution::ExecutionVenue::Hyperlink => "hyperliquidf",
         crate::domain::execution::ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
+        crate::domain::execution::ExecutionVenue::HyperliquidIo => "hyperliquidf-io",
         crate::domain::execution::ExecutionVenue::HyperliquidSpot => "hyperliquid",
         crate::domain::execution::ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
     }

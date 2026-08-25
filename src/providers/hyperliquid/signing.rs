@@ -97,8 +97,25 @@ impl HyperliquidWallet {
         nonce: u64,
         network: HyperliquidNetwork,
     ) -> Result<WireSignature> {
+        self.sign_approve_agent_with_chain(
+            agent_address,
+            agent_name,
+            nonce,
+            network,
+            SIGNATURE_CHAIN_ID,
+        )
+    }
+
+    pub fn sign_approve_agent_with_chain(
+        &self,
+        agent_address: [u8; 20],
+        agent_name: &str,
+        nonce: u64,
+        network: HyperliquidNetwork,
+        signature_chain_id: u64,
+    ) -> Result<WireSignature> {
         let digest = typed_data_digest(
-            transaction_domain_separator(SIGNATURE_CHAIN_ID),
+            transaction_domain_separator(signature_chain_id),
             approve_agent_struct_hash(network.approval_chain(), agent_address, agent_name, nonce),
         );
         self.sign_hash(digest)
