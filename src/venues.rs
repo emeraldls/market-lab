@@ -343,12 +343,6 @@ pub const BUILTIN_VENUES: &[VenueSpec] = &[
     HYPERLIQUID_OUTCOMES,
 ];
 
-/// One representative venue for each independently connected execution transport.
-/// Registering a new exchange transport happens here and in the provider factory;
-/// orchestration code never enumerates exchanges.
-pub const EXECUTION_TRANSPORTS: &[VenueId] =
-    &[VenueId::Bulk, VenueId::Hyperliquid, VenueId::Hyperlink];
-
 pub fn resolve(venue: VenueId) -> Result<VenueSpec> {
     if let Some(spec) = BUILTIN_VENUES.iter().find(|spec| spec.id == venue) {
         return Ok(*spec);

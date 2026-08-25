@@ -108,13 +108,25 @@ fn inspect_python_script_with_limits(
             .context("Python script inspection omitted source selectors")?,
     )
     .context("failed to decode Python source selectors")?;
-    Ok(PythonScriptInspection { manifest, sources })
+    let execution_venues = serde_json::from_value(
+        response
+            .get("executionVenues")
+            .cloned()
+            .context("Python script inspection omitted execution venues")?,
+    )
+    .context("failed to decode Python execution venues")?;
+    Ok(PythonScriptInspection {
+        manifest,
+        sources,
+        execution_venues,
+    })
 }
 
 #[derive(Debug)]
 pub(crate) struct PythonScriptInspection {
     pub(crate) manifest: ScriptManifest,
     pub(crate) sources: Vec<String>,
+    pub(crate) execution_venues: Vec<String>,
 }
 
 pub(crate) struct PythonSession {
@@ -958,8 +970,7 @@ def load_module():
     return module, manifest
 
 
-def inspect_source_selectors():
-    tree = ast.parse(SCRIPT_PATH.read_text(encoding="utf-8"), filename=str(SCRIPT_PATH))
+def module_string_constants(tree):
     constants = {}
     for statement in tree.body:
         if (
@@ -977,6 +988,18 @@ def inspect_source_selectors():
             and isinstance(statement.value.value, str)
         ):
             constants[statement.target.id] = statement.value.value
+    return constants
+
+
+def static_string(node, constants):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in constants:
+        return constants[node.id]
+    return None
+
+
+def inspect_source_selectors(tree, constants):
     selectors = []
     seen = set()
     dynamic_lines = []
@@ -994,11 +1017,8 @@ def inspect_source_selectors():
         if not node.args:
             raise TypeError(f"history.source on line {node.lineno} requires a selector")
         selector = node.args[0]
-        if isinstance(selector, ast.Constant) and isinstance(selector.value, str):
-            value = selector.value
-        elif isinstance(selector, ast.Name) and selector.id in constants:
-            value = constants[selector.id]
-        else:
+        value = static_string(selector, constants)
+        if value is None:
             dynamic_lines.append(node.lineno)
             continue
         if not value:
@@ -1013,6 +1033,50 @@ def inspect_source_selectors():
             "add at least one call with a literal selector or module-level string constant"
         )
     return selectors
+
+
+def inspect_execution_venues(tree, constants):
+    venues = []
+    seen = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function = node.func
+        if not (
+            isinstance(function, ast.Attribute)
+            and function.attr in ("trade", "order")
+            and isinstance(function.value, ast.Name)
+            and function.value.id == "ctx"
+        ):
+            continue
+        operation = f"ctx.{function.attr}"
+        if not node.args:
+            raise TypeError(f"{operation} on line {node.lineno} requires a request object")
+        request = node.args[0]
+        if not isinstance(request, ast.Dict):
+            raise TypeError(
+                f"{operation} on line {node.lineno} cannot declare its exchange dynamically; "
+                "pass a dictionary literal with a literal exchange or module-level string constant"
+            )
+        exchange_node = None
+        for key, value in zip(request.keys, request.values):
+            if isinstance(key, ast.Constant) and key.value == "exchange":
+                exchange_node = value
+                break
+        if exchange_node is None:
+            raise TypeError(f"{operation} on line {node.lineno} requires an exchange")
+        exchange = static_string(exchange_node, constants)
+        if exchange is None:
+            raise TypeError(
+                f"{operation} exchange on line {node.lineno} cannot be dynamic; "
+                "use a literal string or module-level string constant"
+            )
+        if not exchange:
+            raise TypeError(f"{operation} exchange on line {node.lineno} cannot be empty")
+        if exchange not in seen:
+            seen.add(exchange)
+            venues.append(exchange)
+    return venues
 
 
 def selector_without_options(name):
@@ -1254,12 +1318,18 @@ class Context:
 
 try:
     MODULE, MANIFEST = load_module()
-    SOURCE_SELECTORS = inspect_source_selectors()
+    SOURCE_TREE = ast.parse(
+        SCRIPT_PATH.read_text(encoding="utf-8"), filename=str(SCRIPT_PATH)
+    )
+    STRING_CONSTANTS = module_string_constants(SOURCE_TREE)
+    SOURCE_SELECTORS = inspect_source_selectors(SOURCE_TREE, STRING_CONSTANTS)
+    EXECUTION_VENUES = inspect_execution_venues(SOURCE_TREE, STRING_CONSTANTS)
     if MODE == "describe":
         write_message({
             "type": "ready",
             "manifest": MANIFEST,
             "sources": SOURCE_SELECTORS,
+            "executionVenues": EXECUTION_VENUES,
             "hooks": {
                 "onExecution": callable(getattr(MODULE, "on_execution", None)),
                 "onFinish": callable(getattr(MODULE, "on_finish", None)),
@@ -1358,6 +1428,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::domain::execution::ExecutionVenue;
     use crate::scripting::engine::Script;
 
     fn write_python_script(source: &str, name: &str) -> PathBuf {
@@ -2073,6 +2144,84 @@ def on_data(ctx, history):
             Err(error) => error,
         };
         assert!(format!("{error:#}").contains("cannot declare a source dynamically"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn python_inspection_derives_execution_venues() {
+        let path = write_python_script(
+            r#"
+script = {"name": "execution-venues", "version": "2"}
+PRIMARY_EXCHANGE = "hyperlinkf"
+
+def on_data(ctx):
+    ctx.trade({
+        "exchange": PRIMARY_EXCHANGE,
+        "symbol": "BTC",
+        "position": "open-long",
+        "margin": 10,
+    })
+    ctx.order({
+        "exchange": "hyperliquidf-xyz",
+        "symbol": "HYPE",
+        "side": "sell",
+        "size": 1,
+    })
+    ctx.trade({
+        "exchange": PRIMARY_EXCHANGE,
+        "symbol": "ETH",
+        "position": "open-short",
+        "margin": 10,
+    })
+"#,
+            "execution-venues",
+        );
+        if !python_available(&path) {
+            let _ = fs::remove_file(path);
+            return;
+        }
+
+        let script = Script::load(&path).expect("load Python script");
+        assert_eq!(
+            script.execution_venues(),
+            [
+                ExecutionVenue::Hyperlink,
+                ExecutionVenue::parse("hyperliquidf-xyz").expect("XYZ venue"),
+            ]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn python_inspection_rejects_dynamic_execution_venues() {
+        let path = write_python_script(
+            r#"
+script = {"name": "dynamic-execution-venue", "version": "2"}
+
+def on_data(ctx):
+    exchange = "hyperlinkf"
+    ctx.trade({
+        "exchange": exchange,
+        "symbol": "BTC",
+        "position": "open-long",
+        "margin": 10,
+    })
+"#,
+            "dynamic-execution-venue",
+        );
+        if !python_available(&path) {
+            let _ = fs::remove_file(path);
+            return;
+        }
+
+        let error = match Script::load(&path) {
+            Ok(_) => panic!("dynamic execution venue should be rejected"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("exchange on line"));
+        assert!(format!("{error:#}").contains("cannot be dynamic"));
 
         let _ = fs::remove_file(path);
     }

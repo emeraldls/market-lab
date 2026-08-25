@@ -43,7 +43,7 @@ use crate::strategies::jobs::{
 use crate::venues::VenueMarket;
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-pub const RUNTIME_VERSION: u8 = 42;
+pub const RUNTIME_VERSION: u8 = 43;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 
@@ -2307,6 +2307,7 @@ fn create_script_job(
         python_runtime: submission.python_runtime,
         providers: submission.providers,
         exchanges: submission.exchanges,
+        execution_venues: submission.execution_venues,
         sources: submission.sources,
         params: submission.params,
         venue: submission.venue,
@@ -3226,11 +3227,11 @@ async fn prepare_script_execution_transports(
     };
     match job.definition.language {
         crate::scripting::language::ScriptLanguage::PythonV2 => {
-            for (venue, result) in
-                crate::providers::execution::connect_registered_execution_transports(
-                    job.definition.testnet,
-                )
-                .await
+            for (venue, result) in crate::providers::execution::connect_execution_transports(
+                &job.definition.execution_venues,
+                job.definition.testnet,
+            )
+            .await
             {
                 record_execution_transport(&mut readiness, venue.as_str(), result);
             }
@@ -3321,9 +3322,15 @@ async fn execute_script_order(
             if job.definition.venue.is_some() {
                 bail!("Python Scripting V2 cannot use a job-wide execution venue");
             }
-            exchange.context(
+            let venue = exchange.context(
                 "Python Scripting V2 ctx.trade/ctx.order request omitted its execution exchange",
-            )?
+            )?;
+            if !job.definition.execution_venues.contains(&venue) {
+                bail!(
+                    "{operation_name} exchange `{venue}` was not statically declared by this Python script"
+                );
+            }
+            venue
         }
     };
     if reference_price.is_some_and(|price| !price.is_finite() || price <= 0.0) {
@@ -6168,8 +6175,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_protocol_v42_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 42);
+    fn runtime_protocol_v43_decodes_oiwap_submissions() {
+        assert_eq!(RUNTIME_VERSION, 43);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",

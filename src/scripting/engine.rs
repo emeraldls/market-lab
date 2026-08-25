@@ -9,6 +9,8 @@ use anyhow::{Context as AnyhowContext, Result};
 use rquickjs::{CatchResultExt, Context, Ctx, Function, Module, Object, Promise, Runtime, Value};
 use serde_json::Value as JsonValue;
 
+use crate::domain::execution::ExecutionVenue;
+
 use super::execution::{
     ScriptCommandBuffer, ScriptExecutionCommand, ScriptExecutionContext, attach_execution_helpers,
 };
@@ -83,6 +85,7 @@ pub struct Script {
     pub language: ScriptLanguage,
     source: String,
     source_declarations: Vec<String>,
+    execution_venues: Vec<ExecutionVenue>,
     python_runtime: Option<PythonRuntime>,
 }
 
@@ -131,8 +134,10 @@ impl Script {
         language: ScriptLanguage,
         python_runtime: Option<PythonRuntime>,
     ) -> Result<Self> {
-        let (manifest, source_declarations) = match language {
-            ScriptLanguage::JavaScriptV1 => (inspect_manifest(path, &source)?, Vec::new()),
+        let (manifest, source_declarations, execution_venues) = match language {
+            ScriptLanguage::JavaScriptV1 => {
+                (inspect_manifest(path, &source)?, Vec::new(), Vec::new())
+            }
             ScriptLanguage::PythonV2 => {
                 let inspection = inspect_python_script(
                     path,
@@ -140,7 +145,16 @@ impl Script {
                         .as_ref()
                         .context("Python script has no resolved interpreter")?,
                 )?;
-                (inspection.manifest, inspection.sources)
+                let execution_venues = inspection
+                    .execution_venues
+                    .iter()
+                    .map(|venue| {
+                        ExecutionVenue::parse(venue).with_context(|| {
+                            format!("Python script uses unsupported execution exchange `{venue}`")
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (inspection.manifest, inspection.sources, execution_venues)
             }
         };
         manifest.validate_for_version(language.manifest_version())?;
@@ -150,6 +164,7 @@ impl Script {
             language,
             source,
             source_declarations,
+            execution_venues,
             python_runtime,
         })
     }
@@ -160,6 +175,10 @@ impl Script {
 
     pub fn source_declarations(&self) -> &[String] {
         &self.source_declarations
+    }
+
+    pub fn execution_venues(&self) -> &[ExecutionVenue] {
+        &self.execution_venues
     }
 
     pub fn python_runtime(&self) -> Option<&PythonRuntime> {

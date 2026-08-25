@@ -12,7 +12,7 @@ use crate::providers::hyperlink::ws::HyperlinkAccountStream;
 use crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter;
 use crate::providers::hyperliquid::ws::{HyperliquidAccountStream, HyperliquidTradingClient};
 use crate::providers::hyperliquid::{HyperliquidNetwork, HyperliquidProduct};
-use crate::venues::{AuthBackend, EXECUTION_TRANSPORTS, ExecutionBackend};
+use crate::venues::{AuthBackend, ExecutionBackend};
 
 /// Common contract implemented by every execution exchange.
 ///
@@ -850,25 +850,38 @@ pub async fn connect_execution_transport(venue: ExecutionVenue, testnet: bool) -
     execution_factory(venue).connect_transport(testnet).await
 }
 
-pub async fn connect_registered_execution_transports(
+pub async fn connect_execution_transports(
+    venues: &[ExecutionVenue],
     testnet: bool,
 ) -> Vec<(ExecutionVenue, Result<()>)> {
-    futures_util::future::join_all(
-        EXECUTION_TRANSPORTS
-            .iter()
-            .copied()
-            .map(|venue| async move {
-                let venue_testnet = testnet
-                    && venue
-                        .spec()
-                        .is_ok_and(|spec| spec.network == crate::venues::NetworkPolicy::Selectable);
-                (
-                    venue,
-                    connect_execution_transport(venue, venue_testnet).await,
-                )
-            }),
-    )
+    let transports = execution_transports(venues);
+
+    futures_util::future::join_all(transports.into_iter().map(|venue| async move {
+        let venue_testnet = testnet
+            && venue
+                .spec()
+                .is_ok_and(|spec| spec.network == crate::venues::NetworkPolicy::Selectable);
+        (
+            venue,
+            connect_execution_transport(venue, venue_testnet).await,
+        )
+    }))
     .await
+}
+
+fn execution_transports(venues: &[ExecutionVenue]) -> Vec<ExecutionVenue> {
+    let mut transports = Vec::new();
+    for venue in venues {
+        let transport = match venue.execution_backend() {
+            ExecutionBackend::Bulk => ExecutionVenue::Bulk,
+            ExecutionBackend::Hyperliquid => ExecutionVenue::Hyperliquid,
+            ExecutionBackend::Hyperlink => ExecutionVenue::Hyperlink,
+        };
+        if !transports.contains(&transport) {
+            transports.push(transport);
+        }
+    }
+    transports
 }
 
 impl ExecutionAdapter {
@@ -994,5 +1007,19 @@ impl ExecutionAdapter {
 
     pub async fn cancel_orders_fast(&self, plans: &[CancelPlan]) -> Result<Vec<ExecutionOutcome>> {
         self.provider.cancel_orders_fast(plans).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execution_transport_selection_is_targeted_and_deduplicated() {
+        let xyz = ExecutionVenue::parse("hyperliquidf-xyz").expect("XYZ venue");
+        assert_eq!(
+            execution_transports(&[ExecutionVenue::Hyperlink, xyz, ExecutionVenue::Hyperliquid]),
+            [ExecutionVenue::Hyperlink, ExecutionVenue::Hyperliquid]
+        );
     }
 }

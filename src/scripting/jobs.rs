@@ -23,6 +23,8 @@ pub struct ScriptJobSubmission {
     pub providers: Vec<String>,
     pub exchanges: Vec<String>,
     #[serde(default)]
+    pub execution_venues: Vec<ExecutionVenue>,
+    #[serde(default)]
     pub sources: Vec<String>,
     #[serde(default)]
     pub params: Vec<String>,
@@ -83,6 +85,8 @@ pub struct ScriptJobDefinition {
     pub python_runtime: Option<PythonRuntime>,
     pub providers: Vec<String>,
     pub exchanges: Vec<String>,
+    #[serde(default)]
+    pub execution_venues: Vec<ExecutionVenue>,
     pub sources: Vec<String>,
     pub params: Vec<String>,
     pub venue: Option<ExecutionVenue>,
@@ -217,6 +221,7 @@ mod tests {
             }),
             providers: vec!["bulkf".to_string()],
             exchanges: vec!["bulkf".to_string()],
+            execution_venues: Vec::new(),
             sources: vec!["btc@candles@bulkf".to_string()],
             params: Vec::new(),
             venue: Some(ExecutionVenue::Bulk),
