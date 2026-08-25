@@ -767,7 +767,9 @@ mod tests {
 
         assert_eq!(
             signature.r,
-            "0x41ae18e8239a56cacbc5dad94d45d0b747e5da11ad564077fcac71277a946e3"
+            // The Python SDK renders `r` as an integer and drops this leading
+            // zero nibble. Market Lab keeps signature components at 32 bytes.
+            "0x041ae18e8239a56cacbc5dad94d45d0b747e5da11ad564077fcac71277a946e3"
         );
         assert_eq!(
             signature.s,
