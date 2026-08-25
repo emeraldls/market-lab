@@ -73,6 +73,14 @@ impl WeightedOrderBookStream {
                 )
                 .await?,
             )),
+            ExecutionVenue::Hyperlink => Ok(Self::Hyperliquid(
+                HyperliquidOrderBookStream::connect_on(
+                    symbol,
+                    depth.min(20),
+                    HyperliquidNetwork::Mainnet,
+                )
+                .await?,
+            )),
             ExecutionVenue::HyperliquidXyz => Ok(Self::Hyperliquid(
                 HyperliquidOrderBookStream::connect_for(
                     crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual,
@@ -1834,6 +1842,7 @@ pub(super) fn worker_trade_args(
         venue: match definition.venue {
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
             ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
+            ExecutionVenue::Hyperlink => ExecutionVenueArg::Hyperlink,
             ExecutionVenue::HyperliquidXyz => ExecutionVenueArg::HyperliquidXyz,
             ExecutionVenue::HyperliquidSpot => ExecutionVenueArg::HyperliquidSpot,
             ExecutionVenue::HyperliquidOutcomes => ExecutionVenueArg::HyperliquidOutcomes,
@@ -1885,6 +1894,7 @@ pub(super) fn execution_venue_network_name(venue: ExecutionVenue, testnet: bool)
         (ExecutionVenue::Bulk, _) => "BULK testnet",
         (ExecutionVenue::Hyperliquid, true) => "Hyperliquid testnet",
         (ExecutionVenue::Hyperliquid, false) => "Hyperliquid mainnet",
+        (ExecutionVenue::Hyperlink, _) => "HyperLink mainnet",
         (ExecutionVenue::HyperliquidXyz, true) => "Hyperliquid XYZ testnet",
         (ExecutionVenue::HyperliquidXyz, false) => "Hyperliquid XYZ mainnet",
         (ExecutionVenue::HyperliquidSpot, true) => "Hyperliquid Spot testnet",
@@ -1898,6 +1908,7 @@ pub(super) fn execution_venue_name(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "bulkf",
         ExecutionVenue::Hyperliquid => "hyperliquidf",
+        ExecutionVenue::Hyperlink => "hyperlinkf",
         ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
         ExecutionVenue::HyperliquidSpot => "hyperliquid",
         ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",

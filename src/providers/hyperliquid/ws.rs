@@ -47,8 +47,31 @@ struct HyperliquidWsClient {
 
 #[derive(Clone)]
 pub struct HyperliquidTradingClient {
-    network: HyperliquidNetwork,
+    endpoint: TradingEndpoint,
     connection: Arc<Mutex<Option<mpsc::Sender<TradingCommand>>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TradingEndpoint {
+    Hyperliquid(HyperliquidNetwork),
+    Hyperlink,
+}
+
+impl TradingEndpoint {
+    fn ws_url(self) -> &'static str {
+        match self {
+            Self::Hyperliquid(network) => network.ws_url(),
+            Self::Hyperlink => crate::providers::hyperlink::WS_URL,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hyperliquid(HyperliquidNetwork::Mainnet) => "Hyperliquid mainnet",
+            Self::Hyperliquid(HyperliquidNetwork::Testnet) => "Hyperliquid testnet",
+            Self::Hyperlink => "HyperLink",
+        }
+    }
 }
 
 struct TradingCommand {
@@ -66,7 +89,17 @@ impl HyperliquidTradingClient {
         };
         client
             .get_or_init(|| Self {
-                network,
+                endpoint: TradingEndpoint::Hyperliquid(network),
+                connection: Arc::new(Mutex::new(None)),
+            })
+            .clone()
+    }
+
+    pub fn shared_hyperlink() -> Self {
+        static HYPERLINK_CLIENT: OnceLock<HyperliquidTradingClient> = OnceLock::new();
+        HYPERLINK_CLIENT
+            .get_or_init(|| Self {
+                endpoint: TradingEndpoint::Hyperlink,
                 connection: Arc::new(Mutex::new(None)),
             })
             .clone()
@@ -113,12 +146,12 @@ impl HyperliquidTradingClient {
             return Ok(sender.clone());
         }
 
-        let (stream, _) = connect_async(self.network.ws_url())
+        let (stream, _) = connect_async(self.endpoint.ws_url())
             .await
             .with_context(|| {
                 format!(
-                    "failed to connect to Hyperliquid {} trading WebSocket",
-                    self.network.label()
+                    "failed to connect to {} trading WebSocket",
+                    self.endpoint.label()
                 )
             })?;
         let (sender, receiver) = mpsc::channel(MAX_INFLIGHT_POSTS);

@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use rand_core::{OsRng, RngCore};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
@@ -21,15 +22,26 @@ use super::exchange::{
 use super::markets;
 use super::{HyperliquidNetwork, HyperliquidProduct, MARKET_ORDER_SLIPPAGE};
 
-type LeverageKey = (HyperliquidNetwork, String, u32);
+type LeverageKey = (ExecutionRoute, HyperliquidNetwork, String, u32);
 type LeverageValue = (u32, bool);
 type ResolvedMarkets = HashMap<String, ResolvedMarket>;
 
 static LEVERAGE_SETTINGS: OnceLock<Mutex<HashMap<LeverageKey, LeverageValue>>> = OnceLock::new();
+static HYPERLINK_MAX_LEVERAGE: OnceLock<Mutex<HashMap<(String, u32), u32>>> = OnceLock::new();
 static TESTNET_MARKETS: OnceLock<Mutex<Option<ResolvedMarkets>>> = OnceLock::new();
 
 fn leverage_settings() -> &'static Mutex<HashMap<LeverageKey, LeverageValue>> {
     LEVERAGE_SETTINGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn hyperlink_max_leverage() -> &'static Mutex<HashMap<(String, u32), u32>> {
+    HYPERLINK_MAX_LEVERAGE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ExecutionRoute {
+    Hyperliquid,
+    Hyperlink,
 }
 
 fn testnet_markets() -> &'static Mutex<Option<ResolvedMarkets>> {
@@ -51,6 +63,7 @@ pub struct HyperliquidExecutionAdapter {
     account: String,
     network: HyperliquidNetwork,
     product: HyperliquidProduct,
+    route: ExecutionRoute,
 }
 
 impl HyperliquidExecutionAdapter {
@@ -74,6 +87,25 @@ impl HyperliquidExecutionAdapter {
 
     pub async fn new(network: HyperliquidNetwork) -> Result<Self> {
         Self::new_for(HyperliquidProduct::Perpetual, network).await
+    }
+
+    pub async fn new_hyperlink() -> Result<Self> {
+        Self::with_hyperlink_credential(credentials::active_hyperlink_credential()?).await
+    }
+
+    pub async fn with_hyperlink_credential(
+        credential: ActiveHyperliquidCredential,
+    ) -> Result<Self> {
+        if credential.vault_address.is_some() {
+            bail!("HyperLink subaccounts are not supported");
+        }
+        Ok(Self {
+            exchange: HyperliquidExchangeClient::for_hyperlink(credential.agent)?,
+            account: credential.account,
+            network: HyperliquidNetwork::Mainnet,
+            product: HyperliquidProduct::Perpetual,
+            route: ExecutionRoute::Hyperlink,
+        })
     }
 
     pub async fn new_for(product: HyperliquidProduct, network: HyperliquidNetwork) -> Result<Self> {
@@ -114,6 +146,7 @@ impl HyperliquidExecutionAdapter {
             account: credential.account,
             network,
             product,
+            route: ExecutionRoute::Hyperliquid,
         })
     }
 
@@ -129,16 +162,30 @@ impl HyperliquidExecutionAdapter {
             "user": account
         });
         attach_dex(&mut request, self.product);
-        let raw: ClearinghouseState = HyperliquidClient::for_network(self.network)?
-            .info(&request)
-            .await?;
+        let raw: ClearinghouseState = if self.route == ExecutionRoute::Hyperlink {
+            serde_json::from_value(
+                self.exchange
+                    .signed_read(serde_json::json!({ "type": "clearinghouseState", "dex": "" }))
+                    .await?,
+            )
+            .context("HyperLink clearinghouseState returned an unexpected payload")?
+        } else {
+            HyperliquidClient::for_network(self.network)?
+                .info(&request)
+                .await?
+        };
         let contexts = load_mark_prices(self.network, self.product).await?;
-        let positions = raw
+        let mut positions = raw
             .asset_positions
             .into_iter()
             .filter(|position| position.position.size().is_ok_and(|size| size != 0.0))
             .map(|position| position.into_position(&contexts, self.product, self.network))
             .collect::<Result<Vec<_>>>()?;
+        if self.route == ExecutionRoute::Hyperlink {
+            for position in &mut positions {
+                position.venue = ExecutionVenue::Hyperlink;
+            }
+        }
         let unrealized_pnl = positions
             .iter()
             .map(|position| position.unrealized_pnl)
@@ -331,34 +378,74 @@ impl HyperliquidExecutionAdapter {
     }
 
     const fn venue(&self) -> ExecutionVenue {
-        venue_for_product(self.product)
+        match self.route {
+            ExecutionRoute::Hyperliquid => venue_for_product(self.product),
+            ExecutionRoute::Hyperlink => ExecutionVenue::Hyperlink,
+        }
     }
 
     pub async fn open_orders(&self, account: &str) -> Result<Vec<OpenOrder>> {
-        let mut request = serde_json::json!({
-            "type": "frontendOpenOrders",
-            "user": account
-        });
-        attach_dex(&mut request, self.product);
-        let raw: Vec<HyperliquidOpenOrder> = HyperliquidClient::for_network(self.network)?
-            .info(&request)
-            .await?;
-        raw.into_iter()
+        let raw: Vec<HyperliquidOpenOrder> = if self.route == ExecutionRoute::Hyperlink {
+            ensure_account(account, &self.account)?;
+            serde_json::from_value(
+                self.exchange
+                    .signed_read(serde_json::json!({ "type": "openOrders", "dex": "" }))
+                    .await?,
+            )
+            .context("HyperLink openOrders returned an unexpected payload")?
+        } else {
+            let mut request = serde_json::json!({
+                "type": "frontendOpenOrders",
+                "user": account
+            });
+            attach_dex(&mut request, self.product);
+            HyperliquidClient::for_network(self.network)?
+                .info(&request)
+                .await?
+        };
+        let mut orders = raw
+            .into_iter()
             .filter_map(|order| order.into_order(self.product, self.network).transpose())
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        if self.route == ExecutionRoute::Hyperlink {
+            for order in &mut orders {
+                order.venue = ExecutionVenue::Hyperlink;
+            }
+        }
+        Ok(orders)
     }
 
     pub async fn fills(&self, account: &str) -> Result<Vec<Fill>> {
-        let raw: Vec<HyperliquidFill> = HyperliquidClient::for_network(self.network)?
-            .info(&user_fills_request(account))
-            .await?;
-        raw.into_iter()
+        let raw: Vec<HyperliquidFill> = if self.route == ExecutionRoute::Hyperlink {
+            ensure_account(account, &self.account)?;
+            serde_json::from_value(
+                self.exchange
+                    .signed_read(serde_json::json!({
+                        "type": "userFills",
+                        "aggregateByTime": false
+                    }))
+                    .await?,
+            )
+            .context("HyperLink userFills returned an unexpected payload")?
+        } else {
+            HyperliquidClient::for_network(self.network)?
+                .info(&user_fills_request(account))
+                .await?
+        };
+        let mut fills = raw
+            .into_iter()
             .filter_map(|fill| fill.into_fill(self.product, self.network).transpose())
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        if self.route == ExecutionRoute::Hyperlink {
+            for fill in &mut fills {
+                fill.venue = ExecutionVenue::Hyperlink;
+            }
+        }
+        Ok(fills)
     }
 
     pub async fn submit_trade(&self, plan: &TradePlan) -> Result<ExecutionReceipt> {
-        validate_trade_plan(plan, self.product, self.network).await?;
+        validate_trade_plan(plan, self.venue(), self.product, self.network).await?;
         if self.network != HyperliquidNetwork::from_testnet(plan.testnet) {
             bail!("Hyperliquid trade plan network does not match the execution adapter");
         }
@@ -396,6 +483,7 @@ impl HyperliquidExecutionAdapter {
             asset: resolved.asset,
             is_buy: plan.side == OrderSide::Buy,
             reduce_only: plan.reduce_only,
+            client_order_id: self.client_order_id(),
             limit_px: wire_number(entry_price),
             size: wire_number(plan.size),
             order_type: WireOrder::Limit {
@@ -416,6 +504,7 @@ impl HyperliquidExecutionAdapter {
                     asset: resolved.asset,
                     is_buy: protection_side,
                     reduce_only: true,
+                    client_order_id: self.client_order_id(),
                     limit_px: wire_number(price),
                     size: wire_number(plan.size),
                     order_type: WireOrder::Trigger {
@@ -457,7 +546,7 @@ impl HyperliquidExecutionAdapter {
         }
         let mut orders = Vec::with_capacity(plans.len());
         for plan in plans {
-            validate_trade_plan(plan, self.product, self.network).await?;
+            validate_trade_plan(plan, self.venue(), self.product, self.network).await?;
             if self.network != HyperliquidNetwork::from_testnet(plan.testnet) {
                 bail!("Hyperliquid trade plan network does not match the execution adapter");
             }
@@ -497,6 +586,7 @@ impl HyperliquidExecutionAdapter {
                 asset: resolved.asset,
                 is_buy: plan.side == OrderSide::Buy,
                 reduce_only: plan.reduce_only,
+                client_order_id: self.client_order_id(),
                 limit_px: wire_number(entry_price),
                 size: wire_number(plan.size),
                 order_type: WireOrder::Limit {
@@ -557,9 +647,21 @@ impl HyperliquidExecutionAdapter {
             .await
     }
 
+    pub async fn max_leverage(&self, internal_symbol: &str) -> Result<u32> {
+        if !self.product.is_perpetual() {
+            bail!("this Hyperliquid product does not support leverage");
+        }
+        Ok(self.resolve_market(internal_symbol).await?.max_leverage)
+    }
+
     async fn ensure_leverage(&self, asset: u32, leverage: f64, is_cross: bool) -> Result<()> {
         let leverage = leverage.round() as u32;
-        let key = (self.network, self.account.to_ascii_lowercase(), asset);
+        let key = (
+            self.route,
+            self.network,
+            self.account.to_ascii_lowercase(),
+            asset,
+        );
         let expected = (leverage, is_cross);
         let mut settings = leverage_settings().lock().await;
         if settings.get(&key) == Some(&expected) {
@@ -691,7 +793,7 @@ impl HyperliquidExecutionAdapter {
     }
 
     async fn resolve_market(&self, symbol: &str) -> Result<ResolvedMarket> {
-        match (self.product, self.network) {
+        let mut resolved = match (self.product, self.network) {
             (HyperliquidProduct::Spot, network) => resolved_spot_market(network, symbol),
             (HyperliquidProduct::Outcome, network) => {
                 let instrument = super::outcomes::resolve(network, symbol).await?;
@@ -714,16 +816,105 @@ impl HyperliquidExecutionAdapter {
             (HyperliquidProduct::XyzPerpetual, network) => {
                 resolved_network_perpetual_market(self.product, network, symbol)
             }
+        }?;
+        if self.route == ExecutionRoute::Hyperlink {
+            resolved.max_leverage = self
+                .hyperlink_asset_max_leverage(symbol, resolved.asset)
+                .await?;
         }
+        Ok(resolved)
     }
+
+    fn client_order_id(&self) -> Option<String> {
+        (self.route == ExecutionRoute::Hyperlink).then(generate_cloid)
+    }
+
+    async fn hyperlink_asset_max_leverage(&self, symbol: &str, asset: u32) -> Result<u32> {
+        let key = (self.account.to_ascii_lowercase(), asset);
+        if let Some(value) = hyperlink_max_leverage().lock().await.get(&key).copied() {
+            return Ok(value);
+        }
+        let market = markets::market_for(HyperliquidProduct::Perpetual, symbol)?;
+        let data = self
+            .exchange
+            .signed_read(serde_json::json!({
+                "type": "activeAssetData",
+                "coin": market.venue_symbol,
+            }))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to load HyperLink asset metadata for {}",
+                    market.symbol
+                )
+            })?;
+        let max_leverage = hyperlink_asset_leverage(&data).with_context(|| {
+            format!(
+                "HyperLink activeAssetData for {} omitted its leverage value",
+                market.symbol
+            )
+        })?;
+        if max_leverage == 0 {
+            bail!("HyperLink returned zero max leverage for {}", market.symbol);
+        }
+        hyperlink_max_leverage()
+            .lock()
+            .await
+            .insert(key, max_leverage);
+        Ok(max_leverage)
+    }
+}
+
+fn generate_cloid() -> String {
+    let mut bytes = [0_u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    format!("0x{}", hex::encode(bytes))
+}
+
+fn find_u32_field(value: &serde_json::Value, names: &[&str]) -> Option<u32> {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for name in names {
+                if let Some(value) = fields.get(*name) {
+                    if let Some(value) = value.as_u64().and_then(|value| u32::try_from(value).ok())
+                    {
+                        return Some(value);
+                    }
+                    if let Some(value) = value.as_str().and_then(|value| value.parse::<u32>().ok())
+                    {
+                        return Some(value);
+                    }
+                }
+            }
+            fields
+                .values()
+                .find_map(|value| find_u32_field(value, names))
+        }
+        serde_json::Value::Array(values) => {
+            values.iter().find_map(|value| find_u32_field(value, names))
+        }
+        _ => None,
+    }
+}
+
+fn hyperlink_asset_leverage(value: &serde_json::Value) -> Option<u32> {
+    find_u32_field(value, &["maxLeverage", "max_leverage"]).or_else(|| {
+        value.pointer("/leverage/value").and_then(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .or_else(|| value.as_str()?.parse::<u32>().ok())
+        })
+    })
 }
 
 async fn validate_trade_plan(
     plan: &TradePlan,
+    venue: ExecutionVenue,
     product: HyperliquidProduct,
     network: HyperliquidNetwork,
 ) -> Result<()> {
-    if plan.venue != venue_for_product(product) {
+    if plan.venue != venue {
         bail!("Hyperliquid adapter received a plan for another execution venue");
     }
     let (market, variant, fingerprint) = if product == HyperliquidProduct::Outcome {
@@ -1605,6 +1796,52 @@ mod tests {
         assert_eq!(
             market_order_slippage(None).expect("valid venue default"),
             MARKET_ORDER_SLIPPAGE
+        );
+    }
+
+    #[test]
+    fn hyperlink_cloids_are_unique_128_bit_hex_values() {
+        let first = generate_cloid();
+        let second = generate_cloid();
+
+        assert_eq!(first.len(), 34);
+        assert!(first.starts_with("0x"));
+        assert!(first[2..].bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn hyperlink_max_leverage_parser_handles_documented_and_live_shapes() {
+        assert_eq!(
+            hyperlink_asset_leverage(&serde_json::json!({
+                "data": { "maxLeverage": 20 }
+            })),
+            Some(20)
+        );
+        assert_eq!(
+            hyperlink_asset_leverage(&serde_json::json!({
+                "assetContext": { "max_leverage": "10" }
+            })),
+            Some(10)
+        );
+        assert_eq!(
+            hyperlink_asset_leverage(&serde_json::json!({
+                "availableToTrade": ["0.0", "0.0"],
+                "coin": "ETH",
+                "leverage": { "type": "cross", "value": 15 },
+                "markPx": "0.0",
+                "maxTradeSzs": ["0.0", "0.0"],
+                "user": "0xfdc6319fa33aa3b2178ca196963f7a5a06cd0852"
+            })),
+            Some(15)
+        );
+        assert_eq!(
+            hyperlink_asset_leverage(&serde_json::json!({
+                "leverage": { "type": "cross" },
+                "other": { "value": 100 }
+            })),
+            None,
+            "unrelated value fields must not be interpreted as leverage"
         );
     }
 

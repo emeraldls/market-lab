@@ -444,6 +444,8 @@ pub enum ExecutionVenueArg {
     Bulk,
     #[value(name = "hyperliquidf")]
     Hyperliquid,
+    #[value(name = "hyperlinkf")]
+    Hyperlink,
     #[value(name = "hyperliquidf-xyz")]
     HyperliquidXyz,
     #[value(name = "hyperliquid")]
@@ -453,6 +455,9 @@ pub enum ExecutionVenueArg {
 }
 
 fn validate_execution_network(venue: ExecutionVenueArg, testnet: bool) -> Result<()> {
+    if testnet && venue == ExecutionVenueArg::Hyperlink {
+        bail!("--testnet is not supported by HyperLink");
+    }
     if testnet
         && !matches!(
             venue,
@@ -472,6 +477,7 @@ impl From<ExecutionVenueArg> for ExecutionVenue {
         match value {
             ExecutionVenueArg::Bulk => ExecutionVenue::Bulk,
             ExecutionVenueArg::Hyperliquid => ExecutionVenue::Hyperliquid,
+            ExecutionVenueArg::Hyperlink => ExecutionVenue::Hyperlink,
             ExecutionVenueArg::HyperliquidXyz => ExecutionVenue::HyperliquidXyz,
             ExecutionVenueArg::HyperliquidSpot => ExecutionVenue::HyperliquidSpot,
             ExecutionVenueArg::HyperliquidOutcomes => ExecutionVenue::HyperliquidOutcomes,
@@ -656,6 +662,7 @@ pub enum AuthProvider {
     Mmt,
     Bulk,
     Hyperliquid,
+    Hyperlink,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2240,6 +2247,7 @@ impl RunVwapArgs {
         let execution_venue = match self.venue {
             ExecutionVenueArg::Bulk => "bulkf",
             ExecutionVenueArg::Hyperliquid => "hyperliquidf",
+            ExecutionVenueArg::Hyperlink => "hyperliquidf",
             ExecutionVenueArg::HyperliquidXyz => "hyperliquidf-xyz",
             ExecutionVenueArg::HyperliquidSpot => {
                 bail!("VWAP does not support spot execution yet")
@@ -2529,6 +2537,7 @@ fn validate_execution_symbol(venue: ExecutionVenueArg, symbol: &str) -> Result<(
     let market_type = match venue {
         ExecutionVenueArg::Bulk
         | ExecutionVenueArg::Hyperliquid
+        | ExecutionVenueArg::Hyperlink
         | ExecutionVenueArg::HyperliquidXyz => crate::markets::MarketType::Futures,
         ExecutionVenueArg::HyperliquidSpot => crate::markets::MarketType::Spot,
         ExecutionVenueArg::HyperliquidOutcomes => unreachable!("handled above"),
@@ -3061,6 +3070,72 @@ mod tests {
             .is_ok(),
             "`hyperliquid` must resolve deterministically to spot execution"
         );
+    }
+
+    #[test]
+    fn parses_hyperlink_execution_and_rejects_testnet() {
+        let trade = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "long",
+            "BTC",
+            "--venue",
+            "hyperlinkf",
+            "--margin",
+            "100",
+            "--leverage",
+            "5",
+            "--dry-run",
+        ])
+        .expect("HyperLink trade should parse");
+        match trade.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => {
+                args.validate_shape().expect("HyperLink trade validates");
+                assert_eq!(args.venue, ExecutionVenueArg::Hyperlink);
+            }
+            _ => panic!("expected HyperLink trade command"),
+        }
+
+        let testnet = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "long",
+            "BTC",
+            "--venue",
+            "hyperlinkf",
+            "--margin",
+            "100",
+            "--leverage",
+            "5",
+            "--testnet",
+            "--dry-run",
+        ])
+        .expect("HyperLink testnet shape parses before semantic validation");
+        match testnet.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => assert!(
+                args.validate_shape()
+                    .expect_err("HyperLink testnet must fail")
+                    .to_string()
+                    .contains("not supported")
+            ),
+            _ => panic!("expected HyperLink trade command"),
+        }
+
+        let auth = Cli::try_parse_from(["mlab", "auth", "set", "hyperlink"])
+            .expect("HyperLink auth should parse");
+        assert!(matches!(
+            auth.command,
+            Commands::Auth {
+                command: AuthCommands::Set(AuthSetArgs {
+                    provider: AuthProvider::Hyperlink,
+                    ..
+                })
+            }
+        ));
     }
 
     #[test]

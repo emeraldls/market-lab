@@ -7,6 +7,8 @@ pub enum ExecutionVenue {
     Bulk,
     #[serde(rename = "hyperliquidf")]
     Hyperliquid,
+    #[serde(rename = "hyperlinkf")]
+    Hyperlink,
     #[serde(rename = "hyperliquidf-xyz")]
     HyperliquidXyz,
     #[serde(rename = "hyperliquid")]
@@ -344,6 +346,10 @@ mod tests {
     fn hyperliquid_perps_use_the_canonical_id_and_read_legacy_jobs() {
         let encoded = serde_json::to_value(ExecutionVenue::Hyperliquid).expect("venue serializes");
         assert_eq!(encoded, serde_json::json!("hyperliquidf"));
+
+        let hyperlink =
+            serde_json::to_value(ExecutionVenue::Hyperlink).expect("HyperLink venue serializes");
+        assert_eq!(hyperlink, serde_json::json!("hyperlinkf"));
 
         let spot = serde_json::to_value(ExecutionVenue::HyperliquidSpot).expect("venue serializes");
         assert_eq!(spot, serde_json::json!("hyperliquid"));

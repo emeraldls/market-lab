@@ -367,6 +367,7 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
     let venue = job.definition.venue.map(|venue| match venue {
         crate::domain::execution::ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
         crate::domain::execution::ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
+        crate::domain::execution::ExecutionVenue::Hyperlink => ExecutionVenueArg::Hyperlink,
         crate::domain::execution::ExecutionVenue::HyperliquidXyz => {
             ExecutionVenueArg::HyperliquidXyz
         }
@@ -830,7 +831,7 @@ fn script_execution_reference(
     symbol: &str,
     references: &BTreeMap<String, LiveExecutionReference>,
 ) -> Option<f64> {
-    let exchange = exchange.map(live_execution_exchange)?;
+    let exchange = exchange.map(live_execution_price_exchange)?;
     let symbol = crate::scripting::inputs::script_symbol_to_market(symbol);
     references
         .get(&execution_reference_key(exchange, &symbol))
@@ -1034,9 +1035,17 @@ fn live_execution_exchange(venue: ExecutionVenue) -> &'static str {
     match venue {
         ExecutionVenue::Bulk => "bulkf",
         ExecutionVenue::Hyperliquid => "hyperliquidf",
+        ExecutionVenue::Hyperlink => "hyperlinkf",
         ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
         ExecutionVenue::HyperliquidSpot => "hyperliquid",
         ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
+    }
+}
+
+fn live_execution_price_exchange(venue: ExecutionVenue) -> &'static str {
+    match venue {
+        ExecutionVenue::Hyperlink => "hyperliquidf",
+        _ => live_execution_exchange(venue),
     }
 }
 
@@ -2627,5 +2636,25 @@ mod tests {
         assert_eq!(next_stream_reconnect_delay(16), 30);
         assert_eq!(next_stream_reconnect_delay(30), 30);
         assert_eq!(next_stream_reconnect_delay(u64::MAX), 30);
+    }
+
+    #[test]
+    fn hyperlink_execution_uses_hyperliquid_public_price_references() {
+        let references = BTreeMap::from([(
+            execution_reference_key("hyperliquidf", "BTC"),
+            LiveExecutionReference {
+                price: 65_000.0,
+                timestamp_ms: 1,
+            },
+        )]);
+
+        assert_eq!(
+            script_execution_reference(Some(ExecutionVenue::Hyperlink), "BTC", &references),
+            Some(65_000.0)
+        );
+        assert_eq!(
+            live_execution_exchange(ExecutionVenue::Hyperlink),
+            "hyperlinkf"
+        );
     }
 }

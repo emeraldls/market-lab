@@ -212,6 +212,7 @@ fn worker_trade_args(definition: &GridJobDefinition) -> TradeArgs {
         venue: match definition.venue {
             ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
             ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
+            ExecutionVenue::Hyperlink => ExecutionVenueArg::Hyperlink,
             ExecutionVenue::HyperliquidXyz => ExecutionVenueArg::HyperliquidXyz,
             ExecutionVenue::HyperliquidSpot => ExecutionVenueArg::HyperliquidSpot,
             ExecutionVenue::HyperliquidOutcomes => ExecutionVenueArg::HyperliquidOutcomes,
