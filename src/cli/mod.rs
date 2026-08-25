@@ -448,6 +448,8 @@ pub enum ExecutionVenueArg {
     Hyperlink,
     #[value(name = "hyperliquidf-xyz")]
     HyperliquidXyz,
+    #[value(name = "hyperliquidf-io")]
+    HyperliquidIo,
     #[value(name = "hyperliquid")]
     HyperliquidSpot,
     #[value(name = "hyperliquid-outcomes")]
@@ -463,6 +465,7 @@ fn validate_execution_network(venue: ExecutionVenueArg, testnet: bool) -> Result
             venue,
             ExecutionVenueArg::Hyperliquid
                 | ExecutionVenueArg::HyperliquidXyz
+                | ExecutionVenueArg::HyperliquidIo
                 | ExecutionVenueArg::HyperliquidSpot
                 | ExecutionVenueArg::HyperliquidOutcomes
         )
@@ -479,6 +482,7 @@ impl From<ExecutionVenueArg> for ExecutionVenue {
             ExecutionVenueArg::Hyperliquid => ExecutionVenue::Hyperliquid,
             ExecutionVenueArg::Hyperlink => ExecutionVenue::Hyperlink,
             ExecutionVenueArg::HyperliquidXyz => ExecutionVenue::HyperliquidXyz,
+            ExecutionVenueArg::HyperliquidIo => ExecutionVenue::HyperliquidIo,
             ExecutionVenueArg::HyperliquidSpot => ExecutionVenue::HyperliquidSpot,
             ExecutionVenueArg::HyperliquidOutcomes => ExecutionVenue::HyperliquidOutcomes,
         }
@@ -855,6 +859,7 @@ impl ScriptRunArgs {
                 Some(
                     ExecutionVenueArg::Hyperliquid
                         | ExecutionVenueArg::HyperliquidXyz
+                        | ExecutionVenueArg::HyperliquidIo
                         | ExecutionVenueArg::HyperliquidSpot
                         | ExecutionVenueArg::HyperliquidOutcomes
                 )
@@ -2249,6 +2254,7 @@ impl RunVwapArgs {
             ExecutionVenueArg::Hyperliquid => "hyperliquidf",
             ExecutionVenueArg::Hyperlink => "hyperliquidf",
             ExecutionVenueArg::HyperliquidXyz => "hyperliquidf-xyz",
+            ExecutionVenueArg::HyperliquidIo => "hyperliquidf-io",
             ExecutionVenueArg::HyperliquidSpot => {
                 bail!("VWAP does not support spot execution yet")
             }
@@ -2538,7 +2544,8 @@ fn validate_execution_symbol(venue: ExecutionVenueArg, symbol: &str) -> Result<(
         ExecutionVenueArg::Bulk
         | ExecutionVenueArg::Hyperliquid
         | ExecutionVenueArg::Hyperlink
-        | ExecutionVenueArg::HyperliquidXyz => crate::markets::MarketType::Futures,
+        | ExecutionVenueArg::HyperliquidXyz
+        | ExecutionVenueArg::HyperliquidIo => crate::markets::MarketType::Futures,
         ExecutionVenueArg::HyperliquidSpot => crate::markets::MarketType::Spot,
         ExecutionVenueArg::HyperliquidOutcomes => unreachable!("handled above"),
     };
@@ -2592,6 +2599,7 @@ fn resolve_source_provider(
     }
     if exchange.eq_ignore_ascii_case("hyperliquidf")
         || exchange.eq_ignore_ascii_case("hyperliquidf-xyz")
+        || exchange.eq_ignore_ascii_case("hyperliquidf-io")
         || exchange.eq_ignore_ascii_case("hyperliquid")
         || exchange.eq_ignore_ascii_case("hyperliquid-outcomes")
     {
@@ -2629,6 +2637,9 @@ fn resolve_system_provider(
             Ok(ProviderKind::Hyperliquid)
         }
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquidf-xyz") => {
+            Ok(ProviderKind::Hyperliquid)
+        }
+        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquidf-io") => {
             Ok(ProviderKind::Hyperliquid)
         }
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquid") => {
@@ -3031,6 +3042,57 @@ mod tests {
                 assert!(matches!(args.venue, ExecutionVenueArg::HyperliquidXyz));
             }
             _ => panic!("expected XYZ trade long command"),
+        }
+
+        let io_source = Cli::try_parse_from([
+            "mlab",
+            "source",
+            "orderbook",
+            "--exchange",
+            "hyperliquidf-io",
+            "--symbol",
+            "ANTH",
+            "--depth",
+            "20",
+        ])
+        .expect("EntropyIO source command should parse");
+        match io_source.command {
+            Commands::Source {
+                command: SourceCommands::Orderbook(args),
+            } => {
+                args.validate()
+                    .expect("standalone EntropyIO source validates");
+                assert_eq!(
+                    args.provider_kind().expect("EntropyIO provider resolves"),
+                    CliProviderKind::Hyperliquid
+                );
+            }
+            _ => panic!("expected EntropyIO source orderbook command"),
+        }
+
+        let io_trade = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "long",
+            "ANTH",
+            "--venue",
+            "hyperliquidf-io",
+            "--margin",
+            "100",
+            "--leverage",
+            "3",
+            "--dry-run",
+        ])
+        .expect("EntropyIO trade command should parse");
+        match io_trade.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => {
+                args.validate_shape()
+                    .expect("EntropyIO trade shape validates");
+                assert!(matches!(args.venue, ExecutionVenueArg::HyperliquidIo));
+            }
+            _ => panic!("expected EntropyIO trade long command"),
         }
 
         let spot_trade = Cli::try_parse_from([

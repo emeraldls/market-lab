@@ -668,7 +668,7 @@ where
         Some(
             serde_json::from_value(raw).with_context(|| {
                 format!(
-                    "{operation} exchange must be a supported execution exchange: bulkf, hyperliquidf, hyperliquidf-xyz, hyperliquid, or hyperliquid-outcomes"
+                    "{operation} exchange must be a supported execution exchange: bulkf, hyperliquidf, hyperliquidf-xyz, hyperliquidf-io, hyperliquid, or hyperliquid-outcomes"
                 )
             })?,
         )

@@ -214,6 +214,7 @@ fn worker_trade_args(definition: &GridJobDefinition) -> TradeArgs {
             ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
             ExecutionVenue::Hyperlink => ExecutionVenueArg::Hyperlink,
             ExecutionVenue::HyperliquidXyz => ExecutionVenueArg::HyperliquidXyz,
+            ExecutionVenue::HyperliquidIo => ExecutionVenueArg::HyperliquidIo,
             ExecutionVenue::HyperliquidSpot => ExecutionVenueArg::HyperliquidSpot,
             ExecutionVenue::HyperliquidOutcomes => ExecutionVenueArg::HyperliquidOutcomes,
         },

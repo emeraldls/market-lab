@@ -2864,7 +2864,10 @@ async fn create_bot_job(
 
     if matches!(
         submission.definition.venue(),
-        ExecutionVenue::Hyperliquid | ExecutionVenue::Hyperlink | ExecutionVenue::HyperliquidXyz
+        ExecutionVenue::Hyperliquid
+            | ExecutionVenue::Hyperlink
+            | ExecutionVenue::HyperliquidXyz
+            | ExecutionVenue::HyperliquidIo
     ) {
         crate::providers::execution::ExecutionAdapter::new(
             submission.definition.venue(),
@@ -3252,6 +3255,7 @@ async fn prepare_script_execution_transports(
                 ExecutionVenue::Hyperliquid
                 | ExecutionVenue::HyperliquidSpot
                 | ExecutionVenue::HyperliquidXyz
+                | ExecutionVenue::HyperliquidIo
                 | ExecutionVenue::HyperliquidOutcomes,
             ) => {
                 record_execution_transport(
@@ -3430,6 +3434,7 @@ async fn execute_script_order(
         ExecutionVenue::Hyperlink => crate::cli::ExecutionVenueArg::Hyperlink,
         ExecutionVenue::HyperliquidSpot => crate::cli::ExecutionVenueArg::HyperliquidSpot,
         ExecutionVenue::HyperliquidXyz => crate::cli::ExecutionVenueArg::HyperliquidXyz,
+        ExecutionVenue::HyperliquidIo => crate::cli::ExecutionVenueArg::HyperliquidIo,
         ExecutionVenue::HyperliquidOutcomes => crate::cli::ExecutionVenueArg::HyperliquidOutcomes,
     };
     let (args, direction) = match &request {
@@ -3533,7 +3538,8 @@ async fn execute_script_order(
                     ExecutionVenue::Bulk
                     | ExecutionVenue::Hyperliquid
                     | ExecutionVenue::Hyperlink
-                    | ExecutionVenue::HyperliquidXyz => Some(request.leverage_or_default()),
+                    | ExecutionVenue::HyperliquidXyz
+                    | ExecutionVenue::HyperliquidIo => Some(request.leverage_or_default()),
                 },
                 reduce_only: request.reduce_only,
                 sl: None,
@@ -4202,6 +4208,7 @@ async fn execute_bot_trades(
             | ExecutionVenue::Hyperlink
             | ExecutionVenue::HyperliquidSpot
             | ExecutionVenue::HyperliquidXyz
+            | ExecutionVenue::HyperliquidIo
             | ExecutionVenue::HyperliquidOutcomes => {
                 crate::providers::execution::ExecutionAdapter::new(
                     pending_plans[0].venue,
@@ -4292,6 +4299,7 @@ async fn execute_bot_cancels(
             | ExecutionVenue::Hyperlink
             | ExecutionVenue::HyperliquidSpot
             | ExecutionVenue::HyperliquidXyz
+            | ExecutionVenue::HyperliquidIo
             | ExecutionVenue::HyperliquidOutcomes => {
                 crate::providers::execution::ExecutionAdapter::new(
                     pending_plans[0].venue,
@@ -5079,6 +5087,7 @@ async fn execute_trade(
         | ExecutionVenue::Hyperlink
         | ExecutionVenue::HyperliquidSpot
         | ExecutionVenue::HyperliquidXyz
+        | ExecutionVenue::HyperliquidIo
         | ExecutionVenue::HyperliquidOutcomes => {
             crate::providers::execution::ExecutionAdapter::new_for_account(
                 plan.venue,
@@ -5171,7 +5180,9 @@ async fn execute_cancel_with_priority(
             crate::markets::exchange_market(execution_exchange(plan.venue), &plan.internal_symbol)?;
         if matches!(
             plan.venue,
-            ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidXyz
+            ExecutionVenue::HyperliquidSpot
+                | ExecutionVenue::HyperliquidXyz
+                | ExecutionVenue::HyperliquidIo
         ) {
             market
                 .network_variant(HyperliquidNetwork::from_testnet(plan.testnet).label())?
@@ -5205,6 +5216,7 @@ async fn execute_cancel_with_priority(
         | ExecutionVenue::Hyperlink
         | ExecutionVenue::HyperliquidSpot
         | ExecutionVenue::HyperliquidXyz
+        | ExecutionVenue::HyperliquidIo
         | ExecutionVenue::HyperliquidOutcomes => {
             let adapter = crate::providers::execution::ExecutionAdapter::new_for_account(
                 plan.venue,
@@ -5276,6 +5288,7 @@ fn network_label(venue: ExecutionVenue, testnet: bool) -> &'static str {
         ExecutionVenue::Hyperliquid
         | ExecutionVenue::HyperliquidSpot
         | ExecutionVenue::HyperliquidXyz
+        | ExecutionVenue::HyperliquidIo
         | ExecutionVenue::HyperliquidOutcomes
             if testnet =>
         {
@@ -5284,6 +5297,7 @@ fn network_label(venue: ExecutionVenue, testnet: bool) -> &'static str {
         ExecutionVenue::Hyperliquid
         | ExecutionVenue::HyperliquidSpot
         | ExecutionVenue::HyperliquidXyz
+        | ExecutionVenue::HyperliquidIo
         | ExecutionVenue::HyperliquidOutcomes => "mainnet",
     }
 }
@@ -5311,6 +5325,7 @@ fn execution_exchange(venue: ExecutionVenue) -> &'static str {
         ExecutionVenue::Hyperlink => "hyperlinkf",
         ExecutionVenue::HyperliquidSpot => "hyperliquid",
         ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
+        ExecutionVenue::HyperliquidIo => "hyperliquidf-io",
         ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
     }
 }
@@ -5334,7 +5349,9 @@ impl VenueAccountStream {
                     HyperlinkAccountStream::connect(account, &credential.agent).await?,
                 ))
             }
-            ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidXyz => Ok(Self::Hyperliquid(
+            ExecutionVenue::Hyperliquid
+            | ExecutionVenue::HyperliquidXyz
+            | ExecutionVenue::HyperliquidIo => Ok(Self::Hyperliquid(
                 HyperliquidAccountStream::connect_on(
                     account,
                     HyperliquidNetwork::from_testnet(testnet),
@@ -5513,6 +5530,7 @@ async fn handle_account_connection_event(
                     | ExecutionVenue::Hyperlink
                     | ExecutionVenue::HyperliquidSpot
                     | ExecutionVenue::HyperliquidXyz
+                    | ExecutionVenue::HyperliquidIo
             ) && data.get("channel").and_then(serde_json::Value::as_str) == Some("user")
             {
                 refresh_account_positions(venue, testnet, adapter, state, &account, true).await?;
@@ -5546,6 +5564,7 @@ async fn refresh_account_positions(
         | ExecutionVenue::Hyperlink
         | ExecutionVenue::HyperliquidSpot
         | ExecutionVenue::HyperliquidXyz
+        | ExecutionVenue::HyperliquidIo
         | ExecutionVenue::HyperliquidOutcomes => {
             crate::providers::execution::ExecutionAdapter::new(venue, testnet)
                 .await?
@@ -5633,6 +5652,7 @@ fn apply_account_event(
         | ExecutionVenue::Hyperlink
         | ExecutionVenue::HyperliquidSpot
         | ExecutionVenue::HyperliquidXyz
+        | ExecutionVenue::HyperliquidIo
         | ExecutionVenue::HyperliquidOutcomes => apply_hyperliquid_account_event(
             venue,
             testnet,
@@ -5866,6 +5886,9 @@ fn hyperliquid_product(venue: ExecutionVenue) -> crate::providers::hyperliquid::
         }
         ExecutionVenue::HyperliquidXyz => {
             crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual
+        }
+        ExecutionVenue::HyperliquidIo => {
+            crate::providers::hyperliquid::HyperliquidProduct::IoPerpetual
         }
         ExecutionVenue::Bulk => unreachable!("BULK is not a Hyperliquid product"),
     }
@@ -6152,6 +6175,7 @@ async fn recover_account_gap(
         | ExecutionVenue::Hyperlink
         | ExecutionVenue::HyperliquidSpot
         | ExecutionVenue::HyperliquidXyz
+        | ExecutionVenue::HyperliquidIo
         | ExecutionVenue::HyperliquidOutcomes => {
             let execution =
                 crate::providers::execution::ExecutionAdapter::new(venue, testnet).await?;
@@ -6184,6 +6208,7 @@ async fn recover_account_gap(
         | ExecutionVenue::Hyperlink
         | ExecutionVenue::HyperliquidSpot
         | ExecutionVenue::HyperliquidXyz
+        | ExecutionVenue::HyperliquidIo
         | ExecutionVenue::HyperliquidOutcomes => {
             crate::providers::execution::ExecutionAdapter::new(venue, testnet)
                 .await?

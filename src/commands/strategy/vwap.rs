@@ -90,6 +90,15 @@ impl WeightedOrderBookStream {
                 )
                 .await?,
             )),
+            ExecutionVenue::HyperliquidIo => Ok(Self::Hyperliquid(
+                HyperliquidOrderBookStream::connect_for(
+                    crate::providers::hyperliquid::HyperliquidProduct::IoPerpetual,
+                    symbol,
+                    depth.min(20),
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
+            )),
             ExecutionVenue::HyperliquidSpot => Ok(Self::Hyperliquid(
                 HyperliquidOrderBookStream::connect_for(
                     crate::providers::hyperliquid::HyperliquidProduct::Spot,
@@ -132,6 +141,14 @@ impl WeightedTradesStream {
             "hyperliquidf-xyz" => Ok(Self::Hyperliquid(
                 HyperliquidTradesStream::connect_for(
                     crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual,
+                    symbol,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
+            )),
+            "hyperliquidf-io" => Ok(Self::Hyperliquid(
+                HyperliquidTradesStream::connect_for(
+                    crate::providers::hyperliquid::HyperliquidProduct::IoPerpetual,
                     symbol,
                     HyperliquidNetwork::from_testnet(testnet),
                 )
@@ -1137,6 +1154,17 @@ async fn fetch_direct_volume_history_on(
                 )
                 .await?
             }
+            "hyperliquidf-io" => {
+                HyperliquidProvider::volume_bars_for(
+                    crate::providers::hyperliquid::HyperliquidProduct::IoPerpetual,
+                    symbol,
+                    "1m",
+                    cursor,
+                    chunk_to,
+                    network,
+                )
+                .await?
+            }
             _ => bail!("standalone volume adapter for `{exchange}` is not implemented"),
         };
         for bar in series.data {
@@ -1844,6 +1872,7 @@ pub(super) fn worker_trade_args(
             ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
             ExecutionVenue::Hyperlink => ExecutionVenueArg::Hyperlink,
             ExecutionVenue::HyperliquidXyz => ExecutionVenueArg::HyperliquidXyz,
+            ExecutionVenue::HyperliquidIo => ExecutionVenueArg::HyperliquidIo,
             ExecutionVenue::HyperliquidSpot => ExecutionVenueArg::HyperliquidSpot,
             ExecutionVenue::HyperliquidOutcomes => ExecutionVenueArg::HyperliquidOutcomes,
         },
@@ -1897,6 +1926,8 @@ pub(super) fn execution_venue_network_name(venue: ExecutionVenue, testnet: bool)
         (ExecutionVenue::Hyperlink, _) => "HyperLink mainnet",
         (ExecutionVenue::HyperliquidXyz, true) => "Hyperliquid XYZ testnet",
         (ExecutionVenue::HyperliquidXyz, false) => "Hyperliquid XYZ mainnet",
+        (ExecutionVenue::HyperliquidIo, true) => "Hyperliquid EntropyIO testnet",
+        (ExecutionVenue::HyperliquidIo, false) => "Hyperliquid EntropyIO mainnet",
         (ExecutionVenue::HyperliquidSpot, true) => "Hyperliquid Spot testnet",
         (ExecutionVenue::HyperliquidSpot, false) => "Hyperliquid Spot mainnet",
         (ExecutionVenue::HyperliquidOutcomes, true) => "Hyperliquid Outcomes testnet",
@@ -1910,6 +1941,7 @@ pub(super) fn execution_venue_name(venue: ExecutionVenue) -> &'static str {
         ExecutionVenue::Hyperliquid => "hyperliquidf",
         ExecutionVenue::Hyperlink => "hyperlinkf",
         ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
+        ExecutionVenue::HyperliquidIo => "hyperliquidf-io",
         ExecutionVenue::HyperliquidSpot => "hyperliquid",
         ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
     }

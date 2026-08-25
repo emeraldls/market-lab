@@ -389,7 +389,8 @@ async fn build_trade_plan_with_price_normalization(
         ExecutionVenue::Bulk
         | ExecutionVenue::Hyperliquid
         | ExecutionVenue::Hyperlink
-        | ExecutionVenue::HyperliquidXyz => Some(args.leverage.unwrap_or(1.0)),
+        | ExecutionVenue::HyperliquidXyz
+        | ExecutionVenue::HyperliquidIo => Some(args.leverage.unwrap_or(1.0)),
     };
     let sizing_leverage = leverage.unwrap_or(1.0);
     let mut rules = execution_rules(venue, args.testnet, &market)?;
@@ -437,6 +438,15 @@ async fn build_trade_plan_with_price_normalization(
             ExecutionVenue::HyperliquidXyz => {
                 HyperliquidProvider::ticker_for(
                     crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual,
+                    &market.symbol,
+                    HyperliquidNetwork::from_testnet(args.testnet),
+                )
+                .await?
+                .mark_price
+            }
+            ExecutionVenue::HyperliquidIo => {
+                HyperliquidProvider::ticker_for(
+                    crate::providers::hyperliquid::HyperliquidProduct::IoPerpetual,
                     &market.symbol,
                     HyperliquidNetwork::from_testnet(args.testnet),
                 )
@@ -659,7 +669,8 @@ fn normalize_price_to_rules(
         }
         ExecutionVenue::Hyperliquid
         | ExecutionVenue::Hyperlink
-        | ExecutionVenue::HyperliquidXyz => {
+        | ExecutionVenue::HyperliquidXyz
+        | ExecutionVenue::HyperliquidIo => {
             normalize_hyperliquid_price(price, rules.size_precision, 6, rounding)
         }
         ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidOutcomes => {
@@ -863,7 +874,9 @@ fn validate_market_rules(venue: ExecutionVenue, market: &Market, args: &TradeArg
     }
     if matches!(
         venue,
-        ExecutionVenue::Hyperliquid | ExecutionVenue::HyperliquidXyz
+        ExecutionVenue::Hyperliquid
+            | ExecutionVenue::HyperliquidXyz
+            | ExecutionVenue::HyperliquidIo
     ) && leverage.fract().abs() > f64::EPSILON
     {
         bail!("Hyperliquid leverage must be a whole number");
@@ -921,7 +934,8 @@ fn is_price_aligned(
         ExecutionVenue::Bulk => is_step_aligned(price, rules.tick_size),
         ExecutionVenue::Hyperliquid
         | ExecutionVenue::Hyperlink
-        | ExecutionVenue::HyperliquidXyz => {
+        | ExecutionVenue::HyperliquidXyz
+        | ExecutionVenue::HyperliquidIo => {
             crate::providers::hyperliquid::execution::validate_price(price, rules.size_precision)
                 .is_ok()
         }
@@ -994,7 +1008,9 @@ fn execution_rules(
     market: &Market,
 ) -> Result<crate::markets::ExecutionRules> {
     match venue {
-        ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidXyz => market
+        ExecutionVenue::HyperliquidSpot
+        | ExecutionVenue::HyperliquidXyz
+        | ExecutionVenue::HyperliquidIo => market
             .network_variant(HyperliquidNetwork::from_testnet(testnet).label())
             .map(|variant| variant.execution),
         ExecutionVenue::HyperliquidOutcomes
@@ -1006,7 +1022,9 @@ fn execution_rules(
 
 fn execution_venue_symbol(venue: ExecutionVenue, testnet: bool, market: &Market) -> Result<String> {
     match venue {
-        ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidXyz => market
+        ExecutionVenue::HyperliquidSpot
+        | ExecutionVenue::HyperliquidXyz
+        | ExecutionVenue::HyperliquidIo => market
             .network_variant(HyperliquidNetwork::from_testnet(testnet).label())
             .map(|variant| variant.venue_symbol),
         ExecutionVenue::HyperliquidOutcomes
@@ -1022,6 +1040,7 @@ fn venue_key(venue: ExecutionVenue) -> &'static str {
         ExecutionVenue::Hyperliquid => "hyperliquidf",
         ExecutionVenue::Hyperlink => "hyperlinkf",
         ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
+        ExecutionVenue::HyperliquidIo => "hyperliquidf-io",
         ExecutionVenue::HyperliquidSpot => "hyperliquid",
         ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
     }
@@ -1033,6 +1052,7 @@ fn venue_label(venue: ExecutionVenue) -> &'static str {
         ExecutionVenue::Hyperliquid => "Hyperliquid",
         ExecutionVenue::Hyperlink => "HyperLink",
         ExecutionVenue::HyperliquidXyz => "Hyperliquid XYZ",
+        ExecutionVenue::HyperliquidIo => "Hyperliquid EntropyIO",
         ExecutionVenue::HyperliquidSpot => "Hyperliquid Spot",
         ExecutionVenue::HyperliquidOutcomes => "Hyperliquid Outcomes",
     }
@@ -1045,6 +1065,8 @@ fn venue_network_label(venue: ExecutionVenue, testnet: bool) -> &'static str {
         (ExecutionVenue::Hyperlink, _) => "HyperLink mainnet",
         (ExecutionVenue::HyperliquidXyz, true) => "Hyperliquid XYZ testnet",
         (ExecutionVenue::HyperliquidXyz, false) => "Hyperliquid XYZ mainnet",
+        (ExecutionVenue::HyperliquidIo, true) => "Hyperliquid EntropyIO testnet",
+        (ExecutionVenue::HyperliquidIo, false) => "Hyperliquid EntropyIO mainnet",
         (ExecutionVenue::HyperliquidSpot, true) => "Hyperliquid Spot testnet",
         (ExecutionVenue::HyperliquidSpot, false) => "Hyperliquid Spot mainnet",
         (ExecutionVenue::HyperliquidOutcomes, true) => "Hyperliquid Outcomes testnet",
@@ -1094,6 +1116,7 @@ fn render_trade_plan(plan: &TradePlan, dry_run: bool, output: OutputFormat) -> R
                 plan.venue,
                 ExecutionVenue::Hyperliquid
                     | ExecutionVenue::HyperliquidXyz
+                    | ExecutionVenue::HyperliquidIo
                     | ExecutionVenue::HyperliquidSpot
             ) {
                 println!(

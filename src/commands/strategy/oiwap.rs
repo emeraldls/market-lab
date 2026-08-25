@@ -413,6 +413,7 @@ async fn fetch_directional_price_window(
         ExecutionVenue::Hyperliquid
         | ExecutionVenue::Hyperlink
         | ExecutionVenue::HyperliquidXyz
+        | ExecutionVenue::HyperliquidIo
         | ExecutionVenue::HyperliquidSpot
         | ExecutionVenue::HyperliquidOutcomes => {
             let product = match venue {
@@ -421,6 +422,9 @@ async fn fetch_directional_price_window(
                 }
                 ExecutionVenue::HyperliquidXyz => {
                     crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual
+                }
+                ExecutionVenue::HyperliquidIo => {
+                    crate::providers::hyperliquid::HyperliquidProduct::IoPerpetual
                 }
                 ExecutionVenue::HyperliquidSpot => {
                     crate::providers::hyperliquid::HyperliquidProduct::Spot

@@ -308,6 +308,7 @@ fn worker_trade_args(definition: &MidPriceJobDefinition) -> TradeArgs {
             ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
             ExecutionVenue::Hyperlink => ExecutionVenueArg::Hyperlink,
             ExecutionVenue::HyperliquidXyz => ExecutionVenueArg::HyperliquidXyz,
+            ExecutionVenue::HyperliquidIo => ExecutionVenueArg::HyperliquidIo,
             ExecutionVenue::HyperliquidSpot => ExecutionVenueArg::HyperliquidSpot,
             ExecutionVenue::HyperliquidOutcomes => ExecutionVenueArg::HyperliquidOutcomes,
         },
@@ -477,6 +478,8 @@ fn execution_venue_label(venue: ExecutionVenue, testnet: bool) -> &'static str {
         (ExecutionVenue::Hyperlink, _) => "HyperLink mainnet",
         (ExecutionVenue::HyperliquidXyz, true) => "Hyperliquid XYZ testnet",
         (ExecutionVenue::HyperliquidXyz, false) => "Hyperliquid XYZ mainnet",
+        (ExecutionVenue::HyperliquidIo, true) => "Hyperliquid EntropyIO testnet",
+        (ExecutionVenue::HyperliquidIo, false) => "Hyperliquid EntropyIO mainnet",
         (ExecutionVenue::HyperliquidSpot, true) => "Hyperliquid Spot testnet",
         (ExecutionVenue::HyperliquidSpot, false) => "Hyperliquid Spot mainnet",
         (ExecutionVenue::HyperliquidOutcomes, true) => "Hyperliquid Outcomes testnet",
@@ -490,6 +493,7 @@ pub(super) fn venue_key(venue: ExecutionVenue) -> &'static str {
         ExecutionVenue::Hyperliquid => "hyperliquidf",
         ExecutionVenue::Hyperlink => "hyperlinkf",
         ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
+        ExecutionVenue::HyperliquidIo => "hyperliquidf-io",
         ExecutionVenue::HyperliquidSpot => "hyperliquid",
         ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
     }
@@ -501,6 +505,7 @@ pub(super) fn venue_label(venue: ExecutionVenue) -> &'static str {
         ExecutionVenue::Hyperliquid => "Hyperliquid",
         ExecutionVenue::Hyperlink => "HyperLink",
         ExecutionVenue::HyperliquidXyz => "Hyperliquid XYZ",
+        ExecutionVenue::HyperliquidIo => "Hyperliquid EntropyIO",
         ExecutionVenue::HyperliquidSpot => "Hyperliquid Spot",
         ExecutionVenue::HyperliquidOutcomes => "Hyperliquid Outcomes",
     }
@@ -548,6 +553,16 @@ pub(super) async fn live_orderbook(
         ExecutionVenue::HyperliquidXyz => {
             HyperliquidProvider::live_orderbook_for(
                 crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual,
+                symbol,
+                BOOK_DEPTH,
+                None,
+                HyperliquidNetwork::from_testnet(testnet),
+            )
+            .await
+        }
+        ExecutionVenue::HyperliquidIo => {
+            HyperliquidProvider::live_orderbook_for(
+                crate::providers::hyperliquid::HyperliquidProduct::IoPerpetual,
                 symbol,
                 BOOK_DEPTH,
                 None,
@@ -920,6 +935,15 @@ impl BotOrderBookStream {
                 )
                 .await?,
             )),
+            ExecutionVenue::HyperliquidIo => Ok(Self::Hyperliquid(
+                HyperliquidOrderBookStream::connect_for(
+                    crate::providers::hyperliquid::HyperliquidProduct::IoPerpetual,
+                    symbol,
+                    BOOK_DEPTH,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
+            )),
             ExecutionVenue::HyperliquidSpot => Ok(Self::Hyperliquid(
                 HyperliquidOrderBookStream::connect_for(
                     crate::providers::hyperliquid::HyperliquidProduct::Spot,
@@ -1040,6 +1064,13 @@ impl BotAccountStream {
                 ))
             }
             ExecutionVenue::HyperliquidXyz => Ok(Self::Hyperliquid(
+                HyperliquidAccountStream::connect_on(
+                    account,
+                    HyperliquidNetwork::from_testnet(testnet),
+                )
+                .await?,
+            )),
+            ExecutionVenue::HyperliquidIo => Ok(Self::Hyperliquid(
                 HyperliquidAccountStream::connect_on(
                     account,
                     HyperliquidNetwork::from_testnet(testnet),

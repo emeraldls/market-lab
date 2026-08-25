@@ -813,7 +813,7 @@ impl HyperliquidExecutionAdapter {
                 let market = markets::market(symbol)?;
                 resolved_testnet_market(&market.venue_symbol).await
             }
-            (HyperliquidProduct::XyzPerpetual, network) => {
+            (HyperliquidProduct::XyzPerpetual | HyperliquidProduct::IoPerpetual, network) => {
                 resolved_network_perpetual_market(self.product, network, symbol)
             }
         }?;
@@ -1349,6 +1349,7 @@ const fn venue_for_product(product: HyperliquidProduct) -> ExecutionVenue {
         HyperliquidProduct::Outcome => ExecutionVenue::HyperliquidOutcomes,
         HyperliquidProduct::Perpetual => ExecutionVenue::Hyperliquid,
         HyperliquidProduct::XyzPerpetual => ExecutionVenue::HyperliquidXyz,
+        HyperliquidProduct::IoPerpetual => ExecutionVenue::HyperliquidIo,
     }
 }
 
@@ -1882,6 +1883,18 @@ mod tests {
         let mut native = serde_json::json!({ "type": "clearinghouseState", "user": "0xabc" });
         attach_dex(&mut native, HyperliquidProduct::Perpetual);
         assert!(native.get("dex").is_none());
+    }
+
+    #[test]
+    fn entropy_io_uses_its_venue_and_scopes_info_requests() {
+        assert_eq!(
+            venue_for_product(HyperliquidProduct::IoPerpetual),
+            ExecutionVenue::HyperliquidIo
+        );
+
+        let mut request = serde_json::json!({ "type": "clearinghouseState", "user": "0xabc" });
+        attach_dex(&mut request, HyperliquidProduct::IoPerpetual);
+        assert_eq!(request["dex"], "io");
     }
 
     #[test]

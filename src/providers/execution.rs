@@ -53,6 +53,14 @@ impl ExecutionAdapter {
                 )
                 .await?,
             )),
+            ExecutionVenue::HyperliquidIo => Ok(Self::Hyperliquid(
+                HyperliquidExecutionAdapter::new_for_account(
+                    HyperliquidProduct::IoPerpetual,
+                    HyperliquidNetwork::from_testnet(testnet),
+                    account_name,
+                )
+                .await?,
+            )),
             ExecutionVenue::HyperliquidSpot => Ok(Self::Hyperliquid(
                 HyperliquidExecutionAdapter::new_for_account(
                     HyperliquidProduct::Spot,
@@ -83,6 +91,9 @@ impl ExecutionAdapter {
             ExecutionVenue::HyperliquidXyz => {
                 HyperliquidExecutionAdapter::capabilities_for(HyperliquidProduct::XyzPerpetual)
             }
+            ExecutionVenue::HyperliquidIo => {
+                HyperliquidExecutionAdapter::capabilities_for(HyperliquidProduct::IoPerpetual)
+            }
             ExecutionVenue::HyperliquidSpot => {
                 HyperliquidExecutionAdapter::capabilities_for(HyperliquidProduct::Spot)
             }
@@ -105,6 +116,7 @@ impl ExecutionAdapter {
             ExecutionVenue::Bulk => credentials::bulk_account_for(account_name),
             ExecutionVenue::Hyperliquid
             | ExecutionVenue::HyperliquidXyz
+            | ExecutionVenue::HyperliquidIo
             | ExecutionVenue::HyperliquidSpot
             | ExecutionVenue::HyperliquidOutcomes => credentials::hyperliquid_account_for(
                 HyperliquidNetwork::from_testnet(testnet),
@@ -127,6 +139,7 @@ impl ExecutionAdapter {
             ExecutionVenue::Bulk => credentials::bulk_accounts(),
             ExecutionVenue::Hyperliquid
             | ExecutionVenue::HyperliquidXyz
+            | ExecutionVenue::HyperliquidIo
             | ExecutionVenue::HyperliquidSpot
             | ExecutionVenue::HyperliquidOutcomes => {
                 credentials::hyperliquid_accounts(HyperliquidNetwork::from_testnet(testnet))

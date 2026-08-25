@@ -371,6 +371,7 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
         crate::domain::execution::ExecutionVenue::HyperliquidXyz => {
             ExecutionVenueArg::HyperliquidXyz
         }
+        crate::domain::execution::ExecutionVenue::HyperliquidIo => ExecutionVenueArg::HyperliquidIo,
         crate::domain::execution::ExecutionVenue::HyperliquidSpot => {
             ExecutionVenueArg::HyperliquidSpot
         }
@@ -1037,6 +1038,7 @@ fn live_execution_exchange(venue: ExecutionVenue) -> &'static str {
         ExecutionVenue::Hyperliquid => "hyperliquidf",
         ExecutionVenue::Hyperlink => "hyperlinkf",
         ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
+        ExecutionVenue::HyperliquidIo => "hyperliquidf-io",
         ExecutionVenue::HyperliquidSpot => "hyperliquid",
         ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
     }

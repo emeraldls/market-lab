@@ -11,6 +11,8 @@ pub enum ExecutionVenue {
     Hyperlink,
     #[serde(rename = "hyperliquidf-xyz")]
     HyperliquidXyz,
+    #[serde(rename = "hyperliquidf-io")]
+    HyperliquidIo,
     #[serde(rename = "hyperliquid")]
     HyperliquidSpot,
     #[serde(rename = "hyperliquid-outcomes")]
@@ -357,6 +359,10 @@ mod tests {
         let xyz =
             serde_json::to_value(ExecutionVenue::HyperliquidXyz).expect("XYZ venue serializes");
         assert_eq!(xyz, serde_json::json!("hyperliquidf-xyz"));
+
+        let io = serde_json::to_value(ExecutionVenue::HyperliquidIo)
+            .expect("EntropyIO venue serializes");
+        assert_eq!(io, serde_json::json!("hyperliquidf-io"));
 
         let outcomes = serde_json::to_value(ExecutionVenue::HyperliquidOutcomes)
             .expect("outcome venue serializes");

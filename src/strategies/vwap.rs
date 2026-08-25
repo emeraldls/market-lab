@@ -53,7 +53,10 @@ impl VolumeSourceSelector {
             let source = match parts.as_slice() {
                 [exchange] if !exchange.is_empty() => {
                     crate::markets::exchange_market(exchange, symbol)?;
-                    if !matches!(*exchange, "bulkf" | "hyperliquidf" | "hyperliquidf-xyz") {
+                    if !matches!(
+                        *exchange,
+                        "bulkf" | "hyperliquidf" | "hyperliquidf-xyz" | "hyperliquidf-io"
+                    ) {
                         bail!(
                             "standalone volume adapter for `{exchange}` is not implemented; use `{exchange}@mmt`"
                         );
