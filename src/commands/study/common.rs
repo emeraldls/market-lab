@@ -51,14 +51,7 @@ where
 }
 
 pub fn provider_name(kind: ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::Mmt => "mmt",
-        ProviderKind::MarketLab => "marketlab",
-        ProviderKind::Bulk => "bulkf",
-        ProviderKind::Hyperliquid => "hyperliquidf",
-        ProviderKind::Binance => "binance",
-        ProviderKind::BinanceFutures => "binancef",
-    }
+    kind.as_str()
 }
 
 pub fn print_study_json<I, M>(

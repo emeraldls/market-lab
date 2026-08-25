@@ -23,7 +23,7 @@ pub struct SourceMeta {
 pub struct SourceEnvelope<T> {
     pub r#type: String,
     pub version: &'static str,
-    pub provider: &'static str,
+    pub provider: String,
     pub exchange: String,
     pub symbol: String,
     pub ts_ms: u64,
@@ -73,7 +73,7 @@ mod tests {
         let env = SourceEnvelope {
             r#type: "source.orderbook.snapshot".to_string(),
             version: "1",
-            provider: "mmt",
+            provider: "mmt".to_string(),
             exchange: "bybitf".to_string(),
             symbol: "BTC".to_string(),
             ts_ms: 1,

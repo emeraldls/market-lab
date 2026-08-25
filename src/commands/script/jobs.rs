@@ -83,9 +83,11 @@ fn render_jobs(jobs: &[ScriptJob], output: OutputFormat) -> Result<()> {
                         .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
                     truncate(&job.definition.script_name, 22),
                     if job.definition.language == ScriptLanguage::PythonV2 {
-                        "per-request"
+                        "per-request".to_string()
                     } else {
-                        job.definition.venue.map_or("-", venue_name)
+                        job.definition
+                            .venue
+                            .map_or_else(|| "-".to_string(), |venue| venue.to_string())
                     },
                     job.definition.providers.join(","),
                     job_symbols(job)?,
@@ -95,18 +97,6 @@ fn render_jobs(jobs: &[ScriptJob], output: OutputFormat) -> Result<()> {
         OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
     }
     Ok(())
-}
-
-fn venue_name(venue: crate::domain::execution::ExecutionVenue) -> &'static str {
-    match venue {
-        crate::domain::execution::ExecutionVenue::Bulk => "bulkf",
-        crate::domain::execution::ExecutionVenue::Hyperliquid => "hyperliquidf",
-        crate::domain::execution::ExecutionVenue::Hyperlink => "hyperlinkf",
-        crate::domain::execution::ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
-        crate::domain::execution::ExecutionVenue::HyperliquidIo => "hyperliquidf-io",
-        crate::domain::execution::ExecutionVenue::HyperliquidSpot => "hyperliquid",
-        crate::domain::execution::ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
-    }
 }
 
 fn render_job(job: &ScriptJob, output: OutputFormat) -> Result<()> {
@@ -151,10 +141,9 @@ fn render_job(job: &ScriptJob, output: OutputFormat) -> Result<()> {
                 if job.definition.language == ScriptLanguage::PythonV2 {
                     "per request".to_string()
                 } else {
-                    job.definition.venue.map_or_else(
-                        || "disabled".to_string(),
-                        |venue| venue_name(venue).to_string(),
-                    )
+                    job.definition
+                        .venue
+                        .map_or_else(|| "disabled".to_string(), |venue| venue.to_string())
                 }
             );
             println!(

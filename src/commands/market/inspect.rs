@@ -2,13 +2,13 @@ use anyhow::Result;
 
 use crate::cli::{InspectArgs, OutputFormat};
 use crate::domain::types::OrderBookSnapshot;
-use crate::providers::{MarketDataProvider, ProviderClient};
+use crate::providers::{ProviderClient, ProviderService};
 
 pub async fn handle(args: InspectArgs) -> Result<()> {
     args.validate()?;
     let req = args.to_request();
 
-    let client = ProviderClient::from_kind(req.provider);
+    let client = ProviderClient::from_kind(req.provider, &req.exchange)?;
     let snapshot = client.inspect(&req).await?;
 
     render(&snapshot, args.output)

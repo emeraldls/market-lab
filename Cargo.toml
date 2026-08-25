@@ -14,6 +14,7 @@ path = "src/bin/mlabd.rs"
 
 [dependencies]
 anyhow = "1.0.102"
+async-trait = "0.1.89"
 base64 = "0.22.1"
 bulk-keychain = "=0.1.22"
 clap = { version = "4.6.1", features = ["derive"] }

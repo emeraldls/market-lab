@@ -1,62 +1,38 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use crate::cli::{OutputFormat, SourceFundingArgs};
-use crate::domain::enums::ProviderKind;
 use crate::domain::types::FundingRateSnapshot;
-use crate::providers::bulk::market_data::BulkProvider;
-use crate::providers::bulk::ws::BulkTickerStream;
-use crate::providers::hyperliquid::market_data::HyperliquidProvider;
-use crate::providers::hyperliquid::ws::HyperliquidAssetContextStream;
-use crate::providers::hyperliquid::{HyperliquidNetwork, HyperliquidProduct};
+use crate::providers::market_data::{MarketDataAdapter, VenueTickerStream};
 
 use super::common::{SourceEnvelope, SourceMeta, render_terminal};
 
 pub async fn handle(args: SourceFundingArgs) -> Result<()> {
     args.validate()?;
-    match args.provider_kind()?.into() {
-        ProviderKind::Bulk => handle_bulk(args).await,
-        ProviderKind::Hyperliquid => handle_hyperliquid(args).await,
-        ProviderKind::Binance | ProviderKind::BinanceFutures => {
-            bail!("Binance funding is not implemented")
-        }
-        ProviderKind::Mmt | ProviderKind::MarketLab => {
-            unreachable!("funding source is standalone-only")
-        }
-    }
+    handle_direct(args).await
 }
 
-async fn handle_bulk(args: SourceFundingArgs) -> Result<()> {
+async fn handle_direct(args: SourceFundingArgs) -> Result<()> {
+    let adapter = MarketDataAdapter::for_exchange(&args.exchange, false)?;
     if args.stream {
-        return stream_bulk_funding(args).await;
+        return stream_funding(args).await;
     }
 
-    let funding = BulkProvider::funding(&args.symbol).await?;
-    render_funding(funding, &args, "bulkf")
-}
-
-async fn handle_hyperliquid(args: SourceFundingArgs) -> Result<()> {
-    let product = HyperliquidProduct::from_exchange(&args.exchange)?;
-    if args.stream {
-        return stream_hyperliquid_funding(args, product).await;
-    }
-    let funding =
-        HyperliquidProvider::funding_for(product, &args.symbol, HyperliquidNetwork::Mainnet)
-            .await?;
-    render_funding(funding, &args, product.exchange())
+    let funding = adapter.funding(&args.symbol).await?;
+    render_funding(funding, &args, adapter.exchange())
 }
 
 fn render_funding(
     funding: FundingRateSnapshot,
     args: &SourceFundingArgs,
-    provider: &'static str,
+    provider: &str,
 ) -> Result<()> {
     let env = SourceEnvelope {
         r#type: "source.funding.snapshot".to_string(),
         version: "1",
-        provider,
+        provider: provider.to_string(),
         exchange: funding.exchange.clone(),
         symbol: funding.symbol.clone(),
         ts_ms: funding.timestamp_ms,
@@ -95,8 +71,9 @@ fn render_funding(
     Ok(())
 }
 
-async fn stream_bulk_funding(args: SourceFundingArgs) -> Result<()> {
-    let mut stream = BulkTickerStream::connect(&args.symbol).await?;
+async fn stream_funding(args: SourceFundingArgs) -> Result<()> {
+    let adapter = MarketDataAdapter::for_exchange(&args.exchange, false)?;
+    let mut stream = VenueTickerStream::connect(&args.exchange, &args.symbol, false).await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest = None;
     let mut buf: VecDeque<String> = VecDeque::with_capacity(args.buffer_size as usize);
@@ -109,20 +86,14 @@ async fn stream_bulk_funding(args: SourceFundingArgs) -> Result<()> {
             }
             update = stream.next_ticker() => {
                 let update = update?;
-                latest = Some(FundingRateSnapshot {
-                    exchange: update.exchange,
-                    symbol: update.symbol,
-                    timestamp_ms: update.timestamp_ms,
-                    current: update.funding_rate,
-                    annualized: None,
-                });
+                latest = Some(adapter.funding_from_ticker(update));
             }
             _ = ticker.tick() => {
                 let Some(snapshot) = latest.as_ref() else { continue; };
                 let env = SourceEnvelope {
                     r#type: "source.funding.stream".to_string(),
                     version: "1",
-                    provider: "bulkf",
+                    provider: adapter.exchange().to_string(),
                     exchange: snapshot.exchange.clone(),
                     symbol: snapshot.symbol.clone(),
                     ts_ms: snapshot.timestamp_ms,
@@ -146,60 +117,7 @@ async fn stream_bulk_funding(args: SourceFundingArgs) -> Result<()> {
                         let line = format!("ts={} funding_rate={}", snapshot.timestamp_ms, snapshot.current);
                         if buf.len() >= args.buffer_size as usize { buf.pop_front(); }
                         buf.push_back(line);
-                        render_terminal("market-lab source BULK funding stream", &buf)?;
-                    }
-                    OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn stream_hyperliquid_funding(
-    args: SourceFundingArgs,
-    product: HyperliquidProduct,
-) -> Result<()> {
-    let mut stream = HyperliquidAssetContextStream::connect_for(
-        product,
-        &args.symbol,
-        HyperliquidNetwork::Mainnet,
-    )
-    .await?;
-    let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
-    let mut latest = None;
-    let mut buf = VecDeque::with_capacity(args.buffer_size as usize);
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("\nstream stopped");
-                break;
-            }
-            update = stream.next_ticker() => {
-                let update = update?;
-                latest = Some(FundingRateSnapshot {
-                    exchange: update.exchange, symbol: update.symbol,
-                    timestamp_ms: update.timestamp_ms, current: update.funding_rate,
-                    annualized: Some(update.funding_rate * 24.0 * 365.0),
-                });
-            }
-            _ = ticker.tick() => {
-                let Some(snapshot) = latest.as_ref() else { continue; };
-                let env = SourceEnvelope {
-                    r#type: "source.funding.stream".to_string(), version: "1",
-                    provider: product.exchange(), exchange: snapshot.exchange.clone(),
-                    symbol: snapshot.symbol.clone(), ts_ms: snapshot.timestamp_ms,
-                    stream: true, data: snapshot.clone(),
-                    meta: SourceMeta { depth: None, min_size: None, max_size: None, price_group: None,
-                        interval_ms: Some(args.interval_ms), timeframe: None, bucket: None, from: None, to: None },
-                };
-                match args.output {
-                    OutputFormat::Json | OutputFormat::Jsonl => println!("{}", serde_json::to_string(&env)?),
-                    OutputFormat::Terminal => {
-                        let line = format!("ts={} funding_rate={}", snapshot.timestamp_ms, snapshot.current);
-                        if buf.len() >= args.buffer_size as usize { buf.pop_front(); }
-                        buf.push_back(line);
-                        render_terminal("market-lab source Hyperliquid funding stream", &buf)?;
+                        render_terminal(&format!("market-lab source {} funding stream", adapter.label()), &buf)?;
                     }
                     OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
                 }

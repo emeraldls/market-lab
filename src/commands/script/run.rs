@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
-use crate::cli::{ExecutionVenueArg, OutputFormat, ScriptRunArgs, mmt_timeframe_from_seconds};
+use crate::cli::{OutputFormat, ScriptRunArgs, mmt_timeframe_from_seconds};
 use crate::commands::script::pnl::PnlHistory;
 use crate::commands::script::{
     ScriptDescriptor, ScriptInputs, report_builder, write_report_best_effort,
@@ -23,16 +23,11 @@ use crate::domain::types::{
     OiCandle, OpenInterestSnapshot, OrderBookSnapshot, TradeTick, VdCandle, VolumeDeltaTick,
     VolumeProfile,
 };
-use crate::providers::bulk::markets as bulk_markets;
-use crate::providers::bulk::ws::{
-    BulkCandleStream, BulkOrderBookStream, BulkTickerStream, BulkTradesStream,
-};
-use crate::providers::hyperliquid::markets as hyperliquid_markets;
-use crate::providers::hyperliquid::ws::{
-    HyperliquidAssetContextStream, HyperliquidCandleStream, HyperliquidOrderBookStream,
-    HyperliquidTradesStream,
-};
 use crate::providers::hyperliquid::{HyperliquidNetwork, HyperliquidProduct};
+use crate::providers::market_data::{
+    MarketDataAdapter, VenueCandleStream, VenueOrderBookStream, VenueTickerStream,
+    VenueTradesStream,
+};
 use crate::providers::mmt::utils::{
     normalize_exchange_for_mmt, normalize_symbol_for_mmt, normalize_to_ms, parse_levels,
 };
@@ -310,7 +305,7 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
         exchanges,
         sources: source_values.to_vec(),
         params: args.param,
-        venue: args.venue.map(Into::into),
+        venue: args.venue,
         testnet: args.testnet,
         duration_seconds: args.duration,
         verbose: args.verbose,
@@ -364,21 +359,7 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
         job.definition.language,
         job.definition.python_runtime.clone(),
     )?;
-    let venue = job.definition.venue.map(|venue| match venue {
-        crate::domain::execution::ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
-        crate::domain::execution::ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
-        crate::domain::execution::ExecutionVenue::Hyperlink => ExecutionVenueArg::Hyperlink,
-        crate::domain::execution::ExecutionVenue::HyperliquidXyz => {
-            ExecutionVenueArg::HyperliquidXyz
-        }
-        crate::domain::execution::ExecutionVenue::HyperliquidIo => ExecutionVenueArg::HyperliquidIo,
-        crate::domain::execution::ExecutionVenue::HyperliquidSpot => {
-            ExecutionVenueArg::HyperliquidSpot
-        }
-        crate::domain::execution::ExecutionVenue::HyperliquidOutcomes => {
-            ExecutionVenueArg::HyperliquidOutcomes
-        }
-    });
+    let venue = job.definition.venue;
     let args = ScriptRunArgs {
         script: job.definition.snapshot_path.display().to_string(),
         config: None,
@@ -835,7 +816,7 @@ fn script_execution_reference(
     let exchange = exchange.map(live_execution_price_exchange)?;
     let symbol = crate::scripting::inputs::script_symbol_to_market(symbol);
     references
-        .get(&execution_reference_key(exchange, &symbol))
+        .get(&execution_reference_key(&exchange, &symbol))
         .filter(|reference| reference.timestamp_ms > 0)
         .map(|reference| reference.price)
 }
@@ -941,11 +922,7 @@ fn live_fill(event: &ScriptExecutionEvent) -> Option<LiveFill> {
         })
     })?;
     let raw_fee = data.get("fee").and_then(json_number).unwrap_or_default();
-    let fee = if venue != ExecutionVenue::Bulk && data.contains_key("raw") {
-        -raw_fee
-    } else {
-        raw_fee
-    };
+    let fee = raw_fee;
     let external_fill_id = data
         .get("tradeId")
         .or_else(|| data.get("tid"))
@@ -972,7 +949,7 @@ fn live_fill(event: &ScriptExecutionEvent) -> Option<LiveFill> {
         |id| format!("{venue:?}:{id}"),
     );
     Some(LiveFill {
-        key: live_pnl_key(symbol, live_execution_exchange(venue)),
+        key: live_pnl_key(symbol, &live_execution_exchange(venue)),
         signed_quantity: if is_buy { quantity } else { -quantity },
         price,
         fee,
@@ -1032,23 +1009,15 @@ fn live_pnl_key(symbol: &str, exchange: &str) -> String {
     )
 }
 
-fn live_execution_exchange(venue: ExecutionVenue) -> &'static str {
-    match venue {
-        ExecutionVenue::Bulk => "bulkf",
-        ExecutionVenue::Hyperliquid => "hyperliquidf",
-        ExecutionVenue::Hyperlink => "hyperlinkf",
-        ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
-        ExecutionVenue::HyperliquidIo => "hyperliquidf-io",
-        ExecutionVenue::HyperliquidSpot => "hyperliquid",
-        ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
-    }
+fn live_execution_exchange(venue: ExecutionVenue) -> String {
+    venue.to_string()
 }
 
-fn live_execution_price_exchange(venue: ExecutionVenue) -> &'static str {
-    match venue {
-        ExecutionVenue::Hyperlink => "hyperliquidf",
-        _ => live_execution_exchange(venue),
-    }
+fn live_execution_price_exchange(venue: ExecutionVenue) -> String {
+    venue.spec().map_or_else(
+        |_| venue.to_string(),
+        |spec| spec.market_data_venue.to_string(),
+    )
 }
 
 fn now_ms() -> u64 {
@@ -1060,7 +1029,7 @@ fn now_ms() -> u64 {
 
 struct ScriptLiveStreams {
     mmt: Option<MmtScriptStreams>,
-    direct: Vec<Box<DirectScriptStreams>>,
+    direct: Vec<DirectScriptStreams>,
 }
 
 type LiveUpdateFuture<'a> = Pin<Box<dyn Future<Output = Result<Option<LiveUpdate>>> + Send + 'a>>;
@@ -1097,42 +1066,24 @@ impl ScriptLiveStreams {
             })
         };
         let mut direct = Vec::new();
-        for provider in [ProviderKind::Bulk, ProviderKind::Hyperliquid] {
-            for configs in configs_grouped_by_symbol(source_configs, provider).into_values() {
-                let config = configs
-                    .values()
-                    .next()
-                    .context("direct source group is empty")?;
-                let requested = config.market_symbol();
-                let venue_symbol = match provider {
-                    ProviderKind::Bulk => bulk_markets::market(&requested)?.symbol.clone(),
-                    ProviderKind::Hyperliquid => {
-                        let product = HyperliquidProduct::from_exchange(&config.exchange)?;
-                        if product == HyperliquidProduct::Outcome {
-                            crate::providers::hyperliquid::outcomes::resolve(
-                                HyperliquidNetwork::from_testnet(testnet),
-                                &requested,
-                            )
-                            .await?
-                            .symbol
-                        } else {
-                            hyperliquid_markets::market_for(product, &requested)?
-                                .symbol
-                                .clone()
-                        }
-                    }
-                    _ => unreachable!(),
-                };
-                direct.push(Box::new(
-                    DirectScriptStreams::connect(
-                        provider,
-                        &configs,
-                        &venue_symbol,
-                        testnet && provider == ProviderKind::Hyperliquid,
-                    )
-                    .await?,
-                ));
-            }
+        for configs in configs_grouped_by_symbol(source_configs, ProviderKind::Direct).into_values()
+        {
+            let config = configs
+                .values()
+                .next()
+                .context("direct source group is empty")?;
+            let requested = config.market_symbol();
+            let venue_symbol =
+                resolve_direct_market_symbol(&config.exchange, &requested, testnet).await?;
+            direct.push(
+                DirectScriptStreams::connect(
+                    ProviderKind::Direct,
+                    &configs,
+                    &venue_symbol,
+                    testnet,
+                )
+                .await?,
+            );
         }
         if mmt.is_none() && direct.is_empty() {
             bail!("script has no supported live source providers");
@@ -1168,6 +1119,33 @@ impl ScriptLiveStreams {
             }
         }
     }
+}
+
+async fn resolve_direct_market_symbol(
+    exchange: &str,
+    requested: &str,
+    testnet: bool,
+) -> Result<String> {
+    if let Ok(venue) = ExecutionVenue::parse(exchange) {
+        let market_data_venue = venue.market_data_id();
+        let product = HyperliquidProduct::from_venue(market_data_venue).ok();
+        if product == Some(HyperliquidProduct::Outcome) {
+            return Ok(crate::providers::hyperliquid::outcomes::resolve(
+                HyperliquidNetwork::from_testnet(testnet),
+                requested,
+            )
+            .await?
+            .symbol);
+        }
+        return Ok(
+            crate::markets::exchange_market(market_data_venue.as_str(), requested)?
+                .symbol
+                .clone(),
+        );
+    }
+    Ok(crate::markets::exchange_market(exchange, requested)?
+        .symbol
+        .clone())
 }
 
 fn spawn_script_stream_supervisor(
@@ -1321,194 +1299,15 @@ fn trade_candle_aggregators(
         .collect()
 }
 
-enum DirectTradesStream {
-    Bulk(BulkTradesStream),
-    Hyperliquid(HyperliquidTradesStream),
-}
-
-impl DirectTradesStream {
-    async fn connect(
-        provider: ProviderKind,
-        exchange: &str,
-        symbol: &str,
-        testnet: bool,
-    ) -> Result<Self> {
-        match provider {
-            ProviderKind::Bulk => Ok(Self::Bulk(BulkTradesStream::connect(symbol).await?)),
-            ProviderKind::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidTradesStream::connect_for(
-                    HyperliquidProduct::from_exchange(exchange)?,
-                    symbol,
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            ProviderKind::Mmt
-            | ProviderKind::MarketLab
-            | ProviderKind::Binance
-            | ProviderKind::BinanceFutures => {
-                bail!("provider does not use the direct trade stream")
-            }
-        }
-    }
-
-    async fn next_trades(&mut self) -> Result<Vec<TradeTick>> {
-        match self {
-            Self::Bulk(stream) => stream.next_trades().await,
-            Self::Hyperliquid(stream) => stream.next_trades().await,
-        }
-    }
-}
-
-enum DirectOrderBookStream {
-    Bulk(BulkOrderBookStream),
-    Hyperliquid(HyperliquidOrderBookStream),
-}
-
-impl DirectOrderBookStream {
-    async fn connect(
-        provider: ProviderKind,
-        exchange: &str,
-        symbol: &str,
-        depth: u16,
-        testnet: bool,
-    ) -> Result<Self> {
-        match provider {
-            ProviderKind::Bulk => Ok(Self::Bulk(
-                BulkOrderBookStream::connect(symbol, depth).await?,
-            )),
-            ProviderKind::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidOrderBookStream::connect_for(
-                    HyperliquidProduct::from_exchange(exchange)?,
-                    symbol,
-                    depth,
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            ProviderKind::Mmt
-            | ProviderKind::MarketLab
-            | ProviderKind::Binance
-            | ProviderKind::BinanceFutures => {
-                bail!("provider does not use the direct orderbook stream")
-            }
-        }
-    }
-
-    async fn next_snapshot(&mut self) -> Result<OrderBookSnapshot> {
-        match self {
-            Self::Bulk(stream) => stream.next_snapshot().await,
-            Self::Hyperliquid(stream) => stream.next_snapshot().await,
-        }
-    }
-}
-
-enum DirectTickerStream {
-    Bulk(BulkTickerStream),
-    Hyperliquid(HyperliquidAssetContextStream),
-}
-
-impl DirectTickerStream {
-    async fn connect(
-        provider: ProviderKind,
-        exchange: &str,
-        symbol: &str,
-        testnet: bool,
-    ) -> Result<Self> {
-        match provider {
-            ProviderKind::Bulk => Ok(Self::Bulk(BulkTickerStream::connect(symbol).await?)),
-            ProviderKind::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidAssetContextStream::connect_for(
-                    HyperliquidProduct::from_exchange(exchange)?,
-                    symbol,
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            ProviderKind::Mmt
-            | ProviderKind::MarketLab
-            | ProviderKind::Binance
-            | ProviderKind::BinanceFutures => {
-                bail!("provider does not use the direct ticker stream")
-            }
-        }
-    }
-
-    async fn next_ticker(&mut self) -> Result<crate::domain::types::MarketTicker> {
-        match self {
-            Self::Bulk(stream) => stream.next_ticker().await,
-            Self::Hyperliquid(stream) => stream.next_ticker().await,
-        }
-    }
-}
-
-enum DirectCandleStream {
-    Bulk(BulkCandleStream),
-    Hyperliquid(HyperliquidCandleStream),
-}
-
-impl DirectCandleStream {
-    async fn connect(
-        provider: ProviderKind,
-        exchange: &str,
-        symbol: &str,
-        interval: &str,
-        testnet: bool,
-    ) -> Result<Self> {
-        match provider {
-            ProviderKind::Bulk => Ok(Self::Bulk(
-                BulkCandleStream::connect(symbol, interval).await?,
-            )),
-            ProviderKind::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidCandleStream::connect_for(
-                    HyperliquidProduct::from_exchange(exchange)?,
-                    symbol,
-                    interval,
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            ProviderKind::Mmt
-            | ProviderKind::MarketLab
-            | ProviderKind::Binance
-            | ProviderKind::BinanceFutures => {
-                bail!("provider does not use the direct candle stream")
-            }
-        }
-    }
-
-    async fn next_candle(&mut self) -> Result<crate::domain::types::OhlcvCandle> {
-        match self {
-            Self::Bulk(stream) => stream.next_candle().await,
-            Self::Hyperliquid(stream) => stream.next_candle().await,
-        }
-    }
-}
-
 fn direct_provider_name(provider: ProviderKind, exchange: &str) -> &str {
     match provider {
-        ProviderKind::Bulk => "bulkf",
-        ProviderKind::Hyperliquid => exchange,
-        ProviderKind::Binance => "binance",
-        ProviderKind::BinanceFutures => "binancef",
-        ProviderKind::Mmt => "mmt",
-        ProviderKind::MarketLab => "marketlab",
+        ProviderKind::Direct => exchange,
+        provider => provider.as_str(),
     }
 }
 
-fn direct_timeframe(provider: ProviderKind, seconds: u32) -> Result<&'static str> {
-    match provider {
-        ProviderKind::Bulk => crate::providers::bulk::market_data::timeframe_from_seconds(seconds),
-        ProviderKind::Hyperliquid => {
-            crate::providers::hyperliquid::market_data::timeframe_from_seconds(seconds)
-        }
-        ProviderKind::Mmt
-        | ProviderKind::MarketLab
-        | ProviderKind::Binance
-        | ProviderKind::BinanceFutures => {
-            bail!("provider does not use a direct timeframe")
-        }
-    }
+fn direct_timeframe(exchange: &str, seconds: u32) -> Result<&'static str> {
+    MarketDataAdapter::for_exchange(exchange, false)?.timeframe_from_seconds(seconds)
 }
 
 struct DirectScriptStreams {
@@ -1516,11 +1315,11 @@ struct DirectScriptStreams {
     exchange: String,
     symbol: String,
     source_configs: SourceConfigs,
-    trades: Option<DirectTradesStream>,
+    trades: Option<VenueTradesStream>,
     candle_aggregator: Option<TradeCandleAggregator>,
-    orderbook: Option<DirectOrderBookStream>,
-    oi: Option<DirectTickerStream>,
-    volumes: Option<DirectCandleStream>,
+    orderbook: Option<VenueOrderBookStream>,
+    oi: Option<VenueTickerStream>,
+    volumes: Option<VenueCandleStream>,
     latest_trade: Option<LiveExecutionReference>,
     cumulative_delta: f64,
     pending: VecDeque<LiveUpdate>,
@@ -1555,7 +1354,7 @@ impl DirectScriptStreams {
                 .values()
                 .any(|config| matches!(config.source, ScriptSource::Trades | ScriptSource::Vd))
         {
-            Some(DirectTradesStream::connect(provider, &exchange, symbol, testnet).await?)
+            Some(VenueTradesStream::connect_exchange(&exchange, symbol, testnet).await?)
         } else {
             None
         };
@@ -1566,7 +1365,7 @@ impl DirectScriptStreams {
             .any(|config| config.source == ScriptSource::Orderbook)
         {
             let depth = source_config(source_configs, &ScriptSource::Orderbook)?.depth_or_default();
-            Some(DirectOrderBookStream::connect(provider, &exchange, symbol, depth, testnet).await?)
+            Some(VenueOrderBookStream::connect_exchange(&exchange, symbol, depth, testnet).await?)
         } else {
             None
         };
@@ -1574,7 +1373,7 @@ impl DirectScriptStreams {
             .values()
             .any(|config| config.source == ScriptSource::Oi)
         {
-            Some(DirectTickerStream::connect(provider, &exchange, symbol, testnet).await?)
+            Some(VenueTickerStream::connect(&exchange, symbol, testnet).await?)
         } else {
             None
         };
@@ -1584,8 +1383,8 @@ impl DirectScriptStreams {
         {
             let seconds = source_config(source_configs, &ScriptSource::Volumes)?
                 .require_timeframe(&ScriptSource::Volumes)?;
-            let interval = direct_timeframe(provider, seconds)?;
-            Some(DirectCandleStream::connect(provider, &exchange, symbol, interval, testnet).await?)
+            let interval = direct_timeframe(&exchange, seconds)?;
+            Some(VenueCandleStream::connect(&exchange, symbol, interval, testnet).await?)
         } else {
             None
         };
@@ -2437,7 +2236,7 @@ mod tests {
         ])
         .expect("parse direct multi-symbol configs");
 
-        let grouped = configs_grouped_by_symbol(&configs, ProviderKind::Bulk);
+        let grouped = configs_grouped_by_symbol(&configs, ProviderKind::Direct);
 
         assert_eq!(grouped.len(), 2);
         assert!(grouped["bulkf:btc"].contains_key("btc@trades@bulkf"));
@@ -2600,7 +2399,7 @@ mod tests {
                     "price": price.to_string(),
                     "size": size.to_string(),
                     "side": side,
-                    "fee": fee.to_string(),
+                    "fee": (-fee).to_string(),
                     "raw": { "tid": seq }
                 }),
             }

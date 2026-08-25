@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
 
 use crate::domain::enums::ProviderKind;
-use crate::providers::bulk::market_data::timeframe_from_seconds as bulk_timeframe_from_seconds;
+use crate::providers::market_data::MarketDataAdapter;
 
 use super::manifest::{InputType, ScriptManifest, ScriptParamSchema, ScriptSource};
 
@@ -215,20 +215,13 @@ pub fn configured_source_selectors(configs: &SourceConfigs) -> Vec<String> {
 
 fn source_config_provider_name(config: &SourceConfig) -> String {
     match config.provider {
-        ProviderKind::Hyperliquid => config.exchange.clone(),
+        ProviderKind::Direct => config.exchange.clone(),
         provider => source_provider_name(provider).to_string(),
     }
 }
 
 pub fn source_provider_name(provider: ProviderKind) -> &'static str {
-    match provider {
-        ProviderKind::Mmt => "mmt",
-        ProviderKind::Bulk => "bulkf",
-        ProviderKind::Hyperliquid => "hyperliquid",
-        ProviderKind::Binance => "binance",
-        ProviderKind::BinanceFutures => "binancef",
-        ProviderKind::MarketLab => "marketlab",
-    }
+    provider.as_str()
 }
 
 pub fn source_configs_payload(configs: &SourceConfigs) -> Value {
@@ -336,85 +329,100 @@ fn validate_source_config(config: &SourceConfig, historical: bool) -> Result<()>
                 config.require_timeframe(&config.source)?;
             }
         },
-        ProviderKind::Bulk | ProviderKind::Hyperliquid => match &config.source {
-            ScriptSource::Candles => {
-                let timeframe = config.require_timeframe(&config.source)?;
-                if historical {
-                    direct_timeframe_from_seconds(config.provider, timeframe)?;
-                }
-            }
-            ScriptSource::Trades if historical => {
-                bail!(
-                    "{} raw trades are live-only and cannot be backtested",
-                    source_provider_name(config.provider)
-                );
-            }
-            ScriptSource::Trades => {
-                if config.timeframe.is_some() {
-                    bail!("standalone live trades do not use a timeframe");
-                }
-            }
-            ScriptSource::Volumes => {
-                let timeframe = config.require_timeframe(&config.source)?;
-                direct_timeframe_from_seconds(config.provider, timeframe)?;
-            }
-            ScriptSource::Orderbook if historical => {
-                bail!(
-                    "{} does not provide historical orderbooks for script backtests",
-                    source_provider_name(config.provider)
-                );
-            }
-            ScriptSource::Vd if historical => {
-                bail!(
-                    "{} does not provide historical volume delta for script backtests",
-                    source_provider_name(config.provider)
-                );
-            }
-            ScriptSource::Oi if historical => {
-                bail!(
-                    "{} does not provide historical open interest for script backtests",
-                    source_provider_name(config.provider)
-                );
-            }
-            ScriptSource::Orderbook => {
-                if config.timeframe.is_some() {
-                    bail!("standalone live orderbook does not use a timeframe");
-                }
-            }
-            ScriptSource::Vd => {
-                if config.timeframe.is_some() || config.bucket.is_some() {
-                    bail!(
-                        "standalone live volume delta is trade-derived; omit timeframe and bucket"
-                    );
-                }
-            }
-            ScriptSource::Oi => {
-                if config.timeframe.is_some() {
-                    bail!("standalone live open interest is snapshot-based; omit timeframe");
-                }
-            }
-        },
-        ProviderKind::Binance | ProviderKind::BinanceFutures => {
-            if !historical {
-                bail!(
-                    "{} live script sources are not implemented",
-                    source_provider_name(config.provider)
-                );
-            }
+        ProviderKind::Direct => {
+            let adapter = MarketDataAdapter::for_exchange(&config.exchange, false)?;
+            let capabilities = adapter.capabilities();
             match &config.source {
-                ScriptSource::Candles | ScriptSource::Volumes => {
+                ScriptSource::Candles => {
                     let timeframe = config.require_timeframe(&config.source)?;
-                    direct_timeframe_from_seconds(config.provider, timeframe)?;
+                    if historical {
+                        direct_timeframe_from_seconds(&config.exchange, timeframe)?;
+                        if !capabilities.historical_candles {
+                            bail!("{} does not provide historical candles", config.exchange);
+                        }
+                    } else if !capabilities.live_trades {
+                        bail!(
+                            "{} does not provide live trades for candle aggregation",
+                            config.exchange
+                        );
+                    }
                 }
-                ScriptSource::Orderbook
-                | ScriptSource::Trades
-                | ScriptSource::Vd
-                | ScriptSource::Oi => {
+                ScriptSource::Trades if historical => {
                     bail!(
-                        "{} does not provide historical {} for script backtests",
-                        source_provider_name(config.provider),
-                        config.source.as_str()
+                        "{} raw trades are live-only and cannot be backtested",
+                        config.exchange
                     );
+                }
+                ScriptSource::Trades => {
+                    if config.timeframe.is_some() {
+                        bail!("standalone live trades do not use a timeframe");
+                    }
+                    if !capabilities.live_trades {
+                        bail!("{} does not provide live trades", config.exchange);
+                    }
+                }
+                ScriptSource::Volumes => {
+                    let timeframe = config.require_timeframe(&config.source)?;
+                    direct_timeframe_from_seconds(&config.exchange, timeframe)?;
+                    let supported = if historical {
+                        capabilities.historical_volume_bars
+                    } else {
+                        capabilities.live_candles
+                    };
+                    if !supported {
+                        bail!(
+                            "{} does not provide {} volume bars",
+                            config.exchange,
+                            if historical { "historical" } else { "live" }
+                        );
+                    }
+                }
+                ScriptSource::Orderbook if historical => {
+                    bail!(
+                        "{} does not provide historical orderbooks for script backtests",
+                        config.exchange
+                    );
+                }
+                ScriptSource::Vd if historical => {
+                    bail!(
+                        "{} does not provide historical volume delta for script backtests",
+                        config.exchange
+                    );
+                }
+                ScriptSource::Oi if historical => {
+                    bail!(
+                        "{} does not provide historical open interest for script backtests",
+                        config.exchange
+                    );
+                }
+                ScriptSource::Orderbook => {
+                    if config.timeframe.is_some() {
+                        bail!("standalone live orderbook does not use a timeframe");
+                    }
+                    if !capabilities.live_orderbook {
+                        bail!("{} does not provide live orderbooks", config.exchange);
+                    }
+                }
+                ScriptSource::Vd => {
+                    if config.timeframe.is_some() || config.bucket.is_some() {
+                        bail!(
+                            "standalone live volume delta is trade-derived; omit timeframe and bucket"
+                        );
+                    }
+                    if !capabilities.live_trades {
+                        bail!(
+                            "{} does not provide live trades for volume delta",
+                            config.exchange
+                        );
+                    }
+                }
+                ScriptSource::Oi => {
+                    if config.timeframe.is_some() {
+                        bail!("standalone live open interest is snapshot-based; omit timeframe");
+                    }
+                    if !capabilities.live_ticker {
+                        bail!("{} does not provide live open interest", config.exchange);
+                    }
                 }
             }
         }
@@ -495,10 +503,7 @@ fn parse_source_selector(
     validate_exchange_name(&exchange)?;
     let selector = match provider {
         ProviderKind::Mmt => format!("{symbol}@{}@{exchange}@mmt", source.as_str()),
-        ProviderKind::Bulk => format!("{symbol}@{}@bulkf", source.as_str()),
-        ProviderKind::Hyperliquid => format!("{symbol}@{}@{exchange}", source.as_str()),
-        ProviderKind::Binance => format!("{symbol}@{}@binance", source.as_str()),
-        ProviderKind::BinanceFutures => format!("{symbol}@{}@binancef", source.as_str()),
+        ProviderKind::Direct => format!("{symbol}@{}@{exchange}", source.as_str()),
         ProviderKind::MarketLab => unreachable!(),
     };
     Ok((selector, symbol, source, provider, exchange))
@@ -538,31 +543,16 @@ fn validate_source_market(_provider: ProviderKind, exchange: &str, symbol: &str)
 }
 
 fn parse_source_provider(raw: &str) -> Result<ProviderKind> {
-    match raw.trim().to_ascii_lowercase().as_str() {
+    let raw = raw.trim().to_ascii_lowercase();
+    match raw.as_str() {
         "mmt" => Ok(ProviderKind::Mmt),
-        "bulkf" => Ok(ProviderKind::Bulk),
-        "hyperliquid"
-        | "hyperliquidf"
-        | "hyperliquidf-xyz"
-        | "hyperliquidf-io"
-        | "hyperliquid-outcomes" => Ok(ProviderKind::Hyperliquid),
-        "binance" => Ok(ProviderKind::Binance),
-        "binancef" => Ok(ProviderKind::BinanceFutures),
-        other => bail!("unsupported script source provider `{other}`"),
+        _ if MarketDataAdapter::for_exchange(&raw, false).is_ok() => Ok(ProviderKind::Direct),
+        _ => bail!("unsupported script source provider `{raw}`"),
     }
 }
 
-fn direct_timeframe_from_seconds(provider: ProviderKind, seconds: u32) -> Result<&'static str> {
-    match provider {
-        ProviderKind::Bulk => bulk_timeframe_from_seconds(seconds),
-        ProviderKind::Hyperliquid => {
-            crate::providers::hyperliquid::market_data::timeframe_from_seconds(seconds)
-        }
-        ProviderKind::Binance | ProviderKind::BinanceFutures => {
-            crate::providers::binance::market_data::timeframe_from_seconds(seconds)
-        }
-        ProviderKind::Mmt | ProviderKind::MarketLab => unreachable!("direct provider required"),
-    }
+fn direct_timeframe_from_seconds(exchange: &str, seconds: u32) -> Result<&'static str> {
+    MarketDataAdapter::for_exchange(exchange, false)?.timeframe_from_seconds(seconds)
 }
 
 fn validate_exchange_name(exchange: &str) -> Result<()> {
@@ -891,7 +881,7 @@ mod tests {
             .expect("standalone Hyperliquid live configs should validate");
         assert_eq!(
             configs["btc@candles@hyperliquidf"].provider,
-            ProviderKind::Hyperliquid
+            ProviderKind::Direct
         );
         assert_eq!(configs["btc@orderbook@hyperliquidf"].depth, Some(20));
         assert_eq!(configs["btc@trades@hyperliquidf"].timeframe, None);
@@ -930,7 +920,7 @@ mod tests {
             .expect("standalone XYZ live configs should validate");
         assert_eq!(
             configs["tsla@candles@hyperliquidf-xyz"].provider,
-            ProviderKind::Hyperliquid
+            ProviderKind::Direct
         );
         assert_eq!(
             configs["tsla@candles@hyperliquidf-xyz"].exchange,
@@ -975,7 +965,7 @@ mod tests {
         );
         assert_eq!(
             configs["btc/usdc@candles@hyperliquid"].provider,
-            ProviderKind::Hyperliquid
+            ProviderKind::Direct
         );
 
         let oi_manifest = manifest(vec![ScriptSource::Oi]);
@@ -1042,11 +1032,11 @@ mod tests {
             .expect("historical Binance configs should validate");
         assert_eq!(
             configs["btc/usdt@candles@binance"].provider,
-            ProviderKind::Binance
+            ProviderKind::Direct
         );
         assert_eq!(
             configs["btc@volumes@binancef"].provider,
-            ProviderKind::BinanceFutures
+            ProviderKind::Direct
         );
         validate_source_configs_for_run(&manifest, &configs)
             .expect_err("live Binance streams are not implemented");

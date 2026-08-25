@@ -17,11 +17,10 @@ use crate::commands::bot::mid_price::{
     execution_market, floor_to_step, inventory_unwind_plan, is_order_gone_error,
     is_order_gone_message, is_post_only_crossing_message, is_terminal_order_status, live_orderbook,
     quote_plan, render_submission, spawn_account_feed, spawn_book_feed, stop_loss_triggered,
-    venue_key, venue_label,
 };
 use crate::commands::execution::build_trade_plan;
 use crate::domain::execution::{
-    ExecutionReceipt, ExecutionVenue, Fill, OpenOrder, OrderSide, PositionDirection, TradePlan,
+    ExecutionReceipt, Fill, OpenOrder, OrderSide, PositionDirection, TradePlan,
 };
 use crate::providers::bulk::market_data::normalize_timestamp_ms;
 use crate::providers::execution::ExecutionAdapter;
@@ -45,7 +44,7 @@ struct GridPlanLevel {
 struct GridPlanView<'a> {
     r#type: &'static str,
     bot: &'static str,
-    venue: &'static str,
+    venue: String,
     symbol: &'a str,
     max_inventory_size: f64,
     requested_margin: Option<f64>,
@@ -81,12 +80,12 @@ pub async fn handle(args: RunGridArgs) -> Result<()> {
         .bids
         .first()
         .copied()
-        .with_context(|| format!("{} book has no bid", venue_label(parent.venue)))?;
+        .with_context(|| format!("{} book has no bid", parent.venue.label()))?;
     let best_ask = book
         .asks
         .first()
         .copied()
-        .with_context(|| format!("{} book has no ask", venue_label(parent.venue)))?;
+        .with_context(|| format!("{} book has no ask", parent.venue.label()))?;
     let center = (best_bid.price + best_ask.price) / 2.0;
     let raw = quote_grid(GridSpec {
         center_price: center,
@@ -209,15 +208,7 @@ fn worker_trade_args(definition: &GridJobDefinition) -> TradeArgs {
         symbol: definition.symbol.clone(),
         symbol_flag: None,
         config: None,
-        venue: match definition.venue {
-            ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
-            ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
-            ExecutionVenue::Hyperlink => ExecutionVenueArg::Hyperlink,
-            ExecutionVenue::HyperliquidXyz => ExecutionVenueArg::HyperliquidXyz,
-            ExecutionVenue::HyperliquidIo => ExecutionVenueArg::HyperliquidIo,
-            ExecutionVenue::HyperliquidSpot => ExecutionVenueArg::HyperliquidSpot,
-            ExecutionVenue::HyperliquidOutcomes => ExecutionVenueArg::HyperliquidOutcomes,
-        },
+        venue: definition.venue,
         testnet: definition.testnet,
         size: Some(definition.max_inventory_size),
         margin: None,
@@ -244,7 +235,7 @@ fn plan_view<'a>(
     GridPlanView {
         r#type: "bot.plan",
         bot: BOT_NAME,
-        venue: venue_key(parent.venue),
+        venue: parent.venue.to_string(),
         symbol: &parent.internal_symbol,
         max_inventory_size: definition.max_inventory_size,
         requested_margin: definition.requested_margin,
@@ -517,12 +508,12 @@ async fn run_worker(job_id: &str, definition: &GridJobDefinition) -> Result<()> 
         .bids
         .first()
         .copied()
-        .with_context(|| format!("{} book has no bid", venue_label(definition.venue)))?;
+        .with_context(|| format!("{} book has no bid", definition.venue.label()))?;
     let initial_ask = initial_book
         .asks
         .first()
         .copied()
-        .with_context(|| format!("{} book has no ask", venue_label(definition.venue)))?;
+        .with_context(|| format!("{} book has no ask", definition.venue.label()))?;
     let anchor_mid = (initial_bid.price + initial_ask.price) / 2.0;
     let initial_quotes = executable_quotes(
         quote_grid(GridSpec {

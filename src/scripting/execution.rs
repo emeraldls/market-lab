@@ -658,23 +658,20 @@ where
 {
     let mut value: serde_json::Value = serde_json::from_str(payload)
         .with_context(|| format!("{operation} request must be valid JSON"))?;
-    let exchange = if request_routed {
-        let object = value
-            .as_object_mut()
-            .with_context(|| format!("{operation} request must be an object"))?;
-        let raw = object
-            .remove("exchange")
-            .with_context(|| format!("{operation} requires exchange in Python Scripting V2"))?;
-        Some(
-            serde_json::from_value(raw).with_context(|| {
-                format!(
-                    "{operation} exchange must be a supported execution exchange: bulkf, hyperliquidf, hyperliquidf-xyz, hyperliquidf-io, hyperliquid, or hyperliquid-outcomes"
-                )
-            })?,
-        )
-    } else {
-        None
-    };
+    let exchange =
+        if request_routed {
+            let object = value
+                .as_object_mut()
+                .with_context(|| format!("{operation} request must be an object"))?;
+            let raw = object
+                .remove("exchange")
+                .with_context(|| format!("{operation} requires exchange in Python Scripting V2"))?;
+            Some(serde_json::from_value(raw).with_context(|| {
+                format!("{operation} exchange is not a registered execution venue")
+            })?)
+        } else {
+            None
+        };
     let request =
         serde_json::from_value(value).with_context(|| format!("{operation} request is invalid"))?;
     Ok((exchange, request))

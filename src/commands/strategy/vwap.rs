@@ -8,19 +8,13 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::cli::{
-    CliSide, ExecutionVenueArg, OutputFormat, RunVwapArgs, TradeArgs, TradeOrderKind,
-    TradeTimeInForce,
-};
+use crate::cli::{CliSide, OutputFormat, RunVwapArgs, TradeArgs, TradeOrderKind, TradeTimeInForce};
 use crate::commands::execution::build_trade_plan;
 use crate::domain::execution::{ExecutionVenue, PositionDirection, TradePlan};
 use crate::domain::types::{OiCandle, OrderBookLevel, OrderBookSnapshot};
-use crate::providers::bulk::market_data::BulkProvider;
-use crate::providers::bulk::ws::{BulkOrderBookStream, BulkTradesStream};
 use crate::providers::execution::ExecutionAdapter;
 use crate::providers::hyperliquid::HyperliquidNetwork;
-use crate::providers::hyperliquid::market_data::HyperliquidProvider;
-use crate::providers::hyperliquid::ws::{HyperliquidOrderBookStream, HyperliquidTradesStream};
+use crate::providers::market_data::{MarketDataAdapter, VenueOrderBookStream, VenueTradesStream};
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::utils::{
     normalize_exchange_for_mmt, normalize_symbol_for_mmt, normalize_to_ms,
@@ -48,123 +42,6 @@ const TRAJECTORY_BAND_FRACTION: f64 = 0.005;
 pub(super) const MAX_PARTICIPATION_RATE: f64 = 0.10;
 pub(super) const MAX_TAKER_SLIPPAGE_BPS: f64 = 20.0;
 const FINAL_FILL_WAIT_SECS: u64 = 10;
-
-enum WeightedOrderBookStream {
-    Bulk(BulkOrderBookStream),
-    Hyperliquid(HyperliquidOrderBookStream),
-}
-
-impl WeightedOrderBookStream {
-    async fn connect(
-        venue: ExecutionVenue,
-        symbol: &str,
-        depth: u16,
-        testnet: bool,
-    ) -> Result<Self> {
-        match venue {
-            ExecutionVenue::Bulk => Ok(Self::Bulk(
-                BulkOrderBookStream::connect(symbol, depth).await?,
-            )),
-            ExecutionVenue::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidOrderBookStream::connect_on(
-                    symbol,
-                    depth.min(20),
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            ExecutionVenue::Hyperlink => Ok(Self::Hyperliquid(
-                HyperliquidOrderBookStream::connect_on(
-                    symbol,
-                    depth.min(20),
-                    HyperliquidNetwork::Mainnet,
-                )
-                .await?,
-            )),
-            ExecutionVenue::HyperliquidXyz => Ok(Self::Hyperliquid(
-                HyperliquidOrderBookStream::connect_for(
-                    crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual,
-                    symbol,
-                    depth.min(20),
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            ExecutionVenue::HyperliquidIo => Ok(Self::Hyperliquid(
-                HyperliquidOrderBookStream::connect_for(
-                    crate::providers::hyperliquid::HyperliquidProduct::IoPerpetual,
-                    symbol,
-                    depth.min(20),
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            ExecutionVenue::HyperliquidSpot => Ok(Self::Hyperliquid(
-                HyperliquidOrderBookStream::connect_for(
-                    crate::providers::hyperliquid::HyperliquidProduct::Spot,
-                    symbol,
-                    depth.min(20),
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            ExecutionVenue::HyperliquidOutcomes => {
-                bail!("VWAP does not support outcome-market execution")
-            }
-        }
-    }
-
-    async fn next_snapshot(&mut self) -> Result<OrderBookSnapshot> {
-        match self {
-            Self::Bulk(stream) => stream.next_snapshot().await,
-            Self::Hyperliquid(stream) => stream.next_snapshot().await,
-        }
-    }
-}
-
-enum WeightedTradesStream {
-    Bulk(BulkTradesStream),
-    Hyperliquid(HyperliquidTradesStream),
-}
-
-impl WeightedTradesStream {
-    async fn connect(exchange: &str, symbol: &str, testnet: bool) -> Result<Self> {
-        match exchange {
-            "bulkf" => Ok(Self::Bulk(BulkTradesStream::connect(symbol).await?)),
-            "hyperliquidf" => Ok(Self::Hyperliquid(
-                HyperliquidTradesStream::connect_on(
-                    symbol,
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            "hyperliquidf-xyz" => Ok(Self::Hyperliquid(
-                HyperliquidTradesStream::connect_for(
-                    crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual,
-                    symbol,
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            "hyperliquidf-io" => Ok(Self::Hyperliquid(
-                HyperliquidTradesStream::connect_for(
-                    crate::providers::hyperliquid::HyperliquidProduct::IoPerpetual,
-                    symbol,
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            _ => bail!("standalone live trade adapter for `{exchange}` is not implemented"),
-        }
-    }
-
-    async fn next_trades(&mut self) -> Result<Vec<crate::domain::types::TradeTick>> {
-        match self {
-            Self::Bulk(stream) => stream.next_trades().await,
-            Self::Hyperliquid(stream) => stream.next_trades().await,
-        }
-    }
-}
 
 pub(super) struct WeightedCurves {
     pub(super) trajectory: VolumeCurve,
@@ -283,7 +160,7 @@ impl ParticipationLedger {
 struct VwapPlanView<'a> {
     r#type: &'static str,
     strategy: &'static str,
-    venue: &'static str,
+    venue: String,
     symbol: &'a str,
     side: &'static str,
     total_size: f64,
@@ -366,7 +243,7 @@ struct VwapRunSummary<'a> {
     r#type: &'static str,
     strategy: &'static str,
     job_id: &'a str,
-    venue: &'static str,
+    venue: String,
     symbol: &'a str,
     side: &'static str,
     status: &'static str,
@@ -527,10 +404,10 @@ impl LiveVolumeTracker {
 
 pub async fn handle(args: RunVwapArgs) -> Result<()> {
     args.validate()?;
-    let execution_venue = ExecutionVenue::from(args.venue);
+    let execution_venue = args.venue;
     let selector = VolumeSourceSelector::parse(
         &args.volume_sources,
-        execution_venue_name(execution_venue),
+        &execution_market_data_name(execution_venue),
         &args.symbol,
     )?;
     let direction = direction(args.side);
@@ -693,7 +570,7 @@ pub(super) async fn run_weighted_execution(
 ) -> Result<()> {
     let direction = strategy_direction(definition.side);
     let market = crate::markets::exchange_market(
-        execution_venue_name(definition.venue),
+        &execution_market_data_name(definition.venue),
         &definition.symbol,
     )?;
     let rules = market.execution_rules()?;
@@ -710,7 +587,7 @@ pub(super) async fn run_weighted_execution(
     let adapter = ExecutionAdapter::new(definition.venue, definition.testnet).await?;
     let mut orders = StrategyOrderManager::new(job_id, &parent);
     let started = Instant::now();
-    let mut book_stream = WeightedOrderBookStream::connect(
+    let mut book_stream = VenueOrderBookStream::connect(
         definition.venue,
         &definition.symbol,
         ORDERBOOK_DEPTH,
@@ -1052,7 +929,7 @@ async fn build_curves(
         .iter()
         .filter(|source| source.provider == VolumeProvider::Direct)
     {
-        if source.exchange == execution_venue_name(execution_venue) {
+        if source.exchange == execution_market_data_name(execution_venue) {
             trajectory_history.extend(execution_history.iter().copied());
         } else {
             trajectory_history.extend(
@@ -1092,7 +969,7 @@ pub(super) async fn fetch_execution_volume_history(
     testnet: bool,
 ) -> Result<Vec<HistoricalVolume>> {
     fetch_direct_volume_history_on(
-        execution_venue_name(venue),
+        &execution_market_data_name(venue),
         symbol,
         from_ms,
         to_ms,
@@ -1130,43 +1007,11 @@ async fn fetch_direct_volume_history_on(
     let mut points = BTreeMap::new();
     while cursor < to_ms {
         let chunk_to = cursor.saturating_add(chunk_ms).min(to_ms);
-        let series = match exchange {
-            "bulkf" => BulkProvider::volume_bars(symbol, "1m", cursor, chunk_to).await?,
-            "hyperliquidf" => {
-                HyperliquidProvider::volume_bars_for(
-                    crate::providers::hyperliquid::HyperliquidProduct::Perpetual,
-                    symbol,
-                    "1m",
-                    cursor,
-                    chunk_to,
-                    network,
-                )
-                .await?
-            }
-            "hyperliquidf-xyz" => {
-                HyperliquidProvider::volume_bars_for(
-                    crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual,
-                    symbol,
-                    "1m",
-                    cursor,
-                    chunk_to,
-                    network,
-                )
-                .await?
-            }
-            "hyperliquidf-io" => {
-                HyperliquidProvider::volume_bars_for(
-                    crate::providers::hyperliquid::HyperliquidProduct::IoPerpetual,
-                    symbol,
-                    "1m",
-                    cursor,
-                    chunk_to,
-                    network,
-                )
-                .await?
-            }
-            _ => bail!("standalone volume adapter for `{exchange}` is not implemented"),
-        };
+        let venue = ExecutionVenue::parse(exchange)?;
+        let testnet = network == HyperliquidNetwork::Testnet;
+        let series = MarketDataAdapter::for_venue(venue, testnet)?
+            .volume_bars(symbol, "1m", cursor, chunk_to)
+            .await?;
         for bar in series.data {
             if bar.t >= from_ms && bar.t < to_ms {
                 points.insert(bar.t, bar.volume);
@@ -1230,7 +1075,7 @@ fn spawn_live_volume_feeds(
             }
         });
     }
-    let execution_exchange = execution_venue_name(execution_venue).to_string();
+    let execution_exchange = execution_market_data_name(execution_venue);
     let includes_execution_trajectory = sources.iter().any(|source| {
         source.provider == VolumeProvider::Direct && source.exchange == execution_exchange
     });
@@ -1324,7 +1169,7 @@ fn spawn_live_open_interest_feeds(
     });
 
     let execution_symbol = symbol.to_string();
-    let execution_source = execution_venue_name(execution_venue).to_string();
+    let execution_source = execution_market_data_name(execution_venue);
     tokio::spawn(async move {
         if let Err(error) = stream_direct_trades(
             &execution_source,
@@ -1447,7 +1292,8 @@ async fn stream_direct_trades(
     testnet: bool,
     sender: mpsc::Sender<LiveVolumeEvent>,
 ) -> Result<()> {
-    let mut stream = WeightedTradesStream::connect(exchange, symbol, testnet).await?;
+    let venue = ExecutionVenue::parse(exchange)?;
+    let mut stream = VenueTradesStream::connect(venue, symbol, testnet).await?;
     loop {
         for trade in stream.next_trades().await? {
             sender
@@ -1706,7 +1552,7 @@ fn append_summary(
             r#type: "strategy.run.finished",
             strategy: definition.strategy,
             job_id,
-            venue: execution_venue_name(definition.venue),
+            venue: definition.venue.to_string(),
             symbol: &definition.symbol,
             side: strategy_side_name(definition.side),
             status,
@@ -1732,7 +1578,7 @@ fn plan_view(input: PlanInput<'_>) -> VwapPlanView<'_> {
     VwapPlanView {
         r#type: "strategy.plan",
         strategy: "vwap",
-        venue: execution_venue_name(input.parent.venue),
+        venue: input.parent.venue.to_string(),
         symbol: input.symbol,
         side: input.side,
         total_size: input.parent.size,
@@ -1867,15 +1713,7 @@ pub(super) fn worker_trade_args(
         symbol: definition.symbol.clone(),
         symbol_flag: None,
         config: None,
-        venue: match definition.venue {
-            ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
-            ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
-            ExecutionVenue::Hyperlink => ExecutionVenueArg::Hyperlink,
-            ExecutionVenue::HyperliquidXyz => ExecutionVenueArg::HyperliquidXyz,
-            ExecutionVenue::HyperliquidIo => ExecutionVenueArg::HyperliquidIo,
-            ExecutionVenue::HyperliquidSpot => ExecutionVenueArg::HyperliquidSpot,
-            ExecutionVenue::HyperliquidOutcomes => ExecutionVenueArg::HyperliquidOutcomes,
-        },
+        venue: definition.venue,
         testnet: definition.testnet,
         size: Some(size),
         margin: None,
@@ -1903,7 +1741,7 @@ pub(super) fn worker_trade_args(
 fn confirm_live_execution(venue: ExecutionVenue, testnet: bool) -> Result<bool> {
     print!(
         "Submit a live maker-first VWAP job on {}? [y/N]: ",
-        execution_venue_network_name(venue, testnet)
+        venue.network_label(testnet)
     );
     io::stdout()
         .flush()
@@ -1918,33 +1756,8 @@ fn confirm_live_execution(venue: ExecutionVenue, testnet: bool) -> Result<bool> 
     ))
 }
 
-pub(super) fn execution_venue_network_name(venue: ExecutionVenue, testnet: bool) -> &'static str {
-    match (venue, testnet) {
-        (ExecutionVenue::Bulk, _) => "BULK testnet",
-        (ExecutionVenue::Hyperliquid, true) => "Hyperliquid testnet",
-        (ExecutionVenue::Hyperliquid, false) => "Hyperliquid mainnet",
-        (ExecutionVenue::Hyperlink, _) => "HyperLink mainnet",
-        (ExecutionVenue::HyperliquidXyz, true) => "Hyperliquid XYZ testnet",
-        (ExecutionVenue::HyperliquidXyz, false) => "Hyperliquid XYZ mainnet",
-        (ExecutionVenue::HyperliquidIo, true) => "Hyperliquid EntropyIO testnet",
-        (ExecutionVenue::HyperliquidIo, false) => "Hyperliquid EntropyIO mainnet",
-        (ExecutionVenue::HyperliquidSpot, true) => "Hyperliquid Spot testnet",
-        (ExecutionVenue::HyperliquidSpot, false) => "Hyperliquid Spot mainnet",
-        (ExecutionVenue::HyperliquidOutcomes, true) => "Hyperliquid Outcomes testnet",
-        (ExecutionVenue::HyperliquidOutcomes, false) => "Hyperliquid Outcomes mainnet",
-    }
-}
-
-pub(super) fn execution_venue_name(venue: ExecutionVenue) -> &'static str {
-    match venue {
-        ExecutionVenue::Bulk => "bulkf",
-        ExecutionVenue::Hyperliquid => "hyperliquidf",
-        ExecutionVenue::Hyperlink => "hyperlinkf",
-        ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
-        ExecutionVenue::HyperliquidIo => "hyperliquidf-io",
-        ExecutionVenue::HyperliquidSpot => "hyperliquid",
-        ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
-    }
+fn execution_market_data_name(venue: ExecutionVenue) -> String {
+    venue.market_data_id().to_string()
 }
 
 fn direction(side: CliSide) -> PositionDirection {

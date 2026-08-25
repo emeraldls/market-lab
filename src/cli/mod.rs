@@ -215,7 +215,7 @@ pub struct TradeArgs {
     pub symbol_flag: Option<String>,
     #[arg(long)]
     pub config: Option<PathBuf>,
-    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
     /// Use Hyperliquid testnet instead of the default mainnet.
     #[arg(long, default_value_t = false)]
@@ -348,7 +348,7 @@ impl TradeArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct AccountQueryArgs {
-    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
     /// Query Hyperliquid testnet instead of the default mainnet.
     #[arg(long, default_value_t = false)]
@@ -363,7 +363,7 @@ pub struct AccountQueryArgs {
 pub struct CancelOrderArgs {
     pub symbol: String,
     pub order_id: String,
-    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
     /// Cancel on Hyperliquid testnet instead of the default mainnet.
     #[arg(long, default_value_t = false)]
@@ -396,7 +396,7 @@ impl CancelOrderArgs {
 #[derive(Clone, Debug, Args)]
 pub struct ClosePositionArgs {
     pub symbol: Option<String>,
-    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
     /// Close on Hyperliquid testnet instead of the default mainnet.
     #[arg(long, default_value_t = false)]
@@ -438,55 +438,10 @@ impl AccountQueryArgs {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum ExecutionVenueArg {
-    #[value(name = "bulkf")]
-    Bulk,
-    #[value(name = "hyperliquidf")]
-    Hyperliquid,
-    #[value(name = "hyperlinkf")]
-    Hyperlink,
-    #[value(name = "hyperliquidf-xyz")]
-    HyperliquidXyz,
-    #[value(name = "hyperliquidf-io")]
-    HyperliquidIo,
-    #[value(name = "hyperliquid")]
-    HyperliquidSpot,
-    #[value(name = "hyperliquid-outcomes")]
-    HyperliquidOutcomes,
-}
+pub type ExecutionVenueArg = ExecutionVenue;
 
 fn validate_execution_network(venue: ExecutionVenueArg, testnet: bool) -> Result<()> {
-    if testnet && venue == ExecutionVenueArg::Hyperlink {
-        bail!("--testnet is not supported by HyperLink");
-    }
-    if testnet
-        && !matches!(
-            venue,
-            ExecutionVenueArg::Hyperliquid
-                | ExecutionVenueArg::HyperliquidXyz
-                | ExecutionVenueArg::HyperliquidIo
-                | ExecutionVenueArg::HyperliquidSpot
-                | ExecutionVenueArg::HyperliquidOutcomes
-        )
-    {
-        bail!("--testnet is only valid with a Hyperliquid venue");
-    }
-    Ok(())
-}
-
-impl From<ExecutionVenueArg> for ExecutionVenue {
-    fn from(value: ExecutionVenueArg) -> Self {
-        match value {
-            ExecutionVenueArg::Bulk => ExecutionVenue::Bulk,
-            ExecutionVenueArg::Hyperliquid => ExecutionVenue::Hyperliquid,
-            ExecutionVenueArg::Hyperlink => ExecutionVenue::Hyperlink,
-            ExecutionVenueArg::HyperliquidXyz => ExecutionVenue::HyperliquidXyz,
-            ExecutionVenueArg::HyperliquidIo => ExecutionVenue::HyperliquidIo,
-            ExecutionVenueArg::HyperliquidSpot => ExecutionVenue::HyperliquidSpot,
-            ExecutionVenueArg::HyperliquidOutcomes => ExecutionVenue::HyperliquidOutcomes,
-        }
-    }
+    venue.spec()?.validate_network(testnet)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -853,18 +808,9 @@ impl ScriptRunArgs {
                     "Python Scripting V2 derives data from literal history.source calls; remove --source and [sources] from marketlab.toml"
                 );
             }
-        } else if self.testnet
-            && !matches!(
-                self.venue,
-                Some(
-                    ExecutionVenueArg::Hyperliquid
-                        | ExecutionVenueArg::HyperliquidXyz
-                        | ExecutionVenueArg::HyperliquidIo
-                        | ExecutionVenueArg::HyperliquidSpot
-                        | ExecutionVenueArg::HyperliquidOutcomes
-                )
-            )
-        {
+        } else if let Some(venue) = self.venue {
+            validate_execution_network(venue, self.testnet)?;
+        } else if self.testnet {
             bail!("--testnet requires a Hyperliquid execution venue");
         }
         Ok(())
@@ -986,16 +932,7 @@ pub struct SourceVdArgs {
 impl SourceVdArgs {
     pub fn validate(&self) -> Result<()> {
         let provider = validate_source_identity(self.provider, &self.exchange, &self.symbol)?;
-        if matches!(
-            provider,
-            CliProviderKind::Binance | CliProviderKind::BinanceFutures
-        ) {
-            bail!("Binance live volume delta is not implemented");
-        }
-        if matches!(
-            provider,
-            CliProviderKind::Bulk | CliProviderKind::Hyperliquid
-        ) {
+        if provider == CliProviderKind::Direct {
             if !self.stream {
                 bail!("standalone volume delta is derived from live trades and requires --stream");
             }
@@ -1127,7 +1064,7 @@ impl SourceCandlesArgs {
     }
 
     pub fn timeframe_name(&self) -> Result<&'static str> {
-        provider_timeframe_from_seconds(self.provider_kind()?, self.timeframe)
+        provider_timeframe_from_seconds(self.provider_kind()?, &self.exchange, self.timeframe)
     }
 
     pub fn exchange_name(&self) -> Result<&str> {
@@ -1168,22 +1105,13 @@ pub struct SourceOiArgs {
 impl SourceOiArgs {
     pub fn validate(&self) -> Result<()> {
         let provider = validate_source_identity(self.provider, &self.exchange, &self.symbol)?;
-        if matches!(
-            provider,
-            CliProviderKind::Binance | CliProviderKind::BinanceFutures
-        ) {
-            bail!("Binance open interest is not implemented");
-        }
         if !crate::markets::is_futures_exchange(&self.exchange)? {
             bail!(
                 "open interest requires a futures exchange; `{}` is spot",
                 self.exchange
             );
         }
-        if matches!(
-            provider,
-            CliProviderKind::Bulk | CliProviderKind::Hyperliquid
-        ) {
+        if provider == CliProviderKind::Direct {
             if self.timeframe.is_some() || self.from.is_some() || self.to.is_some() {
                 bail!(
                     "standalone open interest is current/live only; omit --timeframe/--from/--to"
@@ -1268,7 +1196,7 @@ impl SourceVolumesArgs {
     }
 
     pub fn timeframe_name(&self) -> Result<&'static str> {
-        provider_timeframe_from_seconds(self.provider_kind()?, self.timeframe)
+        provider_timeframe_from_seconds(self.provider_kind()?, &self.exchange, self.timeframe)
     }
 
     pub fn exchange_name(&self) -> Result<&str> {
@@ -1298,15 +1226,7 @@ impl TimeframeSourceValidation<'_> {
             bail!("--exchange cannot be empty");
         }
         validate_exchange_symbol(self.exchange, self.symbol)?;
-        provider_timeframe_from_seconds(self.provider, self.timeframe)?;
-        if self.stream
-            && matches!(
-                self.provider,
-                CliProviderKind::Binance | CliProviderKind::BinanceFutures
-            )
-        {
-            bail!("Binance live candle and volume streaming is not implemented");
-        }
+        provider_timeframe_from_seconds(self.provider, self.exchange, self.timeframe)?;
         if self.stream {
             if self.from.is_some() || self.to.is_some() {
                 bail!("--from/--to are not allowed with --stream");
@@ -1863,7 +1783,7 @@ pub struct DepthArgs {
 #[derive(Clone, Debug, Args)]
 pub struct RunTwapArgs {
     pub symbol: String,
-    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
     /// Execute through Hyperliquid testnet instead of the default mainnet.
     #[arg(long, default_value_t = false)]
@@ -1898,7 +1818,7 @@ pub struct RunTwapArgs {
 #[derive(Clone, Debug, Args)]
 pub struct RunVwapArgs {
     pub symbol: String,
-    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
     /// Execute through Hyperliquid testnet instead of the default mainnet.
     #[arg(long, default_value_t = false)]
@@ -1933,7 +1853,7 @@ pub struct RunVwapArgs {
 #[derive(Clone, Debug, Args)]
 pub struct RunOiwapArgs {
     pub symbol: String,
-    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
     /// Execute through Hyperliquid testnet instead of the default mainnet.
     #[arg(long, default_value_t = false)]
@@ -1968,7 +1888,7 @@ pub struct RunOiwapArgs {
 #[derive(Clone, Debug, Args)]
 pub struct RunMidPriceArgs {
     pub symbol: String,
-    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
     /// Execute through Hyperliquid testnet instead of the default mainnet.
     #[arg(long, default_value_t = false)]
@@ -2017,7 +1937,7 @@ pub struct RunVolumeMidArgs {
 #[derive(Clone, Debug, Args)]
 pub struct RunGridArgs {
     pub symbol: String,
-    #[arg(long, value_enum, default_value_t = ExecutionVenueArg::Bulk)]
+    #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
     /// Execute through Hyperliquid testnet instead of the default mainnet.
     #[arg(long, default_value_t = false)]
@@ -2249,19 +2169,14 @@ impl RunVwapArgs {
         if matches!(self.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("strategy run supports only --output terminal|json|jsonl");
         }
-        let execution_venue = match self.venue {
-            ExecutionVenueArg::Bulk => "bulkf",
-            ExecutionVenueArg::Hyperliquid => "hyperliquidf",
-            ExecutionVenueArg::Hyperlink => "hyperliquidf",
-            ExecutionVenueArg::HyperliquidXyz => "hyperliquidf-xyz",
-            ExecutionVenueArg::HyperliquidIo => "hyperliquidf-io",
-            ExecutionVenueArg::HyperliquidSpot => {
-                bail!("VWAP does not support spot execution yet")
-            }
-            ExecutionVenueArg::HyperliquidOutcomes => {
-                bail!("VWAP does not support outcome-market execution")
-            }
-        };
+        let venue = self.venue.spec()?;
+        if venue.market == crate::venues::VenueMarket::Spot {
+            bail!("VWAP does not support spot execution yet");
+        }
+        if venue.market == crate::venues::VenueMarket::Outcome {
+            bail!("VWAP does not support outcome-market execution");
+        }
+        let execution_venue = venue.market_data_venue.as_str();
         crate::strategies::vwap::VolumeSourceSelector::parse(
             &self.volume_sources,
             execution_venue,
@@ -2537,17 +2452,16 @@ impl VampArgs {
 }
 
 fn validate_execution_symbol(venue: ExecutionVenueArg, symbol: &str) -> Result<()> {
-    if venue == ExecutionVenueArg::HyperliquidOutcomes {
+    let venue = venue.spec()?;
+    if venue.market == crate::venues::VenueMarket::Outcome {
         return crate::providers::hyperliquid::outcomes::parse_symbol(symbol).map(|_| ());
     }
-    let market_type = match venue {
-        ExecutionVenueArg::Bulk
-        | ExecutionVenueArg::Hyperliquid
-        | ExecutionVenueArg::Hyperlink
-        | ExecutionVenueArg::HyperliquidXyz
-        | ExecutionVenueArg::HyperliquidIo => crate::markets::MarketType::Futures,
-        ExecutionVenueArg::HyperliquidSpot => crate::markets::MarketType::Spot,
-        ExecutionVenueArg::HyperliquidOutcomes => unreachable!("handled above"),
+    let market_type = match venue.market {
+        crate::venues::VenueMarket::Spot => crate::markets::MarketType::Spot,
+        crate::venues::VenueMarket::Perpetual | crate::venues::VenueMarket::Hip3 => {
+            crate::markets::MarketType::Futures
+        }
+        crate::venues::VenueMarket::Outcome => unreachable!("handled above"),
     };
     crate::markets::canonical_market_symbol(symbol, market_type).map(|_| ())
 }
@@ -2594,22 +2508,15 @@ fn resolve_source_provider(
         }
         return Ok(CliProviderKind::Mmt);
     }
-    if exchange.eq_ignore_ascii_case("bulkf") {
-        return Ok(CliProviderKind::Bulk);
-    }
-    if exchange.eq_ignore_ascii_case("hyperliquidf")
-        || exchange.eq_ignore_ascii_case("hyperliquidf-xyz")
-        || exchange.eq_ignore_ascii_case("hyperliquidf-io")
-        || exchange.eq_ignore_ascii_case("hyperliquid")
-        || exchange.eq_ignore_ascii_case("hyperliquid-outcomes")
-    {
-        return Ok(CliProviderKind::Hyperliquid);
+    if let Ok(venue) = ExecutionVenue::parse(exchange) {
+        let _ = venue;
+        return Ok(CliProviderKind::Direct);
     }
     if exchange.eq_ignore_ascii_case("binance") {
-        return Ok(CliProviderKind::Binance);
+        return Ok(CliProviderKind::Direct);
     }
     if exchange.eq_ignore_ascii_case("binancef") {
-        return Ok(CliProviderKind::BinanceFutures);
+        return Ok(CliProviderKind::Direct);
     }
     bail!(
         "standalone exchange `{exchange}` is not supported yet; use --provider mmt when `{exchange}` is routed through MMT"
@@ -2632,27 +2539,14 @@ fn resolve_system_provider(
             bail!("omit --provider for the standalone `{exchange}` exchange")
         }
         (Some(_), _) => Ok(ProviderKind::Mmt),
-        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("bulkf") => Ok(ProviderKind::Bulk),
-        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquidf") => {
-            Ok(ProviderKind::Hyperliquid)
-        }
-        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquidf-xyz") => {
-            Ok(ProviderKind::Hyperliquid)
-        }
-        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquidf-io") => {
-            Ok(ProviderKind::Hyperliquid)
-        }
-        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquid") => {
-            Ok(ProviderKind::Hyperliquid)
-        }
-        (None, Some(exchange)) if exchange.eq_ignore_ascii_case("hyperliquid-outcomes") => {
-            Ok(ProviderKind::Hyperliquid)
+        (None, Some(exchange)) if ExecutionVenue::parse(exchange).is_ok() => {
+            resolve_source_provider(None, exchange).map(Into::into)
         }
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("binance") => {
-            Ok(ProviderKind::Binance)
+            Ok(ProviderKind::Direct)
         }
         (None, Some(exchange)) if exchange.eq_ignore_ascii_case("binancef") => {
-            Ok(ProviderKind::BinanceFutures)
+            Ok(ProviderKind::Direct)
         }
         (None, Some(exchange)) => bail!("unsupported standalone exchange `{exchange}`"),
         (None, None) => Ok(ProviderKind::MarketLab),
@@ -2661,17 +2555,13 @@ fn resolve_system_provider(
 
 fn provider_timeframe_from_seconds(
     provider: CliProviderKind,
+    exchange: &str,
     seconds: u32,
 ) -> Result<&'static str> {
     match provider {
-        CliProviderKind::Bulk => {
-            crate::providers::bulk::market_data::timeframe_from_seconds(seconds)
-        }
-        CliProviderKind::Hyperliquid => {
-            crate::providers::hyperliquid::market_data::timeframe_from_seconds(seconds)
-        }
-        CliProviderKind::Binance | CliProviderKind::BinanceFutures => {
-            crate::providers::binance::market_data::timeframe_from_seconds(seconds)
+        CliProviderKind::Direct => {
+            crate::providers::market_data::MarketDataAdapter::for_exchange(exchange, false)?
+                .timeframe_from_seconds(seconds)
         }
         CliProviderKind::Mmt | CliProviderKind::MarketLab => mmt_timeframe_from_seconds(seconds),
     }
@@ -2743,10 +2633,7 @@ pub enum CliDataProvider {
 pub enum CliProviderKind {
     MarketLab,
     Mmt,
-    Bulk,
-    Hyperliquid,
-    Binance,
-    BinanceFutures,
+    Direct,
 }
 
 impl From<CliDataProvider> for CliProviderKind {
@@ -2762,10 +2649,7 @@ impl From<CliProviderKind> for ProviderKind {
         match value {
             CliProviderKind::MarketLab => ProviderKind::MarketLab,
             CliProviderKind::Mmt => ProviderKind::Mmt,
-            CliProviderKind::Bulk => ProviderKind::Bulk,
-            CliProviderKind::Hyperliquid => ProviderKind::Hyperliquid,
-            CliProviderKind::Binance => ProviderKind::Binance,
-            CliProviderKind::BinanceFutures => ProviderKind::BinanceFutures,
+            CliProviderKind::Direct => ProviderKind::Direct,
         }
     }
 }
@@ -2813,32 +2697,6 @@ pub enum OutputFormat {
 mod tests {
     use super::*;
     use clap::Parser;
-
-    #[test]
-    fn parse_bulk_markets_command() {
-        let cli = Cli::try_parse_from([
-            "mlab",
-            "markets",
-            "--exchange",
-            "bulkf",
-            "--symbol",
-            "BTC",
-            "--json",
-        ])
-        .expect("markets command should parse");
-
-        match cli.command {
-            Commands::Markets(args) => {
-                assert!(args.provider.is_none());
-                assert_eq!(args.exchange, "bulkf");
-                assert_eq!(args.symbol.as_deref(), Some("BTC"));
-                assert!(!args.refresh);
-                assert!(args.json);
-                args.validate().expect("BULK markets should validate");
-            }
-            _ => panic!("expected markets command"),
-        }
-    }
 
     #[test]
     fn parses_remote_management_and_global_override() {
@@ -2936,7 +2794,7 @@ mod tests {
                     .expect("standalone Hyperliquid source should validate");
                 assert_eq!(
                     args.provider_kind().expect("provider resolves"),
-                    CliProviderKind::Hyperliquid
+                    CliProviderKind::Direct
                 );
             }
             _ => panic!("expected source orderbook command"),
@@ -3014,7 +2872,7 @@ mod tests {
                 args.validate().expect("standalone XYZ source validates");
                 assert_eq!(
                     args.provider_kind().expect("XYZ provider resolves"),
-                    CliProviderKind::Hyperliquid
+                    CliProviderKind::Direct
                 );
             }
             _ => panic!("expected XYZ source orderbook command"),
@@ -3039,7 +2897,7 @@ mod tests {
                 command: TradeCommands::Long(args),
             } => {
                 args.validate_shape().expect("XYZ trade shape validates");
-                assert!(matches!(args.venue, ExecutionVenueArg::HyperliquidXyz));
+                assert_eq!(args.venue.as_str(), "hyperliquidf-xyz");
             }
             _ => panic!("expected XYZ trade long command"),
         }
@@ -3064,7 +2922,7 @@ mod tests {
                     .expect("standalone EntropyIO source validates");
                 assert_eq!(
                     args.provider_kind().expect("EntropyIO provider resolves"),
-                    CliProviderKind::Hyperliquid
+                    CliProviderKind::Direct
                 );
             }
             _ => panic!("expected EntropyIO source orderbook command"),
@@ -3090,7 +2948,7 @@ mod tests {
             } => {
                 args.validate_shape()
                     .expect("EntropyIO trade shape validates");
-                assert!(matches!(args.venue, ExecutionVenueArg::HyperliquidIo));
+                assert_eq!(args.venue.as_str(), "hyperliquidf-io");
             }
             _ => panic!("expected EntropyIO trade long command"),
         }
@@ -3201,29 +3059,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_markets_refresh_command() {
-        let cli = Cli::try_parse_from([
-            "mlab",
-            "markets",
-            "--provider",
-            "mmt",
-            "--exchange",
-            "binancef",
-            "--refresh",
-        ])
-        .expect("markets refresh command should parse");
-
-        match cli.command {
-            Commands::Markets(args) => {
-                assert_eq!(args.provider, Some(CliDataProvider::Mmt));
-                assert_eq!(args.exchange, "binancef");
-                assert!(args.refresh);
-            }
-            _ => panic!("expected markets command"),
-        }
-    }
-
-    #[test]
     fn parses_outcome_market_data_execution_and_user_actions() {
         let source = Cli::try_parse_from([
             "mlab",
@@ -3244,7 +3079,7 @@ mod tests {
                 args.validate().expect("outcome source validates");
                 assert_eq!(
                     args.provider_kind().expect("provider resolves"),
-                    CliProviderKind::Hyperliquid
+                    CliProviderKind::Direct
                 );
             }
             _ => panic!("expected outcome orderbook source"),
@@ -3356,30 +3191,6 @@ mod tests {
                 command: TradeCommands::Long(args),
             } => assert!(args.validate_shape().is_err()),
             _ => panic!("expected outcome buy command"),
-        }
-    }
-
-    #[test]
-    fn parse_mmt_markets_command() {
-        let cli = Cli::try_parse_from([
-            "mlab",
-            "markets",
-            "--provider",
-            "mmt",
-            "--exchange",
-            "binancef",
-            "--symbol",
-            "BTC",
-        ])
-        .expect("MMT markets command should parse");
-
-        match cli.command {
-            Commands::Markets(args) => {
-                assert_eq!(args.provider, Some(CliDataProvider::Mmt));
-                assert_eq!(args.exchange, "binancef");
-                args.validate().expect("MMT snapshot should validate");
-            }
-            _ => panic!("expected markets command"),
         }
     }
 
@@ -3694,30 +3505,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_inspect_command() {
-        let cli = Cli::try_parse_from([
-            "market-lab",
-            "inspect",
-            "--exchange",
-            "bybit",
-            "--symbol",
-            "BTC/USDT",
-            "--at",
-            "1716200000000",
-        ])
-        .expect("inspect parse should succeed");
-
-        match cli.command {
-            Commands::Inspect(args) => {
-                assert_eq!(args.exchange, "bybit");
-                assert_eq!(args.symbol, "BTC/USDT");
-                assert!(matches!(args.book_mode, CliBookMode::Binned));
-            }
-            _ => panic!("expected inspect command"),
-        }
-    }
-
-    #[test]
     fn parse_source_vd_command() {
         let cli = Cli::try_parse_from([
             "market-lab",
@@ -3828,76 +3615,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_source_candles_command() {
-        let cli = Cli::try_parse_from([
-            "market-lab",
-            "source",
-            "candles",
-            "--provider",
-            "mmt",
-            "--exchange",
-            "binancef",
-            "--symbol",
-            "BTC",
-            "--timeframe",
-            "60",
-            "--from",
-            "2024-01-01",
-            "--to",
-            "2024-01-01 00:10:00",
-            "--output",
-            "json",
-        ])
-        .expect("source candles parse should succeed");
-
-        match cli.command {
-            Commands::Source {
-                command: SourceCommands::Candles(args),
-            } => {
-                assert_eq!(args.timeframe, 60);
-                assert_eq!(args.from, Some(1704067200000));
-                assert_eq!(args.to, Some(1704067800000));
-            }
-            _ => panic!("expected source candles command"),
-        }
-    }
-
-    #[test]
-    fn parse_source_oi_command() {
-        let cli = Cli::try_parse_from([
-            "market-lab",
-            "source",
-            "oi",
-            "--provider",
-            "mmt",
-            "--exchange",
-            "binancef",
-            "--symbol",
-            "BTC",
-            "--timeframe",
-            "60",
-            "--from",
-            "2024-01-01",
-            "--to",
-            "2024-01-01 00:10:00",
-            "--output",
-            "json",
-        ])
-        .expect("source oi parse should succeed");
-
-        match cli.command {
-            Commands::Source {
-                command: SourceCommands::Oi(args),
-            } => {
-                assert_eq!(args.timeframe, Some(60));
-                assert_eq!(args.from, Some(1704067200000));
-                assert_eq!(args.to, Some(1704067800000));
-            }
-            _ => panic!("expected source oi command"),
-        }
-    }
-
-    #[test]
     fn reject_source_oi_for_spot_exchange() {
         let cli = Cli::try_parse_from([
             "market-lab",
@@ -3925,41 +3642,6 @@ mod tests {
             .validate()
             .expect_err("spot exchange must reject open interest");
         assert!(error.to_string().contains("requires a futures exchange"));
-    }
-
-    #[test]
-    fn parse_source_volumes_command() {
-        let cli = Cli::try_parse_from([
-            "market-lab",
-            "source",
-            "volumes",
-            "--provider",
-            "mmt",
-            "--exchange",
-            "binancef",
-            "--symbol",
-            "BTC",
-            "--timeframe",
-            "60",
-            "--from",
-            "2024-01-01",
-            "--to",
-            "2024-01-01 00:10:00",
-            "--output",
-            "json",
-        ])
-        .expect("source volumes parse should succeed");
-
-        match cli.command {
-            Commands::Source {
-                command: SourceCommands::Volumes(args),
-            } => {
-                assert_eq!(args.timeframe, 60);
-                assert_eq!(args.from, Some(1704067200000));
-                assert_eq!(args.to, Some(1704067800000));
-            }
-            _ => panic!("expected source volumes command"),
-        }
     }
 
     #[test]
@@ -3999,162 +3681,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_health_command() {
-        let cli = Cli::try_parse_from(["market-lab", "health", "--provider", "mmt"])
-            .expect("health parse should succeed");
-        match cli.command {
-            Commands::Health(args) => {
-                assert!(matches!(args.provider, Some(CliDataProvider::Mmt)))
-            }
-            _ => panic!("expected health command"),
-        }
-    }
-
-    #[test]
-    fn parse_status_command() {
-        let cli = Cli::try_parse_from(["market-lab", "status", "--provider", "mmt"])
-            .expect("status parse should succeed");
-        match cli.command {
-            Commands::Status(args) => {
-                assert!(matches!(args.provider, Some(CliDataProvider::Mmt)))
-            }
-            _ => panic!("expected status command"),
-        }
-    }
-
-    #[test]
-    fn parse_upgrade_check_command() {
-        let cli = Cli::try_parse_from(["mlab", "upgrade", "--check", "--output", "json"])
-            .expect("upgrade parse should succeed");
-
-        match cli.command {
-            Commands::Upgrade(args) => {
-                assert!(args.check);
-                assert!(matches!(args.output, OutputFormat::Json));
-            }
-            _ => panic!("expected upgrade command"),
-        }
-    }
-
-    #[test]
-    fn parse_upgrade_with_custom_daemon_image() {
-        let cli = Cli::try_parse_from([
-            "mlab",
-            "upgrade",
-            "--daemon-image",
-            "marketlab-python:v0.0.8",
-        ])
-        .expect("custom daemon upgrade image should parse");
-
-        match cli.command {
-            Commands::Upgrade(args) => {
-                assert_eq!(
-                    args.daemon_image.as_deref(),
-                    Some("marketlab-python:v0.0.8")
-                );
-            }
-            _ => panic!("expected upgrade command"),
-        }
-    }
-
-    #[test]
-    fn parse_study_imbalance_command() {
-        let cli = Cli::try_parse_from([
-            "market-lab",
-            "study",
-            "imbalance",
-            "--provider",
-            "mmt",
-            "--exchange",
-            "bybitf",
-            "--symbol",
-            "BTC",
-            "--depth",
-            "25",
-            "--stream",
-        ])
-        .expect("study imbalance parse should succeed");
-
-        match cli.command {
-            Commands::Study {
-                command: StudyCommands::Imbalance(args),
-            } => {
-                assert!(matches!(args.provider, Some(CliDataProvider::Mmt)));
-                assert_eq!(args.depth, 25);
-                assert!(args.stream);
-            }
-            _ => panic!("expected study imbalance command"),
-        }
-    }
-
-    #[test]
-    fn parse_study_vamp_command() {
-        let cli = Cli::try_parse_from([
-            "market-lab",
-            "study",
-            "vamp",
-            "--provider",
-            "mmt",
-            "--exchange",
-            "bybitf",
-            "--symbol",
-            "BTC",
-            "--depth",
-            "100",
-            "--dollar-depth",
-            "50000",
-        ])
-        .expect("study vamp parse should succeed");
-
-        match cli.command {
-            Commands::Study {
-                command: StudyCommands::Vamp(args),
-            } => {
-                assert!(matches!(args.provider, Some(CliDataProvider::Mmt)));
-                assert_eq!(args.depth, 100);
-                assert_eq!(args.dollar_depth, 50000.0);
-            }
-            _ => panic!("expected study vamp command"),
-        }
-    }
-
-    #[test]
-    fn parse_source_orderbook_command() {
-        let cli = Cli::try_parse_from([
-            "market-lab",
-            "source",
-            "orderbook",
-            "--provider",
-            "mmt",
-            "--exchange",
-            "bybitf",
-            "--symbol",
-            "BTC",
-            "--depth",
-            "100",
-            "--stream",
-            "--interval-ms",
-            "500",
-            "--min-size",
-            "0.1",
-            "--price-group",
-            "1",
-        ])
-        .expect("source orderbook parse should succeed");
-
-        match cli.command {
-            Commands::Source {
-                command: SourceCommands::Orderbook(args),
-            } => {
-                assert!(matches!(args.provider, Some(CliDataProvider::Mmt)));
-                assert!(args.stream);
-                assert_eq!(args.interval_ms, 500);
-            }
-            _ => panic!("expected source orderbook command"),
-        }
-    }
-
-    #[test]
     fn bulk_market_data_sources_use_exchange_without_mmt_auth() {
         let candles = Cli::try_parse_from([
             "mlab",
@@ -4180,7 +3706,7 @@ mod tests {
                 assert!(args.provider.is_none());
                 assert_eq!(
                     args.provider_kind().expect("BULK provider should resolve"),
-                    CliProviderKind::Bulk
+                    CliProviderKind::Direct
                 );
                 args.validate().expect("standalone BULK candles validate");
             }
@@ -4314,7 +3840,7 @@ mod tests {
             } => {
                 assert_eq!(
                     args.provider_kind().expect("standalone route resolves"),
-                    CliProviderKind::BinanceFutures
+                    CliProviderKind::Direct
                 );
             }
             _ => panic!("expected standalone candles command"),
@@ -4887,40 +4413,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_strategy_job_management_commands() {
-        let status = Cli::try_parse_from([
-            "mlab",
-            "strategy",
-            "status",
-            "strategy_123",
-            "--output",
-            "json",
-        ])
-        .expect("strategy status should parse");
-        match status.command {
-            Commands::Strategy {
-                command: StrategyCommands::Status(args),
-            } => {
-                args.validate().expect("strategy status should validate");
-                assert_eq!(args.job, "strategy_123");
-            }
-            _ => panic!("expected strategy status command"),
-        }
-
-        let logs = Cli::try_parse_from(["mlab", "strategy", "logs", "strategy_123", "--follow"])
-            .expect("strategy logs should parse");
-        match logs.command {
-            Commands::Strategy {
-                command: StrategyCommands::Logs(args),
-            } => {
-                args.validate().expect("strategy logs should validate");
-                assert!(args.follow);
-            }
-            _ => panic!("expected strategy logs command"),
-        }
-    }
-
-    #[test]
     fn parse_script_run_command() {
         let cli = Cli::try_parse_from([
             "mlab",
@@ -5158,47 +4650,6 @@ mod tests {
         ])
         .expect_err("script run should not accept leverage");
         assert!(err.to_string().contains("--leverage"));
-    }
-
-    #[test]
-    fn parse_script_runs_command() {
-        let cli = Cli::try_parse_from([
-            "mlab", "script", "runs", "list", "--limit", "10", "--output", "json",
-        ])
-        .expect("script runs list parse should succeed");
-
-        match cli.command {
-            Commands::Script {
-                command:
-                    ScriptCommands::Runs {
-                        command: ScriptRunHistoryCommands::List(args),
-                    },
-            } => {
-                assert_eq!(args.limit, 10);
-                assert!(matches!(args.output, OutputFormat::Json));
-                args.validate().expect("validate should succeed");
-            }
-            _ => panic!("expected script runs list command"),
-        }
-    }
-
-    #[test]
-    fn parse_script_show_command() {
-        let cli = Cli::try_parse_from(["mlab", "script", "runs", "show", "1780-script-run-test"])
-            .expect("script runs show parse should succeed");
-
-        match cli.command {
-            Commands::Script {
-                command:
-                    ScriptCommands::Runs {
-                        command: ScriptRunHistoryCommands::Show(args),
-                    },
-            } => {
-                assert_eq!(args.run, "1780-script-run-test");
-                args.validate().expect("validate should succeed");
-            }
-            _ => panic!("expected script runs show command"),
-        }
     }
 
     #[test]

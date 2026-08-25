@@ -10,10 +10,6 @@ pub mod ws;
 use serde::{Deserialize, Serialize};
 
 pub const EXCHANGE: &str = "hyperliquidf";
-pub const XYZ_EXCHANGE: &str = "hyperliquidf-xyz";
-pub const XYZ_DEX: &str = "xyz";
-pub const IO_EXCHANGE: &str = "hyperliquidf-io";
-pub const IO_DEX: &str = "io";
 pub const SPOT_EXCHANGE: &str = "hyperliquid";
 pub const OUTCOMES_EXCHANGE: &str = "hyperliquid-outcomes";
 pub const MAINNET_HTTP_URL: &str = "https://api.hyperliquid.xyz";
@@ -35,53 +31,53 @@ pub enum HyperliquidProduct {
     Spot,
     Outcome,
     Perpetual,
-    XyzPerpetual,
-    IoPerpetual,
+    Hip3(crate::venues::VenueId),
 }
 
 impl HyperliquidProduct {
     pub fn from_exchange(exchange: &str) -> anyhow::Result<Self> {
-        match exchange.trim().to_ascii_lowercase().as_str() {
-            SPOT_EXCHANGE => Ok(Self::Spot),
-            OUTCOMES_EXCHANGE => Ok(Self::Outcome),
-            EXCHANGE => Ok(Self::Perpetual),
-            XYZ_EXCHANGE => Ok(Self::XyzPerpetual),
-            IO_EXCHANGE => Ok(Self::IoPerpetual),
-            _ => anyhow::bail!(
-                "Hyperliquid exchange must be `hyperliquid` (spot), `hyperliquid-outcomes` (HIP-4 outcomes), `hyperliquidf` (native perpetuals), `hyperliquidf-xyz` (XYZ perpetuals), or `hyperliquidf-io` (EntropyIO perpetuals)"
-            ),
+        let venue = crate::venues::VenueId::parse(exchange)?;
+        Self::from_venue(venue)
+    }
+
+    pub fn from_venue(venue: crate::venues::VenueId) -> anyhow::Result<Self> {
+        match venue.spec()?.market {
+            crate::venues::VenueMarket::Spot => Ok(Self::Spot),
+            crate::venues::VenueMarket::Outcome => Ok(Self::Outcome),
+            crate::venues::VenueMarket::Perpetual
+                if venue == crate::venues::VenueId::Hyperliquid =>
+            {
+                Ok(Self::Perpetual)
+            }
+            crate::venues::VenueMarket::Hip3 => Ok(Self::Hip3(venue)),
+            _ => anyhow::bail!("`{venue}` is not a Hyperliquid market-data venue"),
         }
     }
 
-    pub const fn exchange(self) -> &'static str {
+    pub fn exchange(&self) -> &str {
         match self {
             Self::Spot => SPOT_EXCHANGE,
             Self::Outcome => OUTCOMES_EXCHANGE,
             Self::Perpetual => EXCHANGE,
-            Self::XyzPerpetual => XYZ_EXCHANGE,
-            Self::IoPerpetual => IO_EXCHANGE,
+            Self::Hip3(venue) => venue.as_str(),
         }
     }
 
-    pub const fn dex(self) -> Option<&'static str> {
+    pub fn dex(&self) -> Option<&str> {
         match self {
-            Self::XyzPerpetual => Some(XYZ_DEX),
-            Self::IoPerpetual => Some(IO_DEX),
+            Self::Hip3(venue) => venue.as_str().strip_prefix("hyperliquidf-"),
             Self::Spot | Self::Outcome | Self::Perpetual => None,
         }
     }
 
     pub const fn is_perpetual(self) -> bool {
-        matches!(
-            self,
-            Self::Perpetual | Self::XyzPerpetual | Self::IoPerpetual
-        )
+        matches!(self, Self::Perpetual | Self::Hip3(_))
     }
 
     pub const fn max_price_decimals(self) -> u8 {
         match self {
             Self::Spot | Self::Outcome => 8,
-            Self::Perpetual | Self::XyzPerpetual | Self::IoPerpetual => 6,
+            Self::Perpetual | Self::Hip3(_) => 6,
         }
     }
 }

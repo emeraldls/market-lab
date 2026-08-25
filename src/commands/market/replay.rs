@@ -2,13 +2,13 @@ use anyhow::Result;
 
 use crate::cli::{OutputFormat, ReplayArgs};
 use crate::domain::types::TopOfBook;
-use crate::providers::{MarketDataProvider, ProviderClient};
+use crate::providers::{ProviderClient, ProviderService};
 
 pub async fn handle(args: ReplayArgs) -> Result<()> {
     args.validate()?;
     let req = args.to_request();
 
-    let client = ProviderClient::from_kind(req.provider);
+    let client = ProviderClient::from_kind(req.provider, &req.exchange)?;
     let events = client.replay(&req).await?;
 
     render(&events, args.output)

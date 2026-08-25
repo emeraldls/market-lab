@@ -25,13 +25,9 @@ use crate::domain::execution::{
     PositionDirection, TimeInForce, TradePlan,
 };
 use crate::domain::types::{OrderBookSnapshot, TopOfBook};
-use crate::providers::bulk::market_data::{BulkProvider, normalize_timestamp_ms};
-use crate::providers::bulk::ws::{BulkAccountStream, BulkOrderBookStream};
-use crate::providers::execution::ExecutionAdapter;
-use crate::providers::hyperlink::ws::HyperlinkAccountStream;
-use crate::providers::hyperliquid::HyperliquidNetwork;
-use crate::providers::hyperliquid::market_data::HyperliquidProvider;
-use crate::providers::hyperliquid::ws::{HyperliquidAccountStream, HyperliquidOrderBookStream};
+use crate::providers::bulk::market_data::normalize_timestamp_ms;
+use crate::providers::execution::{AccountEventStream, ExecutionAdapter};
+use crate::providers::market_data::{MarketDataAdapter, VenueOrderBookStream};
 
 const BOOK_DEPTH: u16 = 1;
 const RECONNECT_MAX_SECONDS: u64 = 5;
@@ -66,7 +62,7 @@ impl MidMode {
 struct MidPricePlanView<'a> {
     r#type: &'static str,
     bot: &'static str,
-    venue: &'static str,
+    venue: String,
     symbol: &'a str,
     max_inventory_size: f64,
     requested_margin: Option<f64>,
@@ -158,12 +154,12 @@ async fn handle(
         .bids
         .first()
         .copied()
-        .with_context(|| format!("{} book has no bid", venue_label(parent.venue)))?;
+        .with_context(|| format!("{} book has no bid", parent.venue.label()))?;
     let best_ask = top
         .asks
         .first()
         .copied()
-        .with_context(|| format!("{} book has no ask", venue_label(parent.venue)))?;
+        .with_context(|| format!("{} book has no ask", parent.venue.label()))?;
     let quotes = quote_prices(
         best_bid,
         best_ask,
@@ -303,15 +299,7 @@ fn worker_trade_args(definition: &MidPriceJobDefinition) -> TradeArgs {
         symbol: definition.symbol.clone(),
         symbol_flag: None,
         config: None,
-        venue: match definition.venue {
-            ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
-            ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
-            ExecutionVenue::Hyperlink => ExecutionVenueArg::Hyperlink,
-            ExecutionVenue::HyperliquidXyz => ExecutionVenueArg::HyperliquidXyz,
-            ExecutionVenue::HyperliquidIo => ExecutionVenueArg::HyperliquidIo,
-            ExecutionVenue::HyperliquidSpot => ExecutionVenueArg::HyperliquidSpot,
-            ExecutionVenue::HyperliquidOutcomes => ExecutionVenueArg::HyperliquidOutcomes,
-        },
+        venue: definition.venue,
         testnet: definition.testnet,
         size: Some(definition.max_inventory_size),
         margin: None,
@@ -342,7 +330,7 @@ fn plan_view<'a>(
     MidPricePlanView {
         r#type: "bot.plan",
         bot,
-        venue: venue_key(parent.venue),
+        venue: parent.venue.to_string(),
         symbol: &parent.internal_symbol,
         max_inventory_size: definition.max_inventory_size,
         requested_margin: definition.requested_margin,
@@ -455,7 +443,7 @@ pub(super) fn render_submission(job: &BotJob, output: OutputFormat) -> Result<()
 pub(super) fn confirm_live_execution(venue: ExecutionVenue, testnet: bool) -> Result<bool> {
     print!(
         "Deploy this live maker-only bot on {}? [y/N]: ",
-        execution_venue_label(venue, testnet)
+        venue.network_label(testnet)
     );
     io::stdout()
         .flush()
@@ -470,59 +458,11 @@ pub(super) fn confirm_live_execution(venue: ExecutionVenue, testnet: bool) -> Re
     ))
 }
 
-fn execution_venue_label(venue: ExecutionVenue, testnet: bool) -> &'static str {
-    match (venue, testnet) {
-        (ExecutionVenue::Bulk, _) => "BULK testnet",
-        (ExecutionVenue::Hyperliquid, true) => "Hyperliquid testnet",
-        (ExecutionVenue::Hyperliquid, false) => "Hyperliquid mainnet",
-        (ExecutionVenue::Hyperlink, _) => "HyperLink mainnet",
-        (ExecutionVenue::HyperliquidXyz, true) => "Hyperliquid XYZ testnet",
-        (ExecutionVenue::HyperliquidXyz, false) => "Hyperliquid XYZ mainnet",
-        (ExecutionVenue::HyperliquidIo, true) => "Hyperliquid EntropyIO testnet",
-        (ExecutionVenue::HyperliquidIo, false) => "Hyperliquid EntropyIO mainnet",
-        (ExecutionVenue::HyperliquidSpot, true) => "Hyperliquid Spot testnet",
-        (ExecutionVenue::HyperliquidSpot, false) => "Hyperliquid Spot mainnet",
-        (ExecutionVenue::HyperliquidOutcomes, true) => "Hyperliquid Outcomes testnet",
-        (ExecutionVenue::HyperliquidOutcomes, false) => "Hyperliquid Outcomes mainnet",
-    }
-}
-
-pub(super) fn venue_key(venue: ExecutionVenue) -> &'static str {
-    match venue {
-        ExecutionVenue::Bulk => "bulkf",
-        ExecutionVenue::Hyperliquid => "hyperliquidf",
-        ExecutionVenue::Hyperlink => "hyperlinkf",
-        ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
-        ExecutionVenue::HyperliquidIo => "hyperliquidf-io",
-        ExecutionVenue::HyperliquidSpot => "hyperliquid",
-        ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
-    }
-}
-
-pub(super) fn venue_label(venue: ExecutionVenue) -> &'static str {
-    match venue {
-        ExecutionVenue::Bulk => "BULK",
-        ExecutionVenue::Hyperliquid => "Hyperliquid",
-        ExecutionVenue::Hyperlink => "HyperLink",
-        ExecutionVenue::HyperliquidXyz => "Hyperliquid XYZ",
-        ExecutionVenue::HyperliquidIo => "Hyperliquid EntropyIO",
-        ExecutionVenue::HyperliquidSpot => "Hyperliquid Spot",
-        ExecutionVenue::HyperliquidOutcomes => "Hyperliquid Outcomes",
-    }
-}
-
 pub(super) fn execution_market(
     venue: ExecutionVenue,
     symbol: &str,
 ) -> Result<std::sync::Arc<crate::markets::Market>> {
-    crate::markets::exchange_market(
-        if venue == ExecutionVenue::Hyperlink {
-            "hyperliquidf"
-        } else {
-            venue_key(venue)
-        },
-        symbol,
-    )
+    crate::markets::exchange_market(venue.spec()?.market_data_venue.as_str(), symbol)
 }
 
 pub(super) async fn live_orderbook(
@@ -530,67 +470,9 @@ pub(super) async fn live_orderbook(
     symbol: &str,
     testnet: bool,
 ) -> Result<OrderBookSnapshot> {
-    match venue {
-        ExecutionVenue::Bulk => BulkProvider::live_orderbook(symbol, BOOK_DEPTH, None).await,
-        ExecutionVenue::Hyperliquid => {
-            HyperliquidProvider::live_orderbook_on(
-                symbol,
-                BOOK_DEPTH,
-                None,
-                HyperliquidNetwork::from_testnet(testnet),
-            )
-            .await
-        }
-        ExecutionVenue::Hyperlink => {
-            HyperliquidProvider::live_orderbook_on(
-                symbol,
-                BOOK_DEPTH,
-                None,
-                HyperliquidNetwork::Mainnet,
-            )
-            .await
-        }
-        ExecutionVenue::HyperliquidXyz => {
-            HyperliquidProvider::live_orderbook_for(
-                crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual,
-                symbol,
-                BOOK_DEPTH,
-                None,
-                HyperliquidNetwork::from_testnet(testnet),
-            )
-            .await
-        }
-        ExecutionVenue::HyperliquidIo => {
-            HyperliquidProvider::live_orderbook_for(
-                crate::providers::hyperliquid::HyperliquidProduct::IoPerpetual,
-                symbol,
-                BOOK_DEPTH,
-                None,
-                HyperliquidNetwork::from_testnet(testnet),
-            )
-            .await
-        }
-        ExecutionVenue::HyperliquidSpot => {
-            HyperliquidProvider::live_orderbook_for(
-                crate::providers::hyperliquid::HyperliquidProduct::Spot,
-                symbol,
-                BOOK_DEPTH,
-                None,
-                HyperliquidNetwork::from_testnet(testnet),
-            )
-            .await
-        }
-        ExecutionVenue::HyperliquidOutcomes => {
-            HyperliquidProvider::live_orderbook_for(
-                crate::providers::hyperliquid::HyperliquidProduct::Outcome,
-                symbol,
-                BOOK_DEPTH,
-                None,
-                HyperliquidNetwork::from_testnet(testnet),
-            )
-            .await
-        }
-    }
+    MarketDataAdapter::for_venue(venue, testnet)?
+        .orderbook(symbol, BOOK_DEPTH, None)
+        .await
 }
 
 fn bias_name(bias: f64) -> &'static str {
@@ -899,80 +781,6 @@ impl FillLedger {
     }
 }
 
-enum BotOrderBookStream {
-    Bulk(BulkOrderBookStream),
-    Hyperliquid(HyperliquidOrderBookStream),
-}
-
-impl BotOrderBookStream {
-    async fn connect(venue: ExecutionVenue, symbol: &str, testnet: bool) -> Result<Self> {
-        match venue {
-            ExecutionVenue::Bulk => Ok(Self::Bulk(
-                BulkOrderBookStream::connect(symbol, BOOK_DEPTH).await?,
-            )),
-            ExecutionVenue::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidOrderBookStream::connect_on(
-                    symbol,
-                    BOOK_DEPTH,
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            ExecutionVenue::Hyperlink => Ok(Self::Hyperliquid(
-                HyperliquidOrderBookStream::connect_on(
-                    symbol,
-                    BOOK_DEPTH,
-                    HyperliquidNetwork::Mainnet,
-                )
-                .await?,
-            )),
-            ExecutionVenue::HyperliquidXyz => Ok(Self::Hyperliquid(
-                HyperliquidOrderBookStream::connect_for(
-                    crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual,
-                    symbol,
-                    BOOK_DEPTH,
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            ExecutionVenue::HyperliquidIo => Ok(Self::Hyperliquid(
-                HyperliquidOrderBookStream::connect_for(
-                    crate::providers::hyperliquid::HyperliquidProduct::IoPerpetual,
-                    symbol,
-                    BOOK_DEPTH,
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            ExecutionVenue::HyperliquidSpot => Ok(Self::Hyperliquid(
-                HyperliquidOrderBookStream::connect_for(
-                    crate::providers::hyperliquid::HyperliquidProduct::Spot,
-                    symbol,
-                    BOOK_DEPTH,
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            ExecutionVenue::HyperliquidOutcomes => Ok(Self::Hyperliquid(
-                HyperliquidOrderBookStream::connect_for(
-                    crate::providers::hyperliquid::HyperliquidProduct::Outcome,
-                    symbol,
-                    BOOK_DEPTH,
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-        }
-    }
-
-    async fn next_top(&mut self) -> Result<TopOfBook> {
-        match self {
-            Self::Bulk(stream) => stream.next_top().await,
-            Self::Hyperliquid(stream) => stream.next_top().await,
-        }
-    }
-}
-
 pub(super) fn spawn_book_feed(
     venue: ExecutionVenue,
     testnet: bool,
@@ -983,7 +791,7 @@ pub(super) fn spawn_book_feed(
         let mut delay = 1_u64;
         let mut revision = 0_u64;
         loop {
-            match BotOrderBookStream::connect(venue, &symbol, testnet).await {
+            match VenueOrderBookStream::connect(venue, &symbol, BOOK_DEPTH, testnet).await {
                 Ok(mut stream) => {
                     delay = 1;
                     loop {
@@ -1037,74 +845,6 @@ pub(super) fn spawn_book_feed(
     receiver
 }
 
-enum BotAccountStream {
-    Bulk(BulkAccountStream),
-    Hyperliquid(HyperliquidAccountStream),
-    Hyperlink(HyperlinkAccountStream),
-}
-
-impl BotAccountStream {
-    async fn connect(venue: ExecutionVenue, account: &str, testnet: bool) -> Result<Self> {
-        match venue {
-            ExecutionVenue::Bulk => Ok(Self::Bulk(BulkAccountStream::connect(account).await?)),
-            ExecutionVenue::Hyperliquid => Ok(Self::Hyperliquid(
-                HyperliquidAccountStream::connect_on(
-                    account,
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            ExecutionVenue::Hyperlink => {
-                let credential = crate::credentials::active_hyperlink_credential()?;
-                if !credential.account.eq_ignore_ascii_case(account) {
-                    bail!("HyperLink stream account does not match the configured account");
-                }
-                Ok(Self::Hyperlink(
-                    HyperlinkAccountStream::connect(account, &credential.agent).await?,
-                ))
-            }
-            ExecutionVenue::HyperliquidXyz => Ok(Self::Hyperliquid(
-                HyperliquidAccountStream::connect_on(
-                    account,
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            ExecutionVenue::HyperliquidIo => Ok(Self::Hyperliquid(
-                HyperliquidAccountStream::connect_on(
-                    account,
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            ExecutionVenue::HyperliquidSpot => Ok(Self::Hyperliquid(
-                HyperliquidAccountStream::connect_on(
-                    account,
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-            ExecutionVenue::HyperliquidOutcomes => Ok(Self::Hyperliquid(
-                HyperliquidAccountStream::connect_on(
-                    account,
-                    HyperliquidNetwork::from_testnet(testnet),
-                )
-                .await?,
-            )),
-        }
-    }
-
-    async fn next_events(&mut self) -> Result<Vec<Value>> {
-        match self {
-            Self::Bulk(stream) => Ok(vec![stream.next_event().await?]),
-            Self::Hyperliquid(stream) => {
-                normalize_hyperliquid_account_events(stream.next_event().await?)
-            }
-            Self::Hyperlink(stream) => Ok(vec![stream.next_event().await?]),
-        }
-    }
-}
-
 pub(super) fn spawn_account_feed(
     venue: ExecutionVenue,
     testnet: bool,
@@ -1123,7 +863,7 @@ pub(super) fn spawn_account_feed(
         };
         let mut delay = 1_u64;
         loop {
-            match BotAccountStream::connect(venue, &account, testnet).await {
+            match AccountEventStream::connect(venue, testnet, &account).await {
                 Ok(mut stream) => {
                     let (open_orders, fills) =
                         tokio::join!(adapter.open_orders(&account), adapter.fills(&account),);
@@ -1158,7 +898,7 @@ pub(super) fn spawn_account_feed(
                     }
                     delay = 1;
                     loop {
-                        match stream.next_events().await {
+                        match stream.next_bot_events().await {
                             Ok(values) => {
                                 for value in values {
                                     if sender.send(AccountFeedEvent::Data(value)).await.is_err() {
@@ -1200,106 +940,9 @@ fn result_error<T>(result: Result<T>) -> String {
     result.map_or_else(|error| format!("{error:#}"), |_| "ok".to_string())
 }
 
+#[cfg(test)]
 fn normalize_hyperliquid_account_events(value: Value) -> Result<Vec<Value>> {
-    match value.get("channel").and_then(Value::as_str) {
-        Some("orderUpdates") => value
-            .get("data")
-            .and_then(Value::as_array)
-            .context("Hyperliquid orderUpdates omitted its update list")?
-            .iter()
-            .map(normalize_hyperliquid_order_update)
-            .collect(),
-        Some("user") => value
-            .pointer("/data/fills")
-            .and_then(Value::as_array)
-            .map_or_else(
-                || Ok(Vec::new()),
-                |fills| fills.iter().map(normalize_hyperliquid_fill).collect(),
-            ),
-        _ => Ok(Vec::new()),
-    }
-}
-
-fn normalize_hyperliquid_order_update(update: &Value) -> Result<Value> {
-    let order = update
-        .get("order")
-        .context("Hyperliquid order update omitted order")?;
-    let order_id = json_identifier(
-        order
-            .get("oid")
-            .context("Hyperliquid order update omitted oid")?,
-    )?;
-    let raw_status = update
-        .get("status")
-        .and_then(Value::as_str)
-        .context("Hyperliquid order update omitted status")?;
-    let size = json_number(order.get("sz"), "order size")?.unwrap_or_default();
-    let original_size = json_number(order.get("origSz"), "original order size")?.unwrap_or(size);
-    let is_buy = order.get("side").and_then(Value::as_str) != Some("A");
-    let signed_size = if is_buy { size } else { -size };
-    Ok(serde_json::json!({
-        "type": "orderUpdate",
-        "oid": order_id,
-        "status": normalize_hyperliquid_order_status(raw_status),
-        "ts": update.get("statusTimestamp").and_then(Value::as_u64).unwrap_or_default(),
-        "px": json_number(order.get("limitPx"), "order price")?.unwrap_or_default(),
-        "origSz": original_size,
-        "sz": signed_size,
-        "isBuy": is_buy,
-    }))
-}
-
-fn normalize_hyperliquid_fill(fill: &Value) -> Result<Value> {
-    let order_id = json_identifier(fill.get("oid").context("Hyperliquid fill omitted oid")?)?;
-    let raw_fee = json_number(fill.get("fee"), "fill fee")?;
-    Ok(serde_json::json!({
-        "type": "fill",
-        "orderId": order_id,
-        "timestamp": fill.get("time").and_then(Value::as_u64).unwrap_or_default(),
-        "isBuy": fill.get("side").and_then(Value::as_str) == Some("B"),
-        "size": json_number(fill.get("sz"), "fill size")?.unwrap_or_default(),
-        "price": json_number(fill.get("px"), "fill price")?.unwrap_or_default(),
-        // Hyperliquid reports a positive number for a cost and a negative number
-        // for a rebate. Market Lab's performance ledger uses the opposite sign.
-        "fee": raw_fee.map(|fee| -fee),
-    }))
-}
-
-fn json_identifier(value: &Value) -> Result<String> {
-    match value {
-        Value::String(value) => Ok(value.clone()),
-        Value::Number(value) => Ok(value.to_string()),
-        _ => bail!("Hyperliquid order id is neither a string nor an integer"),
-    }
-}
-
-fn json_number(value: Option<&Value>, field: &str) -> Result<Option<f64>> {
-    value
-        .map(|value| match value {
-            Value::Number(number) => number
-                .as_f64()
-                .with_context(|| format!("invalid Hyperliquid {field}")),
-            Value::String(number) => number
-                .parse::<f64>()
-                .with_context(|| format!("invalid Hyperliquid {field} `{number}`")),
-            Value::Null => Ok(0.0),
-            _ => bail!("invalid Hyperliquid {field}"),
-        })
-        .transpose()
-}
-
-fn normalize_hyperliquid_order_status(status: &str) -> &str {
-    if status.eq_ignore_ascii_case("open") {
-        "resting"
-    } else if status.eq_ignore_ascii_case("filled") {
-        "filled"
-    } else if status.eq_ignore_ascii_case("canceled") || status.eq_ignore_ascii_case("cancelled") {
-        "cancelled"
-    } else if status.eq_ignore_ascii_case("rejected") || status.ends_with("Canceled") {
-        "rejected"
-    } else {
-        status
-    }
+    crate::providers::execution::normalize_hyperliquid_account_events(value)
 }
 
 #[derive(Clone, Debug)]
@@ -1326,12 +969,12 @@ async fn run_worker(job_id: &str, mode: MidMode, definition: &MidPriceJobDefinit
             .bids
             .first()
             .copied()
-            .with_context(|| format!("{} book has no bid", venue_label(definition.venue)))?,
+            .with_context(|| format!("{} book has no bid", definition.venue.label()))?,
         initial_book
             .asks
             .first()
             .copied()
-            .with_context(|| format!("{} book has no ask", venue_label(definition.venue)))?,
+            .with_context(|| format!("{} book has no ask", definition.venue.label()))?,
         definition.spread_bps,
         rules.tick_size,
         rules.price_precision,

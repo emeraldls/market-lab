@@ -2,11 +2,11 @@ use anyhow::Result;
 
 use crate::cli::{HealthArgs, OutputFormat};
 use crate::domain::types::ProviderHealth;
-use crate::providers::{MarketDataProvider, ProviderClient};
+use crate::providers::{ProviderClient, ProviderService};
 
 pub async fn handle(args: HealthArgs) -> Result<()> {
     let provider_kind = args.provider_kind()?;
-    let client = ProviderClient::from_kind(provider_kind);
+    let client = ProviderClient::from_kind(provider_kind, args.exchange.as_deref().unwrap_or(""))?;
     let health = client.health().await?;
 
     render(&health, args.output)

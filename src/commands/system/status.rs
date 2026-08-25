@@ -2,11 +2,11 @@ use anyhow::Result;
 
 use crate::cli::{OutputFormat, StatusArgs};
 use crate::domain::types::{ProviderHealth, SystemStatus};
-use crate::providers::{MarketDataProvider, ProviderClient};
+use crate::providers::{ProviderClient, ProviderService};
 
 pub async fn handle(args: StatusArgs) -> Result<()> {
     let provider_kind = args.provider_kind()?;
-    let client = ProviderClient::from_kind(provider_kind);
+    let client = ProviderClient::from_kind(provider_kind, args.exchange.as_deref().unwrap_or(""))?;
     let provider_health = client.health().await?;
 
     let status = build_status(provider_health);

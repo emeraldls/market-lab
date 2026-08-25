@@ -71,7 +71,7 @@ fn render_jobs(jobs: &[StrategyJob], output: OutputFormat) -> Result<()> {
                     job.pid
                         .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
                     job.definition.name(),
-                    venue_name(job.definition.venue()),
+                    job.definition.venue(),
                     job.definition.symbol(),
                 );
             }
@@ -97,7 +97,7 @@ fn render_job(job: &StrategyJob, output: OutputFormat) -> Result<()> {
             println!("  symbol:           {}", job.definition.symbol());
             match &job.definition {
                 StrategyJobDefinition::Twap(definition) => {
-                    println!("  venue:            {}", venue_name(definition.venue));
+                    println!("  venue:            {}", definition.venue);
                     println!("  side:             {:?}", definition.side);
                     println!("  total size:       {}", definition.total_size);
                     if let Some(margin) = definition.requested_margin {
@@ -111,7 +111,7 @@ fn render_job(job: &StrategyJob, output: OutputFormat) -> Result<()> {
                     println!("  reduce only:      {}", definition.reduce_only);
                 }
                 StrategyJobDefinition::Vwap(definition) => {
-                    println!("  venue:            {}", venue_name(definition.venue));
+                    println!("  venue:            {}", definition.venue);
                     println!("  side:             {:?}", definition.side);
                     println!("  total size:       {}", definition.total_size);
                     if let Some(margin) = definition.requested_margin {
@@ -133,7 +133,7 @@ fn render_job(job: &StrategyJob, output: OutputFormat) -> Result<()> {
                     println!("  reduce only:      {}", definition.reduce_only);
                 }
                 StrategyJobDefinition::Oiwap(definition) => {
-                    println!("  venue:            {}", venue_name(definition.venue));
+                    println!("  venue:            {}", definition.venue);
                     println!("  side:             {:?}", definition.side);
                     println!("  total size:       {}", definition.total_size);
                     if let Some(margin) = definition.requested_margin {
@@ -173,18 +173,6 @@ fn render_job(job: &StrategyJob, output: OutputFormat) -> Result<()> {
         OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
     }
     Ok(())
-}
-
-fn venue_name(venue: crate::domain::execution::ExecutionVenue) -> &'static str {
-    match venue {
-        crate::domain::execution::ExecutionVenue::Bulk => "bulkf",
-        crate::domain::execution::ExecutionVenue::Hyperliquid => "hyperliquidf",
-        crate::domain::execution::ExecutionVenue::Hyperlink => "hyperlinkf",
-        crate::domain::execution::ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
-        crate::domain::execution::ExecutionVenue::HyperliquidIo => "hyperliquidf-io",
-        crate::domain::execution::ExecutionVenue::HyperliquidSpot => "hyperliquid",
-        crate::domain::execution::ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
-    }
 }
 
 fn render_log_values(values: &[serde_json::Value], output: OutputFormat) -> Result<()> {
