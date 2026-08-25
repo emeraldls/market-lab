@@ -12,6 +12,7 @@ use crate::commands::script::{
     ScriptDescriptor, ScriptInputs, report_builder, write_report_best_effort,
     write_running_report_best_effort,
 };
+use crate::commands::source::common::format_utc_ms;
 use crate::commands::study::common::is_empty_object;
 use crate::domain::enums::ProviderKind;
 use crate::domain::types::OrderBookSnapshot;
@@ -409,6 +410,14 @@ async fn backtest_events(
             return Err(ScriptCancelled.into());
         }
 
+        prime_missing_reference_marks_at_timestamp(
+            idx,
+            &events,
+            &data,
+            &reference_sources,
+            &mut latest_marks,
+        )?;
+
         let config = source_configs
             .get(&event.selector)
             .with_context(|| format!("missing source config for {}", event.selector))?;
@@ -639,7 +648,45 @@ async fn fetch_sources(
                 .series,
         );
     }
+    validate_fetched_sources(args.from, args.to, source_configs, &data)?;
     Ok(data)
+}
+
+fn validate_fetched_sources(
+    from: u64,
+    to: u64,
+    source_configs: &SourceConfigs,
+    data: &BacktestData,
+) -> Result<()> {
+    for config in source_configs.values() {
+        let series = data.series.get(&config.selector).with_context(|| {
+            format!(
+                "backtest did not load declared source `{}`",
+                config.selector
+            )
+        })?;
+        if backtest_series_len(series) > 0 {
+            continue;
+        }
+
+        let provider = match config.provider {
+            ProviderKind::Mmt => "MMT".to_string(),
+            ProviderKind::Direct => MarketDataAdapter::for_exchange(&config.exchange, false)?
+                .label()
+                .to_string(),
+            ProviderKind::MarketLab => "Market Lab".to_string(),
+        };
+        bail!(
+            "{} returned no {} data for {} on {} between {} and {}; choose a range available from the provider",
+            provider,
+            config.source.as_str(),
+            config.market_symbol(),
+            config.exchange,
+            format_utc_ms(from),
+            format_utc_ms(to),
+        );
+    }
+    Ok(())
 }
 
 async fn fetch_mmt_sources(
@@ -652,6 +699,8 @@ async fn fetch_mmt_sources(
     let mut configs = source_configs.values().collect::<Vec<_>>();
     configs.retain(|config| config.provider == ProviderKind::Mmt);
     configs.sort_by_key(|config| config.position);
+    let from_utc = format_utc_ms(args.from);
+    let to_utc = format_utc_ms(args.to);
 
     for config in configs {
         let source = &config.source;
@@ -668,8 +717,8 @@ async fn fetch_mmt_sources(
                 report.set_phase("fetching_candles");
                 write_running_report_best_effort(report);
                 eprintln!(
-                    "fetching candles exchange={} symbol={} tf={} from={} to={}",
-                    exchange, market_symbol, timeframe, args.from, args.to
+                    "fetching candles exchange={} symbol={} tf={} from=\"{}\" to=\"{}\"",
+                    exchange, market_symbol, timeframe, from_utc, to_utc
                 );
                 let future = MmtProvider::candles(exchange, &market_symbol, tf, args.from, args.to);
                 let series = tokio::select! {
@@ -709,8 +758,8 @@ async fn fetch_mmt_sources(
                 report.set_phase("fetching_orderbooks");
                 write_running_report_best_effort(report);
                 eprintln!(
-                    "fetching orderbooks exchange={} symbol={} tf={} from={} to={} depth={}",
-                    exchange, market_symbol, timeframe, args.from, args.to, depth
+                    "fetching orderbooks exchange={} symbol={} tf={} from=\"{}\" to=\"{}\" depth={}",
+                    exchange, market_symbol, timeframe, from_utc, to_utc, depth
                 );
                 let future = MmtProvider::historical_orderbooks(
                     exchange,
@@ -749,8 +798,8 @@ async fn fetch_mmt_sources(
                 report.set_phase("fetching_vd");
                 write_running_report_best_effort(report);
                 eprintln!(
-                    "fetching vd exchange={} symbol={} tf={} from={} to={} bucket={}",
-                    exchange, market_symbol, timeframe, args.from, args.to, bucket
+                    "fetching vd exchange={} symbol={} tf={} from=\"{}\" to=\"{}\" bucket={}",
+                    exchange, market_symbol, timeframe, from_utc, to_utc, bucket
                 );
                 let future =
                     MmtProvider::vd(exchange, &market_symbol, tf, args.from, args.to, bucket);
@@ -790,8 +839,8 @@ async fn fetch_mmt_sources(
                 report.set_phase("fetching_oi");
                 write_running_report_best_effort(report);
                 eprintln!(
-                    "fetching oi exchange={} symbol={} tf={} from={} to={}",
-                    exchange, market_symbol, timeframe, args.from, args.to
+                    "fetching oi exchange={} symbol={} tf={} from=\"{}\" to=\"{}\"",
+                    exchange, market_symbol, timeframe, from_utc, to_utc
                 );
                 let future = MmtProvider::oi(exchange, &market_symbol, tf, args.from, args.to);
                 let series = tokio::select! {
@@ -830,8 +879,8 @@ async fn fetch_mmt_sources(
                 report.set_phase("fetching_volumes");
                 write_running_report_best_effort(report);
                 eprintln!(
-                    "fetching volumes exchange={} symbol={} tf={} from={} to={}",
-                    exchange, market_symbol, timeframe, args.from, args.to
+                    "fetching volumes exchange={} symbol={} tf={} from=\"{}\" to=\"{}\"",
+                    exchange, market_symbol, timeframe, from_utc, to_utc
                 );
                 let future = MmtProvider::volumes(exchange, &market_symbol, tf, args.from, args.to);
                 let series = tokio::select! {
@@ -881,6 +930,8 @@ async fn fetch_direct_sources(
     let mut configs = source_configs.values().collect::<Vec<_>>();
     configs.retain(|config| config.provider == provider);
     configs.sort_by_key(|config| config.position);
+    let from_utc = format_utc_ms(args.from);
+    let to_utc = format_utc_ms(args.to);
     for config in configs {
         let source = &config.source;
         let market_symbol = config.market_symbol();
@@ -906,13 +957,13 @@ async fn fetch_direct_sources(
         write_running_report_best_effort(report);
         let started = Instant::now();
         eprintln!(
-            "fetching {} {} symbol={} tf={} from={} to={}",
+            "fetching {} {} symbol={} tf={} from=\"{}\" to=\"{}\"",
             provider_name,
             source.as_str(),
             market_symbol,
             timeframe,
-            args.from,
-            args.to
+            from_utc,
+            to_utc
         );
         let future = adapter.candles(&market_symbol, interval, args.from, args.to);
         let series = tokio::select! {
@@ -1124,6 +1175,37 @@ fn advance_reference_marks(
         }
         latest_marks.insert(key.clone(), (event.ts_ms, price));
     }
+    Ok(())
+}
+
+fn prime_missing_reference_marks_at_timestamp(
+    event_idx: usize,
+    events: &[BacktestEvent],
+    data: &BacktestData,
+    reference_sources: &BTreeMap<String, &SourceConfig>,
+    latest_marks: &mut BTreeMap<String, (u64, f64)>,
+) -> Result<()> {
+    let current = events
+        .get(event_idx)
+        .context("backtest event index is out of range")?;
+    for event in events[event_idx..]
+        .iter()
+        .take_while(|event| event.ts_ms == current.ts_ms)
+    {
+        let series = data
+            .series
+            .get(&event.selector)
+            .with_context(|| format!("{} data not loaded", event.selector))?;
+        let Some(price) = backtest_series_reference_price(series, event.record_idx)? else {
+            continue;
+        };
+        for (key, reference) in reference_sources {
+            if reference.selector == event.selector && !latest_marks.contains_key(key) {
+                latest_marks.insert(key.clone(), (event.ts_ms, price));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -2702,6 +2784,69 @@ mod tests {
             tb: None,
             ts: None,
         }
+    }
+
+    #[test]
+    fn same_timestamp_sources_prime_execution_prices_before_the_first_hook() {
+        let configs = parse_source_configs(&[
+            "btc@candles@hyperliquidf@mmt:timeframe=60".to_string(),
+            "eth@candles@hyperliquidf@mmt:timeframe=60".to_string(),
+        ])
+        .expect("parse source configs");
+        let data = BacktestData {
+            series: BTreeMap::from([
+                (
+                    "btc@candles@hyperliquidf@mmt".to_string(),
+                    BacktestSeries::Candles(vec![candle(0, 100.0, 101.0, 99.0, 100.0)]),
+                ),
+                (
+                    "eth@candles@hyperliquidf@mmt".to_string(),
+                    BacktestSeries::Candles(vec![candle(0, 50.0, 51.0, 49.0, 50.0)]),
+                ),
+            ]),
+        };
+        let events = build_event_timeline(&data, &configs).expect("build timeline");
+        let references =
+            resolve_reference_sources(&data, &configs).expect("resolve reference sources");
+        let mut latest_marks = BTreeMap::new();
+
+        prime_missing_reference_marks_at_timestamp(
+            0,
+            &events,
+            &data,
+            &references,
+            &mut latest_marks,
+        )
+        .expect("prime same-timestamp prices");
+
+        assert_eq!(
+            latest_price(
+                &latest_marks,
+                Some(crate::domain::execution::ExecutionVenue::Hyperliquid),
+                "ETH"
+            ),
+            Some(50.0)
+        );
+    }
+
+    #[test]
+    fn empty_provider_history_fails_before_script_execution() {
+        let configs = parse_source_configs(&["eth@candles@bulkf:timeframe=60".to_string()])
+            .expect("parse direct source");
+        let data = BacktestData {
+            series: BTreeMap::from([(
+                "eth@candles@bulkf".to_string(),
+                BacktestSeries::Candles(Vec::new()),
+            )]),
+        };
+
+        let error = validate_fetched_sources(1_785_542_400_000, 1_787_184_000_000, &configs, &data)
+            .expect_err("empty history must be rejected at ingestion");
+
+        assert_eq!(
+            error.to_string(),
+            "BULK returned no candles data for ETH on bulkf between 2026-08-01 00:00:00 UTC and 2026-08-20 00:00:00 UTC; choose a range available from the provider"
+        );
     }
 
     fn script_trade(mut value: Value) -> ScriptExecutionCommand {

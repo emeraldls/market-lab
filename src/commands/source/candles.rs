@@ -10,7 +10,7 @@ use crate::providers::market_data::{MarketDataAdapter, VenueCandleStream};
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::ws_candles::MmtCandlesStream;
 
-use super::common::{SourceEnvelope, SourceMeta, render_terminal};
+use super::common::{SourceEnvelope, SourceMeta, format_utc_ms, render_terminal};
 
 pub async fn handle(args: SourceCandlesArgs) -> Result<()> {
     args.validate()?;
@@ -70,8 +70,8 @@ async fn handle_mmt(args: SourceCandlesArgs) -> Result<()> {
                 env.symbol,
                 env.meta.timeframe.clone().unwrap_or_default(),
                 env.data.points,
-                env.meta.from.unwrap_or(0),
-                env.meta.to.unwrap_or(0)
+                format_utc_ms(env.meta.from.unwrap_or(0)),
+                format_utc_ms(env.meta.to.unwrap_or(0))
             );
         }
         OutputFormat::Csv | OutputFormat::Parquet => {
@@ -136,7 +136,12 @@ fn render_direct_series(
         OutputFormat::Jsonl => println!("{}", serde_json::to_string(&env)?),
         OutputFormat::Terminal => println!(
             "{} {} candles tf={} points={} from={} to={}",
-            env.symbol, label, series.tf, series.points, series.from, series.to
+            env.symbol,
+            label,
+            series.tf,
+            series.points,
+            format_utc_ms(series.from),
+            format_utc_ms(series.to)
         ),
         OutputFormat::Csv | OutputFormat::Parquet => {
             println!("TODO source candles export: {:?}", args.output)

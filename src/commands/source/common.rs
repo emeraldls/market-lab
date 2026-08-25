@@ -6,6 +6,16 @@ use serde::Serialize;
 
 use crate::cli::OutputFormat;
 
+pub fn format_utc_ms(ts_ms: u64) -> String {
+    i64::try_from(ts_ms)
+        .ok()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map_or_else(
+            || ts_ms.to_string(),
+            |date_time| date_time.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        )
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceMeta {
     pub depth: Option<u16>,
@@ -67,6 +77,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_milliseconds_as_readable_utc() {
+        assert_eq!(format_utc_ms(1_785_542_400_000), "2026-08-01 00:00:00 UTC");
+    }
 
     #[test]
     fn source_envelope_serializes_contract_keys() {

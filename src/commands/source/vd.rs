@@ -11,7 +11,7 @@ use crate::providers::market_data::{MarketDataAdapter, VenueTradesStream};
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::ws_vd::MmtVdStream;
 
-use super::common::{SourceEnvelope, SourceMeta, render_terminal};
+use super::common::{SourceEnvelope, SourceMeta, format_utc_ms, render_terminal};
 
 #[derive(Debug, Clone, Serialize)]
 struct VdStreamItem {
@@ -85,8 +85,8 @@ async fn handle_mmt(args: SourceVdArgs) -> Result<()> {
                 env.meta.timeframe.clone().unwrap_or_default(),
                 env.meta.bucket.unwrap_or(0),
                 env.data.points,
-                env.meta.from.unwrap_or(0),
-                env.meta.to.unwrap_or(0)
+                format_utc_ms(env.meta.from.unwrap_or(0)),
+                format_utc_ms(env.meta.to.unwrap_or(0))
             );
         }
         OutputFormat::Csv | OutputFormat::Parquet => {

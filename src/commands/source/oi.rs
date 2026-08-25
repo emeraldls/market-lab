@@ -11,7 +11,7 @@ use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::utils::{normalize_exchange_for_mmt, normalize_symbol_for_mmt};
 use crate::providers::mmt::ws_client::MmtWsClient;
 
-use super::common::{SourceEnvelope, SourceMeta, render_terminal};
+use super::common::{SourceEnvelope, SourceMeta, format_utc_ms, render_terminal};
 
 pub async fn handle(args: SourceOiArgs) -> Result<()> {
     args.validate()?;
@@ -73,8 +73,8 @@ async fn handle_mmt(args: SourceOiArgs) -> Result<()> {
                 env.symbol,
                 env.meta.timeframe.clone().unwrap_or_default(),
                 env.data.points,
-                env.meta.from.unwrap_or(0),
-                env.meta.to.unwrap_or(0)
+                format_utc_ms(env.meta.from.unwrap_or(0)),
+                format_utc_ms(env.meta.to.unwrap_or(0))
             );
         }
         OutputFormat::Csv | OutputFormat::Parquet => {

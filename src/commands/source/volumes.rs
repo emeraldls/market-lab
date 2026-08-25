@@ -11,7 +11,7 @@ use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::utils::{normalize_exchange_for_mmt, normalize_symbol_for_mmt};
 use crate::providers::mmt::ws_client::MmtWsClient;
 
-use super::common::{SourceEnvelope, SourceMeta, render_terminal};
+use super::common::{SourceEnvelope, SourceMeta, format_utc_ms, render_terminal};
 
 pub async fn handle(args: SourceVolumesArgs) -> Result<()> {
     args.validate()?;
@@ -73,8 +73,8 @@ async fn handle_mmt(args: SourceVolumesArgs) -> Result<()> {
                 env.symbol,
                 env.meta.timeframe.clone().unwrap_or_default(),
                 env.data.points,
-                env.meta.from.unwrap_or(0),
-                env.meta.to.unwrap_or(0)
+                format_utc_ms(env.meta.from.unwrap_or(0)),
+                format_utc_ms(env.meta.to.unwrap_or(0))
             );
         }
         OutputFormat::Csv | OutputFormat::Parquet => {
@@ -141,7 +141,12 @@ fn render_direct_volume_bars(
         OutputFormat::Jsonl => println!("{}", serde_json::to_string(&env)?),
         OutputFormat::Terminal => println!(
             "{} {} volume bars tf={} points={} from={} to={}",
-            env.symbol, label, series.tf, series.points, series.from, series.to
+            env.symbol,
+            label,
+            series.tf,
+            series.points,
+            format_utc_ms(series.from),
+            format_utc_ms(series.to)
         ),
         OutputFormat::Csv | OutputFormat::Parquet => {
             println!("TODO source volume-bars export: {output:?}")
