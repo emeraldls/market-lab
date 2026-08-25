@@ -1,5 +1,5 @@
 use std::io::{self, Write};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -18,7 +18,18 @@ use crate::providers::hyperliquid::{HyperliquidNetwork, MARKET_ORDER_SLIPPAGE};
 use crate::providers::market_data::MarketDataAdapter;
 use crate::venues::{NetworkPolicy, VenueMarket};
 
-pub async fn handle_trade(mut args: TradeArgs, direction: PositionDirection) -> Result<()> {
+const HYPERLINK_RECONCILIATION_ATTEMPTS: usize = 3;
+const HYPERLINK_RECONCILIATION_DELAY: Duration = Duration::from_millis(250);
+
+pub async fn handle_trade(args: TradeArgs, direction: PositionDirection) -> Result<()> {
+    handle_trade_with_position(args, direction, None).await
+}
+
+async fn handle_trade_with_position(
+    mut args: TradeArgs,
+    direction: PositionDirection,
+    current_position: Option<Position>,
+) -> Result<()> {
     args.apply_symbol_flag();
     args.validate_shape()?;
     if args.venue.is_outcome() && args.symbol.trim().is_empty() {
@@ -30,11 +41,11 @@ pub async fn handle_trade(mut args: TradeArgs, direction: PositionDirection) -> 
     }
     let plan = build_trade_plan(&args, direction).await?;
     if args.dry_run {
-        render_trade_plan(&plan, true, args.output)?;
+        render_trade_plan(&plan, current_position.as_ref(), true, args.output)?;
         return Ok(());
     }
     if matches!(args.output, OutputFormat::Terminal) {
-        render_trade_plan(&plan, false, args.output)?;
+        render_trade_plan(&plan, current_position.as_ref(), false, args.output)?;
     }
 
     if !args.yes {
@@ -59,26 +70,86 @@ pub async fn handle_trade(mut args: TradeArgs, direction: PositionDirection) -> 
     }
 
     let receipt = crate::runtime::submit_trade(&plan).await?;
-    let post_trade_position = if matches!(receipt.status.as_str(), "filled" | "partiallyFilled") {
-        match ExecutionAdapter::new(plan.venue, plan.testnet).await {
-            Ok(adapter) => {
-                adapter
-                    .account_snapshot(&plan.account)
-                    .await
-                    .ok()
-                    .and_then(|snapshot| {
-                        snapshot
-                            .positions
-                            .into_iter()
-                            .find(|position| position.internal_symbol == plan.internal_symbol)
-                    })
-            }
-            Err(_) => None,
+    let post_trade_state = reconcile_post_trade_state(&plan, &receipt).await;
+    render_trade_result(&plan, &receipt, &post_trade_state, args.output)
+}
+
+#[derive(Default)]
+struct PostTradeState {
+    position: Option<Position>,
+    position_closed: Option<bool>,
+    reconciliation_error: Option<String>,
+}
+
+async fn reconcile_post_trade_state(
+    plan: &TradePlan,
+    receipt: &ExecutionReceipt,
+) -> PostTradeState {
+    if !matches!(receipt.status.as_str(), "filled" | "partiallyFilled") {
+        return PostTradeState::default();
+    }
+
+    let adapter = match ExecutionAdapter::new(plan.venue, plan.testnet).await {
+        Ok(adapter) => adapter,
+        Err(error) => {
+            return PostTradeState {
+                reconciliation_error: Some(error.to_string()),
+                ..PostTradeState::default()
+            };
         }
-    } else {
-        None
     };
-    render_trade_result(&plan, &receipt, post_trade_position.as_ref(), args.output)
+    let attempts = if plan.venue == ExecutionVenue::Hyperlink {
+        HYPERLINK_RECONCILIATION_ATTEMPTS
+    } else {
+        1
+    };
+    let mut latest_position = None;
+    let mut latest_error = None;
+    let mut successful_read = false;
+
+    for attempt in 0..attempts {
+        match adapter.account_snapshot(&plan.account).await {
+            Ok(snapshot) => {
+                successful_read = true;
+                latest_error = None;
+                let position = snapshot
+                    .positions
+                    .into_iter()
+                    .find(|position| position.internal_symbol == plan.internal_symbol);
+
+                if plan.reduce_only {
+                    if position.is_none() {
+                        return PostTradeState {
+                            position_closed: Some(true),
+                            ..PostTradeState::default()
+                        };
+                    }
+                    latest_position = position;
+                } else if let Some(position) = position {
+                    let liquidation_ready = !plan.venue.is_perpetual()
+                        || position.liquidation_price.is_finite()
+                            && position.liquidation_price > 0.0;
+                    latest_position = Some(position);
+                    if liquidation_ready {
+                        break;
+                    }
+                }
+            }
+            Err(error) => latest_error = Some(error.to_string()),
+        }
+
+        if attempt + 1 < attempts {
+            tokio::time::sleep(HYPERLINK_RECONCILIATION_DELAY).await;
+        }
+    }
+
+    PostTradeState {
+        position_closed: (plan.reduce_only && successful_read).then_some(latest_position.is_none()),
+        position: latest_position,
+        reconciliation_error: (!successful_read).then(|| {
+            latest_error.unwrap_or_else(|| "post-trade account state was unavailable".to_string())
+        }),
+    }
 }
 
 pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
@@ -239,9 +310,9 @@ pub async fn handle_close(args: ClosePositionArgs) -> Result<()> {
         PositionDirection::Long => PositionDirection::Short,
         PositionDirection::Short => PositionDirection::Long,
     };
-    handle_trade(
+    handle_trade_with_position(
         TradeArgs {
-            symbol: position.internal_symbol,
+            symbol: position.internal_symbol.clone(),
             symbol_flag: None,
             config: None,
             venue: args.venue,
@@ -260,6 +331,7 @@ pub async fn handle_close(args: ClosePositionArgs) -> Result<()> {
             output: args.output,
         },
         direction,
+        Some(position),
     )
     .await
 }
@@ -953,7 +1025,12 @@ fn round_to_precision(value: f64, precision: u8) -> f64 {
     (value * scale).round() / scale
 }
 
-fn render_trade_plan(plan: &TradePlan, dry_run: bool, output: OutputFormat) -> Result<()> {
+fn render_trade_plan(
+    plan: &TradePlan,
+    current_position: Option<&Position>,
+    dry_run: bool,
+    output: OutputFormat,
+) -> Result<()> {
     match output {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(plan)?),
         OutputFormat::Jsonl => println!("{}", serde_json::to_string(plan)?),
@@ -999,7 +1076,19 @@ fn render_trade_plan(plan: &TradePlan, dry_run: bool, output: OutputFormat) -> R
             if let Some(leverage) = plan.leverage {
                 println!("  leverage:          {leverage}x");
             }
-            if plan.venue.is_perpetual() {
+            if let Some(position) = current_position {
+                if position.liquidation_price.is_finite() && position.liquidation_price > 0.0 {
+                    println!(
+                        "  liquidation price: {} (current position)",
+                        position.liquidation_price
+                    );
+                } else {
+                    println!(
+                        "  liquidation price: not available from {} for the current position",
+                        plan.venue.label()
+                    );
+                }
+            } else if plan.venue.is_perpetual() && !plan.reduce_only {
                 println!(
                     "  liquidation price: determined by {} after fill",
                     plan.venue.label()
@@ -1067,6 +1156,10 @@ struct TradeExecutionOutput<'a> {
     plan: &'a TradePlan,
     receipt: &'a ExecutionReceipt,
     post_trade_position: Option<&'a Position>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_closed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position_reconciliation_error: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -1078,22 +1171,39 @@ struct CancelExecutionOutput<'a> {
 fn render_trade_result(
     plan: &TradePlan,
     receipt: &ExecutionReceipt,
-    post_trade_position: Option<&Position>,
+    post_trade_state: &PostTradeState,
     output: OutputFormat,
 ) -> Result<()> {
     let result = TradeExecutionOutput {
         plan,
         receipt,
-        post_trade_position,
+        post_trade_position: post_trade_state.position.as_ref(),
+        position_closed: post_trade_state.position_closed,
+        position_reconciliation_error: post_trade_state.reconciliation_error.as_deref(),
     };
     match output {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
         OutputFormat::Jsonl => println!("{}", serde_json::to_string(&result)?),
         OutputFormat::Terminal => {
             render_terminal_receipt(receipt);
-            if let Some(position) = post_trade_position {
+            if post_trade_state.position_closed == Some(true) {
+                println!("  position:          closed");
+            } else if let Some(position) = post_trade_state.position.as_ref() {
+                println!("  position:          open");
+                if plan.reduce_only {
+                    println!("  remaining size:    {}", position.size);
+                }
                 println!("  position leverage: {}x", position.leverage);
-                println!("  liquidation price: {}", position.liquidation_price);
+                if position.liquidation_price.is_finite() && position.liquidation_price > 0.0 {
+                    println!("  liquidation price: {}", position.liquidation_price);
+                } else if plan.venue.is_perpetual() {
+                    println!(
+                        "  liquidation price: not yet available from {}",
+                        plan.venue.label()
+                    );
+                }
+            } else if let Some(error) = post_trade_state.reconciliation_error.as_deref() {
+                println!("  position state:    unavailable ({error})");
             } else if plan.venue.is_perpetual()
                 && matches!(receipt.status.as_str(), "filled" | "partiallyFilled")
             {
