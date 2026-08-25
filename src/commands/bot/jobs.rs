@@ -68,7 +68,7 @@ fn render_jobs(jobs: &[BotJob], output: OutputFormat) -> Result<()> {
                     job.pid
                         .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
                     job.definition.name(),
-                    venue_name(job.definition.venue()),
+                    job.definition.venue(),
                     job.definition.symbol(),
                 );
             }
@@ -94,7 +94,7 @@ fn render_job(job: &BotJob, output: OutputFormat) -> Result<()> {
             println!("  symbol:           {}", job.definition.symbol());
             match &job.definition {
                 BotJobDefinition::Grid(definition) => {
-                    println!("  venue:            {}", venue_name(definition.venue));
+                    println!("  venue:            {}", definition.venue);
                     println!("  allocated size:   {}", definition.max_inventory_size);
                     if let Some(margin) = definition.requested_margin {
                         println!("  requested margin: {margin}");
@@ -122,7 +122,7 @@ fn render_job(job: &BotJob, output: OutputFormat) -> Result<()> {
                 }
                 BotJobDefinition::MidPrice(definition)
                 | BotJobDefinition::VolumeMid(definition) => {
-                    println!("  venue:            {}", venue_name(definition.venue));
+                    println!("  venue:            {}", definition.venue);
                     println!("  max inventory:    {}", definition.max_inventory_size);
                     if let Some(margin) = definition.requested_margin {
                         println!("  requested margin: {margin}");
@@ -243,18 +243,6 @@ fn render_job(job: &BotJob, output: OutputFormat) -> Result<()> {
         OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
     }
     Ok(())
-}
-
-fn venue_name(venue: crate::domain::execution::ExecutionVenue) -> &'static str {
-    match venue {
-        crate::domain::execution::ExecutionVenue::Bulk => "bulkf",
-        crate::domain::execution::ExecutionVenue::Hyperliquid => "hyperliquidf",
-        crate::domain::execution::ExecutionVenue::Hyperlink => "hyperlinkf",
-        crate::domain::execution::ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
-        crate::domain::execution::ExecutionVenue::HyperliquidIo => "hyperliquidf-io",
-        crate::domain::execution::ExecutionVenue::HyperliquidSpot => "hyperliquid",
-        crate::domain::execution::ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
-    }
 }
 
 fn render_outcome_execution(

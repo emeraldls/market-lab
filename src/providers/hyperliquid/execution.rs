@@ -82,6 +82,9 @@ impl HyperliquidExecutionAdapter {
             native_protective_triggers: product.is_perpetual(),
             native_oco: false,
             native_on_fill: false,
+            integer_leverage: product.is_perpetual(),
+            configure_leverage_before_orders: product.is_perpetual(),
+            price_encoding: crate::domain::execution::PriceEncoding::Hyperliquid,
         }
     }
 
@@ -813,7 +816,7 @@ impl HyperliquidExecutionAdapter {
                 let market = markets::market(symbol)?;
                 resolved_testnet_market(&market.venue_symbol).await
             }
-            (HyperliquidProduct::XyzPerpetual | HyperliquidProduct::IoPerpetual, network) => {
+            (HyperliquidProduct::Hip3(_), network) => {
                 resolved_network_perpetual_market(self.product, network, symbol)
             }
         }?;
@@ -1137,10 +1140,6 @@ pub fn normalize_price_for(
     }
 }
 
-pub(crate) fn validate_price(price: f64, size_precision: u8) -> Result<()> {
-    validate_price_for(price, size_precision, 6)
-}
-
 pub(crate) fn validate_price_for(
     price: f64,
     size_precision: u8,
@@ -1348,8 +1347,7 @@ const fn venue_for_product(product: HyperliquidProduct) -> ExecutionVenue {
         HyperliquidProduct::Spot => ExecutionVenue::HyperliquidSpot,
         HyperliquidProduct::Outcome => ExecutionVenue::HyperliquidOutcomes,
         HyperliquidProduct::Perpetual => ExecutionVenue::Hyperliquid,
-        HyperliquidProduct::XyzPerpetual => ExecutionVenue::HyperliquidXyz,
-        HyperliquidProduct::IoPerpetual => ExecutionVenue::HyperliquidIo,
+        HyperliquidProduct::Hip3(venue) => venue,
     }
 }
 
@@ -1848,36 +1846,29 @@ mod tests {
 
     #[test]
     fn xyz_uses_its_venue_and_network_specific_asset_ids() {
+        let venue = ExecutionVenue::parse("hyperliquidf-xyz").expect("dynamic XYZ venue");
+        let product = HyperliquidProduct::from_venue(venue).expect("XYZ product");
+        assert_eq!(venue_for_product(product), venue);
         assert_eq!(
-            venue_for_product(HyperliquidProduct::XyzPerpetual),
-            ExecutionVenue::HyperliquidXyz
-        );
-        assert_eq!(
-            resolved_network_perpetual_market(
-                HyperliquidProduct::XyzPerpetual,
-                HyperliquidNetwork::Mainnet,
-                "TSLA",
-            )
-            .expect("mainnet XYZ market resolves")
-            .asset,
+            resolved_network_perpetual_market(product, HyperliquidNetwork::Mainnet, "TSLA",)
+                .expect("mainnet XYZ market resolves")
+                .asset,
             110_001
         );
         assert_eq!(
-            resolved_network_perpetual_market(
-                HyperliquidProduct::XyzPerpetual,
-                HyperliquidNetwork::Testnet,
-                "TSLA",
-            )
-            .expect("testnet XYZ market resolves")
-            .asset,
+            resolved_network_perpetual_market(product, HyperliquidNetwork::Testnet, "TSLA",)
+                .expect("testnet XYZ market resolves")
+                .asset,
             750_001
         );
     }
 
     #[test]
     fn xyz_info_requests_are_scoped_to_the_xyz_dex() {
+        let product =
+            HyperliquidProduct::from_exchange("hyperliquidf-xyz").expect("dynamic XYZ product");
         let mut request = serde_json::json!({ "type": "clearinghouseState", "user": "0xabc" });
-        attach_dex(&mut request, HyperliquidProduct::XyzPerpetual);
+        attach_dex(&mut request, product);
         assert_eq!(request["dex"], "xyz");
 
         let mut native = serde_json::json!({ "type": "clearinghouseState", "user": "0xabc" });
@@ -1887,13 +1878,12 @@ mod tests {
 
     #[test]
     fn entropy_io_uses_its_venue_and_scopes_info_requests() {
-        assert_eq!(
-            venue_for_product(HyperliquidProduct::IoPerpetual),
-            ExecutionVenue::HyperliquidIo
-        );
+        let venue = ExecutionVenue::parse("hyperliquidf-io").expect("dynamic EntropyIO venue");
+        let product = HyperliquidProduct::from_venue(venue).expect("EntropyIO product");
+        assert_eq!(venue_for_product(product), venue);
 
         let mut request = serde_json::json!({ "type": "clearinghouseState", "user": "0xabc" });
-        attach_dex(&mut request, HyperliquidProduct::IoPerpetual);
+        attach_dex(&mut request, product);
         assert_eq!(request["dex"], "io");
     }
 

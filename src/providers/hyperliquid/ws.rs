@@ -358,7 +358,7 @@ pub struct HyperliquidOrderBookStream {
     client: HyperliquidWsClient,
     internal_symbol: String,
     venue_symbol: String,
-    exchange: &'static str,
+    exchange: String,
     depth: u16,
     last_touch: Option<(f64, f64)>,
 }
@@ -397,7 +397,7 @@ impl HyperliquidOrderBookStream {
             client,
             internal_symbol: market.symbol.clone(),
             venue_symbol: variant.venue_symbol,
-            exchange: product.exchange(),
+            exchange: product.exchange().to_string(),
             depth,
             last_touch: None,
         })
@@ -468,7 +468,7 @@ pub struct HyperliquidTradesStream {
     client: HyperliquidWsClient,
     internal_symbol: String,
     venue_symbol: String,
-    exchange: &'static str,
+    exchange: String,
 }
 
 impl HyperliquidTradesStream {
@@ -503,7 +503,7 @@ impl HyperliquidTradesStream {
             client,
             internal_symbol: market.symbol.clone(),
             venue_symbol: variant.venue_symbol,
-            exchange: product.exchange(),
+            exchange: product.exchange().to_string(),
         })
     }
 

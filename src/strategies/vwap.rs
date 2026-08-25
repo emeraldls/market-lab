@@ -52,15 +52,11 @@ impl VolumeSourceSelector {
             let parts = value.split('@').collect::<Vec<_>>();
             let source = match parts.as_slice() {
                 [exchange] if !exchange.is_empty() => {
-                    crate::markets::exchange_market(exchange, symbol)?;
-                    if !matches!(
-                        *exchange,
-                        "bulkf" | "hyperliquidf" | "hyperliquidf-xyz" | "hyperliquidf-io"
-                    ) {
-                        bail!(
-                            "standalone volume adapter for `{exchange}` is not implemented; use `{exchange}@mmt`"
-                        );
-                    }
+                    let venue = crate::domain::execution::ExecutionVenue::parse(exchange)
+                        .with_context(|| {
+                            format!("standalone volume adapter for `{exchange}` is not registered")
+                        })?;
+                    crate::markets::exchange_market(venue.market_data_id().as_str(), symbol)?;
                     VolumeSource {
                         exchange: (*exchange).to_string(),
                         provider: VolumeProvider::Direct,

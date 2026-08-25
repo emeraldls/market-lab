@@ -7,11 +7,7 @@ use serde::Serialize;
 use crate::cli::{OutputFormat, SourceOrderbookArgs};
 use crate::domain::enums::ProviderKind;
 use crate::domain::types::{OrderBookLevel, OrderBookSnapshot};
-use crate::providers::bulk::market_data::BulkProvider;
-use crate::providers::bulk::ws::BulkOrderBookStream;
-use crate::providers::hyperliquid::market_data::HyperliquidProvider;
-use crate::providers::hyperliquid::ws::HyperliquidOrderBookStream;
-use crate::providers::hyperliquid::{HyperliquidNetwork, HyperliquidProduct};
+use crate::providers::market_data::{MarketDataAdapter, VenueOrderBookStream};
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::ws::MmtDepthStream;
 
@@ -28,11 +24,7 @@ pub async fn handle(args: SourceOrderbookArgs) -> Result<()> {
     args.validate()?;
     match args.provider_kind()?.into() {
         ProviderKind::Mmt => handle_mmt(args).await,
-        ProviderKind::Bulk => handle_bulk(args).await,
-        ProviderKind::Hyperliquid => handle_hyperliquid(args).await,
-        ProviderKind::Binance | ProviderKind::BinanceFutures => {
-            bail!("Binance orderbook snapshots and streaming are not implemented")
-        }
+        ProviderKind::Direct => handle_direct(args).await,
         ProviderKind::MarketLab => unreachable!("source routing cannot resolve to Market Lab"),
     }
 }
@@ -52,41 +44,18 @@ async fn handle_mmt(args: SourceOrderbookArgs) -> Result<()> {
     )
 }
 
-async fn handle_bulk(args: SourceOrderbookArgs) -> Result<()> {
+async fn handle_direct(args: SourceOrderbookArgs) -> Result<()> {
+    let exchange = args.exchange_name()?.to_string();
+    let adapter = MarketDataAdapter::for_exchange(&exchange, false)?;
     if args.stream {
         if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("stream mode currently supports only --output terminal|json|jsonl");
         }
-        return stream_bulk_orderbook(args).await;
+        return stream_direct_orderbook(args, &exchange).await;
     }
 
-    let snap = BulkProvider::live_orderbook(&args.symbol, args.depth, None).await?;
-    let env = build_orderbook_envelope(&snap, &args, "bulkf", false)?;
-    render_json_or_terminal(
-        &env,
-        &args.output,
-        format_terminal_summary,
-        "source orderbook",
-    )
-}
-
-async fn handle_hyperliquid(args: SourceOrderbookArgs) -> Result<()> {
-    let product = HyperliquidProduct::from_exchange(args.exchange_name()?)?;
-    if args.stream {
-        if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
-            bail!("stream mode currently supports only --output terminal|json|jsonl");
-        }
-        return stream_hyperliquid_orderbook(args, product).await;
-    }
-    let snapshot = HyperliquidProvider::live_orderbook_for(
-        product,
-        &args.symbol,
-        args.depth,
-        None,
-        HyperliquidNetwork::Mainnet,
-    )
-    .await?;
-    let envelope = build_orderbook_envelope(&snapshot, &args, product.exchange(), false)?;
+    let snapshot = adapter.orderbook(&args.symbol, args.depth, None).await?;
+    let envelope = build_orderbook_envelope(&snapshot, &args, adapter.exchange(), false)?;
     render_json_or_terminal(
         &envelope,
         &args.output,
@@ -136,8 +105,10 @@ async fn stream_mmt_orderbook(args: SourceOrderbookArgs) -> Result<()> {
     Ok(())
 }
 
-async fn stream_bulk_orderbook(args: SourceOrderbookArgs) -> Result<()> {
-    let mut stream = BulkOrderBookStream::connect(&args.symbol, args.depth).await?;
+async fn stream_direct_orderbook(args: SourceOrderbookArgs, exchange: &str) -> Result<()> {
+    let adapter = MarketDataAdapter::for_exchange(exchange, false)?;
+    let mut stream =
+        VenueOrderBookStream::connect_exchange(exchange, &args.symbol, args.depth, false).await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest: Option<OrderBookSnapshot> = None;
     let mut buf: VecDeque<String> = VecDeque::with_capacity(args.buffer_size as usize);
@@ -153,54 +124,14 @@ async fn stream_bulk_orderbook(args: SourceOrderbookArgs) -> Result<()> {
             }
             _ = ticker.tick() => {
                 let Some(snapshot) = latest.as_ref() else { continue; };
-                let env = build_orderbook_envelope(snapshot, &args, "bulkf", true)?;
+                let env = build_orderbook_envelope(snapshot, &args, adapter.exchange(), true)?;
                 match args.output {
                     OutputFormat::Json | OutputFormat::Jsonl => println!("{}", serde_json::to_string(&env)?),
                     OutputFormat::Terminal => {
                         let line = format_terminal_summary(&env);
                         if buf.len() >= args.buffer_size as usize { buf.pop_front(); }
                         buf.push_back(line);
-                        render_terminal("market-lab source BULK orderbook stream", &buf)?;
-                    }
-                    OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn stream_hyperliquid_orderbook(
-    args: SourceOrderbookArgs,
-    product: HyperliquidProduct,
-) -> Result<()> {
-    let mut stream = HyperliquidOrderBookStream::connect_for(
-        product,
-        &args.symbol,
-        args.depth,
-        HyperliquidNetwork::Mainnet,
-    )
-    .await?;
-    let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
-    let mut latest = None;
-    let mut buf = VecDeque::with_capacity(args.buffer_size as usize);
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("\nstream stopped");
-                break;
-            }
-            snapshot = stream.next_snapshot() => latest = Some(snapshot?),
-            _ = ticker.tick() => {
-                let Some(snapshot) = latest.as_ref() else { continue; };
-                let envelope = build_orderbook_envelope(snapshot, &args, product.exchange(), true)?;
-                match args.output {
-                    OutputFormat::Json | OutputFormat::Jsonl => println!("{}", serde_json::to_string(&envelope)?),
-                    OutputFormat::Terminal => {
-                        let line = format_terminal_summary(&envelope);
-                        if buf.len() >= args.buffer_size as usize { buf.pop_front(); }
-                        buf.push_back(line);
-                        render_terminal("market-lab source Hyperliquid orderbook stream", &buf)?;
+                        render_terminal(&format!("market-lab source {} orderbook stream", adapter.label()), &buf)?;
                     }
                     OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
                 }
@@ -213,7 +144,7 @@ async fn stream_hyperliquid_orderbook(
 fn build_orderbook_envelope(
     snap: &OrderBookSnapshot,
     args: &SourceOrderbookArgs,
-    provider: &'static str,
+    provider: &str,
     stream: bool,
 ) -> Result<SourceEnvelope<Vec<OrderbookItem>>> {
     let bids = filter_levels(&snap.bids, args.min_size, args.max_size)?;
@@ -253,7 +184,7 @@ fn build_orderbook_envelope(
             "source.orderbook.snapshot".to_string()
         },
         version: "1",
-        provider,
+        provider: provider.to_string(),
         exchange: snap.exchange.clone(),
         symbol: snap.symbol.clone(),
         ts_ms: snap.timestamp_ms,

@@ -11,8 +11,7 @@ use crate::cli::{
 };
 use crate::commands::execution::build_trade_plan;
 use crate::domain::execution::{ExecutionVenue, PositionDirection};
-use crate::providers::bulk::market_data::BulkProvider;
-use crate::providers::hyperliquid::market_data::HyperliquidProvider;
+use crate::providers::market_data::MarketDataAdapter;
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::utils::normalize_to_ms;
 use crate::strategies::jobs::{
@@ -26,9 +25,8 @@ use crate::strategies::vwap::{HistoricalVolume, VolumeCurve};
 
 use super::vwap::{
     MAX_PARTICIPATION_RATE, MAX_TAKER_SLIPPAGE_BPS, StrategyStopped, TrajectoryFeed,
-    VwapFeasibility, WeightedCurves, WeightedJobDefinition, execution_venue_name,
-    execution_venue_network_name, fetch_execution_volume_history, render_submission,
-    run_weighted_execution, strategy_direction, worker_trade_args,
+    VwapFeasibility, WeightedCurves, WeightedJobDefinition, fetch_execution_volume_history,
+    render_submission, run_weighted_execution, strategy_direction, worker_trade_args,
 };
 
 const HISTORY_DAYS: u64 = 28;
@@ -75,7 +73,7 @@ struct OiwapDirectionalView {
 struct OiwapPlanView<'a> {
     r#type: &'static str,
     strategy: &'static str,
-    venue: &'static str,
+    venue: String,
     symbol: &'a str,
     side: &'static str,
     total_size: f64,
@@ -408,43 +406,9 @@ async fn fetch_directional_price_window(
     testnet: bool,
 ) -> Result<(f64, f64)> {
     let from_ms = to_ms.saturating_sub(DIRECTIONAL_CONTEXT_WINDOW_SECS * 1_000);
-    let series = match venue {
-        ExecutionVenue::Bulk => BulkProvider::candles(symbol, "1m", from_ms, to_ms).await?,
-        ExecutionVenue::Hyperliquid
-        | ExecutionVenue::Hyperlink
-        | ExecutionVenue::HyperliquidXyz
-        | ExecutionVenue::HyperliquidIo
-        | ExecutionVenue::HyperliquidSpot
-        | ExecutionVenue::HyperliquidOutcomes => {
-            let product = match venue {
-                ExecutionVenue::Hyperliquid | ExecutionVenue::Hyperlink => {
-                    crate::providers::hyperliquid::HyperliquidProduct::Perpetual
-                }
-                ExecutionVenue::HyperliquidXyz => {
-                    crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual
-                }
-                ExecutionVenue::HyperliquidIo => {
-                    crate::providers::hyperliquid::HyperliquidProduct::IoPerpetual
-                }
-                ExecutionVenue::HyperliquidSpot => {
-                    crate::providers::hyperliquid::HyperliquidProduct::Spot
-                }
-                ExecutionVenue::HyperliquidOutcomes => {
-                    crate::providers::hyperliquid::HyperliquidProduct::Outcome
-                }
-                ExecutionVenue::Bulk => unreachable!(),
-            };
-            HyperliquidProvider::candles_for(
-                product,
-                symbol,
-                "1m",
-                from_ms,
-                to_ms,
-                crate::providers::hyperliquid::HyperliquidNetwork::from_testnet(testnet),
-            )
-            .await?
-        }
-    };
+    let series = MarketDataAdapter::for_venue(venue, testnet)?
+        .candles(symbol, "1m", from_ms, to_ms)
+        .await?;
     let completed = series
         .data
         .iter()
@@ -464,7 +428,7 @@ fn plan_view(input: PlanInput<'_>) -> OiwapPlanView<'_> {
     OiwapPlanView {
         r#type: "strategy.plan",
         strategy: "oiwap",
-        venue: execution_venue_name(input.parent.venue),
+        venue: input.parent.venue.to_string(),
         symbol: input.symbol,
         side: input.side,
         total_size: input.parent.size,
@@ -676,7 +640,7 @@ fn trade_args(args: &RunOiwapArgs, size: Option<f64>, margin: Option<f64>) -> Tr
 fn confirm_live_execution(venue: ExecutionVenue, testnet: bool) -> Result<bool> {
     print!(
         "Submit a live maker-first OIWAP job on {}? [y/N]: ",
-        execution_venue_network_name(venue, testnet)
+        venue.network_label(testnet)
     );
     io::stdout()
         .flush()

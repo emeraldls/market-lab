@@ -7,10 +7,7 @@ use serde::Serialize;
 use crate::cli::{OutputFormat, SourceVdArgs};
 use crate::domain::enums::ProviderKind;
 use crate::domain::types::VolumeDeltaTick;
-use crate::providers::bulk::markets;
-use crate::providers::bulk::ws::BulkTradesStream;
-use crate::providers::hyperliquid::ws::HyperliquidTradesStream;
-use crate::providers::hyperliquid::{HyperliquidNetwork, HyperliquidProduct};
+use crate::providers::market_data::{MarketDataAdapter, VenueTradesStream};
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::ws_vd::MmtVdStream;
 
@@ -32,11 +29,7 @@ pub async fn handle(args: SourceVdArgs) -> Result<()> {
     args.validate()?;
     match args.provider_kind()?.into() {
         ProviderKind::Mmt => handle_mmt(args).await,
-        ProviderKind::Bulk => stream_bulk_vd(args).await,
-        ProviderKind::Hyperliquid => stream_hyperliquid_vd(args).await,
-        ProviderKind::Binance | ProviderKind::BinanceFutures => {
-            bail!("Binance live volume delta is not implemented")
-        }
+        ProviderKind::Direct => stream_direct_vd(args).await,
         ProviderKind::MarketLab => unreachable!("source routing cannot resolve to Market Lab"),
     }
 }
@@ -63,7 +56,7 @@ async fn handle_mmt(args: SourceVdArgs) -> Result<()> {
     let env = SourceEnvelope {
         r#type: "source.vd.series".to_string(),
         version: "1",
-        provider: "mmt",
+        provider: "mmt".to_string(),
         exchange: series.exchange.clone(),
         symbol: series.symbol.clone(),
         ts_ms,
@@ -150,7 +143,7 @@ async fn stream_mmt_vd(args: SourceVdArgs) -> Result<()> {
                 let env = SourceEnvelope {
                     r#type: "source.vd.stream".to_string(),
                     version: "1",
-                    provider: "mmt",
+                    provider: "mmt".to_string(),
                     exchange: exchange.to_lowercase(),
                     symbol: args.symbol.to_uppercase(),
                     ts_ms: c.t * 1000,
@@ -190,11 +183,13 @@ async fn stream_mmt_vd(args: SourceVdArgs) -> Result<()> {
     Ok(())
 }
 
-async fn stream_bulk_vd(args: SourceVdArgs) -> Result<()> {
+async fn stream_direct_vd(args: SourceVdArgs) -> Result<()> {
     ensure_stream_output(args.output)?;
-    let market = markets::market(&args.symbol)?;
+    let exchange = args.exchange_name()?.to_string();
+    let adapter = MarketDataAdapter::for_exchange(&exchange, false)?;
+    let market = crate::markets::exchange_market(adapter.exchange(), &args.symbol)?;
     let internal_symbol = market.symbol.clone();
-    let mut stream = BulkTradesStream::connect(&args.symbol).await?;
+    let mut stream = VenueTradesStream::connect_exchange(&exchange, &args.symbol, false).await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest: Option<VolumeDeltaTick> = None;
     let mut cumulative_delta = 0.0;
@@ -208,7 +203,7 @@ async fn stream_bulk_vd(args: SourceVdArgs) -> Result<()> {
             }
             trades = stream.next_trades() => {
                 let trades = trades?;
-                if let Some(delta) = volume_delta_from_trades(&trades, &mut cumulative_delta, "bulkf", &internal_symbol) {
+                if let Some(delta) = volume_delta_from_trades(&trades, &mut cumulative_delta, adapter.exchange(), &internal_symbol) {
                     latest = Some(delta);
                 }
             }
@@ -217,8 +212,8 @@ async fn stream_bulk_vd(args: SourceVdArgs) -> Result<()> {
                 let env = SourceEnvelope {
                     r#type: "source.vd.trades.stream".to_string(),
                     version: "1",
-                    provider: "bulkf",
-                    exchange: "bulkf".to_string(),
+                    provider: adapter.exchange().to_string(),
+                    exchange: adapter.exchange().to_string(),
                     symbol: internal_symbol.clone(),
                     ts_ms: delta.timestamp_ms,
                     stream: true,
@@ -247,7 +242,7 @@ async fn stream_bulk_vd(args: SourceVdArgs) -> Result<()> {
                         );
                         if buf.len() >= args.buffer_size as usize { buf.pop_front(); }
                         buf.push_back(line);
-                        render_terminal("market-lab source BULK live volume delta", &buf)?;
+                        render_terminal(&format!("market-lab source {} live volume delta", adapter.label()), &buf)?;
                     }
                     OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
                 }
@@ -255,68 +250,6 @@ async fn stream_bulk_vd(args: SourceVdArgs) -> Result<()> {
         }
     }
 
-    Ok(())
-}
-
-async fn stream_hyperliquid_vd(args: SourceVdArgs) -> Result<()> {
-    ensure_stream_output(args.output)?;
-    let product = HyperliquidProduct::from_exchange(args.exchange_name()?)?;
-    let internal_symbol = if product == HyperliquidProduct::Outcome {
-        crate::providers::hyperliquid::outcomes::resolve(HyperliquidNetwork::Mainnet, &args.symbol)
-            .await?
-            .symbol
-    } else {
-        crate::providers::hyperliquid::markets::market_for(product, &args.symbol)?
-            .symbol
-            .clone()
-    };
-    let mut stream =
-        HyperliquidTradesStream::connect_for(product, &args.symbol, HyperliquidNetwork::Mainnet)
-            .await?;
-    let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
-    let mut latest = None;
-    let mut cumulative_delta = 0.0;
-    let mut buf = VecDeque::with_capacity(args.buffer_size as usize);
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("\nstream stopped");
-                break;
-            }
-            trades = stream.next_trades() => {
-                let trades = trades?;
-                if let Some(delta) = volume_delta_from_trades(
-                    &trades,
-                    &mut cumulative_delta,
-                    product.exchange(),
-                    &internal_symbol,
-                ) {
-                    latest = Some(delta);
-                }
-            }
-            _ = ticker.tick() => {
-                let Some(delta) = latest.as_ref() else { continue; };
-                let env = SourceEnvelope {
-                    r#type: "source.vd.trades.stream".to_string(), version: "1",
-                    provider: product.exchange(), exchange: product.exchange().to_string(),
-                    symbol: internal_symbol.clone(), ts_ms: delta.timestamp_ms,
-                    stream: true, data: delta.clone(),
-                    meta: SourceMeta { depth: None, min_size: None, max_size: None, price_group: None,
-                        interval_ms: Some(args.interval_ms), timeframe: None, bucket: None, from: None, to: None },
-                };
-                match args.output {
-                    OutputFormat::Json | OutputFormat::Jsonl => println!("{}", serde_json::to_string(&env)?),
-                    OutputFormat::Terminal => {
-                        let line = format!("ts_ms={} delta={} cumulative_delta={}", delta.timestamp_ms, delta.delta, delta.cumulative_delta);
-                        if buf.len() >= args.buffer_size as usize { buf.pop_front(); }
-                        buf.push_back(line);
-                        render_terminal("market-lab source Hyperliquid live volume delta", &buf)?;
-                    }
-                    OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
-                }
-            }
-        }
-    }
     Ok(())
 }
 

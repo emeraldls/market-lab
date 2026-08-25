@@ -15,9 +15,7 @@ use crate::commands::script::{
 use crate::commands::study::common::is_empty_object;
 use crate::domain::enums::ProviderKind;
 use crate::domain::types::OrderBookSnapshot;
-use crate::providers::binance::{BinanceMarket, BinanceProvider};
-use crate::providers::bulk::market_data::BulkProvider;
-use crate::providers::hyperliquid::market_data::HyperliquidProvider;
+use crate::providers::market_data::MarketDataAdapter;
 use crate::providers::mmt::MmtProvider;
 use crate::scripting::engine::Script;
 use crate::scripting::execution::{
@@ -633,35 +631,13 @@ async fn fetch_sources(
     }
     if source_configs
         .values()
-        .any(|config| config.provider == ProviderKind::Bulk)
+        .any(|config| config.provider == ProviderKind::Direct)
     {
         data.series.extend(
-            fetch_direct_sources(args, source_configs, report, ProviderKind::Bulk)
+            fetch_direct_sources(args, source_configs, report, ProviderKind::Direct)
                 .await?
                 .series,
         );
-    }
-    if source_configs
-        .values()
-        .any(|config| config.provider == ProviderKind::Hyperliquid)
-    {
-        data.series.extend(
-            fetch_direct_sources(args, source_configs, report, ProviderKind::Hyperliquid)
-                .await?
-                .series,
-        );
-    }
-    for provider in [ProviderKind::Binance, ProviderKind::BinanceFutures] {
-        if source_configs
-            .values()
-            .any(|config| config.provider == provider)
-        {
-            data.series.extend(
-                fetch_direct_sources(args, source_configs, report, provider)
-                    .await?
-                    .series,
-            );
-        }
     }
     Ok(data)
 }
@@ -909,25 +885,9 @@ async fn fetch_direct_sources(
         let source = &config.source;
         let market_symbol = config.market_symbol();
         let timeframe = config.require_timeframe(source)?;
-        let provider_name = match provider {
-            ProviderKind::Bulk => "BULK",
-            ProviderKind::Hyperliquid => "Hyperliquid",
-            ProviderKind::Binance => "Binance Spot",
-            ProviderKind::BinanceFutures => "Binance Futures",
-            _ => bail!("historical direct source provider is invalid"),
-        };
-        let interval = match provider {
-            ProviderKind::Bulk => {
-                crate::providers::bulk::market_data::timeframe_from_seconds(timeframe)?
-            }
-            ProviderKind::Hyperliquid => {
-                crate::providers::hyperliquid::market_data::timeframe_from_seconds(timeframe)?
-            }
-            ProviderKind::Binance | ProviderKind::BinanceFutures => {
-                crate::providers::binance::market_data::timeframe_from_seconds(timeframe)?
-            }
-            _ => unreachable!(),
-        };
+        let adapter = MarketDataAdapter::for_exchange(&config.exchange, false)?;
+        let provider_name = adapter.label();
+        let interval = adapter.timeframe_from_seconds(timeframe)?;
         let phase = match source {
             ScriptSource::Candles => "fetching_candles",
             ScriptSource::Volumes => "fetching_volumes",
@@ -954,47 +914,7 @@ async fn fetch_direct_sources(
             args.from,
             args.to
         );
-        let future = async {
-            match provider {
-                ProviderKind::Bulk => {
-                    BulkProvider::candles(&market_symbol, interval, args.from, args.to).await
-                }
-                ProviderKind::Hyperliquid => {
-                    HyperliquidProvider::candles_for(
-                        crate::providers::hyperliquid::HyperliquidProduct::from_exchange(
-                            &config.exchange,
-                        )?,
-                        &market_symbol,
-                        interval,
-                        args.from,
-                        args.to,
-                        crate::providers::hyperliquid::HyperliquidNetwork::Mainnet,
-                    )
-                    .await
-                }
-                ProviderKind::Binance => {
-                    BinanceProvider::candles_paginated(
-                        BinanceMarket::Spot,
-                        &market_symbol,
-                        interval,
-                        args.from,
-                        args.to,
-                    )
-                    .await
-                }
-                ProviderKind::BinanceFutures => {
-                    BinanceProvider::candles_paginated(
-                        BinanceMarket::Futures,
-                        &market_symbol,
-                        interval,
-                        args.from,
-                        args.to,
-                    )
-                    .await
-                }
-                _ => unreachable!(),
-            }
-        };
+        let future = adapter.candles(&market_symbol, interval, args.from, args.to);
         let series = tokio::select! {
             result = future => result?,
             _ = &mut cancel => {
@@ -1513,7 +1433,7 @@ fn missing_execution_price(
         |exchange| {
             format!(
                 "{operation} symbol `{symbol}` on {} requires its own price-bearing source before submitting this order",
-                execution_venue_name(exchange)
+                exchange.market_data_id()
             )
         },
     )
@@ -1535,21 +1455,9 @@ fn execution_mark_key(
         Some(exchange) => format!(
             "{}@{}",
             symbol.to_ascii_lowercase(),
-            execution_venue_name(exchange)
+            exchange.market_data_id()
         ),
         None => symbol.to_ascii_lowercase(),
-    }
-}
-
-fn execution_venue_name(exchange: crate::domain::execution::ExecutionVenue) -> &'static str {
-    match exchange {
-        crate::domain::execution::ExecutionVenue::Bulk => "bulkf",
-        crate::domain::execution::ExecutionVenue::Hyperliquid => "hyperliquidf",
-        crate::domain::execution::ExecutionVenue::Hyperlink => "hyperliquidf",
-        crate::domain::execution::ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
-        crate::domain::execution::ExecutionVenue::HyperliquidIo => "hyperliquidf-io",
-        crate::domain::execution::ExecutionVenue::HyperliquidSpot => "hyperliquid",
-        crate::domain::execution::ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
     }
 }
 
@@ -1561,7 +1469,7 @@ fn route_matches_source(
     exchange.map_or(legacy_reference, |exchange| {
         config
             .exchange
-            .eq_ignore_ascii_case(execution_venue_name(exchange))
+            .eq_ignore_ascii_case(exchange.market_data_id().as_str())
     })
 }
 

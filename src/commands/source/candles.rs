@@ -6,12 +6,7 @@ use anyhow::{Result, bail};
 use crate::cli::{OutputFormat, SourceCandlesArgs};
 use crate::domain::enums::ProviderKind;
 use crate::domain::types::{OhlcvSeries, OhlcvtCandle};
-use crate::providers::binance::{BinanceMarket, BinanceProvider};
-use crate::providers::bulk::market_data::BulkProvider;
-use crate::providers::bulk::ws::BulkCandleStream;
-use crate::providers::hyperliquid::market_data::HyperliquidProvider;
-use crate::providers::hyperliquid::ws::HyperliquidCandleStream;
-use crate::providers::hyperliquid::{HyperliquidNetwork, HyperliquidProduct};
+use crate::providers::market_data::{MarketDataAdapter, VenueCandleStream};
 use crate::providers::mmt::MmtProvider;
 use crate::providers::mmt::ws_candles::MmtCandlesStream;
 
@@ -21,10 +16,7 @@ pub async fn handle(args: SourceCandlesArgs) -> Result<()> {
     args.validate()?;
     match args.provider_kind()?.into() {
         ProviderKind::Mmt => handle_mmt(args).await,
-        ProviderKind::Bulk => handle_bulk(args).await,
-        ProviderKind::Hyperliquid => handle_hyperliquid(args).await,
-        ProviderKind::Binance => handle_binance(args, BinanceMarket::Spot).await,
-        ProviderKind::BinanceFutures => handle_binance(args, BinanceMarket::Futures).await,
+        ProviderKind::Direct => handle_direct(args).await,
         ProviderKind::MarketLab => unreachable!("source routing cannot resolve to Market Lab"),
     }
 }
@@ -50,7 +42,7 @@ async fn handle_mmt(args: SourceCandlesArgs) -> Result<()> {
     let env = SourceEnvelope {
         r#type: "source.candles.series".to_string(),
         version: "1",
-        provider: "mmt",
+        provider: "mmt".to_string(),
         exchange: series.exchange.clone(),
         symbol: series.symbol.clone(),
         ts_ms,
@@ -90,79 +82,37 @@ async fn handle_mmt(args: SourceCandlesArgs) -> Result<()> {
     Ok(())
 }
 
-async fn handle_bulk(args: SourceCandlesArgs) -> Result<()> {
+async fn handle_direct(args: SourceCandlesArgs) -> Result<()> {
+    let exchange = args.exchange_name()?.to_string();
+    let adapter = MarketDataAdapter::for_exchange(&exchange, false)?;
     if args.stream {
         ensure_stream_output(args.output)?;
-        return stream_bulk_candles(args).await;
+        return stream_direct_candles(args, &exchange).await;
     }
 
-    let series = BulkProvider::candles(
-        &args.symbol,
-        args.timeframe_name()?,
-        args.from
-            .ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?,
-        args.to
-            .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?,
-    )
-    .await?;
-    render_bulk_series(&series, &args)
-}
-
-async fn handle_hyperliquid(args: SourceCandlesArgs) -> Result<()> {
-    let product = HyperliquidProduct::from_exchange(args.exchange_name()?)?;
-    if args.stream {
-        ensure_stream_output(args.output)?;
-        return stream_hyperliquid_candles(args, product).await;
-    }
-    let series = HyperliquidProvider::candles_for(
-        product,
-        &args.symbol,
-        args.timeframe_name()?,
-        args.from
-            .ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?,
-        args.to
-            .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?,
-        HyperliquidNetwork::Mainnet,
-    )
-    .await?;
-    render_direct_series(&series, &args, product.exchange(), "Hyperliquid")
-}
-
-async fn handle_binance(args: SourceCandlesArgs, market: BinanceMarket) -> Result<()> {
-    if args.stream {
-        bail!("Binance live candle streaming is not implemented");
-    }
-    let series = BinanceProvider::candles_paginated(
-        market,
-        &args.symbol,
-        args.timeframe_name()?,
-        args.from
-            .ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?,
-        args.to
-            .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?,
-    )
-    .await?;
-    let label = match market {
-        BinanceMarket::Spot => "Binance Spot",
-        BinanceMarket::Futures => "Binance Futures",
-    };
-    render_direct_series(&series, &args, market.exchange(), label)
-}
-
-fn render_bulk_series(series: &OhlcvSeries, args: &SourceCandlesArgs) -> Result<()> {
-    render_direct_series(series, args, "bulkf", "BULK")
+    let series = adapter
+        .candles(
+            &args.symbol,
+            args.timeframe_name()?,
+            args.from
+                .ok_or_else(|| anyhow::anyhow!("--from is required when not streaming"))?,
+            args.to
+                .ok_or_else(|| anyhow::anyhow!("--to is required when not streaming"))?,
+        )
+        .await?;
+    render_direct_series(&series, &args, adapter.exchange(), adapter.label())
 }
 
 fn render_direct_series(
     series: &OhlcvSeries,
     args: &SourceCandlesArgs,
-    provider: &'static str,
+    provider: &str,
     label: &str,
 ) -> Result<()> {
     let env = SourceEnvelope {
         r#type: "source.candles.series".to_string(),
         version: "1",
-        provider,
+        provider: provider.to_string(),
         exchange: series.exchange.clone(),
         symbol: series.symbol.clone(),
         ts_ms: series.data.last().map(|candle| candle.t).unwrap_or(0),
@@ -224,7 +174,7 @@ async fn stream_mmt_candles(args: SourceCandlesArgs) -> Result<()> {
                 let env = SourceEnvelope {
                     r#type: "source.candles.stream".to_string(),
                     version: "1",
-                    provider: "mmt",
+                    provider: "mmt".to_string(),
                     exchange: exchange.to_lowercase(),
                     symbol: args.symbol.to_uppercase(),
                     ts_ms: c.t * 1000,
@@ -265,8 +215,13 @@ async fn stream_mmt_candles(args: SourceCandlesArgs) -> Result<()> {
     Ok(())
 }
 
-async fn stream_bulk_candles(args: SourceCandlesArgs) -> Result<()> {
-    let mut stream = BulkCandleStream::connect(&args.symbol, args.timeframe_name()?).await?;
+async fn stream_direct_candles(args: SourceCandlesArgs, exchange: &str) -> Result<()> {
+    let adapter = MarketDataAdapter::for_exchange(exchange, false)?;
+    let internal_symbol = crate::markets::exchange_market(adapter.exchange(), &args.symbol)?
+        .symbol
+        .clone();
+    let mut stream =
+        VenueCandleStream::connect(exchange, &args.symbol, args.timeframe_name()?, false).await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest = None;
     let mut buf: VecDeque<String> = VecDeque::with_capacity(args.buffer_size as usize);
@@ -285,9 +240,9 @@ async fn stream_bulk_candles(args: SourceCandlesArgs) -> Result<()> {
                 let env = SourceEnvelope {
                     r#type: "source.candles.stream".to_string(),
                     version: "1",
-                    provider: "bulkf",
-                    exchange: "bulkf".to_string(),
-                    symbol: crate::providers::bulk::markets::market(&args.symbol)?.symbol.clone(),
+                    provider: adapter.exchange().to_string(),
+                    exchange: adapter.exchange().to_string(),
+                    symbol: internal_symbol.clone(),
                     ts_ms: candle.t,
                     stream: true,
                     data: candle.clone(),
@@ -313,71 +268,7 @@ async fn stream_bulk_candles(args: SourceCandlesArgs) -> Result<()> {
                         );
                         if buf.len() >= args.buffer_size as usize { buf.pop_front(); }
                         buf.push_back(line);
-                        render_terminal("market-lab source BULK candles stream", &buf)?;
-                    }
-                    OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn stream_hyperliquid_candles(
-    args: SourceCandlesArgs,
-    product: HyperliquidProduct,
-) -> Result<()> {
-    let internal_symbol = if product == HyperliquidProduct::Outcome {
-        crate::providers::hyperliquid::outcomes::resolve(HyperliquidNetwork::Mainnet, &args.symbol)
-            .await?
-            .symbol
-    } else {
-        crate::providers::hyperliquid::markets::market_for(product, &args.symbol)?
-            .symbol
-            .clone()
-    };
-    let mut stream = HyperliquidCandleStream::connect_for(
-        product,
-        &args.symbol,
-        args.timeframe_name()?,
-        HyperliquidNetwork::Mainnet,
-    )
-    .await?;
-    let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
-    let mut latest = None;
-    let mut buf = VecDeque::with_capacity(args.buffer_size as usize);
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("\nstream stopped");
-                break;
-            }
-            candle = stream.next_candle() => latest = Some(candle?),
-            _ = ticker.tick() => {
-                let Some(candle) = latest.as_ref() else { continue; };
-                let env = SourceEnvelope {
-                    r#type: "source.candles.stream".to_string(),
-                    version: "1",
-                    provider: product.exchange(),
-                    exchange: product.exchange().to_string(),
-                    symbol: internal_symbol.clone(),
-                    ts_ms: candle.t,
-                    stream: true,
-                    data: candle.clone(),
-                    meta: SourceMeta {
-                        depth: None, min_size: None, max_size: None, price_group: None,
-                        interval_ms: Some(args.interval_ms),
-                        timeframe: Some(args.timeframe_name()?.to_string()),
-                        bucket: None, from: None, to: None,
-                    },
-                };
-                match args.output {
-                    OutputFormat::Json | OutputFormat::Jsonl => println!("{}", serde_json::to_string(&env)?),
-                    OutputFormat::Terminal => {
-                        let line = format!("t={} o={} h={} l={} c={} volume={} trades={}", candle.t, candle.o, candle.h, candle.l, candle.c, candle.volume, candle.trades);
-                        if buf.len() >= args.buffer_size as usize { buf.pop_front(); }
-                        buf.push_back(line);
-                        render_terminal("market-lab source Hyperliquid candles stream", &buf)?;
+                        render_terminal(&format!("market-lab source {} candles stream", adapter.label()), &buf)?;
                     }
                     OutputFormat::Csv | OutputFormat::Parquet => unreachable!(),
                 }

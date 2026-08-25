@@ -50,6 +50,9 @@ impl BulkExecutionAdapter {
             native_protective_triggers: true,
             native_oco: true,
             native_on_fill: true,
+            integer_leverage: false,
+            configure_leverage_before_orders: false,
+            price_encoding: crate::domain::execution::PriceEncoding::TickSize,
         }
     }
 

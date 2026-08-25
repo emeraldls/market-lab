@@ -7,7 +7,7 @@ use crate::domain::requests::InspectRequest;
 use crate::domain::types::DepthEstimate;
 use crate::functions;
 use crate::providers::mmt::MmtProvider;
-use crate::providers::{MarketDataProvider, ProviderClient};
+use crate::providers::{ProviderClient, ProviderService};
 
 use super::common::{StudyDescriptor, StudyEnvelope, empty_meta, print_study_json, provider_name};
 use super::realtime::{StreamRunConfig, run_mmt_realtime};
@@ -78,7 +78,7 @@ pub async fn handle(args: DepthArgs) -> Result<()> {
             MmtProvider::live_orderbook(&req.exchange, &req.symbol, req.levels).await?
         }
         _ => {
-            let client = ProviderClient::from_kind(req.provider);
+            let client = ProviderClient::from_kind(req.provider, &req.exchange)?;
             let inspect_req = InspectRequest {
                 provider: req.provider,
                 exchange: req.exchange.clone(),

@@ -10,20 +10,18 @@ use crate::cli::{
 };
 use crate::domain::execution::{
     CancelPlan, ExecutionReceipt, ExecutionVenue, OpenOrder, OutcomeHolding, Position,
-    PositionDirection, SpotBalance, TimeInForce, TradePlan,
+    PositionDirection, PriceEncoding, SpotBalance, TimeInForce, TradePlan,
 };
 use crate::markets::Market;
-use crate::providers::bulk::market_data::BulkProvider;
 use crate::providers::execution::ExecutionAdapter;
-use crate::providers::hyperliquid::market_data::HyperliquidProvider;
 use crate::providers::hyperliquid::{HyperliquidNetwork, MARKET_ORDER_SLIPPAGE};
+use crate::providers::market_data::MarketDataAdapter;
+use crate::venues::{NetworkPolicy, VenueMarket};
 
 pub async fn handle_trade(mut args: TradeArgs, direction: PositionDirection) -> Result<()> {
     args.apply_symbol_flag();
     args.validate_shape()?;
-    if args.venue == crate::cli::ExecutionVenueArg::HyperliquidOutcomes
-        && args.symbol.trim().is_empty()
-    {
+    if args.venue.is_outcome() && args.symbol.trim().is_empty() {
         args.symbol = crate::providers::hyperliquid::outcomes::select_interactive(
             HyperliquidNetwork::from_testnet(args.testnet),
         )
@@ -45,7 +43,7 @@ pub async fn handle_trade(mut args: TradeArgs, direction: PositionDirection) -> 
         }
         print!(
             "Submit this order to {}? [y/N]: ",
-            venue_network_label(plan.venue, plan.testnet)
+            plan.venue.network_label(plan.testnet)
         );
         io::stdout()
             .flush()
@@ -85,14 +83,14 @@ pub async fn handle_trade(mut args: TradeArgs, direction: PositionDirection) -> 
 
 pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
     args.validate()?;
-    let venue = ExecutionVenue::from(args.venue);
+    let venue = args.venue;
     let symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
     let account = ExecutionAdapter::configured_account(venue)?;
     let snapshot = ExecutionAdapter::new(venue, args.testnet)
         .await?
         .account_snapshot(&account)
         .await?;
-    if venue == ExecutionVenue::HyperliquidSpot {
+    if venue.is_spot() {
         let balances = snapshot
             .spot_balances
             .into_iter()
@@ -106,7 +104,7 @@ pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
             .collect::<Vec<_>>();
         return render_spot_balances(&balances, args.output);
     }
-    if venue == ExecutionVenue::HyperliquidOutcomes {
+    if venue.is_outcome() {
         let holdings = snapshot
             .outcome_holdings
             .into_iter()
@@ -132,7 +130,7 @@ pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
 
 pub async fn handle_orders(args: AccountQueryArgs) -> Result<()> {
     args.validate()?;
-    let venue = ExecutionVenue::from(args.venue);
+    let venue = args.venue;
     let symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
     let account = ExecutionAdapter::configured_account(venue)?;
     let orders = ExecutionAdapter::new(venue, args.testnet)
@@ -151,7 +149,7 @@ pub async fn handle_orders(args: AccountQueryArgs) -> Result<()> {
 
 pub async fn handle_fills(args: AccountQueryArgs) -> Result<()> {
     args.validate()?;
-    let venue = ExecutionVenue::from(args.venue);
+    let venue = args.venue;
     let symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
     let account = ExecutionAdapter::configured_account(venue)?;
     let fills = ExecutionAdapter::new(venue, args.testnet)
@@ -187,15 +185,11 @@ pub async fn handle_fills(args: AccountQueryArgs) -> Result<()> {
 
 pub async fn handle_cancel(args: CancelOrderArgs) -> Result<()> {
     args.validate()?;
-    let venue = ExecutionVenue::from(args.venue);
+    let venue = args.venue;
     let market = execution_market_on(venue, args.testnet, &args.symbol).await?;
-    if venue == ExecutionVenue::Bulk {
-        bulk_keychain::Hash::from_base58(&args.order_id).context("invalid BULK order id")?;
-    } else {
-        args.order_id
-            .parse::<u64>()
-            .context("Hyperliquid order id must be an unsigned integer")?;
-    }
+    ExecutionAdapter::new(venue, args.testnet)
+        .await?
+        .validate_order_id(&args.order_id)?;
     let account = ExecutionAdapter::configured_account(venue)?;
     let plan = CancelPlan {
         created_at_ms: now_ms()?,
@@ -213,10 +207,7 @@ pub async fn handle_cancel(args: CancelOrderArgs) -> Result<()> {
     if matches!(args.output, OutputFormat::Terminal) {
         render_cancel_plan(&plan, false, args.output)?;
     }
-    let prompt = format!(
-        "Cancel this {} order?",
-        venue_network_label(venue, args.testnet)
-    );
+    let prompt = format!("Cancel this {} order?", venue.network_label(args.testnet));
     if !args.yes && !confirm_live_action(args.output, &prompt)? {
         println!("cancelled; the order was not changed");
         return Ok(());
@@ -227,7 +218,7 @@ pub async fn handle_cancel(args: CancelOrderArgs) -> Result<()> {
 
 pub async fn handle_close(args: ClosePositionArgs) -> Result<()> {
     args.validate()?;
-    let venue = ExecutionVenue::from(args.venue);
+    let venue = args.venue;
     let requested_symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
     let account = ExecutionAdapter::configured_account(venue)?;
     let snapshot = ExecutionAdapter::new(venue, args.testnet)
@@ -361,8 +352,8 @@ async fn build_trade_plan_with_price_normalization(
     market_reference_price: Option<f64>,
     max_slippage: Option<f64>,
 ) -> Result<TradePlan> {
-    let venue = ExecutionVenue::from(args.venue);
-    let outcome = if venue == ExecutionVenue::HyperliquidOutcomes {
+    let venue = args.venue;
+    let outcome = if venue.is_outcome() {
         Some(
             crate::providers::hyperliquid::outcomes::resolve(
                 HyperliquidNetwork::from_testnet(args.testnet),
@@ -384,26 +375,24 @@ async fn build_trade_plan_with_price_normalization(
         .transpose()?;
     let args = normalized_args.as_ref().unwrap_or(args);
     validate_market_rules(venue, &market, args)?;
-    let leverage = match venue {
-        ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidOutcomes => None,
-        ExecutionVenue::Bulk
-        | ExecutionVenue::Hyperliquid
-        | ExecutionVenue::Hyperlink
-        | ExecutionVenue::HyperliquidXyz
-        | ExecutionVenue::HyperliquidIo => Some(args.leverage.unwrap_or(1.0)),
-    };
+    let venue_spec = venue.spec()?;
+    let leverage = venue_spec
+        .market
+        .is_perpetual()
+        .then(|| args.leverage.unwrap_or(1.0));
     let sizing_leverage = leverage.unwrap_or(1.0);
     let mut rules = execution_rules(venue, args.testnet, &market)?;
-    if venue == ExecutionVenue::Hyperlink {
-        let max_leverage = ExecutionAdapter::new(venue, false)
+    if venue.is_perpetual() {
+        let max_leverage = ExecutionAdapter::new(venue, args.testnet)
             .await?
             .max_leverage(&market.symbol)
             .await?;
         rules.max_leverage = u16::try_from(max_leverage)
-            .context("HyperLink max leverage exceeds Market Lab's supported range")?;
+            .context("venue max leverage exceeds Market Lab's supported range")?;
         if leverage.is_some_and(|leverage| leverage > f64::from(rules.max_leverage)) {
             bail!(
-                "HyperLink leverage must be at most {} for {}",
+                "{} leverage must be at most {} for {}",
+                venue.label(),
                 rules.max_leverage,
                 market.symbol
             );
@@ -420,63 +409,17 @@ async fn build_trade_plan_with_price_normalization(
         TradeOrderKind::Market if market_reference_price.is_some() => {
             market_reference_price.expect("guarded script market reference")
         }
-        TradeOrderKind::Market => match venue {
-            ExecutionVenue::Bulk => BulkProvider::ticker(&market.symbol).await?.mark_price,
-            ExecutionVenue::Hyperliquid => {
-                HyperliquidProvider::ticker_on(
-                    &market.symbol,
-                    HyperliquidNetwork::from_testnet(args.testnet),
-                )
+        TradeOrderKind::Market => {
+            MarketDataAdapter::for_venue(venue, args.testnet)?
+                .ticker(&market.symbol)
                 .await?
                 .mark_price
-            }
-            ExecutionVenue::Hyperlink => {
-                HyperliquidProvider::ticker_on(&market.symbol, HyperliquidNetwork::Mainnet)
-                    .await?
-                    .mark_price
-            }
-            ExecutionVenue::HyperliquidXyz => {
-                HyperliquidProvider::ticker_for(
-                    crate::providers::hyperliquid::HyperliquidProduct::XyzPerpetual,
-                    &market.symbol,
-                    HyperliquidNetwork::from_testnet(args.testnet),
-                )
-                .await?
-                .mark_price
-            }
-            ExecutionVenue::HyperliquidIo => {
-                HyperliquidProvider::ticker_for(
-                    crate::providers::hyperliquid::HyperliquidProduct::IoPerpetual,
-                    &market.symbol,
-                    HyperliquidNetwork::from_testnet(args.testnet),
-                )
-                .await?
-                .mark_price
-            }
-            ExecutionVenue::HyperliquidSpot => {
-                HyperliquidProvider::ticker_for(
-                    crate::providers::hyperliquid::HyperliquidProduct::Spot,
-                    &market.symbol,
-                    HyperliquidNetwork::from_testnet(args.testnet),
-                )
-                .await?
-                .mark_price
-            }
-            ExecutionVenue::HyperliquidOutcomes => {
-                HyperliquidProvider::ticker_for(
-                    crate::providers::hyperliquid::HyperliquidProduct::Outcome,
-                    &market.symbol,
-                    HyperliquidNetwork::from_testnet(args.testnet),
-                )
-                .await?
-                .mark_price
-            }
-        },
+        }
     };
     if !reference_price.is_finite() || reference_price <= 0.0 {
         bail!(
             "{} returned an invalid reference price for {}",
-            venue_label(venue),
+            venue.label(),
             market.venue_symbol
         );
     }
@@ -487,7 +430,7 @@ async fn build_trade_plan_with_price_normalization(
         if !is_step_aligned(size, rules.lot_size) {
             bail!(
                 "--size {size} is not aligned to {} lot size {} for {}",
-                venue_label(venue),
+                venue.label(),
                 rules.lot_size,
                 market.symbol
             );
@@ -497,10 +440,8 @@ async fn build_trade_plan_with_price_normalization(
         let margin = args
             .margin
             .context("one of --size or --margin is required")?;
-        let sizing_price = if matches!(
-            venue,
-            ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidOutcomes
-        ) && direction == PositionDirection::Long
+        let sizing_price = if !venue.is_perpetual()
+            && direction == PositionDirection::Long
             && matches!(args.order_kind, TradeOrderKind::Market)
         {
             reference_price * (1.0 + market_slippage)
@@ -511,20 +452,17 @@ async fn build_trade_plan_with_price_normalization(
         floor_to_step(raw_size, rules.lot_size, rules.size_precision)
     };
     if size <= 0.0 {
-        if matches!(
-            venue,
-            ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidOutcomes
-        ) {
+        if !venue.is_perpetual() {
             bail!(
                 "requested amount produces a size below {} spot lot size {} on {}",
-                venue_label(venue),
+                venue.label(),
                 rules.lot_size,
                 market.symbol
             );
         }
         bail!(
             "requested margin and leverage produce a size below {} lot size {} on {}",
-            venue_label(venue),
+            venue.label(),
             rules.lot_size,
             market.symbol
         );
@@ -534,12 +472,12 @@ async fn build_trade_plan_with_price_normalization(
     if estimated_exposure + f64::EPSILON < rules.min_notional {
         bail!(
             "estimated exposure {estimated_exposure:.8} is below {} minimum notional {} for {}",
-            venue_label(venue),
+            venue.label(),
             rules.min_notional,
             market.symbol
         );
     }
-    if venue == ExecutionVenue::HyperliquidSpot {
+    if venue.is_spot() {
         validate_spot_funds(
             args.testnet,
             &account,
@@ -555,7 +493,7 @@ async fn build_trade_plan_with_price_normalization(
         )
         .await?;
     }
-    if venue == ExecutionVenue::HyperliquidOutcomes {
+    if venue.is_outcome() {
         validate_outcome_funds(
             args.testnet,
             &account,
@@ -657,8 +595,9 @@ fn normalize_price_to_rules(
     if !price.is_finite() || price <= 0.0 {
         bail!("automated order price must be finite and positive");
     }
-    let normalized = match venue {
-        ExecutionVenue::Bulk => {
+    let spec = venue.spec()?;
+    let normalized = match ExecutionAdapter::capabilities(venue).price_encoding {
+        PriceEncoding::TickSize => {
             let units = price / rules.tick_size;
             let units = match rounding {
                 PriceRounding::Down => (units + 1e-10).floor(),
@@ -667,19 +606,13 @@ fn normalize_price_to_rules(
             };
             round_to_precision(units * rules.tick_size, rules.price_precision)
         }
-        ExecutionVenue::Hyperliquid
-        | ExecutionVenue::Hyperlink
-        | ExecutionVenue::HyperliquidXyz
-        | ExecutionVenue::HyperliquidIo => {
-            normalize_hyperliquid_price(price, rules.size_precision, 6, rounding)
-        }
-        ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidOutcomes => {
-            normalize_hyperliquid_price(
-                price,
-                rules.size_precision,
-                rules.price_precision,
-                rounding,
-            )
+        PriceEncoding::Hyperliquid => {
+            let price_decimals = if spec.market.is_perpetual() {
+                6
+            } else {
+                rules.price_precision
+            };
+            normalize_hyperliquid_price(price, rules.size_precision, price_decimals, rounding)
         }
     };
     if normalized <= 0.0 {
@@ -802,7 +735,7 @@ fn validate_protection_prices(
         {
             bail!(
                 "{flag} {price} is not aligned to {} price rules for {}",
-                venue_label(venue),
+                venue.label(),
                 market.symbol
             );
         }
@@ -834,13 +767,13 @@ fn validate_market_rules(venue: ExecutionVenue, market: &Market, args: &TradeArg
     if !capabilities.order_kinds.contains(&args.order_kind.into()) {
         bail!(
             "{} execution adapter does not support this order type",
-            venue_label(venue)
+            venue.label()
         );
     }
     if !market.is_available() {
         bail!(
             "{} market `{}` is not trading",
-            venue_label(venue),
+            venue.label(),
             market.venue_symbol
         );
     }
@@ -851,15 +784,11 @@ fn validate_market_rules(venue: ExecutionVenue, market: &Market, args: &TradeArg
     if !market.supports_order_type(order_type) {
         bail!(
             "{} market `{}` does not support {order_type} orders",
-            venue_label(venue),
+            venue.label(),
             market.venue_symbol
         );
     }
-    if matches!(
-        venue,
-        ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidOutcomes
-    ) && args.leverage.is_some()
-    {
+    if !venue.is_perpetual() && args.leverage.is_some() {
         bail!("--leverage is not supported for Hyperliquid spot or outcome markets");
     }
     let leverage = args.leverage.unwrap_or(1.0);
@@ -867,24 +796,17 @@ fn validate_market_rules(venue: ExecutionVenue, market: &Market, args: &TradeArg
         bail!(
             "--leverage {} exceeds {} maximum {}x for {}",
             leverage,
-            venue_label(venue),
+            venue.label(),
             rules.max_leverage,
             market.symbol
         );
     }
-    if matches!(
-        venue,
-        ExecutionVenue::Hyperliquid
-            | ExecutionVenue::HyperliquidXyz
-            | ExecutionVenue::HyperliquidIo
-    ) && leverage.fract().abs() > f64::EPSILON
+    if ExecutionAdapter::capabilities(venue).integer_leverage
+        && leverage.fract().abs() > f64::EPSILON
     {
-        bail!("Hyperliquid leverage must be a whole number");
+        bail!("{} leverage must be a whole number", venue.label());
     }
-    if matches!(
-        venue,
-        ExecutionVenue::HyperliquidSpot | ExecutionVenue::HyperliquidOutcomes
-    ) {
+    if !venue.is_perpetual() {
         if args.reduce_only {
             bail!("Hyperliquid spot and outcome orders do not support --reduce-only");
         }
@@ -899,7 +821,7 @@ fn validate_market_rules(venue: ExecutionVenue, market: &Market, args: &TradeArg
     {
         bail!(
             "--price {price} is not aligned to {} price rules for {} (snapshot tick {})",
-            venue_label(venue),
+            venue.label(),
             market.symbol,
             rules.tick_size,
         );
@@ -917,7 +839,7 @@ fn validate_market_rules(venue: ExecutionVenue, market: &Market, args: &TradeArg
         {
             bail!(
                 "{} market `{}` does not support TIF {tif}",
-                venue_label(venue),
+                venue.label(),
                 market.venue_symbol
             );
         }
@@ -930,28 +852,17 @@ fn is_price_aligned(
     price: f64,
     rules: &crate::markets::ExecutionRules,
 ) -> bool {
-    match venue {
-        ExecutionVenue::Bulk => is_step_aligned(price, rules.tick_size),
-        ExecutionVenue::Hyperliquid
-        | ExecutionVenue::Hyperlink
-        | ExecutionVenue::HyperliquidXyz
-        | ExecutionVenue::HyperliquidIo => {
-            crate::providers::hyperliquid::execution::validate_price(price, rules.size_precision)
-                .is_ok()
-        }
-        ExecutionVenue::HyperliquidSpot => {
+    let Ok(spec) = venue.spec() else {
+        return false;
+    };
+    match ExecutionAdapter::capabilities(venue).price_encoding {
+        PriceEncoding::TickSize => is_step_aligned(price, rules.tick_size),
+        PriceEncoding::Hyperliquid => {
+            let max_price_decimals = if spec.market.is_perpetual() { 6 } else { 8 };
             crate::providers::hyperliquid::execution::validate_price_for(
                 price,
                 rules.size_precision,
-                8,
-            )
-            .is_ok()
-        }
-        ExecutionVenue::HyperliquidOutcomes => {
-            crate::providers::hyperliquid::execution::validate_price_for(
-                price,
-                rules.size_precision,
-                8,
+                max_price_decimals,
             )
             .is_ok()
         }
@@ -959,7 +870,7 @@ fn is_price_aligned(
 }
 
 fn validate_optional_symbol(venue: ExecutionVenue, symbol: Option<&str>) -> Result<Option<String>> {
-    if venue == ExecutionVenue::HyperliquidOutcomes {
+    if venue.is_outcome() {
         return symbol
             .map(|symbol| {
                 crate::providers::hyperliquid::outcomes::parse_symbol(symbol).map(
@@ -976,14 +887,7 @@ fn validate_optional_symbol(venue: ExecutionVenue, symbol: Option<&str>) -> Resu
 }
 
 fn execution_market(venue: ExecutionVenue, symbol: &str) -> Result<std::sync::Arc<Market>> {
-    crate::markets::exchange_market(
-        if venue == ExecutionVenue::Hyperlink {
-            "hyperliquidf"
-        } else {
-            venue_key(venue)
-        },
-        symbol,
-    )
+    crate::markets::exchange_market(venue.spec()?.market_data_venue.as_str(), symbol)
 }
 
 async fn execution_market_on(
@@ -991,7 +895,7 @@ async fn execution_market_on(
     testnet: bool,
     symbol: &str,
 ) -> Result<std::sync::Arc<Market>> {
-    if venue == ExecutionVenue::HyperliquidOutcomes {
+    if venue.is_outcome() {
         let instrument = crate::providers::hyperliquid::outcomes::resolve(
             HyperliquidNetwork::from_testnet(testnet),
             symbol,
@@ -1007,71 +911,22 @@ fn execution_rules(
     testnet: bool,
     market: &Market,
 ) -> Result<crate::markets::ExecutionRules> {
-    match venue {
-        ExecutionVenue::HyperliquidSpot
-        | ExecutionVenue::HyperliquidXyz
-        | ExecutionVenue::HyperliquidIo => market
+    let spec = venue.spec()?;
+    match spec.market {
+        VenueMarket::Spot | VenueMarket::Hip3 => market
             .network_variant(HyperliquidNetwork::from_testnet(testnet).label())
             .map(|variant| variant.execution),
-        ExecutionVenue::HyperliquidOutcomes
-        | ExecutionVenue::Bulk
-        | ExecutionVenue::Hyperlink
-        | ExecutionVenue::Hyperliquid => market.execution_rules().cloned(),
+        VenueMarket::Outcome | VenueMarket::Perpetual => market.execution_rules().cloned(),
     }
 }
 
 fn execution_venue_symbol(venue: ExecutionVenue, testnet: bool, market: &Market) -> Result<String> {
-    match venue {
-        ExecutionVenue::HyperliquidSpot
-        | ExecutionVenue::HyperliquidXyz
-        | ExecutionVenue::HyperliquidIo => market
+    let spec = venue.spec()?;
+    match spec.market {
+        VenueMarket::Spot | VenueMarket::Hip3 => market
             .network_variant(HyperliquidNetwork::from_testnet(testnet).label())
             .map(|variant| variant.venue_symbol),
-        ExecutionVenue::HyperliquidOutcomes
-        | ExecutionVenue::Bulk
-        | ExecutionVenue::Hyperlink
-        | ExecutionVenue::Hyperliquid => Ok(market.venue_symbol.clone()),
-    }
-}
-
-fn venue_key(venue: ExecutionVenue) -> &'static str {
-    match venue {
-        ExecutionVenue::Bulk => "bulkf",
-        ExecutionVenue::Hyperliquid => "hyperliquidf",
-        ExecutionVenue::Hyperlink => "hyperlinkf",
-        ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
-        ExecutionVenue::HyperliquidIo => "hyperliquidf-io",
-        ExecutionVenue::HyperliquidSpot => "hyperliquid",
-        ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
-    }
-}
-
-fn venue_label(venue: ExecutionVenue) -> &'static str {
-    match venue {
-        ExecutionVenue::Bulk => "BULK",
-        ExecutionVenue::Hyperliquid => "Hyperliquid",
-        ExecutionVenue::Hyperlink => "HyperLink",
-        ExecutionVenue::HyperliquidXyz => "Hyperliquid XYZ",
-        ExecutionVenue::HyperliquidIo => "Hyperliquid EntropyIO",
-        ExecutionVenue::HyperliquidSpot => "Hyperliquid Spot",
-        ExecutionVenue::HyperliquidOutcomes => "Hyperliquid Outcomes",
-    }
-}
-
-fn venue_network_label(venue: ExecutionVenue, testnet: bool) -> &'static str {
-    match (venue, testnet) {
-        (ExecutionVenue::Hyperliquid, true) => "Hyperliquid testnet",
-        (ExecutionVenue::Hyperliquid, false) => "Hyperliquid mainnet",
-        (ExecutionVenue::Hyperlink, _) => "HyperLink mainnet",
-        (ExecutionVenue::HyperliquidXyz, true) => "Hyperliquid XYZ testnet",
-        (ExecutionVenue::HyperliquidXyz, false) => "Hyperliquid XYZ mainnet",
-        (ExecutionVenue::HyperliquidIo, true) => "Hyperliquid EntropyIO testnet",
-        (ExecutionVenue::HyperliquidIo, false) => "Hyperliquid EntropyIO mainnet",
-        (ExecutionVenue::HyperliquidSpot, true) => "Hyperliquid Spot testnet",
-        (ExecutionVenue::HyperliquidSpot, false) => "Hyperliquid Spot mainnet",
-        (ExecutionVenue::HyperliquidOutcomes, true) => "Hyperliquid Outcomes testnet",
-        (ExecutionVenue::HyperliquidOutcomes, false) => "Hyperliquid Outcomes mainnet",
-        (ExecutionVenue::Bulk, _) => "BULK",
+        VenueMarket::Outcome | VenueMarket::Perpetual => Ok(market.venue_symbol.clone()),
     }
 }
 
@@ -1111,14 +966,8 @@ fn render_trade_plan(plan: &TradePlan, dry_run: bool, output: OutputFormat) -> R
                     "trade plan"
                 }
             );
-            println!("  venue:             {}", venue_key(plan.venue));
-            if matches!(
-                plan.venue,
-                ExecutionVenue::Hyperliquid
-                    | ExecutionVenue::HyperliquidXyz
-                    | ExecutionVenue::HyperliquidIo
-                    | ExecutionVenue::HyperliquidSpot
-            ) {
+            println!("  venue:             {}", plan.venue);
+            if plan.venue.spec()?.network != NetworkPolicy::TestnetOnly {
                 println!(
                     "  network:           {}",
                     if plan.testnet { "testnet" } else { "mainnet" }
@@ -1150,10 +999,10 @@ fn render_trade_plan(plan: &TradePlan, dry_run: bool, output: OutputFormat) -> R
             if let Some(leverage) = plan.leverage {
                 println!("  leverage:          {leverage}x");
             }
-            if plan.venue != ExecutionVenue::HyperliquidSpot {
+            if plan.venue.is_perpetual() {
                 println!(
                     "  liquidation price: determined by {} after fill",
-                    venue_label(plan.venue)
+                    plan.venue.label()
                 );
             }
             println!("  reduce only:       {}", plan.reduce_only);
@@ -1182,7 +1031,7 @@ fn render_cancel_plan(plan: &CancelPlan, dry_run: bool, output: OutputFormat) ->
                     "cancel plan"
                 }
             );
-            println!("  venue:    {}", venue_key(plan.venue));
+            println!("  venue:    {}", plan.venue);
             println!("  account:  {}", plan.account);
             println!(
                 "  symbol:   {} ({})",
@@ -1245,12 +1094,12 @@ fn render_trade_result(
             if let Some(position) = post_trade_position {
                 println!("  position leverage: {}x", position.leverage);
                 println!("  liquidation price: {}", position.liquidation_price);
-            } else if plan.venue != ExecutionVenue::HyperliquidSpot
+            } else if plan.venue.is_perpetual()
                 && matches!(receipt.status.as_str(), "filled" | "partiallyFilled")
             {
                 println!(
                     "  liquidation price: not yet available from {}",
-                    venue_label(plan.venue)
+                    plan.venue.label()
                 );
             }
         }
@@ -1275,7 +1124,7 @@ fn render_cancel_result(
 }
 
 fn render_terminal_receipt(receipt: &ExecutionReceipt) {
-    println!("{}: order {}", venue_key(receipt.venue), receipt.status);
+    println!("{}: order {}", receipt.venue, receipt.status);
     if let Some(order_id) = &receipt.order_id {
         println!("  order id: {order_id}");
     }

@@ -6,10 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use crate::cli::{
-    CliSide, ExecutionVenueArg, OutputFormat, RunTwapArgs, TradeArgs, TradeOrderKind,
-    TradeTimeInForce,
-};
+use crate::cli::{CliSide, OutputFormat, RunTwapArgs, TradeArgs, TradeOrderKind, TradeTimeInForce};
 use crate::commands::execution::build_trade_plan;
 use crate::domain::execution::{ExecutionVenue, PositionDirection};
 use crate::strategies::jobs::{
@@ -21,7 +18,7 @@ use crate::strategies::twap::TwapSchedule;
 struct TwapPlanView<'a> {
     r#type: &'static str,
     strategy: &'static str,
-    venue: &'static str,
+    venue: String,
     symbol: &'a str,
     side: &'static str,
     total_size: f64,
@@ -63,7 +60,7 @@ struct TwapRunSummary<'a> {
     r#type: &'static str,
     strategy: &'static str,
     job_id: &'a str,
-    venue: &'static str,
+    venue: String,
     symbol: &'a str,
     side: &'static str,
     status: &'static str,
@@ -89,8 +86,10 @@ pub async fn handle(args: RunTwapArgs) -> Result<()> {
     args.validate()?;
     let direction = direction(args.side);
     let parent = build_trade_plan(&trade_args(&args, args.size, args.margin), direction).await?;
-    let market =
-        crate::markets::exchange_market(venue_name(parent.venue), &parent.internal_symbol)?;
+    let market = crate::markets::exchange_market(
+        parent.venue.spec()?.market_data_venue.as_str(),
+        &parent.internal_symbol,
+    )?;
     let rules = market.execution_rules()?;
     let schedule = TwapSchedule::build(
         parent.size,
@@ -190,8 +189,10 @@ async fn run_worker(job_id: &str, definition: &TwapJobDefinition) -> Result<()> 
         direction,
     )
     .await?;
-    let market =
-        crate::markets::exchange_market(venue_name(parent.venue), &parent.internal_symbol)?;
+    let market = crate::markets::exchange_market(
+        parent.venue.spec()?.market_data_venue.as_str(),
+        &parent.internal_symbol,
+    )?;
     let rules = market.execution_rules()?;
     let schedule = TwapSchedule::build(
         parent.size,
@@ -316,7 +317,7 @@ fn append_summary(
             r#type: "strategy.run.finished",
             strategy: "twap",
             job_id,
-            venue: venue_name(definition.venue),
+            venue: definition.venue.to_string(),
             symbol: &definition.symbol,
             side: strategy_side_name(definition.side),
             status,
@@ -356,15 +357,7 @@ fn worker_trade_args(definition: &TwapJobDefinition, size: f64) -> TradeArgs {
         symbol: definition.symbol.clone(),
         symbol_flag: None,
         config: None,
-        venue: match definition.venue {
-            ExecutionVenue::Bulk => ExecutionVenueArg::Bulk,
-            ExecutionVenue::Hyperliquid => ExecutionVenueArg::Hyperliquid,
-            ExecutionVenue::Hyperlink => ExecutionVenueArg::Hyperlink,
-            ExecutionVenue::HyperliquidXyz => ExecutionVenueArg::HyperliquidXyz,
-            ExecutionVenue::HyperliquidIo => ExecutionVenueArg::HyperliquidIo,
-            ExecutionVenue::HyperliquidSpot => ExecutionVenueArg::HyperliquidSpot,
-            ExecutionVenue::HyperliquidOutcomes => ExecutionVenueArg::HyperliquidOutcomes,
-        },
+        venue: definition.venue,
         testnet: definition.testnet,
         size: Some(size),
         margin: None,
@@ -406,7 +399,7 @@ fn plan_view<'a>(
     TwapPlanView {
         r#type: "strategy.plan",
         strategy: "twap",
-        venue: venue_name(venue),
+        venue: venue.to_string(),
         symbol,
         side,
         total_size: schedule.total_size,
@@ -488,7 +481,7 @@ fn render_submission(job: &StrategyJob, output: OutputFormat) -> Result<()> {
 fn confirm_live_execution(venue: ExecutionVenue, testnet: bool, children: usize) -> Result<bool> {
     print!(
         "Submit a live TWAP job with {children} {} market orders? [y/N]: ",
-        execution_venue_name(venue, testnet)
+        venue.network_label(testnet)
     );
     io::stdout()
         .flush()
@@ -501,35 +494,6 @@ fn confirm_live_execution(venue: ExecutionVenue, testnet: bool, children: usize)
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
-}
-
-fn venue_name(venue: ExecutionVenue) -> &'static str {
-    match venue {
-        ExecutionVenue::Bulk => "bulkf",
-        ExecutionVenue::Hyperliquid => "hyperliquidf",
-        ExecutionVenue::Hyperlink => "hyperlinkf",
-        ExecutionVenue::HyperliquidXyz => "hyperliquidf-xyz",
-        ExecutionVenue::HyperliquidIo => "hyperliquidf-io",
-        ExecutionVenue::HyperliquidSpot => "hyperliquid",
-        ExecutionVenue::HyperliquidOutcomes => "hyperliquid-outcomes",
-    }
-}
-
-fn execution_venue_name(venue: ExecutionVenue, testnet: bool) -> &'static str {
-    match (venue, testnet) {
-        (ExecutionVenue::Bulk, _) => "BULK testnet",
-        (ExecutionVenue::Hyperliquid, true) => "Hyperliquid testnet",
-        (ExecutionVenue::Hyperliquid, false) => "Hyperliquid mainnet",
-        (ExecutionVenue::Hyperlink, _) => "HyperLink mainnet",
-        (ExecutionVenue::HyperliquidXyz, true) => "Hyperliquid XYZ testnet",
-        (ExecutionVenue::HyperliquidXyz, false) => "Hyperliquid XYZ mainnet",
-        (ExecutionVenue::HyperliquidIo, true) => "Hyperliquid EntropyIO testnet",
-        (ExecutionVenue::HyperliquidIo, false) => "Hyperliquid EntropyIO mainnet",
-        (ExecutionVenue::HyperliquidSpot, true) => "Hyperliquid Spot testnet",
-        (ExecutionVenue::HyperliquidSpot, false) => "Hyperliquid Spot mainnet",
-        (ExecutionVenue::HyperliquidOutcomes, true) => "Hyperliquid Outcomes testnet",
-        (ExecutionVenue::HyperliquidOutcomes, false) => "Hyperliquid Outcomes mainnet",
-    }
 }
 
 fn direction(side: CliSide) -> PositionDirection {

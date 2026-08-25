@@ -207,9 +207,7 @@ impl HyperliquidProvider {
     ) -> Result<MarketTicker> {
         let (market, variant) = require_market(product, network, symbol).await?;
         match product {
-            HyperliquidProduct::Perpetual
-            | HyperliquidProduct::XyzPerpetual
-            | HyperliquidProduct::IoPerpetual => {
+            HyperliquidProduct::Perpetual | HyperliquidProduct::Hip3(_) => {
                 let (meta, contexts) = meta_and_contexts(network, product).await?;
                 let index = meta
                     .universe

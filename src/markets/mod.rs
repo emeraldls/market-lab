@@ -808,6 +808,9 @@ pub fn direct_exchange(exchange: &str) -> Result<(MarketSnapshot, ExchangeMarket
 
 pub fn is_futures_exchange(exchange: &str) -> Result<bool> {
     ensure_public_exchange_id(exchange)?;
+    if let Ok(venue) = crate::domain::execution::ExecutionVenue::parse(exchange) {
+        return Ok(venue.is_perpetual());
+    }
     let registry = market_registry()?;
     registry
         .exchange_types
@@ -830,11 +833,18 @@ pub async fn refresh_route(provider: Option<&str>, exchange: &str) -> Result<Mar
         None if exchange.eq_ignore_ascii_case("hyperliquidf") => {
             fetch_hyperliquid_snapshot().await?
         }
-        None if exchange.eq_ignore_ascii_case("hyperliquidf-xyz") => {
-            fetch_hyperliquid_xyz_snapshot().await?
-        }
-        None if exchange.eq_ignore_ascii_case("hyperliquidf-io") => {
-            fetch_hyperliquid_io_snapshot().await?
+        None if crate::domain::execution::ExecutionVenue::parse(exchange)
+            .is_ok_and(|venue| venue.is_hip3()) =>
+        {
+            let venue = crate::domain::execution::ExecutionVenue::parse(exchange)?;
+            let dex = venue.spec()?.dex.context("HIP-3 venue has no DEX name")?;
+            fetch_hyperliquid_hip3_snapshot(
+                venue.as_str(),
+                dex.as_str(),
+                &dex.as_str().to_ascii_uppercase(),
+                true,
+            )
+            .await?
         }
         None if exchange.eq_ignore_ascii_case("hyperliquid") => {
             fetch_hyperliquid_spot_snapshot().await?
@@ -858,14 +868,6 @@ pub async fn refresh_hyperliquid() -> Result<MarketSnapshot> {
 
 pub async fn refresh_hyperliquid_spot() -> Result<MarketSnapshot> {
     refresh_route(None, "hyperliquid").await
-}
-
-pub async fn refresh_hyperliquid_xyz() -> Result<MarketSnapshot> {
-    refresh_route(None, "hyperliquidf-xyz").await
-}
-
-pub async fn refresh_hyperliquid_io() -> Result<MarketSnapshot> {
-    refresh_route(None, "hyperliquidf-io").await
 }
 
 pub async fn refresh_binance() -> Result<MarketSnapshot> {
@@ -1223,14 +1225,6 @@ struct BuiltHyperliquidPerpMarket {
     symbol: String,
     quote_asset: String,
     variant: NetworkMarket,
-}
-
-async fn fetch_hyperliquid_xyz_snapshot() -> Result<MarketSnapshot> {
-    fetch_hyperliquid_hip3_snapshot("hyperliquidf-xyz", "xyz", "XYZ", true).await
-}
-
-async fn fetch_hyperliquid_io_snapshot() -> Result<MarketSnapshot> {
-    fetch_hyperliquid_hip3_snapshot("hyperliquidf-io", "io", "EntropyIO", false).await
 }
 
 async fn fetch_hyperliquid_hip3_snapshot(

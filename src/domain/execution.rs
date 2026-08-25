@@ -1,23 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionVenue {
-    #[serde(rename = "bulkf")]
-    Bulk,
-    #[serde(rename = "hyperliquidf")]
-    Hyperliquid,
-    #[serde(rename = "hyperlinkf")]
-    Hyperlink,
-    #[serde(rename = "hyperliquidf-xyz")]
-    HyperliquidXyz,
-    #[serde(rename = "hyperliquidf-io")]
-    HyperliquidIo,
-    #[serde(rename = "hyperliquid")]
-    HyperliquidSpot,
-    #[serde(rename = "hyperliquid-outcomes")]
-    HyperliquidOutcomes,
-}
+pub use crate::venues::VenueId as ExecutionVenue;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -57,6 +40,16 @@ pub enum TimeInForce {
     Alo,
 }
 
+/// Price encoding enforced by an execution provider.
+///
+/// Commands consume this capability instead of identifying exchanges by name.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceEncoding {
+    TickSize,
+    Hyperliquid,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VenueCapabilities {
     pub venue: ExecutionVenue,
@@ -68,13 +61,16 @@ pub struct VenueCapabilities {
     pub native_protective_triggers: bool,
     pub native_oco: bool,
     pub native_on_fill: bool,
+    pub integer_leverage: bool,
+    pub configure_leverage_before_orders: bool,
+    pub price_encoding: PriceEncoding,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TradePlan {
     pub created_at_ms: u64,
     pub venue: ExecutionVenue,
-    /// Routes Hyperliquid execution to testnet. Ignored by other venues.
+    /// Selects testnet for venues whose network policy permits it.
     #[serde(default = "legacy_hyperliquid_testnet")]
     pub testnet: bool,
     pub account: String,
@@ -345,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn hyperliquid_perps_use_the_canonical_id_and_read_legacy_jobs() {
+    fn hyperliquid_products_use_canonical_ids() {
         let encoded = serde_json::to_value(ExecutionVenue::Hyperliquid).expect("venue serializes");
         assert_eq!(encoded, serde_json::json!("hyperliquidf"));
 
@@ -356,12 +352,16 @@ mod tests {
         let spot = serde_json::to_value(ExecutionVenue::HyperliquidSpot).expect("venue serializes");
         assert_eq!(spot, serde_json::json!("hyperliquid"));
 
-        let xyz =
-            serde_json::to_value(ExecutionVenue::HyperliquidXyz).expect("XYZ venue serializes");
+        let xyz = serde_json::to_value(
+            ExecutionVenue::parse("hyperliquidf-xyz").expect("dynamic XYZ venue"),
+        )
+        .expect("XYZ venue serializes");
         assert_eq!(xyz, serde_json::json!("hyperliquidf-xyz"));
 
-        let io = serde_json::to_value(ExecutionVenue::HyperliquidIo)
-            .expect("EntropyIO venue serializes");
+        let io = serde_json::to_value(
+            ExecutionVenue::parse("hyperliquidf-io").expect("dynamic EntropyIO venue"),
+        )
+        .expect("EntropyIO venue serializes");
         assert_eq!(io, serde_json::json!("hyperliquidf-io"));
 
         let outcomes = serde_json::to_value(ExecutionVenue::HyperliquidOutcomes)
