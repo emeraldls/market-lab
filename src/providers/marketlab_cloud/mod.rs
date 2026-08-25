@@ -7,6 +7,10 @@ use anyhow::Result;
 use crate::domain::requests::{InspectRequest, ReplayRequest};
 use crate::domain::types::{OrderBookLevel, OrderBookSnapshot, ProviderHealth, TopOfBook};
 
+mod client;
+
+pub use client::MarketLabCloudClient;
+
 pub struct MarketLabProvider;
 
 impl MarketLabProvider {

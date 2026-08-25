@@ -41,11 +41,13 @@ use crate::strategies::jobs::{
     StrategyJob, StrategyJobDefinition, StrategyJobStatus, StrategyJobSubmission, StrategySide,
 };
 use crate::venues::VenueMarket;
+use crate::volume::{FillVolumeInput, VolumeExporter};
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-pub const RUNTIME_VERSION: u8 = 43;
+pub const RUNTIME_VERSION: u8 = 44;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
+const ORDER_ATTRIBUTION_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TrackedOrder {
@@ -61,6 +63,16 @@ pub struct TrackedOrder {
     pub updated_at_ms: u64,
     #[serde(default)]
     pub script_order_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SubmittedOrderAttribution {
+    venue: ExecutionVenue,
+    testnet: bool,
+    account: String,
+    internal_symbol: String,
+    order_id: String,
+    registered_at_ms: u64,
 }
 
 const fn legacy_hyperliquid_testnet() -> bool {
@@ -393,6 +405,8 @@ struct RuntimeState {
     last_error: Option<String>,
     tracked_orders: BTreeMap<String, TrackedOrder>,
     #[serde(default)]
+    submitted_orders: BTreeMap<String, SubmittedOrderAttribution>,
+    #[serde(default)]
     script_jobs: BTreeMap<String, ScriptJob>,
     #[serde(default)]
     strategy_jobs: BTreeMap<String, StrategyJob>,
@@ -560,6 +574,7 @@ pub async fn serve() -> Result<()> {
         account_disconnected_at_ms: None,
         last_error: None,
         tracked_orders: BTreeMap::new(),
+        submitted_orders: BTreeMap::new(),
         script_jobs: BTreeMap::new(),
         strategy_jobs: BTreeMap::new(),
         strategy_executions: BTreeMap::new(),
@@ -579,6 +594,13 @@ pub async fn serve() -> Result<()> {
     state.account_stream_connected = false;
     persist_state(&paths, &state)?;
     let adapter = BulkExecutionAdapter::new()?;
+    let volume_exporter = match VolumeExporter::start(&daemon::market_lab_home()?) {
+        Ok(exporter) => exporter,
+        Err(error) => {
+            eprintln!("volume telemetry warning: exporter disabled: {error:#}");
+            VolumeExporter::default()
+        }
+    };
     let (account_tx, mut account_rx) = mpsc::channel(1024);
     let mut account_supervisors = HashSet::new();
     if let Ok(account) = credentials::bulk_account() {
@@ -622,6 +644,7 @@ pub async fn serve() -> Result<()> {
                     &paths,
                     &adapter,
                     &mut state,
+                    &volume_exporter,
                 ).await {
                     record_runtime_error(
                         &paths,
@@ -5038,16 +5061,39 @@ fn record_trade_receipt(
     script_order_id: Option<String>,
     receipt: &ExecutionReceipt,
 ) -> Result<()> {
+    let now = now_ms()?;
     if let Err(error) = append_json_line(
         &paths.events,
         &TradeSubmissionEvent {
-            ts_ms: now_ms()?,
+            ts_ms: now,
             event: "order_submitted",
             plan,
             receipt,
         },
     ) {
         eprintln!("execution journal warning: {error:#}");
+    }
+    state.submitted_orders.retain(|_, order| {
+        now.saturating_sub(order.registered_at_ms) <= ORDER_ATTRIBUTION_RETENTION_MS
+    });
+    for order_id in receipt
+        .order_id
+        .iter()
+        .chain(&receipt.related_order_ids)
+        .map(String::as_str)
+    {
+        let order = SubmittedOrderAttribution {
+            venue: plan.venue,
+            testnet: plan.testnet,
+            account: plan.account.clone(),
+            internal_symbol: plan.internal_symbol.clone(),
+            order_id: order_id.to_string(),
+            registered_at_ms: receipt.submitted_at_ms,
+        };
+        state.submitted_orders.insert(
+            tracked_order_key(order.venue, order.testnet, &order.order_id),
+            order,
+        );
     }
     if !receipt.terminal {
         let order_id = receipt
@@ -5073,8 +5119,8 @@ fn record_trade_receipt(
             tracked_order_key(order.venue, order.testnet, &order.order_id),
             order,
         );
-        persist_state(paths, state)?;
     }
+    persist_state(paths, state)?;
     Ok(())
 }
 
@@ -5294,6 +5340,7 @@ async fn handle_account_connection_event(
     paths: &RuntimePaths,
     adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
+    volume_exporter: &VolumeExporter,
 ) -> Result<()> {
     match event {
         AccountConnectionEvent::Connected {
@@ -5307,7 +5354,8 @@ async fn handle_account_connection_event(
             refresh_account_positions(venue, testnet, adapter, state, &account, true).await?;
             persist_state(paths, state)?;
             if reconnected {
-                recover_account_gap(venue, testnet, paths, state, &account).await?;
+                recover_account_gap(venue, testnet, paths, state, &account, volume_exporter)
+                    .await?;
             }
         }
         AccountConnectionEvent::Disconnected {
@@ -5347,13 +5395,16 @@ async fn handle_account_connection_event(
                 },
             )?;
             apply_account_updates(
-                venue,
-                testnet,
-                paths,
+                AccountUpdateContext {
+                    venue,
+                    testnet,
+                    paths,
+                    account: &account,
+                    received_at_ms,
+                    volume_exporter,
+                },
                 state,
-                &account,
                 event.updates,
-                received_at_ms,
             )?;
             if event.refresh_positions {
                 refresh_account_positions(venue, testnet, adapter, state, &account, true).await?;
@@ -5448,15 +5499,28 @@ fn script_positions_in_daemon(
     Ok(positions)
 }
 
-fn apply_account_updates(
+struct AccountUpdateContext<'a> {
     venue: ExecutionVenue,
     testnet: bool,
-    paths: &RuntimePaths,
-    state: &mut RuntimeState,
-    account: &str,
-    updates: Vec<AccountRuntimeUpdate>,
+    paths: &'a RuntimePaths,
+    account: &'a str,
     received_at_ms: u64,
+    volume_exporter: &'a VolumeExporter,
+}
+
+fn apply_account_updates(
+    context: AccountUpdateContext<'_>,
+    state: &mut RuntimeState,
+    updates: Vec<AccountRuntimeUpdate>,
 ) -> Result<()> {
+    let AccountUpdateContext {
+        venue,
+        testnet,
+        paths,
+        account,
+        received_at_ms,
+        volume_exporter,
+    } = context;
     let route = (venue, testnet);
     for update in updates {
         match update {
@@ -5511,12 +5575,47 @@ fn apply_account_updates(
                     data,
                 )?;
             }
+            AccountRuntimeUpdate::Fill(fill) => {
+                record_fill_volume(state, volume_exporter, venue, testnet, account, &fill);
+            }
             AccountRuntimeUpdate::ScriptEvent(data) => {
                 route_account_event_to_scripts(venue, testnet, paths, state, &data)?;
             }
         }
     }
     Ok(())
+}
+
+fn record_fill_volume(
+    state: &RuntimeState,
+    volume_exporter: &VolumeExporter,
+    venue: ExecutionVenue,
+    testnet: bool,
+    account: &str,
+    fill: &crate::domain::execution::Fill,
+) {
+    let Some(order_id) = fill.order_id.as_deref() else {
+        return;
+    };
+    let key = tracked_order_key(venue, testnet, order_id);
+    let Some(submitted) = state.submitted_orders.get(&key) else {
+        return;
+    };
+    if submitted.account != account || fill.venue != submitted.venue {
+        return;
+    }
+    volume_exporter.record(FillVolumeInput {
+        venue,
+        testnet,
+        account: account.to_string(),
+        order_id: order_id.to_string(),
+        trade_id: fill.trade_id.clone(),
+        symbol: submitted.internal_symbol.clone(),
+        amount: fill.amount,
+        price: fill.price,
+        maker: fill.maker,
+        filled_at_ms: fill.ts_ms,
+    });
 }
 
 fn apply_script_order_status(
@@ -5727,6 +5826,7 @@ async fn recover_account_gap(
     paths: &RuntimePaths,
     state: &mut RuntimeState,
     account: &str,
+    volume_exporter: &VolumeExporter,
 ) -> Result<()> {
     let gap_started_ms = state
         .account_disconnected_at_ms
@@ -5761,6 +5861,7 @@ async fn recover_account_gap(
     }
 
     for fill in recovery.fills {
+        record_fill_volume(state, volume_exporter, venue, testnet, account, &fill);
         let data = serde_json::to_value(&fill)?;
         append_json_line(
             &paths.events,
@@ -6175,8 +6276,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_protocol_v43_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 43);
+    fn runtime_protocol_v44_decodes_oiwap_submissions() {
+        assert_eq!(RUNTIME_VERSION, 44);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",

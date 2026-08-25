@@ -1238,10 +1238,16 @@ fn receipt_from_response(
         ExchangeDataStatus::WaitingForTrigger => (None, "waitingForTrigger", false, None, None),
         ExchangeDataStatus::Error(_) => unreachable!("errors handled above"),
     };
+    let related_order_ids = statuses
+        .iter()
+        .filter_map(exchange_status_order_id)
+        .filter(|related| order_id.as_deref() != Some(related.as_str()))
+        .collect();
     Ok(ExecutionReceipt {
         venue,
         account: account.to_string(),
         order_id,
+        related_order_ids,
         status: status.to_string(),
         terminal,
         submitted_at_ms: now_ms()?,
@@ -1315,6 +1321,7 @@ fn batch_outcomes_from_response(
                     venue,
                     account: account.to_string(),
                     order_id,
+                    related_order_ids: Vec::new(),
                     status: name.to_string(),
                     terminal,
                     submitted_at_ms,
@@ -1327,6 +1334,17 @@ fn batch_outcomes_from_response(
             }
         })
         .collect()
+}
+
+fn exchange_status_order_id(status: &ExchangeDataStatus) -> Option<String> {
+    match status {
+        ExchangeDataStatus::Filled(order) => Some(order.oid.to_string()),
+        ExchangeDataStatus::Resting(order) => Some(order.oid.to_string()),
+        ExchangeDataStatus::Success
+        | ExchangeDataStatus::WaitingForFill
+        | ExchangeDataStatus::WaitingForTrigger
+        | ExchangeDataStatus::Error(_) => None,
+    }
 }
 
 fn ensure_account(account: &str, configured: &str) -> Result<()> {
@@ -1685,6 +1703,8 @@ struct HyperliquidFill {
     time: u64,
     dir: String,
     oid: u64,
+    #[serde(default)]
+    tid: Option<u64>,
     crossed: bool,
     #[serde(default)]
     fee: Option<String>,
@@ -1713,6 +1733,7 @@ impl HyperliquidFill {
             price: parse(&self.px, "fill price")?,
             reason: self.dir,
             order_id: Some(self.oid.to_string()),
+            trade_id: self.tid.map(|tid| tid.to_string()),
             maker: !self.crossed,
             // Hyperliquid reports costs as positive values and rebates as
             // negative values. Market Lab uses the opposite signed convention.
@@ -1730,6 +1751,16 @@ impl HyperliquidFill {
             ts_ms: self.time,
         }))
     }
+}
+
+pub(crate) fn account_event_fill(
+    product: HyperliquidProduct,
+    network: HyperliquidNetwork,
+    value: &serde_json::Value,
+) -> Result<Option<Fill>> {
+    serde_json::from_value::<HyperliquidFill>(value.clone())
+        .context("Hyperliquid account stream returned an invalid fill")?
+        .into_fill(product, network)
 }
 
 fn normalized_market_identity(
@@ -1900,6 +1931,7 @@ mod tests {
             "time": 1_784_700_000_000_u64,
             "dir": "Close Short",
             "oid": 56_814_363_179_u64,
+            "tid": 98_765_u64,
             "crossed": true,
             "fee": "0.187391"
         }))
@@ -1910,6 +1942,7 @@ mod tests {
             .expect("perpetual fill");
 
         assert_eq!(fill.fee, Some(-0.187391));
+        assert_eq!(fill.trade_id.as_deref(), Some("98765"));
     }
 
     #[test]

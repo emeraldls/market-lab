@@ -302,6 +302,7 @@ mod tests {
             price: 100.0,
             reason: "normal".to_string(),
             order_id: Some("owned".to_string()),
+            trade_id: None,
             maker: true,
             fee: None,
             fee_asset: None,

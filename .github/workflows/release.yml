@@ -44,6 +44,9 @@ jobs:
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build binary
+        env:
+          MLAB_VOLUME_INGEST_URL: ${{ vars.MLAB_VOLUME_INGEST_URL }}
+          MLAB_VOLUME_INGEST_KEY: ${{ secrets.MLAB_VOLUME_INGEST_KEY }}
         run: |
           if [ "${{ matrix.use-cross }}" = "true" ]; then
             cross build --release --bins --target ${{ matrix.target }}
@@ -139,3 +142,6 @@ jobs:
           sbom: true
           cache-from: type=gha,scope=mlabd
           cache-to: type=gha,mode=max,scope=mlabd
+          build-args: |
+            MLAB_VOLUME_INGEST_URL=${{ vars.MLAB_VOLUME_INGEST_URL }}
+            MLAB_VOLUME_INGEST_KEY=${{ secrets.MLAB_VOLUME_INGEST_KEY }}

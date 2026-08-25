@@ -328,6 +328,7 @@ trait ExecutionProviderFactory: Send + Sync {
         &self,
         venue: ExecutionVenue,
         testnet: bool,
+        account: &str,
         raw: serde_json::Value,
     ) -> Result<AccountRuntimeEvent>;
 
@@ -378,9 +379,10 @@ impl ExecutionProviderFactory for BulkFactory {
         &self,
         _venue: ExecutionVenue,
         _testnet: bool,
+        account: &str,
         raw: serde_json::Value,
     ) -> Result<AccountRuntimeEvent> {
-        let updates = normalize_bulk_runtime_updates(&raw)?;
+        let updates = normalize_bulk_runtime_updates(&raw, account)?;
         Ok(AccountRuntimeEvent {
             raw,
             updates,
@@ -437,6 +439,7 @@ impl ExecutionProviderFactory for HyperliquidFactory {
         &self,
         venue: ExecutionVenue,
         testnet: bool,
+        _account: &str,
         raw: serde_json::Value,
     ) -> Result<AccountRuntimeEvent> {
         let updates = normalize_hyperliquid_runtime_updates(venue, testnet, &raw)?;
@@ -501,9 +504,10 @@ impl ExecutionProviderFactory for HyperlinkFactory {
         &self,
         venue: ExecutionVenue,
         testnet: bool,
+        account: &str,
         raw: serde_json::Value,
     ) -> Result<AccountRuntimeEvent> {
-        HYPERLIQUID_FACTORY.normalize_runtime_event(venue, testnet, raw)
+        HYPERLIQUID_FACTORY.normalize_runtime_event(venue, testnet, account, raw)
     }
 
     async fn connect_transport(&self, _testnet: bool) -> Result<()> {
@@ -514,6 +518,7 @@ impl ExecutionProviderFactory for HyperlinkFactory {
 pub struct AccountEventStream {
     venue: ExecutionVenue,
     testnet: bool,
+    account: String,
     connection: Box<dyn AccountEvents>,
 }
 
@@ -529,6 +534,7 @@ pub enum AccountRuntimeUpdate {
         event_ms: u64,
         data: serde_json::Value,
     },
+    Fill(Fill),
     ScriptEvent(serde_json::Value),
 }
 
@@ -548,6 +554,7 @@ impl AccountEventStream {
         Ok(Self {
             venue,
             testnet,
+            account: account.to_string(),
             connection,
         })
     }
@@ -558,7 +565,7 @@ impl AccountEventStream {
 
     pub async fn next_runtime_event(&mut self) -> Result<AccountRuntimeEvent> {
         let raw = self.next_event().await?;
-        normalize_runtime_account_event(self.venue, self.testnet, raw)
+        normalize_runtime_account_event(self.venue, self.testnet, &self.account, raw)
     }
 
     pub async fn next_bot_events(&mut self) -> Result<Vec<serde_json::Value>> {
@@ -569,12 +576,16 @@ impl AccountEventStream {
 fn normalize_runtime_account_event(
     venue: ExecutionVenue,
     testnet: bool,
+    account: &str,
     raw: serde_json::Value,
 ) -> Result<AccountRuntimeEvent> {
-    execution_factory(venue).normalize_runtime_event(venue, testnet, raw)
+    execution_factory(venue).normalize_runtime_event(venue, testnet, account, raw)
 }
 
-fn normalize_bulk_runtime_updates(data: &serde_json::Value) -> Result<Vec<AccountRuntimeUpdate>> {
+fn normalize_bulk_runtime_updates(
+    data: &serde_json::Value,
+    account: &str,
+) -> Result<Vec<AccountRuntimeUpdate>> {
     let mut updates = Vec::new();
     if let Some(positions) = BulkExecutionAdapter::account_event_positions(data)? {
         updates.push(AccountRuntimeUpdate::Positions {
@@ -628,6 +639,9 @@ fn normalize_bulk_runtime_updates(data: &serde_json::Value) -> Result<Vec<Accoun
             });
         }
         _ => {}
+    }
+    if let Some(fill) = BulkExecutionAdapter::account_event_fill(data, account)? {
+        updates.push(AccountRuntimeUpdate::Fill(fill));
     }
     updates.push(AccountRuntimeUpdate::ScriptEvent(data.clone()));
     Ok(updates)
@@ -690,6 +704,16 @@ fn normalize_hyperliquid_runtime_updates(
                     continue;
                 }
                 let product = HyperliquidProduct::from_venue(venue.market_data_id())?;
+                if let Some(mut domain_fill) =
+                    crate::providers::hyperliquid::execution::account_event_fill(
+                        product,
+                        HyperliquidNetwork::from_testnet(testnet),
+                        fill,
+                    )?
+                {
+                    domain_fill.venue = venue;
+                    updates.push(AccountRuntimeUpdate::Fill(domain_fill));
+                }
                 let symbol = crate::providers::hyperliquid::markets::market_for_wire(
                     product,
                     HyperliquidNetwork::from_testnet(testnet),

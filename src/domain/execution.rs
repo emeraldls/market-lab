@@ -218,6 +218,12 @@ pub struct Fill {
     pub price: f64,
     pub reason: String,
     pub order_id: Option<String>,
+    /// Stable provider fill identity when the venue exposes one.
+    ///
+    /// This is kept at the provider boundary so live account events and gap
+    /// recovery can be deduplicated without relying on timestamps or prices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trade_id: Option<String>,
     pub maker: bool,
     /// Signed venue fee: negative is a cost and positive is a rebate.
     #[serde(default)]
@@ -262,6 +268,10 @@ pub struct ExecutionReceipt {
     pub venue: ExecutionVenue,
     pub account: String,
     pub order_id: Option<String>,
+    /// Additional venue order ids created by the same submission, such as
+    /// attached take-profit and stop-loss orders.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_order_ids: Vec<String>,
     pub status: String,
     pub terminal: bool,
     pub submitted_at_ms: u64,

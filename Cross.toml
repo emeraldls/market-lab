@@ -1,0 +1,2 @@
+[build.env]
+passthrough = ["MLAB_VOLUME_INGEST_URL", "MLAB_VOLUME_INGEST_KEY"]

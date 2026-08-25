@@ -14,3 +14,4 @@ pub mod runtime;
 pub mod scripting;
 pub mod strategies;
 pub mod venues;
+pub mod volume;

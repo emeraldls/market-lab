@@ -93,6 +93,80 @@ impl BulkExecutionAdapter {
         }
     }
 
+    pub(crate) fn account_event_fill(value: &Value, account: &str) -> Result<Option<Fill>> {
+        if value.get("type").and_then(Value::as_str) != Some("fill") {
+            return Ok(None);
+        }
+
+        // Some BULK deployments expose the complete history-row shape on the
+        // account stream. Reuse that canonical decoder whenever it is present.
+        if value.get("orderIdMaker").is_some() && value.get("orderIdTaker").is_some() {
+            return serde_json::from_value::<BulkFill>(value.clone())
+                .context("BULK account stream returned an invalid fill")?
+                .into_fill(account)
+                .map(Some);
+        }
+
+        // The compact account-stream shape is already scoped to the subscribed
+        // account and carries that account's order id directly.
+        let symbol = value
+            .get("symbol")
+            .and_then(Value::as_str)
+            .context("BULK fill omitted symbol")?;
+        let (internal_symbol, venue_symbol, registry_supported) = normalize_account_symbol(symbol)?;
+        let side = if value.get("isBuy").and_then(Value::as_bool).unwrap_or(false) {
+            OrderSide::Buy
+        } else {
+            OrderSide::Sell
+        };
+        let amount = value
+            .get("size")
+            .or_else(|| value.get("amount"))
+            .and_then(Value::as_f64)
+            .context("BULK fill omitted size")?;
+        let price = value
+            .get("price")
+            .and_then(Value::as_f64)
+            .context("BULK fill omitted price")?;
+        let order_id = value
+            .get("orderId")
+            .and_then(json_identifier)
+            .context("BULK fill omitted orderId")?;
+
+        Ok(Some(Fill {
+            venue: ExecutionVenue::Bulk,
+            internal_symbol,
+            venue_symbol,
+            registry_supported,
+            side,
+            amount: amount.abs(),
+            price,
+            reason: value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("fill")
+                .to_string(),
+            order_id: Some(order_id),
+            trade_id: value.get("tradeId").and_then(json_identifier),
+            maker: value.get("maker").and_then(Value::as_bool).unwrap_or(false),
+            fee: value.get("fee").and_then(Value::as_f64),
+            fee_asset: value
+                .get("feeAsset")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            slot: value
+                .get("slot")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            ts_ms: value
+                .get("timestamp")
+                .or_else(|| value.get("ts"))
+                .and_then(Value::as_u64)
+                .map(normalize_timestamp_ms)
+                .unwrap_or_default(),
+        }))
+    }
+
     pub async fn account_snapshot(&self, account: &str) -> Result<AccountSnapshot> {
         let response: Vec<FullAccountEnvelope> = self
             .client
@@ -515,6 +589,7 @@ fn reconciled_history_receipt(account: &str, order: OrderRecord) -> Result<Execu
         venue: ExecutionVenue::Bulk,
         account: account.to_string(),
         order_id: Some(order.order_id.clone()),
+        related_order_ids: Vec::new(),
         status: order.status.clone(),
         terminal: true,
         submitted_at_ms: order.ts_ms,
@@ -534,6 +609,7 @@ fn reconciled_open_order_receipt(account: &str, order: OpenOrder) -> ExecutionRe
         venue: ExecutionVenue::Bulk,
         account: account.to_string(),
         order_id: Some(order.order_id.clone()),
+        related_order_ids: Vec::new(),
         status: order.status.clone(),
         terminal: false,
         submitted_at_ms: order.ts_ms,
@@ -559,6 +635,7 @@ fn reconciled_fill_receipt(
         venue: ExecutionVenue::Bulk,
         account: account.to_string(),
         order_id: Some(order_id.to_string()),
+        related_order_ids: Vec::new(),
         status: if terminal { "filled" } else { "fillObserved" }.to_string(),
         terminal,
         submitted_at_ms: fill.ts_ms,
@@ -972,6 +1049,7 @@ fn receipt_from_status(
         venue: ExecutionVenue::Bulk,
         account: account.to_string(),
         order_id,
+        related_order_ids: Vec::new(),
         status: name.clone(),
         terminal,
         submitted_at_ms: now_ms()?,
@@ -1039,6 +1117,7 @@ fn acknowledged_receipt(
         venue: ExecutionVenue::Bulk,
         account: account.to_string(),
         order_id: Some(order_id),
+        related_order_ids: Vec::new(),
         status: status.to_string(),
         terminal: false,
         submitted_at_ms: now_ms()?,
@@ -1282,6 +1361,8 @@ impl TryFrom<BulkOpenOrder> for OpenOrder {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BulkFill {
+    #[serde(default)]
+    trade_id: Option<String>,
     maker: String,
     taker: String,
     order_id_maker: String,
@@ -1331,6 +1412,7 @@ impl BulkFill {
             } else {
                 self.order_id_taker
             }),
+            trade_id: self.trade_id,
             maker: is_maker,
             fee: self.fee,
             fee_asset: None,
@@ -1446,6 +1528,14 @@ fn normalize_account_symbol(symbol: &str) -> Result<(String, String, bool)> {
     Ok((base.to_string(), venue_symbol, false))
 }
 
+fn json_identifier(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| value.as_u64().map(|value| value.to_string()))
+        .or_else(|| value.as_i64().map(|value| value.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1513,6 +1603,29 @@ mod tests {
     }
 
     #[test]
+    fn compact_account_fill_preserves_trade_identity() {
+        let fill = BulkExecutionAdapter::account_event_fill(
+            &serde_json::json!({
+                "type": "fill",
+                "tradeId": "123:4",
+                "orderId": "order",
+                "symbol": "BTC-USD",
+                "isBuy": true,
+                "size": 0.001,
+                "price": 65_000.0,
+                "timestamp": 1_699_564_800_000_000_000_u64
+            }),
+            "account",
+        )
+        .expect("fill normalizes")
+        .expect("fill event");
+
+        assert_eq!(fill.order_id.as_deref(), Some("order"));
+        assert_eq!(fill.trade_id.as_deref(), Some("123:4"));
+        assert_eq!(fill.ts_ms, 1_699_564_800_000);
+    }
+
+    #[test]
     fn rejected_status_keeps_its_name_when_bulk_only_returns_an_order_id() {
         let error = status_error(&serde_json::json!({
             "rejectedCrossing": { "oid": "order-id" }
@@ -1567,6 +1680,7 @@ mod tests {
             price: 64_000.0,
             reason: "normal".to_string(),
             order_id: Some("deterministic-id".to_string()),
+            trade_id: None,
             maker: false,
             fee: None,
             fee_asset: None,
