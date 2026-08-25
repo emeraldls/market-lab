@@ -110,8 +110,12 @@ impl HyperliquidTradingClient {
     }
 
     pub async fn post_action(&self, payload: &impl Serialize) -> Result<Value> {
-        let payload = serde_json::to_value(payload)
-            .context("failed to encode Hyperliquid WebSocket action payload")?;
+        let payload = serde_json::to_value(payload).with_context(|| {
+            format!(
+                "failed to encode {} WebSocket action payload",
+                self.endpoint.label()
+            )
+        })?;
         let (response_tx, response_rx) = oneshot::channel();
         let mut command = TradingCommand {
             payload,
@@ -124,10 +128,18 @@ impl HyperliquidTradingClient {
                 Ok(()) => {
                     return tokio::time::timeout(TRADING_RESPONSE_TIMEOUT, response_rx)
                         .await
-                        .context("Hyperliquid WebSocket trading response timed out")?
-                        .context(
-                            "Hyperliquid WebSocket trading connection closed before responding",
-                        )?;
+                        .with_context(|| {
+                            format!(
+                                "{} WebSocket trading response timed out",
+                                self.endpoint.label()
+                            )
+                        })?
+                        .with_context(|| {
+                            format!(
+                                "{} WebSocket trading connection closed before responding",
+                                self.endpoint.label()
+                            )
+                        })?;
                 }
                 Err(error) => {
                     command = error.0;
@@ -135,7 +147,10 @@ impl HyperliquidTradingClient {
                 }
             }
         }
-        bail!("Hyperliquid WebSocket trading connection is unavailable")
+        bail!(
+            "{} WebSocket trading connection is unavailable",
+            self.endpoint.label()
+        )
     }
 
     async fn sender(&self) -> Result<mpsc::Sender<TradingCommand>> {
@@ -155,13 +170,17 @@ impl HyperliquidTradingClient {
                 )
             })?;
         let (sender, receiver) = mpsc::channel(MAX_INFLIGHT_POSTS);
-        tokio::spawn(run_trading_connection(stream, receiver));
+        tokio::spawn(run_trading_connection(stream, receiver, self.endpoint));
         *connection = Some(sender.clone());
         Ok(sender)
     }
 }
 
-async fn run_trading_connection(stream: WsStream, mut commands: mpsc::Receiver<TradingCommand>) {
+async fn run_trading_connection(
+    stream: WsStream,
+    mut commands: mpsc::Receiver<TradingCommand>,
+    endpoint: TradingEndpoint,
+) {
     let (mut sink, mut source) = stream.split();
     let mut next_id = 1_u64;
     let mut pending = HashMap::<u64, oneshot::Sender<Result<Value>>>::new();
@@ -173,13 +192,16 @@ async fn run_trading_connection(stream: WsStream, mut commands: mpsc::Receiver<T
         tokio::select! {
             command = commands.recv(), if pending.len() < MAX_INFLIGHT_POSTS => {
                 let Some(command) = command else {
-                    break "Hyperliquid trading request channel closed".to_string();
+                    break format!("{} trading request channel closed", endpoint.label());
                 };
                 let id = next_id;
                 next_id = next_id.saturating_add(1);
                 let request = trading_request(id, command.payload);
                 if let Err(error) = sink.send(Message::Text(request.to_string().into())).await {
-                    let message = format!("failed to send Hyperliquid WebSocket trading request: {error}");
+                    let message = format!(
+                        "failed to send {} WebSocket trading request: {error}",
+                        endpoint.label()
+                    );
                     let _ = command.response.send(Err(anyhow::anyhow!(message.clone())));
                     break message;
                 }
@@ -187,33 +209,33 @@ async fn run_trading_connection(stream: WsStream, mut commands: mpsc::Receiver<T
             }
             message = source.next() => {
                 let Some(message) = message else {
-                    break "Hyperliquid trading WebSocket closed by server".to_string();
+                    break format!("{} trading WebSocket closed by server", endpoint.label());
                 };
                 match message {
                     Ok(Message::Text(text)) => match serde_json::from_str::<Value>(&text) {
-                        Ok(value) => route_trading_response(value, &mut pending),
-                        Err(error) => break format!("Hyperliquid trading WebSocket returned invalid JSON: {error}"),
+                        Ok(value) => route_trading_response(value, &mut pending, endpoint),
+                        Err(error) => break format!("{} trading WebSocket returned invalid JSON: {error}", endpoint.label()),
                     },
                     Ok(Message::Binary(bytes)) => match serde_json::from_slice::<Value>(&bytes) {
-                        Ok(value) => route_trading_response(value, &mut pending),
-                        Err(error) => break format!("Hyperliquid trading WebSocket returned invalid binary JSON: {error}"),
+                        Ok(value) => route_trading_response(value, &mut pending, endpoint),
+                        Err(error) => break format!("{} trading WebSocket returned invalid binary JSON: {error}", endpoint.label()),
                     },
                     Ok(Message::Ping(payload)) => {
                         if let Err(error) = sink.send(Message::Pong(payload)).await {
-                            break format!("failed to answer Hyperliquid trading WebSocket ping: {error}");
+                            break format!("failed to answer {} trading WebSocket ping: {error}", endpoint.label());
                         }
                     }
                     Ok(Message::Close(frame)) => {
-                        break format!("Hyperliquid trading WebSocket closed: {frame:?}");
+                        break format!("{} trading WebSocket closed: {frame:?}", endpoint.label());
                     }
                     Ok(Message::Pong(_) | Message::Frame(_)) => {}
-                    Err(error) => break format!("Hyperliquid trading WebSocket read failed: {error}"),
+                    Err(error) => break format!("{} trading WebSocket read failed: {error}", endpoint.label()),
                 }
             }
             _ = heartbeat.tick() => {
                 let ping = serde_json::json!({ "method": "ping" });
                 if let Err(error) = sink.send(Message::Text(ping.to_string().into())).await {
-                    break format!("failed to heartbeat Hyperliquid trading WebSocket: {error}");
+                    break format!("failed to heartbeat {} trading WebSocket: {error}", endpoint.label());
                 }
             }
         }
@@ -238,12 +260,13 @@ fn trading_request(id: u64, payload: Value) -> Value {
 fn route_trading_response(
     value: Value,
     pending: &mut HashMap<u64, oneshot::Sender<Result<Value>>>,
+    endpoint: TradingEndpoint,
 ) {
     if value.get("channel").and_then(Value::as_str) == Some("pong") {
         return;
     }
     if value.get("channel").and_then(Value::as_str) == Some("error") {
-        let message = format!("Hyperliquid WebSocket trading error: {value}");
+        let message = format!("{} WebSocket trading error: {value}", endpoint.label());
         for (_, response) in pending.drain() {
             let _ = response.send(Err(anyhow::anyhow!(message.clone())));
         }
@@ -253,7 +276,10 @@ fn route_trading_response(
         return;
     }
     let Some(id) = value.pointer("/data/id").and_then(Value::as_u64) else {
-        let message = format!("Hyperliquid WebSocket post response omitted its id: {value}");
+        let message = format!(
+            "{} WebSocket post response omitted its id: {value}",
+            endpoint.label()
+        );
         for (_, response) in pending.drain() {
             let _ = response.send(Err(anyhow::anyhow!(message.clone())));
         }
@@ -267,10 +293,12 @@ fn route_trading_response(
     let result = match (response_type, payload) {
         (Some("action"), Some(payload)) => Ok(payload.clone()),
         (Some("error"), Some(payload)) => Err(anyhow::anyhow!(
-            "Hyperliquid WebSocket trading request failed: {payload}"
+            "{} WebSocket trading request failed: {payload}",
+            endpoint.label()
         )),
         _ => Err(anyhow::anyhow!(
-            "Hyperliquid WebSocket trading request returned an unexpected response: {value}"
+            "{} WebSocket trading request returned an unexpected response: {value}",
+            endpoint.label()
         )),
     };
     let _ = response.send(result);
@@ -923,6 +951,7 @@ mod tests {
                 }
             }),
             &mut pending,
+            TradingEndpoint::Hyperliquid(HyperliquidNetwork::Mainnet),
         );
 
         assert!(pending.is_empty());
@@ -950,17 +979,17 @@ mod tests {
                 }
             }),
             &mut pending,
+            TradingEndpoint::Hyperlink,
         );
 
         assert!(pending.contains_key(&8));
-        assert!(
-            response_rx
-                .try_recv()
-                .expect("response routed")
-                .expect_err("request should fail")
-                .to_string()
-                .contains("429 Too Many Requests")
-        );
+        let error = response_rx
+            .try_recv()
+            .expect("response routed")
+            .expect_err("request should fail")
+            .to_string();
+        assert!(error.contains("429 Too Many Requests"));
+        assert!(error.starts_with("HyperLink WebSocket trading request failed"));
     }
 
     #[test]

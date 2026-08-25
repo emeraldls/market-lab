@@ -555,10 +555,10 @@ pub struct OrderRequest {
     pub size: String,
     #[serde(rename = "r")]
     pub reduce_only: bool,
-    #[serde(rename = "c", skip_serializing_if = "Option::is_none")]
-    pub client_order_id: Option<String>,
     #[serde(rename = "t")]
     pub order_type: WireOrder,
+    #[serde(rename = "c", skip_serializing_if = "Option::is_none")]
+    pub client_order_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -738,6 +738,42 @@ mod tests {
             value["orders"][0]["c"],
             "0x1234567890abcdef1234567890abcdef"
         );
+    }
+
+    #[test]
+    fn hyperlink_cloid_signature_matches_official_sdk_vector() {
+        let wallet = HyperliquidWallet::from_private_key(
+            "0123456789012345678901234567890123456789012345678901234567890123",
+        )
+        .expect("wallet parses");
+        let action = Action::Order {
+            orders: vec![OrderRequest {
+                asset: 1,
+                is_buy: true,
+                limit_px: "100".to_string(),
+                size: "100".to_string(),
+                reduce_only: false,
+                order_type: WireOrder::Limit {
+                    tif: "Gtc".to_string(),
+                },
+                client_order_id: Some("0x00000000000000000000000000000001".to_string()),
+            }],
+            grouping: OrderGrouping::None,
+        };
+
+        let signature = wallet
+            .sign_l1_action(&action, 0, HyperliquidNetwork::Mainnet)
+            .expect("action signs");
+
+        assert_eq!(
+            signature.r,
+            "0x41ae18e8239a56cacbc5dad94d45d0b747e5da11ad564077fcac71277a946e3"
+        );
+        assert_eq!(
+            signature.s,
+            "0x3c61f667e747404fe7eea8f90ab0e76cc12ce60270438b2058324681a00116da"
+        );
+        assert_eq!(signature.v, 27);
     }
 
     #[test]

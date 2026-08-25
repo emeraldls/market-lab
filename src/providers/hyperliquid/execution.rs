@@ -529,10 +529,13 @@ impl HyperliquidExecutionAdapter {
             .order(orders, grouping)
             .await
             .with_context(|| {
-                format!(
-                    "failed to submit Hyperliquid {} order",
-                    self.network.label()
-                )
+                let venue = match self.route {
+                    ExecutionRoute::Hyperliquid => {
+                        format!("Hyperliquid {}", self.network.label())
+                    }
+                    ExecutionRoute::Hyperlink => "HyperLink".to_string(),
+                };
+                format!("failed to submit {venue} order")
             })?;
         receipt_from_response(
             self.venue(),
