@@ -97,6 +97,10 @@ impl VolumeExporter {
             eprintln!("volume telemetry warning: fill queue unavailable: {error}");
         }
     }
+
+    pub fn is_enabled(&self) -> bool {
+        self.sender.is_some()
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -176,10 +180,7 @@ fn build_event(
 ) -> Result<Option<FillVolumeEvent>> {
     let spec = input.venue.spec()?;
     let network = spec.network_label(input.testnet);
-    // Testnet activity is useful for development but is not trading volume.
-    if network != "mainnet" {
-        return Ok(None);
-    }
+    // Restore mainnet-only volume by uncommenting: if network != "mainnet" { return Ok(None); }
     if !input.amount.is_finite()
         || input.amount <= 0.0
         || !input.price.is_finite()
@@ -245,6 +246,7 @@ async fn export_pending(
         fills: store.pending[..count].to_vec(),
     };
     cloud.ingest_volume(&batch).await?;
+    eprintln!("volume telemetry: exported {count} fill(s)");
 
     let delivered = store.pending.drain(..count).collect::<Vec<_>>();
     store
@@ -391,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn testnet_fills_are_not_reported_as_trading_volume() {
+    fn testnet_fills_are_temporarily_reported_for_volume_testing() {
         let event = build_event(
             &identity(),
             FillVolumeInput {
@@ -408,7 +410,7 @@ mod tests {
             },
         )
         .expect("valid fill");
-        assert!(event.is_none());
+        assert_eq!(event.expect("testnet event").network, "testnet");
     }
 
     #[test]

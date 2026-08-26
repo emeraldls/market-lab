@@ -18,7 +18,8 @@ use crate::bots::jobs::{BotJob, BotJobDefinition, BotJobStatus, BotJobSubmission
 use crate::credentials;
 use crate::daemon::{self, DaemonBackend, DaemonConfig};
 use crate::domain::execution::{
-    CancelPlan, ExecutionOutcome, ExecutionReceipt, ExecutionVenue, Position, TradePlan,
+    CancelPlan, ExecutionOutcome, ExecutionReceipt, ExecutionVenue, Fill, OrderSide, Position,
+    TradePlan,
 };
 use crate::providers::bulk::execution::BulkExecutionAdapter;
 use crate::providers::execution::{
@@ -44,7 +45,7 @@ use crate::venues::VenueMarket;
 use crate::volume::{FillVolumeInput, VolumeExporter};
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-pub const RUNTIME_VERSION: u8 = 44;
+pub const RUNTIME_VERSION: u8 = 45;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 const ORDER_ATTRIBUTION_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
@@ -71,7 +72,23 @@ struct SubmittedOrderAttribution {
     testnet: bool,
     account: String,
     internal_symbol: String,
+    #[serde(default)]
+    venue_symbol: String,
     order_id: String,
+    #[serde(default)]
+    provider_order_ids: Vec<String>,
+    #[serde(default)]
+    side: Option<OrderSide>,
+    #[serde(default)]
+    original_size: Option<f64>,
+    #[serde(default)]
+    limit_price: Option<f64>,
+    #[serde(default)]
+    attributed_size: f64,
+    #[serde(default)]
+    attributed_fill_ids: Vec<String>,
+    #[serde(default)]
+    fallback_eligible: bool,
     registered_at_ms: u64,
 }
 
@@ -601,6 +618,11 @@ pub async fn serve() -> Result<()> {
             VolumeExporter::default()
         }
     };
+    if volume_exporter.is_enabled() {
+        eprintln!("volume telemetry: enabled");
+    } else {
+        eprintln!("volume telemetry warning: disabled or not configured");
+    }
     let (account_tx, mut account_rx) = mpsc::channel(1024);
     let mut account_supervisors = HashSet::new();
     if let Ok(account) = credentials::bulk_account() {
@@ -5076,18 +5098,27 @@ fn record_trade_receipt(
     state.submitted_orders.retain(|_, order| {
         now.saturating_sub(order.registered_at_ms) <= ORDER_ATTRIBUTION_RETENTION_MS
     });
-    for order_id in receipt
+    for (index, order_id) in receipt
         .order_id
         .iter()
         .chain(&receipt.related_order_ids)
         .map(String::as_str)
+        .enumerate()
     {
         let order = SubmittedOrderAttribution {
             venue: plan.venue,
             testnet: plan.testnet,
             account: plan.account.clone(),
             internal_symbol: plan.internal_symbol.clone(),
+            venue_symbol: plan.venue_symbol.clone(),
             order_id: order_id.to_string(),
+            provider_order_ids: vec![order_id.to_string()],
+            side: Some(plan.side),
+            original_size: Some(plan.size),
+            limit_price: plan.price,
+            attributed_size: 0.0,
+            attributed_fill_ids: Vec::new(),
+            fallback_eligible: index == 0,
             registered_at_ms: receipt.submitted_at_ms,
         };
         state.submitted_orders.insert(
@@ -5576,7 +5607,15 @@ fn apply_account_updates(
                 )?;
             }
             AccountRuntimeUpdate::Fill(fill) => {
-                record_fill_volume(state, volume_exporter, venue, testnet, account, &fill);
+                record_fill_volume(
+                    paths,
+                    state,
+                    volume_exporter,
+                    venue,
+                    testnet,
+                    account,
+                    &fill,
+                );
             }
             AccountRuntimeUpdate::ScriptEvent(data) => {
                 route_account_event_to_scripts(venue, testnet, paths, state, &data)?;
@@ -5587,35 +5626,221 @@ fn apply_account_updates(
 }
 
 fn record_fill_volume(
-    state: &RuntimeState,
+    paths: &RuntimePaths,
+    state: &mut RuntimeState,
     volume_exporter: &VolumeExporter,
     venue: ExecutionVenue,
     testnet: bool,
     account: &str,
-    fill: &crate::domain::execution::Fill,
+    fill: &Fill,
 ) {
     let Some(order_id) = fill.order_id.as_deref() else {
+        log_volume_attribution(
+            paths,
+            "volume_fill_ignored",
+            venue,
+            testnet,
+            fill,
+            "fill omitted its provider order id",
+            None,
+        );
         return;
     };
-    let key = tracked_order_key(venue, testnet, order_id);
-    let Some(submitted) = state.submitted_orders.get(&key) else {
+
+    let direct_key = tracked_order_key(venue, testnet, order_id);
+    let matched_key = state
+        .submitted_orders
+        .contains_key(&direct_key)
+        .then_some(direct_key)
+        .or_else(|| {
+            state
+                .submitted_orders
+                .iter()
+                .find(|(_, submitted)| {
+                    submitted
+                        .provider_order_ids
+                        .iter()
+                        .any(|provider_id| provider_id == order_id)
+                })
+                .map(|(key, _)| key.clone())
+        });
+
+    let matched_key = match matched_key {
+        Some(key) => key,
+        None => {
+            let candidates = state
+                .submitted_orders
+                .iter()
+                .filter(|(_, submitted)| {
+                    submitted_order_matches_fill(submitted, venue, testnet, account, fill)
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            if candidates.len() != 1 {
+                let reason = if candidates.is_empty() {
+                    "no matching Market Lab submission"
+                } else {
+                    "multiple matching Market Lab submissions"
+                };
+                log_volume_attribution(
+                    paths,
+                    "volume_fill_ignored",
+                    venue,
+                    testnet,
+                    fill,
+                    reason,
+                    None,
+                );
+                return;
+            }
+            candidates[0].clone()
+        }
+    };
+
+    let Some(submitted) = state.submitted_orders.get_mut(&matched_key) else {
         return;
     };
     if submitted.account != account || fill.venue != submitted.venue {
+        log_volume_attribution(
+            paths,
+            "volume_fill_ignored",
+            venue,
+            testnet,
+            fill,
+            "matched submission belongs to another account or venue",
+            None,
+        );
         return;
     }
+    let discovered_alias = !submitted
+        .provider_order_ids
+        .iter()
+        .any(|provider_id| provider_id == order_id);
+    if discovered_alias {
+        submitted.provider_order_ids.push(order_id.to_string());
+        log_volume_attribution(
+            paths,
+            "volume_fill_correlated",
+            venue,
+            testnet,
+            fill,
+            "provider fill id correlated to submitted order",
+            Some(&submitted.order_id),
+        );
+    }
+    let fill_identity = fill_attribution_identity(fill, order_id);
+    if !submitted
+        .attributed_fill_ids
+        .iter()
+        .any(|identity| identity == &fill_identity)
+    {
+        submitted.attributed_size += fill.amount;
+        submitted.attributed_fill_ids.push(fill_identity);
+    }
+    let symbol = submitted.internal_symbol.clone();
     volume_exporter.record(FillVolumeInput {
         venue,
         testnet,
         account: account.to_string(),
         order_id: order_id.to_string(),
         trade_id: fill.trade_id.clone(),
-        symbol: submitted.internal_symbol.clone(),
+        symbol,
         amount: fill.amount,
         price: fill.price,
         maker: fill.maker,
         filled_at_ms: fill.ts_ms,
     });
+}
+
+fn submitted_order_matches_fill(
+    submitted: &SubmittedOrderAttribution,
+    venue: ExecutionVenue,
+    testnet: bool,
+    account: &str,
+    fill: &Fill,
+) -> bool {
+    if !submitted.fallback_eligible
+        || submitted.venue != venue
+        || submitted.testnet != testnet
+        || submitted.account != account
+        || fill.venue != venue
+        || submitted.side.is_some_and(|side| side != fill.side)
+        || (!submitted
+            .internal_symbol
+            .eq_ignore_ascii_case(&fill.internal_symbol)
+            && !submitted
+                .venue_symbol
+                .eq_ignore_ascii_case(&fill.venue_symbol))
+        || fill.ts_ms.saturating_add(5_000) < submitted.registered_at_ms
+    {
+        return false;
+    }
+    if let Some(original_size) = submitted.original_size {
+        let remaining = (original_size - submitted.attributed_size).max(0.0);
+        let tolerance = original_size.abs().max(1.0) * 1e-9;
+        if fill.amount > remaining + tolerance {
+            return false;
+        }
+    }
+    submitted.limit_price.is_none_or(|limit_price| {
+        let tolerance = limit_price.abs().max(1.0) * 1e-9;
+        (fill.price - limit_price).abs() <= tolerance
+    })
+}
+
+fn fill_attribution_identity(fill: &Fill, order_id: &str) -> String {
+    fill.trade_id.clone().unwrap_or_else(|| {
+        format!(
+            "{order_id}:{}:{}:{}",
+            fill.ts_ms,
+            fill.amount.to_bits(),
+            fill.price.to_bits()
+        )
+    })
+}
+
+fn log_volume_attribution(
+    paths: &RuntimePaths,
+    event: &str,
+    venue: ExecutionVenue,
+    testnet: bool,
+    fill: &Fill,
+    reason: &str,
+    submitted_order_id: Option<&str>,
+) {
+    let provider_order_id = fill.order_id.as_deref().unwrap_or("-");
+    if event == "volume_fill_ignored" {
+        eprintln!(
+            "volume telemetry warning: {reason}: venue={venue} symbol={} side={:?} size={} order_id={provider_order_id}",
+            fill.internal_symbol, fill.side, fill.amount
+        );
+    } else {
+        eprintln!(
+            "volume telemetry: {reason}: venue={venue} symbol={} order_id={provider_order_id}",
+            fill.internal_symbol
+        );
+    }
+    if let Err(error) = append_json_line(
+        &paths.events,
+        &serde_json::json!({
+            "ts_ms": fill.ts_ms,
+            "event": event,
+            "venue": venue,
+            "network": venue
+                .spec()
+                .map(|spec| spec.network_label(testnet))
+                .unwrap_or("unknown"),
+            "symbol": fill.internal_symbol,
+            "side": fill.side,
+            "size": fill.amount,
+            "price": fill.price,
+            "order_id": fill.order_id,
+            "submitted_order_id": submitted_order_id,
+            "reason": reason,
+        }),
+    ) {
+        eprintln!("volume telemetry warning: failed to journal attribution: {error:#}");
+    }
 }
 
 fn apply_script_order_status(
@@ -5861,7 +6086,15 @@ async fn recover_account_gap(
     }
 
     for fill in recovery.fills {
-        record_fill_volume(state, volume_exporter, venue, testnet, account, &fill);
+        record_fill_volume(
+            paths,
+            state,
+            volume_exporter,
+            venue,
+            testnet,
+            account,
+            &fill,
+        );
         let data = serde_json::to_value(&fill)?;
         append_json_line(
             &paths.events,
@@ -6243,6 +6476,96 @@ mod tests {
     }
 
     #[test]
+    fn volume_attribution_matches_a_unique_provider_order_alias() {
+        let submitted = SubmittedOrderAttribution {
+            venue: ExecutionVenue::Bulk,
+            testnet: false,
+            account: "account".to_string(),
+            internal_symbol: "ZEC".to_string(),
+            venue_symbol: "ZEC-USD".to_string(),
+            order_id: "submission-id".to_string(),
+            provider_order_ids: vec!["submission-id".to_string()],
+            side: Some(OrderSide::Buy),
+            original_size: Some(0.103_690_07),
+            limit_price: None,
+            attributed_size: 0.0,
+            attributed_fill_ids: Vec::new(),
+            fallback_eligible: true,
+            registered_at_ms: 1_000,
+        };
+        let fill = Fill {
+            venue: ExecutionVenue::Bulk,
+            internal_symbol: "ZEC".to_string(),
+            venue_symbol: "ZEC-USD".to_string(),
+            registry_supported: true,
+            side: OrderSide::Buy,
+            amount: 0.103_690_07,
+            price: 771.56,
+            reason: "fill".to_string(),
+            order_id: Some("account-stream-id".to_string()),
+            trade_id: Some("123:4".to_string()),
+            maker: false,
+            fee: None,
+            fee_asset: None,
+            slot: 123,
+            ts_ms: 1_100,
+        };
+
+        assert!(submitted_order_matches_fill(
+            &submitted,
+            ExecutionVenue::Bulk,
+            false,
+            "account",
+            &fill,
+        ));
+    }
+
+    #[test]
+    fn volume_attribution_rejects_an_unrelated_fill() {
+        let submitted = SubmittedOrderAttribution {
+            venue: ExecutionVenue::Bulk,
+            testnet: false,
+            account: "account".to_string(),
+            internal_symbol: "ZEC".to_string(),
+            venue_symbol: "ZEC-USD".to_string(),
+            order_id: "submission-id".to_string(),
+            provider_order_ids: vec!["submission-id".to_string()],
+            side: Some(OrderSide::Buy),
+            original_size: Some(0.1),
+            limit_price: Some(770.0),
+            attributed_size: 0.0,
+            attributed_fill_ids: Vec::new(),
+            fallback_eligible: true,
+            registered_at_ms: 1_000,
+        };
+        let fill = Fill {
+            venue: ExecutionVenue::Bulk,
+            internal_symbol: "ZEC".to_string(),
+            venue_symbol: "ZEC-USD".to_string(),
+            registry_supported: true,
+            side: OrderSide::Sell,
+            amount: 0.1,
+            price: 771.0,
+            reason: "fill".to_string(),
+            order_id: Some("external-id".to_string()),
+            trade_id: Some("123:5".to_string()),
+            maker: false,
+            fee: None,
+            fee_asset: None,
+            slot: 123,
+            ts_ms: 1_100,
+        };
+
+        assert!(!submitted_order_matches_fill(
+            &submitted,
+            ExecutionVenue::Bulk,
+            false,
+            "account",
+            &fill,
+        ));
+    }
+
+    #[test]
     fn terminal_script_order_status_cannot_regress() {
         assert!(should_apply_script_order_status("submitted", "resting"));
         assert!(should_apply_script_order_status("resting", "filled"));
@@ -6276,8 +6599,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_protocol_v44_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 44);
+    fn runtime_protocol_v45_decodes_oiwap_submissions() {
+        assert_eq!(RUNTIME_VERSION, 45);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",
