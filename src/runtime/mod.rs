@@ -47,6 +47,7 @@ use crate::volume::{FillVolumeInput, VolumeExporter};
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
 pub const RUNTIME_VERSION: u8 = 45;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
+const ACCOUNT_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
 const ORDER_ATTRIBUTION_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
@@ -5313,8 +5314,13 @@ async fn supervise_account_stream(
                 connected_once = true;
                 reconnect_delay_secs = 1;
                 loop {
-                    match stream.next_runtime_event().await {
-                        Ok(event) => {
+                    match tokio::time::timeout(
+                        ACCOUNT_STREAM_IDLE_TIMEOUT,
+                        stream.next_runtime_event(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(event)) => {
                             if sender
                                 .send(AccountConnectionEvent::Data {
                                     venue,
@@ -5328,13 +5334,31 @@ async fn supervise_account_stream(
                                 return;
                             }
                         }
-                        Err(error) => {
+                        Ok(Err(error)) => {
                             if sender
                                 .send(AccountConnectionEvent::Disconnected {
                                     venue,
                                     testnet,
                                     account: account.clone(),
                                     error: format!("{error:#}"),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            break;
+                        }
+                        Err(_) => {
+                            if sender
+                                .send(AccountConnectionEvent::Disconnected {
+                                    venue,
+                                    testnet,
+                                    account: account.clone(),
+                                    error: format!(
+                                        "account WebSocket received no events for {} seconds",
+                                        ACCOUNT_STREAM_IDLE_TIMEOUT.as_secs()
+                                    ),
                                 })
                                 .await
                                 .is_err()
@@ -6053,10 +6077,10 @@ async fn recover_account_gap(
     account: &str,
     volume_exporter: &VolumeExporter,
 ) -> Result<()> {
-    let gap_started_ms = state
-        .account_disconnected_at_ms
-        .or(state.last_account_event_ms)
-        .unwrap_or(0);
+    let gap_started_ms = account_recovery_start_ms(
+        state.last_account_event_ms,
+        state.account_disconnected_at_ms,
+    );
 
     // These are one-shot gap-recovery calls after a proven disconnect. They are
     // never scheduled on a timer while the account WebSocket is healthy.
@@ -6127,6 +6151,13 @@ async fn recover_account_gap(
     state.last_recovery_ms = Some(now_ms()?);
     state.account_disconnected_at_ms = None;
     persist_state(paths, state)
+}
+
+fn account_recovery_start_ms(
+    last_account_event_ms: Option<u64>,
+    disconnected_at_ms: Option<u64>,
+) -> u64 {
+    last_account_event_ms.or(disconnected_at_ms).unwrap_or(0)
 }
 
 fn is_terminal_order_status(status: &str) -> bool {
@@ -6473,6 +6504,13 @@ mod tests {
         assert!(!is_terminal_order_status("partiallyFilled"));
         assert!(is_terminal_order_status("filled"));
         assert!(is_terminal_order_status("cancelled"));
+    }
+
+    #[test]
+    fn account_gap_recovery_starts_at_the_last_received_event() {
+        assert_eq!(account_recovery_start_ms(Some(1_000), Some(5_000)), 1_000);
+        assert_eq!(account_recovery_start_ms(None, Some(5_000)), 5_000);
+        assert_eq!(account_recovery_start_ms(None, None), 0);
     }
 
     #[test]

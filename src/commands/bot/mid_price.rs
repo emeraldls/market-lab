@@ -5,7 +5,6 @@ use std::io::{self, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use futures_util::future::join_all;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
@@ -1315,6 +1314,8 @@ async fn run_worker(job_id: &str, mode: MidMode, definition: &MidPriceJobDefinit
         &mut sell,
         &mut ledger,
         &mut owned_orders,
+        &mut order_sequence,
+        &mut cancel_sequence,
     )
     .await;
     let performance = ledger.performance(current_mark(&book, parent.reference_price));
@@ -1695,6 +1696,94 @@ pub(super) fn inventory_unwind_plan(
     })
 }
 
+pub(super) fn correlate_cleanup_fill_order_id(
+    plan: &TradePlan,
+    receipt: &ExecutionReceipt,
+    fills: &[Fill],
+) -> Option<String> {
+    let tolerance = plan.size.abs().max(1.0) * 1e-9;
+    let latest_fill_ms = receipt.submitted_at_ms.saturating_add(30_000);
+    let mut amounts = HashMap::<String, f64>::new();
+    for fill in fills {
+        let Some(order_id) = fill.order_id.as_deref() else {
+            continue;
+        };
+        if fill.venue != plan.venue
+            || fill.side != plan.side
+            || (!fill
+                .internal_symbol
+                .eq_ignore_ascii_case(&plan.internal_symbol)
+                && !fill.venue_symbol.eq_ignore_ascii_case(&plan.venue_symbol))
+            || fill.ts_ms.saturating_add(1_000) < plan.created_at_ms
+            || fill.ts_ms > latest_fill_ms
+        {
+            continue;
+        }
+        *amounts.entry(order_id.to_string()).or_default() += fill.amount;
+    }
+    let mut candidates = amounts
+        .into_iter()
+        .filter(|(_, amount)| *amount <= plan.size + tolerance)
+        .collect::<Vec<_>>();
+    let exact = candidates
+        .iter()
+        .filter(|(_, amount)| (*amount - plan.size).abs() <= tolerance)
+        .map(|(order_id, _)| order_id.clone())
+        .collect::<Vec<_>>();
+    if exact.len() == 1 {
+        return exact.into_iter().next();
+    }
+    if candidates.len() == 1 {
+        return candidates.pop().map(|(order_id, _)| order_id);
+    }
+    None
+}
+
+pub(super) async fn account_symbol_is_flat(
+    adapter: &ExecutionAdapter,
+    account: &str,
+    symbol: &str,
+    lot_size: f64,
+) -> Result<bool> {
+    let snapshot = adapter.account_snapshot(account).await?;
+    let signed_size = snapshot
+        .positions
+        .iter()
+        .filter(|position| position.internal_symbol.eq_ignore_ascii_case(symbol))
+        .map(|position| match position.direction {
+            PositionDirection::Long => position.size,
+            PositionDirection::Short => -position.size,
+        })
+        .sum::<f64>();
+    Ok(signed_size.abs() < lot_size / 2.0)
+}
+
+pub(super) fn record_position_reconciled_unwind(
+    job_id: &str,
+    bot: &str,
+    mark_price: f64,
+    order_id: &str,
+    average_fill_price: Option<f64>,
+    ledger: &mut FillLedger,
+) -> Result<()> {
+    let inventory = ledger.inventory();
+    if inventory.abs() <= f64::EPSILON {
+        return Ok(());
+    }
+    let observed = ObservedFill {
+        timestamp: now_ms()?,
+        recovered: true,
+        buy: inventory < 0.0,
+        size: inventory.abs(),
+        price: average_fill_price.unwrap_or(mark_price),
+        fee: None,
+    };
+    if ledger.record_live(order_id, &observed) {
+        append_fill(job_id, bot, mark_price, ledger, order_id, &observed)?;
+    }
+    Ok(())
+}
+
 pub(super) fn cancel_plan(parent: &TradePlan, order_id: String) -> Result<CancelPlan> {
     Ok(CancelPlan {
         created_at_ms: now_ms()?,
@@ -2069,6 +2158,8 @@ async fn cleanup(
     sell: &mut QuoteSlot,
     ledger: &mut FillLedger,
     owned_orders: &mut HashSet<String>,
+    order_sequence: &mut u64,
+    cancel_sequence: &mut u64,
 ) -> Result<()> {
     let cleanup_deadline = Instant::now() + CLEANUP_TIMEOUT;
     loop {
@@ -2104,14 +2195,25 @@ async fn cleanup(
                 Ok((order, plan))
             })
             .collect::<Result<Vec<_>>>()?;
-        let cancellation_results = join_all(
-            cancellation_plans
-                .iter()
-                .map(|(_, plan)| adapter.cancel_order_fast(plan)),
-        )
-        .await;
-        for ((order, _), result) in cancellation_plans.into_iter().zip(cancellation_results) {
-            match result {
+        let cancel_items = cancellation_plans
+            .iter()
+            .map(|(_, plan)| {
+                *cancel_sequence = cancel_sequence.saturating_add(1);
+                (*cancel_sequence, plan.clone())
+            })
+            .collect::<Vec<_>>();
+        let cancellation_results = crate::runtime::submit_bot_cancels(job_id, &cancel_items)
+            .await
+            .context("failed to submit the mid-price cleanup cancellation batch")?;
+        if cancellation_results.len() != cancellation_plans.len() {
+            bail!(
+                "runtime returned {} outcomes for {} mid-price cleanup cancellations",
+                cancellation_results.len(),
+                cancellation_plans.len()
+            );
+        }
+        for ((order, _), outcome) in cancellation_plans.into_iter().zip(cancellation_results) {
+            match outcome.into_result().map_err(anyhow::Error::msg) {
                 Ok(receipt) => append_quote(
                     job_id,
                     bot,
@@ -2156,17 +2258,22 @@ async fn cleanup(
         PositionDirection::Long
     };
     let plan = inventory_unwind_plan(parent, direction, size, mark_price)?;
-    let receipt = adapter
-        .submit_trade(&plan)
+    *order_sequence = order_sequence.saturating_add(1);
+    let receipt = crate::runtime::submit_bot_trade(job_id, *order_sequence, &plan)
         .await
         .context("failed to unwind mid-price bot-owned inventory")?;
     let order_id = receipt
         .order_id
+        .clone()
         .context("mid-price inventory unwind omitted its order id")?;
-    owned_orders.insert(order_id);
+    owned_orders.insert(order_id.clone());
 
     let deadline = Instant::now() + CLEANUP_TIMEOUT;
     loop {
+        let fills = adapter.fills(&parent.account).await?;
+        if let Some(provider_order_id) = correlate_cleanup_fill_order_id(&plan, &receipt, &fills) {
+            owned_orders.insert(provider_order_id);
+        }
         reconcile_recovery(
             RecoveryContext {
                 job_id,
@@ -2175,7 +2282,7 @@ async fn cleanup(
                 open_orders: &[],
                 owned_orders,
             },
-            adapter.fills(&parent.account).await?,
+            fills,
             buy,
             sell,
             ledger,
@@ -2184,6 +2291,24 @@ async fn cleanup(
             break;
         }
         if Instant::now() >= deadline {
+            if account_symbol_is_flat(
+                adapter,
+                &parent.account,
+                &parent.internal_symbol,
+                rules.lot_size,
+            )
+            .await?
+            {
+                record_position_reconciled_unwind(
+                    job_id,
+                    bot,
+                    mark_price,
+                    &order_id,
+                    receipt.average_fill_price,
+                    ledger,
+                )?;
+                break;
+            }
             bail!(
                 "timed out waiting for bot-owned residual inventory to unwind; remaining={}",
                 ledger.inventory()
@@ -2628,6 +2753,74 @@ mod tests {
         assert_eq!(plan.side, OrderSide::Sell);
         assert_eq!(plan.size, 0.25);
         assert!(!plan.reduce_only);
+    }
+
+    #[test]
+    fn cleanup_correlates_a_provider_order_id_from_partial_fills() {
+        let parent = TradePlan {
+            created_at_ms: 1,
+            venue: ExecutionVenue::Bulk,
+            testnet: false,
+            account: "account".to_string(),
+            internal_symbol: "LIT".to_string(),
+            venue_symbol: "LIT-USD".to_string(),
+            direction: PositionDirection::Long,
+            side: OrderSide::Buy,
+            order_kind: OrderKind::Market,
+            time_in_force: None,
+            requested_size: Some(1.0),
+            size: 1.0,
+            price: None,
+            reference_price: 3.45,
+            max_slippage: None,
+            requested_margin: Some(1.0),
+            estimated_margin: 1.0,
+            estimated_exposure: 10.0,
+            projected_liquidation_price: None,
+            leverage: Some(10.0),
+            reduce_only: false,
+            stop_loss_price: None,
+            take_profit_price: None,
+            market_fingerprint: None,
+        };
+        let plan = inventory_unwind_plan(&parent, PositionDirection::Short, 1.0, 3.45)
+            .expect("unwind plan");
+        let receipt = ExecutionReceipt {
+            venue: ExecutionVenue::Bulk,
+            account: "account".to_string(),
+            order_id: Some("submission-id".to_string()),
+            related_order_ids: Vec::new(),
+            status: "working".to_string(),
+            terminal: false,
+            submitted_at_ms: plan.created_at_ms.saturating_add(10),
+            raw_status: serde_json::Value::Null,
+            requested_size: Some(1.0),
+            filled_size: None,
+            average_fill_price: None,
+        };
+        let fill = |amount: f64, trade_id: &str| Fill {
+            venue: ExecutionVenue::Bulk,
+            internal_symbol: "LIT".to_string(),
+            venue_symbol: "LIT-USD".to_string(),
+            registry_supported: true,
+            side: OrderSide::Sell,
+            amount,
+            price: 3.44,
+            reason: "fill".to_string(),
+            order_id: Some("provider-id".to_string()),
+            trade_id: Some(trade_id.to_string()),
+            maker: false,
+            fee: Some(0.0),
+            fee_asset: None,
+            slot: 1,
+            ts_ms: plan.created_at_ms.saturating_add(5),
+        };
+        let fills = vec![fill(0.4, "1:1"), fill(0.6, "1:2")];
+
+        assert_eq!(
+            correlate_cleanup_fill_order_id(&plan, &receipt, &fills).as_deref(),
+            Some("provider-id")
+        );
     }
 
     #[test]

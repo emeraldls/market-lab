@@ -12,11 +12,13 @@ use crate::cli::{
     ExecutionVenueArg, OutputFormat, RunGridArgs, TradeArgs, TradeOrderKind, TradeTimeInForce,
 };
 use crate::commands::bot::mid_price::{
-    AccountFeedEvent, BotStopped, FillKey, FillLedger, ObservedFill, QuoteSide, append_fill,
-    append_market_data, append_stop_loss, cancel_plan, confirm_live_execution, current_mark,
-    execution_market, floor_to_step, inventory_unwind_plan, is_order_gone_error,
-    is_order_gone_message, is_post_only_crossing_message, is_terminal_order_status, live_orderbook,
-    quote_plan, render_submission, spawn_account_feed, spawn_book_feed, stop_loss_triggered,
+    AccountFeedEvent, BotStopped, FillKey, FillLedger, ObservedFill, QuoteSide,
+    account_symbol_is_flat, append_fill, append_market_data, append_stop_loss, cancel_plan,
+    confirm_live_execution, correlate_cleanup_fill_order_id, current_mark, execution_market,
+    floor_to_step, inventory_unwind_plan, is_order_gone_error, is_order_gone_message,
+    is_post_only_crossing_message, is_terminal_order_status, live_orderbook, quote_plan,
+    record_position_reconciled_unwind, render_submission, spawn_account_feed, spawn_book_feed,
+    stop_loss_triggered,
 };
 use crate::commands::execution::build_trade_plan;
 use crate::domain::execution::{
@@ -751,6 +753,8 @@ async fn run_worker(job_id: &str, definition: &GridJobDefinition) -> Result<()> 
         &mut slots,
         &mut ledger,
         &mut order_roles,
+        &mut order_sequence,
+        &mut cancel_sequence,
     )
     .await;
     let performance = ledger.performance(current_mark(&book, parent.reference_price));
@@ -1422,6 +1426,8 @@ async fn cleanup(
     slots: &mut HashMap<GridKey, QuoteSlot>,
     ledger: &mut FillLedger,
     order_roles: &mut HashMap<String, OrderRole>,
+    order_sequence: &mut u64,
+    cancel_sequence: &mut u64,
 ) -> Result<()> {
     let cleanup_deadline = Instant::now() + CLEANUP_TIMEOUT;
     loop {
@@ -1453,12 +1459,14 @@ async fn cleanup(
                 Ok((order, plan))
             })
             .collect::<Result<Vec<_>>>()?;
-        let plans = cancellation_plans
+        let cancel_items = cancellation_plans
             .iter()
-            .map(|(_, plan)| plan.clone())
+            .map(|(_, plan)| {
+                *cancel_sequence = cancel_sequence.saturating_add(1);
+                (*cancel_sequence, plan.clone())
+            })
             .collect::<Vec<_>>();
-        let cancellation_results = adapter
-            .cancel_orders_fast(&plans)
+        let cancellation_results = crate::runtime::submit_bot_cancels(job_id, &cancel_items)
             .await
             .context("failed to submit the grid cancellation batch")?;
         if cancellation_results.len() != cancellation_plans.len() {
@@ -1514,30 +1522,45 @@ async fn cleanup(
         PositionDirection::Long
     };
     let plan = inventory_unwind_plan(parent, direction, size, mark_price)?;
-    let receipt = adapter
-        .submit_trade(&plan)
+    *order_sequence = order_sequence.saturating_add(1);
+    let receipt = crate::runtime::submit_bot_trade(job_id, *order_sequence, &plan)
         .await
         .context("failed to unwind grid bot-owned inventory")?;
     let order_id = receipt
         .order_id
+        .clone()
         .context("grid inventory unwind omitted its order id")?;
-    order_roles.insert(order_id, OrderRole::Cleanup);
+    order_roles.insert(order_id.clone(), OrderRole::Cleanup);
 
     let deadline = Instant::now() + CLEANUP_TIMEOUT;
     loop {
-        reconcile_recovery(
-            job_id,
-            mark_price,
-            &[],
-            adapter.fills(&parent.account).await?,
-            order_roles,
-            slots,
-            ledger,
-        )?;
+        let fills = adapter.fills(&parent.account).await?;
+        if let Some(provider_order_id) = correlate_cleanup_fill_order_id(&plan, &receipt, &fills) {
+            order_roles.insert(provider_order_id, OrderRole::Cleanup);
+        }
+        reconcile_recovery(job_id, mark_price, &[], fills, order_roles, slots, ledger)?;
         if ledger.inventory().abs() < rules.lot_size / 2.0 {
             break;
         }
         if Instant::now() >= deadline {
+            if account_symbol_is_flat(
+                adapter,
+                &parent.account,
+                &parent.internal_symbol,
+                rules.lot_size,
+            )
+            .await?
+            {
+                record_position_reconciled_unwind(
+                    job_id,
+                    BOT_NAME,
+                    mark_price,
+                    &order_id,
+                    receipt.average_fill_price,
+                    ledger,
+                )?;
+                break;
+            }
             bail!(
                 "timed out waiting for grid bot-owned inventory to unwind; remaining={}",
                 ledger.inventory()
