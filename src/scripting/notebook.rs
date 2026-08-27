@@ -68,26 +68,26 @@ async fn handle_history<W>(request: &Value, writer: &mut W) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let from_raw = request
-        .get("from")
+    let start_raw = request
+        .get("start")
         .and_then(Value::as_str)
-        .context("mlab.history from_ must be a UTC date string")?;
-    let to_raw = request
-        .get("to")
+        .context("mlab.history start must be a UTC date string")?;
+    let end_raw = request
+        .get("end")
         .and_then(Value::as_str)
-        .context("mlab.history to must be a UTC date string")?;
-    let from = crate::cli::parse_datetime_ms(from_raw).map_err(anyhow::Error::msg)?;
-    let to = crate::cli::parse_datetime_ms(to_raw).map_err(anyhow::Error::msg)?;
-    if from >= to {
-        bail!("mlab.history from_ must be earlier than to");
+        .context("mlab.history end must be a UTC date string")?;
+    let start = crate::cli::parse_datetime_ms(start_raw).map_err(anyhow::Error::msg)?;
+    let end = crate::cli::parse_datetime_ms(end_raw).map_err(anyhow::Error::msg)?;
+    if start >= end {
+        bail!("mlab.history start must be earlier than end");
     }
     write_result(
         writer,
         &json!({
-            "fromMs": from,
-            "toMs": to,
-            "fromUtc": format_utc_ms(from),
-            "toUtc": format_utc_ms(to),
+            "startMs": start,
+            "endMs": end,
+            "startUtc": format_utc_ms(start),
+            "endUtc": format_utc_ms(end),
         }),
     )
     .await
@@ -103,18 +103,18 @@ where
         .and_then(Value::as_str)
         .filter(|selector| !selector.trim().is_empty())
         .context("history.source selector must be a non-empty string")?;
-    let from = request
-        .get("fromMs")
+    let start = request
+        .get("startMs")
         .and_then(Value::as_u64)
-        .context("history.source request omitted fromMs")?;
-    let to = request
-        .get("toMs")
+        .context("history.source request omitted startMs")?;
+    let end = request
+        .get("endMs")
         .and_then(Value::as_u64)
-        .context("history.source request omitted toMs")?;
-    validate_range(from, to)?;
+        .context("history.source request omitted endMs")?;
+    validate_range(start, end)?;
 
     let records = tokio::select! {
-        result = fetch_notebook_source(selector, from, to) => result?,
+        result = fetch_notebook_source(selector, start, end) => result?,
         result = wait_for_disconnect(reader) => {
             result?;
             bail!("notebook history request was cancelled");
@@ -361,9 +361,10 @@ mod tests {
         let program = r#"
 from marketlab_notebook import MarketLabNotebook
 mlab = MarketLabNotebook(__import__('os').environ['MLAB_NOTEBOOK_SOCKET'], __import__('os').environ['MLAB_NOTEBOOK_TOKEN'])
-history = mlab.history(from_='2026-08-01', to='2026-08-02')
+history = mlab.history(start='2026-08-01', end='2026-08-02')
 study = mlab.study.sma([{'c': 1.0}, {'c': 3.0}], {'window': 2})
-assert history.from_ms == 1785542400000
+assert history.start_ms == 1785542400000
+assert history.end_ms == 1785628800000
 assert 'sources=0' in repr(history)
 assert study['latest'] == 2.0
 print('ok')

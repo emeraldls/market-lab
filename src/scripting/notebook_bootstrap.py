@@ -60,21 +60,21 @@ class _Study:
 
 
 class NotebookHistory:
-    def __init__(self, bridge, from_ms, to_ms, from_utc, to_utc):
+    def __init__(self, bridge, start_ms, end_ms, start_utc, end_utc):
         self._bridge = bridge
-        self._from_ms = from_ms
-        self._to_ms = to_ms
-        self._from_utc = from_utc
-        self._to_utc = to_utc
+        self._start_ms = start_ms
+        self._end_ms = end_ms
+        self._start_utc = start_utc
+        self._end_utc = end_utc
         self._cache = {}
 
     @property
-    def from_ms(self):
-        return self._from_ms
+    def start_ms(self):
+        return self._start_ms
 
     @property
-    def to_ms(self):
-        return self._to_ms
+    def end_ms(self):
+        return self._end_ms
 
     def source(self, selector, index=None):
         if not isinstance(selector, str) or not selector.strip():
@@ -84,8 +84,8 @@ class NotebookHistory:
         if selector not in self._cache:
             self._cache[selector] = self._bridge._source(
                 selector,
-                self._from_ms,
-                self._to_ms,
+                self._start_ms,
+                self._end_ms,
             )
         rows = self._cache[selector]
         if index is None:
@@ -101,7 +101,7 @@ class NotebookHistory:
     def __repr__(self):
         return (
             "MarketLabHistory("
-            f"from_={self._from_utc!r}, to={self._to_utc!r}, "
+            f"start={self._start_utc!r}, end={self._end_utc!r}, "
             f"sources={len(self._cache)})"
         )
 
@@ -147,9 +147,9 @@ class MarketLabNotebook:
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise RuntimeError("Market Lab notebook result is invalid JSON") from error
 
-    def history(self, *, from_, to):
-        if not isinstance(from_, str) or not isinstance(to, str):
-            raise TypeError("mlab.history from_ and to must be UTC date strings")
+    def history(self, *, start, end):
+        if not isinstance(start, str) or not isinstance(end, str):
+            raise TypeError("mlab.history start and end must be UTC date strings")
         with self._connect() as connection, connection.makefile(
             "rwb", buffering=0
         ) as stream:
@@ -158,20 +158,20 @@ class MarketLabNotebook:
                 {
                     "type": "history",
                     "token": self._token,
-                    "from": from_,
-                    "to": to,
+                    "start": start,
+                    "end": end,
                 },
             )
             result = self._read_result(stream)
         return NotebookHistory(
             self,
-            result["fromMs"],
-            result["toMs"],
-            result["fromUtc"],
-            result["toUtc"],
+            result["startMs"],
+            result["endMs"],
+            result["startUtc"],
+            result["endUtc"],
         )
 
-    def _source(self, selector, from_ms, to_ms):
+    def _source(self, selector, start_ms, end_ms):
         with self._connect() as connection, connection.makefile(
             "rwb", buffering=0
         ) as stream:
@@ -181,8 +181,8 @@ class MarketLabNotebook:
                     "type": "source",
                     "token": self._token,
                     "selector": selector,
-                    "fromMs": from_ms,
-                    "toMs": to_ms,
+                    "startMs": start_ms,
+                    "endMs": end_ms,
                 },
             )
             first = _read_frame(stream)
