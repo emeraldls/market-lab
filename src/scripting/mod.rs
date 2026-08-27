@@ -7,6 +7,7 @@ pub mod language;
 pub mod limits;
 pub mod manifest;
 pub mod market_data;
+pub(crate) mod notebook;
 pub mod output;
 pub(crate) mod python;
 pub mod studies;

@@ -109,6 +109,7 @@ async fn main() -> Result<()> {
                 ScriptRunHistoryCommands::Show(args) => commands::script::runs::handle_show(args)?,
             },
         },
+        Commands::Notebook(args) => commands::notebook::handle(args).await?,
         Commands::Strategy { command: strategy } => match strategy {
             StrategyCommands::Run { command } => match command {
                 StrategyRunCommands::Twap(args) => commands::strategy::twap::handle(args).await?,

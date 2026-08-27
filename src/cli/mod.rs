@@ -68,6 +68,8 @@ pub enum Commands {
         #[command(subcommand)]
         command: ScriptCommands,
     },
+    /// Start a local Jupyter research session backed by Market Lab historical data.
+    Notebook(NotebookArgs),
     Strategy {
         #[command(subcommand)]
         command: StrategyCommands,
@@ -658,6 +660,16 @@ pub enum ScriptCommands {
         #[command(subcommand)]
         command: ScriptRunHistoryCommands,
     },
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct NotebookArgs {
+    /// Python interpreter for the notebook kernel. Defaults to ./.venv, then python3.
+    #[arg(long)]
+    pub python: Option<PathBuf>,
+    /// Start Jupyter without opening a browser.
+    #[arg(long, default_value_t = false)]
+    pub no_browser: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2577,7 +2589,7 @@ fn validate_stream_controls(buffer_size: u16, interval_ms: u64) -> Result<()> {
     Ok(())
 }
 
-fn parse_datetime_ms(raw: &str) -> std::result::Result<u64, String> {
+pub(crate) fn parse_datetime_ms(raw: &str) -> std::result::Result<u64, String> {
     let raw = raw.trim();
     let datetime = if let Ok(value) = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S") {
         value
@@ -4486,6 +4498,23 @@ mod tests {
             } => assert_eq!(args.python, Some(PathBuf::from(".venv/bin/python"))),
             _ => panic!("expected Python script backtest"),
         }
+    }
+
+    #[test]
+    fn parse_notebook_research_command() {
+        let cli = Cli::try_parse_from([
+            "mlab",
+            "notebook",
+            "--python",
+            ".venv/bin/python",
+            "--no-browser",
+        ])
+        .expect("notebook command should parse");
+        let Commands::Notebook(args) = cli.command else {
+            panic!("expected notebook command");
+        };
+        assert_eq!(args.python, Some(PathBuf::from(".venv/bin/python")));
+        assert!(args.no_browser);
     }
 
     #[test]

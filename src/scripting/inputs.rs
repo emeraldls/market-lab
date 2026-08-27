@@ -278,6 +278,10 @@ pub fn validate_source_configs(manifest: &ScriptManifest, configs: &SourceConfig
     Ok(())
 }
 
+pub fn validate_historical_source_config(config: &SourceConfig) -> Result<()> {
+    validate_source_config(config, true)
+}
+
 pub fn validate_source_configs_for_run(
     manifest: &ScriptManifest,
     configs: &SourceConfigs,

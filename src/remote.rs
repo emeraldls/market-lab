@@ -297,7 +297,7 @@ pub fn route_invocation(args: impl IntoIterator<Item = OsString>) -> Result<Invo
         .get(1)
         .and_then(|value| value.to_str())
         .unwrap_or_default();
-    if matches!(command, "remote" | "transport") {
+    if matches!(command, "remote" | "transport" | "notebook") {
         if requested.as_deref().is_some_and(|name| name != "local") {
             bail!("--remote cannot be used with the `{command}` command");
         }

@@ -26,7 +26,8 @@ use crate::scripting::execution::{
 use crate::scripting::inputs::{
     SourceConfig, SourceConfigs, configured_source_selectors, parse_param_values,
     parse_source_configs, resolve_params, source_configs_payload, source_exchange_label,
-    source_provider_label, source_provider_name, source_type_names, validate_source_configs,
+    source_provider_label, source_provider_name, source_type_names,
+    validate_historical_source_config, validate_source_configs,
 };
 use crate::scripting::manifest::ScriptSource;
 use crate::scripting::market_data::{
@@ -286,6 +287,36 @@ enum BacktestSeries {
     Volumes(Vec<ScriptVolume>),
 }
 
+struct HistoricalFetchReporter<'a> {
+    report: Option<&'a mut crate::scripting::telemetry::ScriptRuntimeReportBuilder>,
+}
+
+impl<'a> HistoricalFetchReporter<'a> {
+    fn reporting(report: &'a mut crate::scripting::telemetry::ScriptRuntimeReportBuilder) -> Self {
+        Self {
+            report: Some(report),
+        }
+    }
+
+    fn silent() -> Self {
+        Self { report: None }
+    }
+
+    fn set_phase(&mut self, phase: impl Into<String>) {
+        if let Some(report) = self.report.as_deref_mut() {
+            report.set_phase(phase);
+            write_running_report_best_effort(report);
+        }
+    }
+
+    fn set_progress(&mut self, phase: impl Into<String>, current: u64, total: u64) {
+        if let Some(report) = self.report.as_deref_mut() {
+            report.set_progress(phase, current, total);
+            write_running_report_best_effort(report);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BacktestEvent {
     selector: String,
@@ -359,7 +390,7 @@ async fn backtest_events(
     resolved_params: Value,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
 ) -> Result<()> {
-    let data = fetch_sources(&args, &script, &source_configs, report).await?;
+    let data = fetch_sources(&args, &source_configs, report).await?;
     let events = build_event_timeline(&data, &source_configs)?;
     if events.is_empty() {
         bail!("script backtest received no source events in the requested range");
@@ -623,9 +654,20 @@ async fn backtest_events(
 
 async fn fetch_sources(
     args: &ScriptBacktestArgs,
-    _script: &Script,
     source_configs: &SourceConfigs,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
+) -> Result<BacktestData> {
+    let mut reporter = HistoricalFetchReporter::reporting(report);
+    let data = fetch_historical_sources(args.from, args.to, source_configs, &mut reporter).await?;
+    validate_fetched_sources(args.from, args.to, source_configs, &data)?;
+    Ok(data)
+}
+
+async fn fetch_historical_sources(
+    from: u64,
+    to: u64,
+    source_configs: &SourceConfigs,
+    reporter: &mut HistoricalFetchReporter<'_>,
 ) -> Result<BacktestData> {
     let mut data = BacktestData::default();
     if source_configs
@@ -633,7 +675,7 @@ async fn fetch_sources(
         .any(|config| config.provider == ProviderKind::Mmt)
     {
         data.series.extend(
-            fetch_mmt_sources(args, source_configs, report)
+            fetch_mmt_sources(from, to, source_configs, reporter)
                 .await?
                 .series,
         );
@@ -643,13 +685,34 @@ async fn fetch_sources(
         .any(|config| config.provider == ProviderKind::Direct)
     {
         data.series.extend(
-            fetch_direct_sources(args, source_configs, report, ProviderKind::Direct)
+            fetch_direct_sources(from, to, source_configs, reporter, ProviderKind::Direct)
                 .await?
                 .series,
         );
     }
-    validate_fetched_sources(args.from, args.to, source_configs, &data)?;
     Ok(data)
+}
+
+pub(crate) async fn fetch_notebook_source(
+    selector: &str,
+    from: u64,
+    to: u64,
+) -> Result<Vec<Value>> {
+    let configs = parse_source_configs(&[selector.to_string()])?;
+    let config = configs
+        .values()
+        .next()
+        .context("notebook source selector produced no source")?;
+    validate_historical_source_config(config)?;
+    let normalized_selector = config.selector.clone();
+    let mut reporter = HistoricalFetchReporter::silent();
+    let mut data = fetch_historical_sources(from, to, &configs, &mut reporter).await?;
+    validate_fetched_sources(from, to, &configs, &data)?;
+    let series = data
+        .series
+        .remove(&normalized_selector)
+        .context("notebook historical source was not returned")?;
+    backtest_series_values(series)
 }
 
 fn validate_fetched_sources(
@@ -690,17 +753,18 @@ fn validate_fetched_sources(
 }
 
 async fn fetch_mmt_sources(
-    args: &ScriptBacktestArgs,
+    from: u64,
+    to: u64,
     source_configs: &SourceConfigs,
-    report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
+    reporter: &mut HistoricalFetchReporter<'_>,
 ) -> Result<BacktestData> {
     let mut data = BacktestData::default();
     let mut cancel = Box::pin(tokio::signal::ctrl_c());
     let mut configs = source_configs.values().collect::<Vec<_>>();
     configs.retain(|config| config.provider == ProviderKind::Mmt);
     configs.sort_by_key(|config| config.position);
-    let from_utc = format_utc_ms(args.from);
-    let to_utc = format_utc_ms(args.to);
+    let from_utc = format_utc_ms(from);
+    let to_utc = format_utc_ms(to);
 
     for config in configs {
         let source = &config.source;
@@ -714,17 +778,16 @@ async fn fetch_mmt_sources(
                 let timeframe = config.require_timeframe(source)?;
                 let tf = mmt_timeframe_from_seconds(timeframe)?;
                 let started = Instant::now();
-                report.set_phase("fetching_candles");
-                write_running_report_best_effort(report);
+                reporter.set_phase("fetching_candles");
                 eprintln!(
                     "fetching candles exchange={} symbol={} tf={} from=\"{}\" to=\"{}\"",
                     exchange, market_symbol, timeframe, from_utc, to_utc
                 );
-                let future = MmtProvider::candles(exchange, &market_symbol, tf, args.from, args.to);
+                let future = MmtProvider::candles(exchange, &market_symbol, tf, from, to);
                 let series = tokio::select! {
                     result = future => result?,
                     _ = &mut cancel => {
-                        report.set_phase("cancelled");
+                        reporter.set_phase("cancelled");
                         return Err(ScriptCancelled.into());
                     }
                 };
@@ -733,12 +796,11 @@ async fn fetch_mmt_sources(
                     series.data.len(),
                     started.elapsed().as_millis()
                 );
-                report.set_progress(
+                reporter.set_progress(
                     "candles_fetched",
                     series.data.len() as u64,
                     series.data.len() as u64,
                 );
-                write_running_report_best_effort(report);
                 data.series.insert(
                     config.selector.clone(),
                     BacktestSeries::Candles(
@@ -755,8 +817,7 @@ async fn fetch_mmt_sources(
                 let tf = mmt_timeframe_from_seconds(timeframe)?;
                 let depth = config.depth_or_default();
                 let started = Instant::now();
-                report.set_phase("fetching_orderbooks");
-                write_running_report_best_effort(report);
+                reporter.set_phase("fetching_orderbooks");
                 eprintln!(
                     "fetching orderbooks exchange={} symbol={} tf={} from=\"{}\" to=\"{}\" depth={}",
                     exchange, market_symbol, timeframe, from_utc, to_utc, depth
@@ -765,14 +826,14 @@ async fn fetch_mmt_sources(
                     exchange,
                     &market_symbol,
                     tf,
-                    args.from,
-                    args.to,
+                    from,
+                    to,
                     depth,
                 );
                 let series = tokio::select! {
                     result = future => result?,
                     _ = &mut cancel => {
-                        report.set_phase("cancelled");
+                        reporter.set_phase("cancelled");
                         return Err(ScriptCancelled.into());
                     }
                 };
@@ -781,12 +842,11 @@ async fn fetch_mmt_sources(
                     series.len(),
                     started.elapsed().as_millis()
                 );
-                report.set_progress(
+                reporter.set_progress(
                     "orderbooks_fetched",
                     series.len() as u64,
                     series.len() as u64,
                 );
-                write_running_report_best_effort(report);
                 data.series
                     .insert(config.selector.clone(), BacktestSeries::Orderbooks(series));
             }
@@ -795,18 +855,16 @@ async fn fetch_mmt_sources(
                 let tf = mmt_timeframe_from_seconds(timeframe)?;
                 let bucket = config.require_bucket(source)?;
                 let started = Instant::now();
-                report.set_phase("fetching_vd");
-                write_running_report_best_effort(report);
+                reporter.set_phase("fetching_vd");
                 eprintln!(
                     "fetching vd exchange={} symbol={} tf={} from=\"{}\" to=\"{}\" bucket={}",
                     exchange, market_symbol, timeframe, from_utc, to_utc, bucket
                 );
-                let future =
-                    MmtProvider::vd(exchange, &market_symbol, tf, args.from, args.to, bucket);
+                let future = MmtProvider::vd(exchange, &market_symbol, tf, from, to, bucket);
                 let series = tokio::select! {
                     result = future => result?,
                     _ = &mut cancel => {
-                        report.set_phase("cancelled");
+                        reporter.set_phase("cancelled");
                         return Err(ScriptCancelled.into());
                     }
                 };
@@ -815,12 +873,11 @@ async fn fetch_mmt_sources(
                     series.data.len(),
                     started.elapsed().as_millis()
                 );
-                report.set_progress(
+                reporter.set_progress(
                     "vd_fetched",
                     series.data.len() as u64,
                     series.data.len() as u64,
                 );
-                write_running_report_best_effort(report);
                 data.series.insert(
                     config.selector.clone(),
                     BacktestSeries::Vd(
@@ -836,17 +893,16 @@ async fn fetch_mmt_sources(
                 let timeframe = config.require_timeframe(source)?;
                 let tf = mmt_timeframe_from_seconds(timeframe)?;
                 let started = Instant::now();
-                report.set_phase("fetching_oi");
-                write_running_report_best_effort(report);
+                reporter.set_phase("fetching_oi");
                 eprintln!(
                     "fetching oi exchange={} symbol={} tf={} from=\"{}\" to=\"{}\"",
                     exchange, market_symbol, timeframe, from_utc, to_utc
                 );
-                let future = MmtProvider::oi(exchange, &market_symbol, tf, args.from, args.to);
+                let future = MmtProvider::oi(exchange, &market_symbol, tf, from, to);
                 let series = tokio::select! {
                     result = future => result?,
                     _ = &mut cancel => {
-                        report.set_phase("cancelled");
+                        reporter.set_phase("cancelled");
                         return Err(ScriptCancelled.into());
                     }
                 };
@@ -855,12 +911,11 @@ async fn fetch_mmt_sources(
                     series.data.len(),
                     started.elapsed().as_millis()
                 );
-                report.set_progress(
+                reporter.set_progress(
                     "oi_fetched",
                     series.data.len() as u64,
                     series.data.len() as u64,
                 );
-                write_running_report_best_effort(report);
                 data.series.insert(
                     config.selector.clone(),
                     BacktestSeries::Oi(
@@ -876,17 +931,16 @@ async fn fetch_mmt_sources(
                 let timeframe = config.require_timeframe(source)?;
                 let tf = mmt_timeframe_from_seconds(timeframe)?;
                 let started = Instant::now();
-                report.set_phase("fetching_volumes");
-                write_running_report_best_effort(report);
+                reporter.set_phase("fetching_volumes");
                 eprintln!(
                     "fetching volumes exchange={} symbol={} tf={} from=\"{}\" to=\"{}\"",
                     exchange, market_symbol, timeframe, from_utc, to_utc
                 );
-                let future = MmtProvider::volumes(exchange, &market_symbol, tf, args.from, args.to);
+                let future = MmtProvider::volumes(exchange, &market_symbol, tf, from, to);
                 let series = tokio::select! {
                     result = future => result?,
                     _ = &mut cancel => {
-                        report.set_phase("cancelled");
+                        reporter.set_phase("cancelled");
                         return Err(ScriptCancelled.into());
                     }
                 };
@@ -895,12 +949,11 @@ async fn fetch_mmt_sources(
                     series.data.len(),
                     started.elapsed().as_millis()
                 );
-                report.set_progress(
+                reporter.set_progress(
                     "volumes_fetched",
                     series.data.len() as u64,
                     series.data.len() as u64,
                 );
-                write_running_report_best_effort(report);
                 data.series.insert(
                     config.selector.clone(),
                     BacktestSeries::Volumes(
@@ -919,9 +972,10 @@ async fn fetch_mmt_sources(
 }
 
 async fn fetch_direct_sources(
-    args: &ScriptBacktestArgs,
+    from: u64,
+    to: u64,
     source_configs: &SourceConfigs,
-    report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
+    reporter: &mut HistoricalFetchReporter<'_>,
     provider: ProviderKind,
 ) -> Result<BacktestData> {
     let mut data = BacktestData::default();
@@ -930,8 +984,8 @@ async fn fetch_direct_sources(
     let mut configs = source_configs.values().collect::<Vec<_>>();
     configs.retain(|config| config.provider == provider);
     configs.sort_by_key(|config| config.position);
-    let from_utc = format_utc_ms(args.from);
-    let to_utc = format_utc_ms(args.to);
+    let from_utc = format_utc_ms(from);
+    let to_utc = format_utc_ms(to);
     for config in configs {
         let source = &config.source;
         let market_symbol = config.market_symbol();
@@ -953,8 +1007,7 @@ async fn fetch_direct_sources(
                 );
             }
         };
-        report.set_phase(phase);
-        write_running_report_best_effort(report);
+        reporter.set_phase(phase);
         let started = Instant::now();
         eprintln!(
             "fetching {} {} symbol={} tf={} from=\"{}\" to=\"{}\"",
@@ -965,11 +1018,11 @@ async fn fetch_direct_sources(
             from_utc,
             to_utc
         );
-        let future = adapter.candles(&market_symbol, interval, args.from, args.to);
+        let future = adapter.candles(&market_symbol, interval, from, to);
         let series = tokio::select! {
             result = future => result?,
             _ = &mut cancel => {
-                report.set_phase("cancelled");
+                reporter.set_phase("cancelled");
                 return Err(ScriptCancelled.into());
             }
         };
@@ -1010,12 +1063,11 @@ async fn fetch_direct_sources(
             source.as_str(),
             started.elapsed().as_millis()
         );
-        report.set_progress(
+        reporter.set_progress(
             format!("{}_fetched", source.as_str()),
             points as u64,
             points as u64,
         );
-        write_running_report_best_effort(report);
     }
 
     Ok(data)
@@ -1227,6 +1279,32 @@ fn backtest_series_len(series: &BacktestSeries) -> usize {
         BacktestSeries::Oi(items) => items.len(),
         BacktestSeries::Volumes(items) => items.len(),
     }
+}
+
+fn backtest_series_values(series: BacktestSeries) -> Result<Vec<Value>> {
+    match series {
+        BacktestSeries::Candles(items) => items
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<_, _>>(),
+        BacktestSeries::Orderbooks(items) => items
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<_, _>>(),
+        BacktestSeries::Vd(items) => items
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<_, _>>(),
+        BacktestSeries::Oi(items) => items
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<_, _>>(),
+        BacktestSeries::Volumes(items) => items
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<_, _>>(),
+    }
+    .context("failed to serialize historical source records")
 }
 
 fn backtest_series_ts_ms(series: &BacktestSeries, idx: usize) -> Result<u64> {

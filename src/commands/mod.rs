@@ -2,6 +2,7 @@ pub mod bot;
 pub mod execution;
 pub mod market;
 pub mod markets;
+pub mod notebook;
 pub mod outcome;
 pub mod remote;
 pub mod runtime;
