@@ -552,8 +552,12 @@ async fn run_worker(job_id: &str, definition: &GridJobDefinition) -> Result<()> 
         definition.testnet,
         definition.symbol.clone(),
     );
-    let mut account_events =
-        spawn_account_feed(definition.venue, definition.testnet, parent.account.clone());
+    let mut account_events = spawn_account_feed(
+        definition.venue,
+        definition.testnet,
+        parent.account.clone(),
+        parent.internal_symbol.clone(),
+    );
     let mut account_connected = false;
     let allocated_margin = definition
         .requested_margin
@@ -1432,7 +1436,7 @@ async fn cleanup(
     let cleanup_deadline = Instant::now() + CLEANUP_TIMEOUT;
     loop {
         let (open_orders, fills) = tokio::join!(
-            adapter.open_orders(&parent.account),
+            adapter.open_orders_for_market(&parent.account, &parent.internal_symbol),
             adapter.fills(&parent.account),
         );
         let open_orders = open_orders?;

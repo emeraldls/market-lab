@@ -362,17 +362,8 @@ mod tests {
         let spot = serde_json::to_value(ExecutionVenue::HyperliquidSpot).expect("venue serializes");
         assert_eq!(spot, serde_json::json!("hyperliquid"));
 
-        let xyz = serde_json::to_value(
-            ExecutionVenue::parse("hyperliquidf-xyz").expect("dynamic XYZ venue"),
-        )
-        .expect("XYZ venue serializes");
-        assert_eq!(xyz, serde_json::json!("hyperliquidf-xyz"));
-
-        let io = serde_json::to_value(
-            ExecutionVenue::parse("hyperliquidf-io").expect("dynamic EntropyIO venue"),
-        )
-        .expect("EntropyIO venue serializes");
-        assert_eq!(io, serde_json::json!("hyperliquidf-io"));
+        assert!(ExecutionVenue::parse("hyperliquidf-xyz").is_err());
+        assert!(ExecutionVenue::parse("hyperliquidf-io").is_err());
 
         let outcomes = serde_json::to_value(ExecutionVenue::HyperliquidOutcomes)
             .expect("outcome venue serializes");

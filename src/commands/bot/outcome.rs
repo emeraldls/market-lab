@@ -653,8 +653,12 @@ pub(super) async fn run_mid_worker(
         definition.testnet,
         pair.primary.symbol.clone(),
     );
-    let mut account_events =
-        spawn_account_feed(definition.venue, definition.testnet, account.clone());
+    let mut account_events = spawn_account_feed(
+        definition.venue,
+        definition.testnet,
+        account.clone(),
+        pair.primary.symbol.clone(),
+    );
     let mut ledger = OutcomeLedger::new(definition.requested_margin);
     let mut action_sequence = 0_u64;
     let mut order_sequence = 0_u64;

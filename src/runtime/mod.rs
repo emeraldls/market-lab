@@ -3463,7 +3463,10 @@ async fn execute_script_order(
     let venue_arg = venue;
     let (args, direction) = match &request {
         ScriptManagedRequest::Trade(request) => {
-            let snapshot = match venue_adapter.account_snapshot(&account).await {
+            let snapshot = match venue_adapter
+                .account_snapshot_for_market(&account, &internal_symbol)
+                .await
+            {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     fail_script_order(paths, state, job_id, &order.id, &error)?;
@@ -5186,7 +5189,7 @@ async fn execute_cancel_with_priority(
             plan.venue.market_data_id().as_str(),
             &plan.internal_symbol,
         )?;
-        if matches!(plan.venue.market(), VenueMarket::Spot | VenueMarket::Hip3) {
+        if plan.venue.market() == VenueMarket::Spot || !market.network_variants.is_empty() {
             market
                 .network_variant(HyperliquidNetwork::from_testnet(plan.testnet).label())?
                 .venue_symbol
@@ -5406,7 +5409,7 @@ async fn handle_account_connection_event(
         } => {
             state.account_stream_connected = true;
             state.last_error = None;
-            refresh_account_positions(venue, testnet, adapter, state, &account, true).await?;
+            refresh_account_positions(venue, testnet, adapter, state, &account, None, true).await?;
             persist_state(paths, state)?;
             if reconnected {
                 recover_account_gap(venue, testnet, paths, state, &account, volume_exporter)
@@ -5438,6 +5441,24 @@ async fn handle_account_connection_event(
             event,
         } => {
             let received_at_ms = now_ms()?;
+            let mut refresh_symbols = Vec::<String>::new();
+            for fill in event.updates.iter().filter_map(|update| match update {
+                crate::providers::execution::AccountRuntimeUpdate::Fill(fill) => Some(fill),
+                _ => None,
+            }) {
+                let scope = fill
+                    .internal_symbol
+                    .split_once(':')
+                    .map(|(dex, _)| dex.to_ascii_lowercase());
+                if !refresh_symbols.iter().any(|symbol| {
+                    symbol
+                        .split_once(':')
+                        .map(|(dex, _)| dex.to_ascii_lowercase())
+                        == scope
+                }) {
+                    refresh_symbols.push(fill.internal_symbol.clone());
+                }
+            }
             state.account_stream_connected = true;
             state.last_account_event_ms = Some(received_at_ms);
             append_json_line(
@@ -5462,7 +5483,23 @@ async fn handle_account_connection_event(
                 event.updates,
             )?;
             if event.refresh_positions {
-                refresh_account_positions(venue, testnet, adapter, state, &account, true).await?;
+                if refresh_symbols.is_empty() {
+                    refresh_account_positions(venue, testnet, adapter, state, &account, None, true)
+                        .await?;
+                } else {
+                    for symbol in refresh_symbols {
+                        refresh_account_positions(
+                            venue,
+                            testnet,
+                            adapter,
+                            state,
+                            &account,
+                            Some(&symbol),
+                            true,
+                        )
+                        .await?;
+                    }
+                }
             }
             persist_state(paths, state)?;
         }
@@ -5476,6 +5513,7 @@ async fn refresh_account_positions(
     _adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
     account: &str,
+    market_symbol: Option<&str>,
     force: bool,
 ) -> Result<()> {
     let now = now_ms()?;
@@ -5487,14 +5525,33 @@ async fn refresh_account_positions(
     {
         return Ok(());
     }
-    let snapshot = crate::providers::execution::ExecutionAdapter::new(venue, testnet)
-        .await?
-        .account_snapshot(account)
-        .await?;
+    let adapter = crate::providers::execution::ExecutionAdapter::new(venue, testnet).await?;
+    let snapshot = match market_symbol {
+        Some(symbol) => adapter.account_snapshot_for_market(account, symbol).await?,
+        None => adapter.account_snapshot(account).await?,
+    };
     let cache_key = account_cache_key(venue, testnet, account);
-    state
-        .account_positions
-        .insert(cache_key.clone(), snapshot.positions);
+    if let Some(symbol) = market_symbol {
+        let dex = symbol
+            .split_once(':')
+            .map(|(dex, _)| dex.to_ascii_lowercase());
+        let positions = state
+            .account_positions
+            .entry(cache_key.clone())
+            .or_default();
+        positions.retain(|position| {
+            position
+                .internal_symbol
+                .split_once(':')
+                .map(|(candidate, _)| candidate.to_ascii_lowercase())
+                != dex
+        });
+        positions.extend(snapshot.positions);
+    } else {
+        state
+            .account_positions
+            .insert(cache_key.clone(), snapshot.positions);
+    }
     state
         .account_positions_refreshed_at_ms
         .insert(cache_key, snapshot.fetched_at_ms);

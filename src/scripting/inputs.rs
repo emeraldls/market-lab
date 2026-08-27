@@ -538,6 +538,9 @@ fn validate_source_market(_provider: ProviderKind, exchange: &str, symbol: &str)
     if exchange.eq_ignore_ascii_case("hyperliquid-outcomes") {
         return crate::providers::hyperliquid::outcomes::parse_symbol(symbol).map(|_| ());
     }
+    if exchange.eq_ignore_ascii_case("hyperliquidf") {
+        return crate::providers::hyperliquid::parse_perpetual_symbol(symbol).map(|_| ());
+    }
     let market_type = if crate::markets::is_futures_exchange(exchange)? {
         crate::markets::MarketType::Futures
     } else {
@@ -901,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_standalone_hyperliquid_xyz_bindings() {
+    fn validates_symbol_scoped_hyperliquid_hip3_bindings() {
         let live_manifest = manifest(vec![
             ScriptSource::Candles,
             ScriptSource::Orderbook,
@@ -911,32 +914,33 @@ mod tests {
             ScriptSource::Volumes,
         ]);
         let configs = parse_source_configs(&[
-            "tsla@candles@hyperliquidf-xyz:timeframe=60".to_string(),
-            "tsla@orderbook@hyperliquidf-xyz:depth=20".to_string(),
-            "tsla@trades@hyperliquidf-xyz".to_string(),
-            "tsla@vd@hyperliquidf-xyz".to_string(),
-            "tsla@oi@hyperliquidf-xyz".to_string(),
-            "tsla@volumes@hyperliquidf-xyz:timeframe=60".to_string(),
+            "xyz:tsla@candles@hyperliquidf:timeframe=60".to_string(),
+            "xyz:tsla@orderbook@hyperliquidf:depth=20".to_string(),
+            "xyz:tsla@trades@hyperliquidf".to_string(),
+            "xyz:tsla@vd@hyperliquidf".to_string(),
+            "xyz:tsla@oi@hyperliquidf".to_string(),
+            "xyz:tsla@volumes@hyperliquidf:timeframe=60".to_string(),
         ])
         .expect("standalone XYZ selectors should parse");
 
         validate_source_configs_for_run(&live_manifest, &configs)
             .expect("standalone XYZ live configs should validate");
         assert_eq!(
-            configs["tsla@candles@hyperliquidf-xyz"].provider,
+            configs["xyz:tsla@candles@hyperliquidf"].provider,
             ProviderKind::Direct
         );
         assert_eq!(
-            configs["tsla@candles@hyperliquidf-xyz"].exchange,
-            "hyperliquidf-xyz"
+            configs["xyz:tsla@candles@hyperliquidf"].exchange,
+            "hyperliquidf"
         );
+        assert_eq!(configs["xyz:tsla@candles@hyperliquidf"].symbol, "xyz:tsla");
 
         let historical_manifest = manifest(vec![ScriptSource::Candles, ScriptSource::Volumes]);
         validate_source_configs(
             &historical_manifest,
             &parse_source_configs(&[
-                "tsla@candles@hyperliquidf-xyz:timeframe=60".to_string(),
-                "tsla@volumes@hyperliquidf-xyz:timeframe=60".to_string(),
+                "xyz:tsla@candles@hyperliquidf:timeframe=60".to_string(),
+                "xyz:tsla@volumes@hyperliquidf:timeframe=60".to_string(),
             ])
             .expect("historical XYZ selectors should parse"),
         )

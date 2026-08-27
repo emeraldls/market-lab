@@ -9,8 +9,16 @@ pub fn normalize_symbol_for_mmt(exchange: &str, symbol: &str) -> Result<String> 
         .clone())
 }
 
-pub fn normalize_exchange_for_mmt(exchange: &str) -> Result<String> {
-    crate::markets::upstream_exchange("mmt", exchange)
+pub fn normalize_exchange_for_mmt(exchange: &str, symbol: &str) -> Result<String> {
+    let exchange = exchange.trim().to_ascii_lowercase();
+    if exchange == "hyperliquidf" {
+        let symbol = crate::providers::hyperliquid::parse_perpetual_symbol(symbol)?;
+        return Ok(symbol.dex.map_or_else(
+            || "hyperliquid".to_string(),
+            |dex| format!("hyperliquid-{dex}"),
+        ));
+    }
+    crate::markets::upstream_exchange("mmt", &exchange)
 }
 
 pub fn normalize_to_ms(ts: u64) -> u64 {

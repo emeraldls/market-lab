@@ -154,7 +154,7 @@ Market Lab uses normalized symbols and domain types while preserving the provide
 | BULK perpetuals | `bulkf` | Public testnet |
 | Hyperliquid Spot | `hyperliquid` | Mainnet or testnet |
 | Hyperliquid core perpetuals | `hyperliquidf` | Mainnet or testnet |
-| Hyperliquid HIP-3 perpetuals | `hyperliquidf-{dex}` | Mainnet or testnet |
+| Hyperliquid HIP-3 perpetuals | `hyperliquidf` with `{dex}:{coin}`, e.g. `xyz:TSLA` | Mainnet or testnet |
 | Hyperliquid outcomes | `hyperliquid-outcomes` | Mainnet or testnet |
 | HyperLink perpetuals | `hyperlinkf` | Mainnet; access controlled by HyperLink |
 

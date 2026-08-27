@@ -154,6 +154,27 @@ impl HyperliquidExecutionAdapter {
     }
 
     pub async fn account_snapshot(&self, account: &str) -> Result<AccountSnapshot> {
+        self.account_snapshot_on_dex(account, None).await
+    }
+
+    pub async fn account_snapshot_for_market(
+        &self,
+        account: &str,
+        symbol: &str,
+    ) -> Result<AccountSnapshot> {
+        if self.product != HyperliquidProduct::Perpetual || self.route == ExecutionRoute::Hyperlink
+        {
+            return self.account_snapshot(account).await;
+        }
+        let dex = super::perpetual_dex(symbol)?;
+        self.account_snapshot_on_dex(account, dex.as_deref()).await
+    }
+
+    async fn account_snapshot_on_dex(
+        &self,
+        account: &str,
+        dex: Option<&str>,
+    ) -> Result<AccountSnapshot> {
         if self.product == HyperliquidProduct::Spot {
             return self.spot_account_snapshot(account).await;
         }
@@ -164,7 +185,7 @@ impl HyperliquidExecutionAdapter {
             "type": "clearinghouseState",
             "user": account
         });
-        attach_dex(&mut request, self.product);
+        attach_dex(&mut request, dex);
         let raw: ClearinghouseState = if self.route == ExecutionRoute::Hyperlink {
             serde_json::from_value(
                 self.exchange
@@ -177,7 +198,7 @@ impl HyperliquidExecutionAdapter {
                 .info(&request)
                 .await?
         };
-        let contexts = load_mark_prices(self.network, self.product).await?;
+        let contexts = load_mark_prices(self.network, dex).await?;
         let mut positions = raw
             .asset_positions
             .into_iter()
@@ -224,7 +245,7 @@ impl HyperliquidExecutionAdapter {
             positions,
             spot_balances: Vec::new(),
             outcome_holdings: Vec::new(),
-            open_orders: self.open_orders(account).await?,
+            open_orders: self.open_orders_on_dex(account, dex).await?,
             leverage_settings,
         })
     }
@@ -388,6 +409,23 @@ impl HyperliquidExecutionAdapter {
     }
 
     pub async fn open_orders(&self, account: &str) -> Result<Vec<OpenOrder>> {
+        self.open_orders_on_dex(account, None).await
+    }
+
+    pub async fn open_orders_for_market(
+        &self,
+        account: &str,
+        symbol: &str,
+    ) -> Result<Vec<OpenOrder>> {
+        if self.product != HyperliquidProduct::Perpetual || self.route == ExecutionRoute::Hyperlink
+        {
+            return self.open_orders(account).await;
+        }
+        let dex = super::perpetual_dex(symbol)?;
+        self.open_orders_on_dex(account, dex.as_deref()).await
+    }
+
+    async fn open_orders_on_dex(&self, account: &str, dex: Option<&str>) -> Result<Vec<OpenOrder>> {
         let raw: Vec<HyperliquidOpenOrder> = if self.route == ExecutionRoute::Hyperlink {
             ensure_account(account, &self.account)?;
             serde_json::from_value(
@@ -401,7 +439,7 @@ impl HyperliquidExecutionAdapter {
                 "type": "frontendOpenOrders",
                 "user": account
             });
-            attach_dex(&mut request, self.product);
+            attach_dex(&mut request, dex);
             HyperliquidClient::for_network(self.network)?
                 .info(&request)
                 .await?
@@ -816,11 +854,12 @@ impl HyperliquidExecutionAdapter {
                 resolved_mainnet_market(symbol)
             }
             (HyperliquidProduct::Perpetual, HyperliquidNetwork::Testnet) => {
-                let market = markets::market(symbol)?;
-                resolved_testnet_market(&market.venue_symbol).await
-            }
-            (HyperliquidProduct::Hip3(_), network) => {
-                resolved_network_perpetual_market(self.product, network, symbol)
+                if super::perpetual_dex(symbol)?.is_some() {
+                    resolved_network_perpetual_market(self.product, self.network, symbol)
+                } else {
+                    let market = markets::market(symbol)?;
+                    resolved_testnet_market(&market.venue_symbol).await
+                }
             }
         }?;
         if self.route == ExecutionRoute::Hyperlink {
@@ -1368,12 +1407,11 @@ const fn venue_for_product(product: HyperliquidProduct) -> ExecutionVenue {
         HyperliquidProduct::Spot => ExecutionVenue::HyperliquidSpot,
         HyperliquidProduct::Outcome => ExecutionVenue::HyperliquidOutcomes,
         HyperliquidProduct::Perpetual => ExecutionVenue::Hyperliquid,
-        HyperliquidProduct::Hip3(venue) => venue,
     }
 }
 
-fn attach_dex(request: &mut serde_json::Value, product: HyperliquidProduct) {
-    if let Some(dex) = product.dex()
+fn attach_dex(request: &mut serde_json::Value, dex: Option<&str>) {
+    if let Some(dex) = dex
         && let Some(request) = request.as_object_mut()
     {
         request.insert(
@@ -1466,10 +1504,10 @@ fn is_step_aligned(value: f64, step: f64) -> bool {
 
 async fn load_mark_prices(
     network: HyperliquidNetwork,
-    product: HyperliquidProduct,
+    dex: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
     let mut request = serde_json::json!({ "type": "metaAndAssetCtxs" });
-    attach_dex(&mut request, product);
+    attach_dex(&mut request, dex);
     let value: serde_json::Value = HyperliquidClient::for_network(network)?
         .info(&request)
         .await?;
@@ -1879,18 +1917,17 @@ mod tests {
     }
 
     #[test]
-    fn xyz_uses_its_venue_and_network_specific_asset_ids() {
-        let venue = ExecutionVenue::parse("hyperliquidf-xyz").expect("dynamic XYZ venue");
-        let product = HyperliquidProduct::from_venue(venue).expect("XYZ product");
-        assert_eq!(venue_for_product(product), venue);
+    fn scoped_perpetual_symbol_uses_network_specific_asset_ids() {
+        let product = HyperliquidProduct::Perpetual;
+        assert_eq!(venue_for_product(product), ExecutionVenue::Hyperliquid);
         assert_eq!(
-            resolved_network_perpetual_market(product, HyperliquidNetwork::Mainnet, "TSLA",)
+            resolved_network_perpetual_market(product, HyperliquidNetwork::Mainnet, "xyz:TSLA",)
                 .expect("mainnet XYZ market resolves")
                 .asset,
             110_001
         );
         assert_eq!(
-            resolved_network_perpetual_market(product, HyperliquidNetwork::Testnet, "TSLA",)
+            resolved_network_perpetual_market(product, HyperliquidNetwork::Testnet, "xyz:TSLA",)
                 .expect("testnet XYZ market resolves")
                 .asset,
             750_001
@@ -1899,25 +1936,25 @@ mod tests {
 
     #[test]
     fn xyz_info_requests_are_scoped_to_the_xyz_dex() {
-        let product =
-            HyperliquidProduct::from_exchange("hyperliquidf-xyz").expect("dynamic XYZ product");
         let mut request = serde_json::json!({ "type": "clearinghouseState", "user": "0xabc" });
-        attach_dex(&mut request, product);
+        attach_dex(&mut request, Some("xyz"));
         assert_eq!(request["dex"], "xyz");
 
         let mut native = serde_json::json!({ "type": "clearinghouseState", "user": "0xabc" });
-        attach_dex(&mut native, HyperliquidProduct::Perpetual);
+        attach_dex(&mut native, None);
         assert!(native.get("dex").is_none());
     }
 
     #[test]
-    fn entropy_io_uses_its_venue_and_scopes_info_requests() {
-        let venue = ExecutionVenue::parse("hyperliquidf-io").expect("dynamic EntropyIO venue");
-        let product = HyperliquidProduct::from_venue(venue).expect("EntropyIO product");
-        assert_eq!(venue_for_product(product), venue);
+    fn entropy_io_symbol_scopes_info_requests() {
+        let symbol =
+            super::super::parse_perpetual_symbol("io:ANTH").expect("Entropy HIP-3 symbol parses");
+        assert_eq!(symbol.canonical, "io:ANTH");
+        assert_eq!(symbol.coin, "ANTH");
+        assert_eq!(symbol.dex.as_deref(), Some("io"));
 
         let mut request = serde_json::json!({ "type": "clearinghouseState", "user": "0xabc" });
-        attach_dex(&mut request, product);
+        attach_dex(&mut request, symbol.dex.as_deref());
         assert_eq!(request["dex"], "io");
     }
 

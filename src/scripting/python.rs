@@ -1085,14 +1085,29 @@ def selector_without_options(name):
     return name if option < 0 else name[:option]
 
 
+ASCII_LOWER = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "abcdefghijklmnopqrstuvwxyz",
+)
+
+
+def canonical_source_selector(name):
+    return selector_without_options(name).translate(ASCII_LOWER)
+
+
 class History:
     def __init__(self, capacity, configured_sources):
         self.capacity = max(2, int(capacity))
         self.records = {}
         self.identities = {}
-        self.configured_sources = None if configured_sources is None else set(configured_sources)
+        self.configured_sources = (
+            None
+            if configured_sources is None
+            else {canonical_source_selector(source) for source in configured_sources}
+        )
 
     def record(self, source, value, identity):
+        source = canonical_source_selector(source)
         records = self.records.setdefault(source, [])
         if identity is not None and self.identities.get(source) == identity and records:
             records[0] = value
@@ -1107,7 +1122,7 @@ class History:
     def source(self, name, offset=None):
         if not isinstance(name, str) or not name:
             raise TypeError("history.source name must be a non-empty string")
-        selector = selector_without_options(name)
+        selector = canonical_source_selector(name)
         if self.configured_sources is not None and selector not in self.configured_sources:
             raise ValueError(
                 f"history.source `{name}` is not configured for this script"
@@ -2077,7 +2092,7 @@ def on_data(ctx, history):
         let path = write_python_script(
             r#"
 script = {"name": "literal-sources", "version": "2"}
-CANDLES = "btc@candles@binancef:timeframe=60"
+CANDLES = "BTC@candles@binancef:timeframe=60"
 
 def on_data(ctx, history):
     candles = history.source(CANDLES)
@@ -2099,7 +2114,7 @@ def on_finish(ctx, history):
         assert_eq!(
             script.source_declarations(),
             [
-                "btc@candles@binancef:timeframe=60",
+                "BTC@candles@binancef:timeframe=60",
                 "eth@orderbook@bybitf@mmt:depth=20",
             ]
         );
@@ -2163,8 +2178,8 @@ def on_data(ctx):
         "margin": 10,
     })
     ctx.order({
-        "exchange": "hyperliquidf-xyz",
-        "symbol": "HYPE",
+        "exchange": "hyperliquidf",
+        "symbol": "xyz:HYPE",
         "side": "sell",
         "size": 1,
     })
@@ -2185,10 +2200,7 @@ def on_data(ctx):
         let script = Script::load(&path).expect("load Python script");
         assert_eq!(
             script.execution_venues(),
-            [
-                ExecutionVenue::Hyperlink,
-                ExecutionVenue::parse("hyperliquidf-xyz").expect("XYZ venue"),
-            ]
+            [ExecutionVenue::Hyperlink, ExecutionVenue::Hyperliquid]
         );
 
         let _ = fs::remove_file(path);

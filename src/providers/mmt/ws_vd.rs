@@ -12,7 +12,7 @@ pub struct MmtVdStream {
 impl MmtVdStream {
     pub async fn connect(exchange: &str, symbol: &str, tf: &str, bucket: u8) -> Result<Self> {
         let provider_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
-        let provider_exchange = normalize_exchange_for_mmt(exchange)?;
+        let provider_exchange = normalize_exchange_for_mmt(exchange, symbol)?;
         let client = MmtWsClient::shared().await?;
 
         let subscribe = serde_json::json!({

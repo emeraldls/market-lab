@@ -833,19 +833,6 @@ pub async fn refresh_route(provider: Option<&str>, exchange: &str) -> Result<Mar
         None if exchange.eq_ignore_ascii_case("hyperliquidf") => {
             fetch_hyperliquid_snapshot().await?
         }
-        None if crate::domain::execution::ExecutionVenue::parse(exchange)
-            .is_ok_and(|venue| venue.is_hip3()) =>
-        {
-            let venue = crate::domain::execution::ExecutionVenue::parse(exchange)?;
-            let dex = venue.spec()?.dex.context("HIP-3 venue has no DEX name")?;
-            fetch_hyperliquid_hip3_snapshot(
-                venue.as_str(),
-                dex.as_str(),
-                &dex.as_str().to_ascii_uppercase(),
-                true,
-            )
-            .await?
-        }
         None if exchange.eq_ignore_ascii_case("hyperliquid") => {
             fetch_hyperliquid_spot_snapshot().await?
         }
@@ -1036,6 +1023,7 @@ async fn fetch_binance_snapshot(futures: bool) -> Result<MarketSnapshot> {
         })
         .map(|market| binance_market(market, market_type))
         .collect::<Result<Vec<_>>>()?;
+
     if markets.is_empty() {
         bail!("{name} returned no active markets");
     }
@@ -1142,7 +1130,7 @@ async fn fetch_hyperliquid_snapshot() -> Result<MarketSnapshot> {
         bail!("Hyperliquid perpetual metadata and asset contexts are out of sync");
     }
 
-    let markets = raw
+    let mut markets = raw
         .into_iter()
         .zip(contexts)
         .enumerate()
@@ -1186,6 +1174,45 @@ async fn fetch_hyperliquid_snapshot() -> Result<MarketSnapshot> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
+
+    let (mainnet_hip3, testnet_hip3) = tokio::join!(
+        fetch_hyperliquid_hip3_universe(HYPERLIQUID_INFO_URL, "mainnet"),
+        fetch_hyperliquid_hip3_universe(HYPERLIQUID_TESTNET_INFO_URL, "testnet"),
+    );
+    let mainnet_hip3 = mainnet_hip3?;
+    let testnet_hip3 = match testnet_hip3 {
+        Ok(markets) => markets,
+        Err(error) => {
+            eprintln!(
+                "warning: Hyperliquid testnet HIP-3 metadata is unavailable; saved mainnet markets only: {error:#}"
+            );
+            BTreeMap::new()
+        }
+    };
+    for (symbol, mainnet_market) in mainnet_hip3 {
+        let mut network_variants =
+            BTreeMap::from([("mainnet".to_string(), mainnet_market.variant.clone())]);
+        if let Some(testnet_market) = testnet_hip3.get(&symbol) {
+            network_variants.insert("testnet".to_string(), testnet_market.variant.clone());
+        }
+        let variant = &mainnet_market.variant;
+        markets.push(Market {
+            symbol: symbol.clone(),
+            provider_symbol: variant.provider_symbol.clone(),
+            venue_symbol: variant.venue_symbol.clone(),
+            venue_id: Some(variant.venue_id),
+            aliases: Vec::new(),
+            base_asset: mainnet_market.base_asset,
+            quote_asset: mainnet_market.quote_asset,
+            venue_base_asset: variant.venue_base_asset.clone(),
+            venue_quote_asset: variant.venue_quote_asset.clone(),
+            status: "TRADING".to_string(),
+            price_increment: Some(variant.price_increment),
+            size_increment: Some(variant.size_increment),
+            execution: Some(variant.execution.clone()),
+            network_variants,
+        });
+    }
     if markets.is_empty() {
         bail!("Hyperliquid returned no active native perpetual markets");
     }
@@ -1222,97 +1249,14 @@ struct HyperliquidPerpMetadata {
 
 #[derive(Clone)]
 struct BuiltHyperliquidPerpMarket {
-    symbol: String,
+    base_asset: String,
     quote_asset: String,
     variant: NetworkMarket,
 }
 
-async fn fetch_hyperliquid_hip3_snapshot(
-    exchange: &str,
-    dex: &str,
-    display_name: &str,
-    include_testnet: bool,
-) -> Result<MarketSnapshot> {
-    let (mainnet, testnet) = if include_testnet {
-        let (mainnet, testnet) = tokio::join!(
-            fetch_hyperliquid_hip3_network(HYPERLIQUID_INFO_URL, "mainnet", dex, display_name,),
-            fetch_hyperliquid_hip3_network(
-                HYPERLIQUID_TESTNET_INFO_URL,
-                "testnet",
-                dex,
-                display_name,
-            ),
-        );
-        let testnet = match testnet {
-            Ok(markets) => markets,
-            Err(error) => {
-                eprintln!(
-                    "warning: Hyperliquid testnet {display_name} metadata is unavailable; saved mainnet markets only: {error:#}"
-                );
-                BTreeMap::new()
-            }
-        };
-        (mainnet?, testnet)
-    } else {
-        (
-            fetch_hyperliquid_hip3_network(HYPERLIQUID_INFO_URL, "mainnet", dex, display_name)
-                .await?,
-            BTreeMap::new(),
-        )
-    };
-    if mainnet.is_empty() {
-        bail!("Hyperliquid returned no active mainnet {display_name} perpetual markets");
-    }
-
-    let mut markets = Vec::with_capacity(mainnet.len());
-    for (_, mainnet_market) in mainnet {
-        let mut network_variants =
-            BTreeMap::from([("mainnet".to_string(), mainnet_market.variant.clone())]);
-        if let Some(testnet_market) = testnet.get(&mainnet_market.symbol) {
-            network_variants.insert("testnet".to_string(), testnet_market.variant.clone());
-        }
-        let variant = &mainnet_market.variant;
-        markets.push(Market {
-            symbol: mainnet_market.symbol.clone(),
-            provider_symbol: variant.provider_symbol.clone(),
-            venue_symbol: variant.venue_symbol.clone(),
-            venue_id: Some(variant.venue_id),
-            aliases: vec![variant.venue_symbol.clone()],
-            base_asset: mainnet_market.symbol,
-            quote_asset: mainnet_market.quote_asset,
-            venue_base_asset: variant.venue_base_asset.clone(),
-            venue_quote_asset: variant.venue_quote_asset.clone(),
-            status: "TRADING".to_string(),
-            price_increment: Some(variant.price_increment),
-            size_increment: Some(variant.size_increment),
-            execution: Some(variant.execution.clone()),
-            network_variants,
-        });
-    }
-
-    let snapshot = MarketSnapshot {
-        schema_version: SNAPSHOT_SCHEMA_VERSION,
-        provider: exchange.to_string(),
-        provider_type: ProviderType::Standalone,
-        source_url: HYPERLIQUID_INFO_URL.to_string(),
-        fetched_at: fetched_at(),
-        exchanges: vec![ExchangeMarkets {
-            exchange: exchange.to_string(),
-            provider_exchange: None,
-            name: format!("Hyperliquid {display_name} Perpetuals"),
-            market_type: MarketType::Futures,
-            markets,
-        }],
-    };
-    snapshot.validate()?;
-    Ok(snapshot)
-}
-
-async fn fetch_hyperliquid_hip3_network(
+async fn fetch_hyperliquid_hip3_universe(
     url: &str,
     network: &str,
-    dex: &str,
-    display_name: &str,
 ) -> Result<BTreeMap<String, BuiltHyperliquidPerpMarket>> {
     let client = Client::new();
     let dexes = fetch_hyperliquid_info(
@@ -1324,23 +1268,6 @@ async fn fetch_hyperliquid_hip3_network(
     .await?;
     let dexes = serde_json::from_value::<Vec<Option<HyperliquidPerpDex>>>(dexes)
         .with_context(|| format!("invalid Hyperliquid {network} perpetual DEX list"))?;
-    let dex_index = dexes
-        .iter()
-        .position(|entry| {
-            entry
-                .as_ref()
-                .is_some_and(|entry| entry.name.eq_ignore_ascii_case(dex))
-        })
-        .with_context(|| {
-            format!("Hyperliquid {network} does not expose the {display_name} perpetual DEX")
-        })?;
-    let metadata = fetch_hyperliquid_info(
-        &client,
-        url,
-        serde_json::json!({ "type": "metaAndAssetCtxs", "dex": dex }),
-        &format!("Hyperliquid {network} {display_name} markets"),
-    )
-    .await?;
     let spot_meta = fetch_hyperliquid_info(
         &client,
         url,
@@ -1348,7 +1275,41 @@ async fn fetch_hyperliquid_hip3_network(
         &format!("Hyperliquid {network} spot metadata"),
     )
     .await?;
-    decode_hyperliquid_hip3_network(metadata, spot_meta, dex_index, network, dex, display_name)
+    let requests = dexes
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, dex)| dex.map(|dex| (index, dex.name)))
+        .map(|(index, dex)| {
+            let client = client.clone();
+            let spot_meta = spot_meta.clone();
+            async move {
+                let display_name = dex.to_ascii_uppercase();
+                let metadata = fetch_hyperliquid_info(
+                    &client,
+                    url,
+                    serde_json::json!({ "type": "metaAndAssetCtxs", "dex": dex }),
+                    &format!("Hyperliquid {network} {display_name} markets"),
+                )
+                .await?;
+                decode_hyperliquid_hip3_network(
+                    metadata,
+                    spot_meta,
+                    index,
+                    network,
+                    &dex,
+                    &display_name,
+                )
+            }
+        });
+    let mut markets = BTreeMap::new();
+    for result in futures_util::future::join_all(requests).await {
+        for (symbol, market) in result? {
+            if markets.insert(symbol.clone(), market).is_some() {
+                bail!("Hyperliquid {network} returned duplicate HIP-3 market {symbol}");
+            }
+        }
+    }
+    Ok(markets)
 }
 
 async fn fetch_hyperliquid_info(
@@ -1436,7 +1397,7 @@ fn decode_hyperliquid_hip3_network(
         }
         let wire_symbol = market.name;
         let prefix = format!("{dex}:");
-        let symbol = wire_symbol
+        let coin = wire_symbol
             .strip_prefix(&prefix)
             .with_context(|| {
                 format!(
@@ -1444,6 +1405,7 @@ fn decode_hyperliquid_hip3_network(
                 )
             })?
             .to_ascii_uppercase();
+        let symbol = format!("{}:{coin}", dex.to_ascii_lowercase());
         let mark_price = context.mark_px.parse::<f64>().with_context(|| {
             format!("invalid Hyperliquid {network} {display_name} mark price for {wire_symbol}")
         })?;
@@ -1470,13 +1432,13 @@ fn decode_hyperliquid_hip3_network(
             time_in_forces: vec!["GTC".to_string(), "IOC".to_string(), "ALO".to_string()],
         };
         let built = BuiltHyperliquidPerpMarket {
-            symbol: symbol.clone(),
+            base_asset: coin.clone(),
             quote_asset: quote_asset.clone(),
             variant: NetworkMarket {
                 provider_symbol: wire_symbol.clone(),
                 venue_symbol: wire_symbol,
                 venue_id,
-                venue_base_asset: symbol.clone(),
+                venue_base_asset: coin,
                 venue_quote_asset: quote_asset.clone(),
                 base_token_id: None,
                 quote_token_id: Some(collateral.token_id.to_ascii_lowercase()),
@@ -1802,13 +1764,21 @@ async fn fetch_mmt_snapshot() -> Result<MarketSnapshot> {
         .exchanges
         .into_iter()
         .map(|exchange| {
+            let provider_exchange = exchange.id;
+            let hip3_dex = key(&provider_exchange)
+                .strip_prefix("hyperliquid-")
+                .filter(|dex| !dex.is_empty())
+                .map(str::to_string);
+            let canonical_exchange = canonical_mmt_exchange(&provider_exchange);
             let mut markets = BTreeMap::new();
             for market in exchange.symbols {
                 let base_asset = market.normalised_base.to_ascii_uppercase();
-                let market_type = classify_mmt_exchange(&canonical_mmt_exchange(&exchange.id));
+                let market_type = classify_mmt_exchange(&canonical_exchange);
                 let quote_asset = market.quote.to_ascii_uppercase();
                 let symbol = if market_type.is_futures() {
-                    base_asset.clone()
+                    hip3_dex
+                        .as_ref()
+                        .map_or_else(|| base_asset.clone(), |dex| format!("{dex}:{base_asset}"))
                 } else {
                     format!("{base_asset}/{quote_asset}")
                 };
@@ -1829,8 +1799,6 @@ async fn fetch_mmt_snapshot() -> Result<MarketSnapshot> {
                     network_variants: BTreeMap::new(),
                 });
             }
-            let provider_exchange = exchange.id;
-            let canonical_exchange = canonical_mmt_exchange(&provider_exchange);
             ExchangeMarkets {
                 market_type: classify_mmt_exchange(&canonical_exchange),
                 exchange: canonical_exchange,
@@ -1840,7 +1808,7 @@ async fn fetch_mmt_snapshot() -> Result<MarketSnapshot> {
             }
         })
         .collect();
-    let snapshot = MarketSnapshot {
+    let mut snapshot = MarketSnapshot {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         provider: "mmt".to_string(),
         provider_type: ProviderType::Aggregator,
@@ -1848,6 +1816,7 @@ async fn fetch_mmt_snapshot() -> Result<MarketSnapshot> {
         fetched_at: fetched_at(),
         exchanges,
     };
+    canonicalize_snapshot(&mut snapshot);
     snapshot.validate()?;
     Ok(snapshot)
 }
@@ -1898,12 +1867,53 @@ fn write_snapshot(snapshot: &MarketSnapshot) -> Result<()> {
             fs::remove_file(&legacy)
                 .with_context(|| format!("failed to remove {}", legacy.display()))?;
         }
+        if snapshot.provider.eq_ignore_ascii_case("hyperliquidf") {
+            remove_legacy_hyperliquid_perpetual_snapshots(&directory, &destination)?;
+        }
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&staging);
     }
     result
+}
+
+fn remove_legacy_hyperliquid_perpetual_snapshots(
+    directory: &Path,
+    destination: &Path,
+) -> Result<()> {
+    for entry in fs::read_dir(directory)
+        .with_context(|| format!("failed to inspect {}", directory.display()))?
+    {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if path != destination
+            && name.starts_with("hyperliquidf-")
+            && name.ends_with("-markets.json")
+        {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove legacy snapshot {}", path.display()))?;
+        }
+    }
+
+    let legacy = directory.join("hyperliquid-markets.json");
+    if legacy == destination || !legacy.exists() {
+        return Ok(());
+    }
+    let Ok(source) = fs::read_to_string(&legacy) else {
+        return Ok(());
+    };
+    let Ok(mut snapshot) = serde_json::from_str::<MarketSnapshot>(&source) else {
+        return Ok(());
+    };
+    canonicalize_snapshot(&mut snapshot);
+    if snapshot.provider.eq_ignore_ascii_case("hyperliquidf") {
+        fs::remove_file(&legacy)
+            .with_context(|| format!("failed to remove legacy snapshot {}", legacy.display()))?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1936,7 +1946,12 @@ fn insert_market_aliases(
     provider: &str,
     exchange: &str,
 ) -> Result<()> {
-    for symbol in market.lookup_symbols() {
+    let lookup_symbols = if market.symbol.contains(':') {
+        vec![market.symbol.as_str()]
+    } else {
+        market.lookup_symbols().collect::<Vec<_>>()
+    };
+    for symbol in lookup_symbols {
         let lookup = symbol_key(symbol);
         if let Some(existing) = index.insert(lookup.clone(), Arc::clone(&market))
             && !Arc::ptr_eq(&existing, &market)
@@ -1961,10 +1976,30 @@ fn validate_optional_increment(
 }
 
 pub fn canonical_market_symbol(symbol: &str, market_type: MarketType) -> Result<String> {
-    let normalized = symbol.trim().to_ascii_uppercase();
+    let trimmed = symbol.trim();
     if market_type.is_futures() {
+        if let Some((dex, coin)) = trimmed.split_once(':') {
+            if dex.is_empty()
+                || coin.is_empty()
+                || coin.contains(':')
+                || !dex
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+                || !coin
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || matches!(character, '-' | '_'))
+            {
+                bail!("scoped futures symbol must use dex:coin, e.g. xyz:TSLA");
+            }
+            return Ok(format!(
+                "{}:{}",
+                dex.to_ascii_lowercase(),
+                coin.to_ascii_uppercase()
+            ));
+        }
+        let normalized = trimmed.to_ascii_uppercase();
         if normalized.is_empty()
-            || normalized.contains(['/', '-'])
+            || normalized.contains('/')
             || !normalized
                 .chars()
                 .all(|character| character.is_alphanumeric() || character == '_')
@@ -1974,6 +2009,7 @@ pub fn canonical_market_symbol(symbol: &str, market_type: MarketType) -> Result<
         return Ok(normalized);
     }
 
+    let normalized = trimmed.to_ascii_uppercase();
     let mut parts = normalized.split('/');
     match (parts.next(), parts.next(), parts.next()) {
         (Some(base), Some(quote), None)
@@ -2005,8 +2041,19 @@ fn key(value: &str) -> String {
 }
 
 fn ensure_public_exchange_id(exchange: &str) -> Result<()> {
-    if key(exchange) == "bulk" {
+    let exchange = key(exchange);
+    if exchange == "bulk" {
         bail!("exchange `bulk` is not available; use `bulkf` for BULK perpetuals");
+    }
+    if let Some(dex) = exchange.strip_prefix("hyperliquidf-") {
+        let example = if dex.is_empty() {
+            "xyz:TSLA".to_string()
+        } else {
+            format!("{dex}:COIN")
+        };
+        bail!(
+            "exchange `{exchange}` was removed; use `hyperliquidf` with a DEX-qualified symbol such as `{example}`"
+        );
     }
     Ok(())
 }
@@ -2028,25 +2075,60 @@ fn classify_exchange_name(exchange: &str) -> MarketType {
 fn canonical_mmt_exchange(exchange: &str) -> String {
     let exchange = key(exchange);
     match exchange.strip_prefix("hyperliquid-") {
-        Some(suffix) => format!("hyperliquidf-{suffix}"),
+        Some(_) => "hyperliquidf".to_string(),
         None if exchange == "hyperliquid" => "hyperliquidf".to_string(),
         None => exchange,
     }
+}
+
+fn canonicalize_mmt_exchanges(exchanges: &mut Vec<ExchangeMarkets>) {
+    let mut merged = BTreeMap::<String, ExchangeMarkets>::new();
+    for mut exchange in std::mem::take(exchanges) {
+        let upstream = exchange
+            .provider_exchange
+            .clone()
+            .unwrap_or_else(|| exchange.exchange.clone());
+        let canonical = canonical_mmt_exchange(&upstream);
+        let dex = key(&upstream)
+            .strip_prefix("hyperliquid-")
+            .filter(|dex| !dex.is_empty())
+            .map(str::to_string);
+        if let Some(dex) = dex {
+            for market in &mut exchange.markets {
+                if !market.symbol.contains(':') {
+                    market.symbol = format!("{dex}:{}", market.base_asset.to_ascii_uppercase());
+                }
+                market.aliases.clear();
+            }
+        }
+        exchange.exchange.clone_from(&canonical);
+        exchange.market_type = classify_exchange_name(&canonical);
+        exchange.provider_exchange = Some(upstream);
+
+        match merged.entry(canonical.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                if canonical == "hyperliquidf" {
+                    exchange.name = "Hyperliquid Perpetuals".to_string();
+                }
+                entry.insert(exchange);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                if existing.provider_exchange != exchange.provider_exchange {
+                    existing.provider_exchange = None;
+                }
+                existing.markets.append(&mut exchange.markets);
+            }
+        }
+    }
+    *exchanges = merged.into_values().collect();
 }
 
 fn canonicalize_snapshot(snapshot: &mut MarketSnapshot) {
     if snapshot.provider_type == ProviderType::Aggregator
         && snapshot.provider.eq_ignore_ascii_case("mmt")
     {
-        for exchange in &mut snapshot.exchanges {
-            let upstream = exchange
-                .provider_exchange
-                .clone()
-                .unwrap_or_else(|| exchange.exchange.clone());
-            exchange.provider_exchange = Some(upstream.clone());
-            exchange.exchange = canonical_mmt_exchange(&upstream);
-            exchange.market_type = classify_exchange_name(&exchange.exchange);
-        }
+        canonicalize_mmt_exchanges(&mut snapshot.exchanges);
     }
 
     if snapshot.provider_type == ProviderType::Standalone
@@ -2071,7 +2153,14 @@ fn canonicalize_snapshot(snapshot: &mut MarketSnapshot) {
             market.quote_asset = market.quote_asset.trim().to_ascii_uppercase();
             if exchange.market_type.is_futures() {
                 market.quote_asset = market.venue_quote_asset.trim().to_ascii_uppercase();
-                market.symbol = market.base_asset.clone();
+                market.symbol = if exchange.exchange.eq_ignore_ascii_case("hyperliquidf")
+                    && market.symbol.contains(':')
+                {
+                    canonical_market_symbol(&market.symbol, MarketType::Futures)
+                        .unwrap_or_else(|_| market.symbol.clone())
+                } else {
+                    market.base_asset.clone()
+                };
                 market.aliases.retain(|alias| !alias.contains('/'));
             } else if snapshot.provider.eq_ignore_ascii_case("mmt") {
                 market.quote_asset = market.venue_quote_asset.trim().to_ascii_uppercase();
@@ -2144,6 +2233,38 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
         venue_quote_asset: "USDT".to_string(),
         status: "AVAILABLE".to_string(),
         price_increment: Some(0.01),
+        size_increment: Some(0.001),
+        execution: None,
+        network_variants: BTreeMap::new(),
+    };
+    let mmt_xyz_market = Market {
+        symbol: "TSLA".to_string(),
+        provider_symbol: "tsla/usd".to_string(),
+        venue_symbol: "tsla/usd".to_string(),
+        venue_id: None,
+        aliases: Vec::new(),
+        base_asset: "TSLA".to_string(),
+        quote_asset: "USD".to_string(),
+        venue_base_asset: "TSLA".to_string(),
+        venue_quote_asset: "USD".to_string(),
+        status: "AVAILABLE".to_string(),
+        price_increment: Some(0.01),
+        size_increment: Some(0.001),
+        execution: None,
+        network_variants: BTreeMap::new(),
+    };
+    let mmt_xyz_btc_market = Market {
+        symbol: "BTC".to_string(),
+        provider_symbol: "btc/usd".to_string(),
+        venue_symbol: "btc/usd".to_string(),
+        venue_id: None,
+        aliases: Vec::new(),
+        base_asset: "BTC".to_string(),
+        quote_asset: "USD".to_string(),
+        venue_base_asset: "BTC".to_string(),
+        venue_quote_asset: "USD".to_string(),
+        status: "AVAILABLE".to_string(),
+        price_increment: Some(0.1),
         size_increment: Some(0.001),
         execution: None,
         network_variants: BTreeMap::new(),
@@ -2252,11 +2373,11 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
         time_in_forces: vec!["GTC".to_string(), "IOC".to_string(), "ALO".to_string()],
     };
     let hyperliquid_xyz_market = Market {
-        symbol: "TSLA".to_string(),
+        symbol: "xyz:TSLA".to_string(),
         provider_symbol: "xyz:TSLA".to_string(),
         venue_symbol: "xyz:TSLA".to_string(),
         venue_id: Some(110_001),
-        aliases: vec!["xyz:TSLA".to_string()],
+        aliases: Vec::new(),
         base_asset: "TSLA".to_string(),
         quote_asset: "USDC".to_string(),
         venue_base_asset: "TSLA".to_string(),
@@ -2345,7 +2466,7 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
                 provider_exchange: None,
                 name: "Hyperliquid".to_string(),
                 market_type: MarketType::Futures,
-                markets: vec![hyperliquid_market],
+                markets: vec![hyperliquid_market, hyperliquid_xyz_market],
             }],
         },
         MarketSnapshot {
@@ -2360,20 +2481,6 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
                 name: "Hyperliquid Spot".to_string(),
                 market_type: MarketType::Spot,
                 markets: vec![hyperliquid_spot_market],
-            }],
-        },
-        MarketSnapshot {
-            schema_version: SNAPSHOT_SCHEMA_VERSION,
-            provider: "hyperliquidf-xyz".to_string(),
-            provider_type: ProviderType::Standalone,
-            source_url: HYPERLIQUID_INFO_URL.to_string(),
-            fetched_at: "2026-07-19T00:00:00Z".to_string(),
-            exchanges: vec![ExchangeMarkets {
-                exchange: "hyperliquidf-xyz".to_string(),
-                provider_exchange: None,
-                name: "Hyperliquid XYZ Perpetuals".to_string(),
-                market_type: MarketType::Futures,
-                markets: vec![hyperliquid_xyz_market],
             }],
         },
         MarketSnapshot {
@@ -2439,6 +2546,13 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
                     market_type: MarketType::Futures,
                     markets: vec![mmt_market],
                 },
+                ExchangeMarkets {
+                    exchange: "hyperliquid-xyz".to_string(),
+                    provider_exchange: None,
+                    name: "hyperliquid-xyz".to_string(),
+                    market_type: MarketType::Futures,
+                    markets: vec![mmt_xyz_market, mmt_xyz_btc_market],
+                },
             ],
         },
     ]
@@ -2450,8 +2564,7 @@ mod tests {
 
     #[test]
     fn snapshots_build_provider_and_direct_indexes() {
-        let registry = MarketRegistry::new(test_snapshots()).expect("snapshots index");
-        assert_eq!(registry.snapshots.len(), 7);
+        MarketRegistry::new(test_snapshots()).expect("snapshots index");
 
         let bulk = exchange_market("bulkf", "btc").expect("BULK market resolves");
         assert_eq!(bulk.symbol, "BTC");
@@ -2473,8 +2586,9 @@ mod tests {
         assert_eq!(futures.provider_symbol, "BTCUSDT");
         assert!(is_futures_exchange("binancef").expect("Binance futures type resolves"));
 
-        let xyz = exchange_market("hyperliquidf-xyz", "tsla")
+        let xyz = exchange_market("hyperliquidf", "xyz:tsla")
             .expect("standalone XYZ perpetual market resolves");
+        assert_eq!(xyz.symbol, "xyz:TSLA");
         assert_eq!(xyz.venue_symbol, "xyz:TSLA");
         assert_eq!(
             xyz.network_variant("testnet")
@@ -2512,8 +2626,22 @@ mod tests {
     #[test]
     fn provider_and_direct_routes_are_distinct() {
         assert!(provider_market("mmt", "hyperliquidf", "BTC").is_ok());
+        let mmt_xyz = provider_market("mmt", "hyperliquidf", "xyz:TSLA")
+            .expect("MMT XYZ market resolves through the canonical exchange");
+        assert_eq!(mmt_xyz.symbol, "xyz:TSLA");
+        assert_eq!(mmt_xyz.provider_symbol, "tsla/usd");
+        let mmt_xyz_btc = provider_market("mmt", "hyperliquidf", "xyz:BTC")
+            .expect("scoped BTC does not collide with the native provider symbol");
+        assert_eq!(mmt_xyz_btc.provider_symbol, "btc/usd");
+        assert!(provider_market("mmt", "hyperliquidf", "missing:COIN").is_err());
         assert_eq!(
-            upstream_exchange("mmt", "hyperliquidf").expect("MMT exchange mapping resolves"),
+            crate::providers::mmt::utils::normalize_exchange_for_mmt("hyperliquidf", "xyz:TSLA",)
+                .expect("MMT HIP-3 route resolves"),
+            "hyperliquid-xyz"
+        );
+        assert_eq!(
+            crate::providers::mmt::utils::normalize_exchange_for_mmt("hyperliquidf", "BTC")
+                .expect("MMT native route resolves"),
             "hyperliquid"
         );
         let direct =
@@ -2552,6 +2680,10 @@ mod tests {
             canonical_market_symbol("btc", MarketType::Futures).expect("futures base"),
             "BTC"
         );
+        assert_eq!(
+            canonical_market_symbol("XYZ:tsla", MarketType::Futures).expect("HIP-3 scoped future"),
+            "xyz:TSLA"
+        );
         assert!(canonical_market_symbol("BTC/USDT", MarketType::Futures).is_err());
         assert_eq!(
             canonical_market_symbol("hype/usdh", MarketType::Spot).expect("spot pair"),
@@ -2576,7 +2708,7 @@ mod tests {
         assert!(is_futures_exchange("bulkf").expect("BULK type resolves"));
         assert!(is_futures_exchange("binancef").expect("Binance Futures type resolves"));
         assert!(is_futures_exchange("hyperliquidf").expect("Hyperliquid type resolves"));
-        assert!(is_futures_exchange("hyperliquidf-xyz").expect("XYZ type resolves"));
+        assert!(is_futures_exchange("hyperliquidf-xyz").is_err());
         assert!(!is_futures_exchange("hyperliquid").expect("Hyperliquid spot type resolves"));
         assert!(!is_futures_exchange("binance").expect("Binance spot type resolves"));
         assert!(is_futures_exchange("missing").is_err());
@@ -2622,15 +2754,9 @@ mod tests {
         assert_eq!(classify_mmt_exchange("okx"), MarketType::Spot);
         assert_eq!(classify_mmt_exchange("binancef"), MarketType::Futures);
         assert_eq!(classify_mmt_exchange("bybitf-inverse"), MarketType::Futures);
-        assert_eq!(
-            classify_mmt_exchange("hyperliquidf-xyz"),
-            MarketType::Futures
-        );
+        assert_eq!(classify_mmt_exchange("hyperliquidf"), MarketType::Futures);
         assert_eq!(canonical_mmt_exchange("hyperliquid"), "hyperliquidf");
-        assert_eq!(
-            canonical_mmt_exchange("hyperliquid-xyz"),
-            "hyperliquidf-xyz"
-        );
+        assert_eq!(canonical_mmt_exchange("hyperliquid-xyz"), "hyperliquidf");
     }
 
     #[test]
@@ -2711,7 +2837,7 @@ mod tests {
         )
         .expect("XYZ metadata decodes");
 
-        let market = decoded.get("TSLA").expect("active XYZ market");
+        let market = decoded.get("xyz:TSLA").expect("active XYZ market");
         assert_eq!(market.variant.venue_symbol, "xyz:TSLA");
         assert_eq!(market.variant.venue_id, 110_001);
         assert_eq!(market.quote_asset, "USDC");
@@ -2769,14 +2895,14 @@ mod tests {
         )
         .expect("EntropyIO metadata decodes");
 
-        assert!(!decoded.contains_key("OAI"));
-        let anth = decoded.get("ANTH").expect("active ANTH market");
+        assert!(!decoded.contains_key("io:OAI"));
+        let anth = decoded.get("io:ANTH").expect("active ANTH market");
         assert_eq!(anth.variant.venue_symbol, "io:ANTH");
         assert_eq!(anth.variant.venue_id, 200_001);
         assert_eq!(anth.variant.execution.max_leverage, 3);
         assert!(!anth.variant.execution.cross_margin);
 
-        let sndk = decoded.get("SNDK").expect("active SNDK market");
+        let sndk = decoded.get("io:SNDK").expect("active SNDK market");
         assert_eq!(sndk.variant.venue_id, 200_002);
         assert_eq!(sndk.variant.execution.max_leverage, 10);
     }

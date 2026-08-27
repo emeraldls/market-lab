@@ -220,7 +220,7 @@ fn build_event(
         event_id: hex::encode(digest.finalize()),
         venue: input.venue.to_string(),
         network: network.to_string(),
-        market: market_name(spec.market).to_string(),
+        market: market_name(spec.market, input.venue, &input.symbol).to_string(),
         symbol: input.symbol.to_ascii_uppercase(),
         notional_usd: format!("{notional:.8}"),
         maker: input.maker,
@@ -259,10 +259,12 @@ async fn export_pending(
     persist_store(store_path, store)
 }
 
-fn market_name(market: VenueMarket) -> &'static str {
+fn market_name(market: VenueMarket, venue: ExecutionVenue, symbol: &str) -> &'static str {
     match market {
+        VenueMarket::Perpetual if venue == ExecutionVenue::Hyperliquid && symbol.contains(':') => {
+            "hip3"
+        }
         VenueMarket::Perpetual => "perpetual",
-        VenueMarket::Hip3 => "hip3",
         VenueMarket::Spot => "spot",
         VenueMarket::Outcome => "outcome",
     }

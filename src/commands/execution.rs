@@ -108,7 +108,10 @@ async fn reconcile_post_trade_state(
     let mut successful_read = false;
 
     for attempt in 0..attempts {
-        match adapter.account_snapshot(&plan.account).await {
+        match adapter
+            .account_snapshot_for_market(&plan.account, &plan.internal_symbol)
+            .await
+        {
             Ok(snapshot) => {
                 successful_read = true;
                 latest_error = None;
@@ -157,10 +160,15 @@ pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
     let venue = args.venue;
     let symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
     let account = ExecutionAdapter::configured_account(venue)?;
-    let snapshot = ExecutionAdapter::new(venue, args.testnet)
-        .await?
-        .account_snapshot(&account)
-        .await?;
+    let adapter = ExecutionAdapter::new(venue, args.testnet).await?;
+    let snapshot = match symbol.as_deref() {
+        Some(symbol) => {
+            adapter
+                .account_snapshot_for_market(&account, symbol)
+                .await?
+        }
+        None => adapter.account_snapshot(&account).await?,
+    };
     if venue.is_spot() {
         let balances = snapshot
             .spot_balances
@@ -204,17 +212,18 @@ pub async fn handle_orders(args: AccountQueryArgs) -> Result<()> {
     let venue = args.venue;
     let symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
     let account = ExecutionAdapter::configured_account(venue)?;
-    let orders = ExecutionAdapter::new(venue, args.testnet)
-        .await?
-        .open_orders(&account)
-        .await?
-        .into_iter()
-        .filter(|order| {
-            symbol
-                .as_deref()
-                .is_none_or(|symbol| order.internal_symbol == symbol)
-        })
-        .collect::<Vec<_>>();
+    let adapter = ExecutionAdapter::new(venue, args.testnet).await?;
+    let orders = match symbol.as_deref() {
+        Some(symbol) => adapter.open_orders_for_market(&account, symbol).await?,
+        None => adapter.open_orders(&account).await?,
+    }
+    .into_iter()
+    .filter(|order| {
+        symbol
+            .as_deref()
+            .is_none_or(|symbol| order.internal_symbol == symbol)
+    })
+    .collect::<Vec<_>>();
     render_orders(&orders, args.output)
 }
 
@@ -292,10 +301,15 @@ pub async fn handle_close(args: ClosePositionArgs) -> Result<()> {
     let venue = args.venue;
     let requested_symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
     let account = ExecutionAdapter::configured_account(venue)?;
-    let snapshot = ExecutionAdapter::new(venue, args.testnet)
-        .await?
-        .account_snapshot(&account)
-        .await?;
+    let adapter = ExecutionAdapter::new(venue, args.testnet).await?;
+    let snapshot = match requested_symbol.as_deref() {
+        Some(symbol) => {
+            adapter
+                .account_snapshot_for_market(&account, symbol)
+                .await?
+        }
+        None => adapter.account_snapshot(&account).await?,
+    };
     let positions = snapshot
         .positions
         .into_iter()
@@ -985,7 +999,10 @@ fn execution_rules(
 ) -> Result<crate::markets::ExecutionRules> {
     let spec = venue.spec()?;
     match spec.market {
-        VenueMarket::Spot | VenueMarket::Hip3 => market
+        VenueMarket::Spot => market
+            .network_variant(HyperliquidNetwork::from_testnet(testnet).label())
+            .map(|variant| variant.execution),
+        VenueMarket::Perpetual if !market.network_variants.is_empty() => market
             .network_variant(HyperliquidNetwork::from_testnet(testnet).label())
             .map(|variant| variant.execution),
         VenueMarket::Outcome | VenueMarket::Perpetual => market.execution_rules().cloned(),
@@ -995,7 +1012,10 @@ fn execution_rules(
 fn execution_venue_symbol(venue: ExecutionVenue, testnet: bool, market: &Market) -> Result<String> {
     let spec = venue.spec()?;
     match spec.market {
-        VenueMarket::Spot | VenueMarket::Hip3 => market
+        VenueMarket::Spot => market
+            .network_variant(HyperliquidNetwork::from_testnet(testnet).label())
+            .map(|variant| variant.venue_symbol),
+        VenueMarket::Perpetual if !market.network_variants.is_empty() => market
             .network_variant(HyperliquidNetwork::from_testnet(testnet).label())
             .map(|variant| variant.venue_symbol),
         VenueMarket::Outcome | VenueMarket::Perpetual => Ok(market.venue_symbol.clone()),

@@ -848,6 +848,7 @@ pub(super) fn spawn_account_feed(
     venue: ExecutionVenue,
     testnet: bool,
     account: String,
+    symbol: String,
 ) -> mpsc::Receiver<AccountFeedEvent> {
     let (sender, receiver) = mpsc::channel(1024);
     tokio::spawn(async move {
@@ -864,8 +865,10 @@ pub(super) fn spawn_account_feed(
         loop {
             match AccountEventStream::connect(venue, testnet, &account).await {
                 Ok(mut stream) => {
-                    let (open_orders, fills) =
-                        tokio::join!(adapter.open_orders(&account), adapter.fills(&account),);
+                    let (open_orders, fills) = tokio::join!(
+                        adapter.open_orders_for_market(&account, &symbol),
+                        adapter.fills(&account),
+                    );
                     match (open_orders, fills) {
                         (Ok(open_orders), Ok(fills)) => {
                             if sender
@@ -1019,8 +1022,12 @@ async fn run_worker(job_id: &str, mode: MidMode, definition: &MidPriceJobDefinit
         definition.testnet,
         definition.symbol.clone(),
     );
-    let mut account_events =
-        spawn_account_feed(definition.venue, definition.testnet, parent.account.clone());
+    let mut account_events = spawn_account_feed(
+        definition.venue,
+        definition.testnet,
+        parent.account.clone(),
+        parent.internal_symbol.clone(),
+    );
     let mut account_connected = false;
     let mut buy = QuoteSlot::default();
     let mut sell = QuoteSlot::default();
@@ -1745,7 +1752,7 @@ pub(super) async fn account_symbol_is_flat(
     symbol: &str,
     lot_size: f64,
 ) -> Result<bool> {
-    let snapshot = adapter.account_snapshot(account).await?;
+    let snapshot = adapter.account_snapshot_for_market(account, symbol).await?;
     let signed_size = snapshot
         .positions
         .iter()
@@ -2164,7 +2171,7 @@ async fn cleanup(
     let cleanup_deadline = Instant::now() + CLEANUP_TIMEOUT;
     loop {
         let (open_orders, fills) = tokio::join!(
-            adapter.open_orders(&parent.account),
+            adapter.open_orders_for_market(&parent.account, &parent.internal_symbol),
             adapter.fills(&parent.account),
         );
         let open_orders = open_orders?;

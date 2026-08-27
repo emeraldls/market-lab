@@ -2470,9 +2470,7 @@ fn validate_execution_symbol(venue: ExecutionVenueArg, symbol: &str) -> Result<(
     }
     let market_type = match venue.market {
         crate::venues::VenueMarket::Spot => crate::markets::MarketType::Spot,
-        crate::venues::VenueMarket::Perpetual | crate::venues::VenueMarket::Hip3 => {
-            crate::markets::MarketType::Futures
-        }
+        crate::venues::VenueMarket::Perpetual => crate::markets::MarketType::Futures,
         crate::venues::VenueMarket::Outcome => unreachable!("handled above"),
     };
     crate::markets::canonical_market_symbol(symbol, market_type).map(|_| ())
@@ -2870,9 +2868,9 @@ mod tests {
             "source",
             "orderbook",
             "--exchange",
-            "hyperliquidf-xyz",
+            "hyperliquidf",
             "--symbol",
-            "TSLA",
+            "xyz:TSLA",
             "--depth",
             "20",
         ])
@@ -2894,9 +2892,9 @@ mod tests {
             "mlab",
             "trade",
             "long",
-            "TSLA",
+            "xyz:TSLA",
             "--venue",
-            "hyperliquidf-xyz",
+            "hyperliquidf",
             "--margin",
             "100",
             "--leverage",
@@ -2909,7 +2907,8 @@ mod tests {
                 command: TradeCommands::Long(args),
             } => {
                 args.validate_shape().expect("XYZ trade shape validates");
-                assert_eq!(args.venue.as_str(), "hyperliquidf-xyz");
+                assert_eq!(args.venue.as_str(), "hyperliquidf");
+                assert_eq!(args.symbol, "xyz:TSLA");
             }
             _ => panic!("expected XYZ trade long command"),
         }
@@ -2919,9 +2918,9 @@ mod tests {
             "source",
             "orderbook",
             "--exchange",
-            "hyperliquidf-io",
+            "hyperliquidf",
             "--symbol",
-            "ANTH",
+            "io:ANTH",
             "--depth",
             "20",
         ])
@@ -2944,9 +2943,9 @@ mod tests {
             "mlab",
             "trade",
             "long",
-            "ANTH",
+            "io:ANTH",
             "--venue",
-            "hyperliquidf-io",
+            "hyperliquidf",
             "--margin",
             "100",
             "--leverage",
@@ -2960,7 +2959,8 @@ mod tests {
             } => {
                 args.validate_shape()
                     .expect("EntropyIO trade shape validates");
-                assert_eq!(args.venue.as_str(), "hyperliquidf-io");
+                assert_eq!(args.venue.as_str(), "hyperliquidf");
+                assert_eq!(args.symbol, "io:ANTH");
             }
             _ => panic!("expected EntropyIO trade long command"),
         }

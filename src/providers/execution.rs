@@ -24,7 +24,17 @@ pub trait ExecutionProvider: Send + Sync {
     fn venue_capabilities(&self) -> VenueCapabilities;
     fn validate_order_id(&self, order_id: &str) -> Result<()>;
     async fn account_snapshot(&self, account: &str) -> Result<AccountSnapshot>;
+    async fn account_snapshot_for_market(
+        &self,
+        account: &str,
+        _symbol: &str,
+    ) -> Result<AccountSnapshot> {
+        self.account_snapshot(account).await
+    }
     async fn open_orders(&self, account: &str) -> Result<Vec<OpenOrder>>;
+    async fn open_orders_for_market(&self, account: &str, _symbol: &str) -> Result<Vec<OpenOrder>> {
+        self.open_orders(account).await
+    }
     async fn fills(&self, account: &str) -> Result<Vec<Fill>>;
     async fn submit_trade(&self, plan: &TradePlan) -> Result<ExecutionReceipt>;
     async fn cancel_order(&self, plan: &CancelPlan) -> Result<ExecutionReceipt>;
@@ -211,8 +221,20 @@ impl ExecutionProvider for HyperliquidExecutionAdapter {
         Self::account_snapshot(self, account).await
     }
 
+    async fn account_snapshot_for_market(
+        &self,
+        account: &str,
+        symbol: &str,
+    ) -> Result<AccountSnapshot> {
+        Self::account_snapshot_for_market(self, account, symbol).await
+    }
+
     async fn open_orders(&self, account: &str) -> Result<Vec<OpenOrder>> {
         Self::open_orders(self, account).await
+    }
+
+    async fn open_orders_for_market(&self, account: &str, symbol: &str) -> Result<Vec<OpenOrder>> {
+        Self::open_orders_for_market(self, account, symbol).await
     }
 
     async fn fills(&self, account: &str) -> Result<Vec<Fill>> {
@@ -978,6 +1000,16 @@ impl ExecutionAdapter {
         self.provider.account_snapshot(account).await
     }
 
+    pub async fn account_snapshot_for_market(
+        &self,
+        account: &str,
+        symbol: &str,
+    ) -> Result<AccountSnapshot> {
+        self.provider
+            .account_snapshot_for_market(account, symbol)
+            .await
+    }
+
     pub async fn max_leverage(&self, symbol: &str) -> Result<u32> {
         self.provider.max_leverage(symbol).await
     }
@@ -988,6 +1020,14 @@ impl ExecutionAdapter {
 
     pub async fn open_orders(&self, account: &str) -> Result<Vec<OpenOrder>> {
         self.provider.open_orders(account).await
+    }
+
+    pub async fn open_orders_for_market(
+        &self,
+        account: &str,
+        symbol: &str,
+    ) -> Result<Vec<OpenOrder>> {
+        self.provider.open_orders_for_market(account, symbol).await
     }
 
     pub async fn fills(&self, account: &str) -> Result<Vec<Fill>> {
@@ -1040,9 +1080,12 @@ mod tests {
 
     #[test]
     fn execution_transport_selection_is_targeted_and_deduplicated() {
-        let xyz = ExecutionVenue::parse("hyperliquidf-xyz").expect("XYZ venue");
         assert_eq!(
-            execution_transports(&[ExecutionVenue::Hyperlink, xyz, ExecutionVenue::Hyperliquid]),
+            execution_transports(&[
+                ExecutionVenue::Hyperlink,
+                ExecutionVenue::Hyperliquid,
+                ExecutionVenue::Hyperliquid,
+            ]),
             [ExecutionVenue::Hyperlink, ExecutionVenue::Hyperliquid]
         );
     }

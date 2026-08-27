@@ -143,7 +143,7 @@ fn render_direct_snapshot(
 async fn stream_oi(args: SourceOiArgs) -> Result<()> {
     let exchange = args.exchange_name()?.to_string();
     let provider_symbol = normalize_symbol_for_mmt(&exchange, &args.symbol)?;
-    let provider_exchange = normalize_exchange_for_mmt(&exchange)?;
+    let provider_exchange = normalize_exchange_for_mmt(&exchange, &args.symbol)?;
     let ws = MmtWsClient::shared().await?;
     ws.subscribe(serde_json::json!({
         "type": "subscribe",

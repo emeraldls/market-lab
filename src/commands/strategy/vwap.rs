@@ -1202,7 +1202,7 @@ async fn stream_mmt_trades(
     for exchange in exchanges {
         let canonical_exchange = exchange.to_ascii_lowercase();
         let provider_symbol = normalize_symbol_for_mmt(&canonical_exchange, symbol)?;
-        let provider_exchange = normalize_exchange_for_mmt(&canonical_exchange)?;
+        let provider_exchange = normalize_exchange_for_mmt(&canonical_exchange, symbol)?;
         ws.subscribe(serde_json::json!({
             "type": "subscribe",
             "channel": "trades",
@@ -1246,7 +1246,7 @@ async fn stream_mmt_open_interest(
     for exchange in exchanges {
         let canonical_exchange = exchange.to_ascii_lowercase();
         let provider_symbol = normalize_symbol_for_mmt(&canonical_exchange, symbol)?;
-        let provider_exchange = normalize_exchange_for_mmt(&canonical_exchange)?;
+        let provider_exchange = normalize_exchange_for_mmt(&canonical_exchange, symbol)?;
         ws.subscribe(serde_json::json!({
             "type": "subscribe",
             "channel": "oi",

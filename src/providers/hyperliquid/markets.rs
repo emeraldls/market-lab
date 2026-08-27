@@ -22,9 +22,12 @@ pub fn network_market(
 ) -> Result<(Arc<HyperliquidMarket>, HyperliquidNetworkMarket)> {
     let market = market_for(product, symbol)?;
     let variant = match (product, network) {
-        (HyperliquidProduct::Perpetual, _) | (_, HyperliquidNetwork::Mainnet) => {
-            market.network_variant("mainnet")?
-        }
+        (HyperliquidProduct::Perpetual, network) if market.network_variants.is_empty() => market
+            .network_variant(match network {
+                HyperliquidNetwork::Mainnet => "mainnet",
+                HyperliquidNetwork::Testnet => "mainnet",
+            })?,
+        (_, HyperliquidNetwork::Mainnet) => market.network_variant("mainnet")?,
         (_, HyperliquidNetwork::Testnet) => market.network_variant("testnet")?,
     };
     Ok((market, variant))
@@ -39,9 +42,15 @@ pub fn market_for_wire(
         .into_iter()
         .find_map(|market| {
             let variant = match (product, network) {
-                (HyperliquidProduct::Perpetual, _) | (_, HyperliquidNetwork::Mainnet) => {
-                    market.network_variant("mainnet").ok()?
+                (HyperliquidProduct::Perpetual, network) if market.network_variants.is_empty() => {
+                    market
+                        .network_variant(match network {
+                            HyperliquidNetwork::Mainnet => "mainnet",
+                            HyperliquidNetwork::Testnet => "mainnet",
+                        })
+                        .ok()?
                 }
+                (_, HyperliquidNetwork::Mainnet) => market.network_variant("mainnet").ok()?,
                 (_, HyperliquidNetwork::Testnet) => market.network_variant("testnet").ok()?,
             };
             (variant.provider_symbol.eq_ignore_ascii_case(wire_symbol)

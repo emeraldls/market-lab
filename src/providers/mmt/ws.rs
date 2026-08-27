@@ -17,7 +17,7 @@ pub struct MmtDepthStream {
 impl MmtDepthStream {
     pub async fn connect(exchange: &str, symbol: &str, depth: u16) -> Result<Self> {
         let provider_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
-        let provider_exchange = normalize_exchange_for_mmt(exchange)?;
+        let provider_exchange = normalize_exchange_for_mmt(exchange, symbol)?;
         let client = MmtWsClient::shared().await?;
 
         let subscribe = serde_json::json!({

@@ -11,7 +11,7 @@ Implement the exchange once behind Market Lab's execution contracts. Existing bo
 
 Choose the smallest valid integration:
 
-- **New Hyperliquid HIP-3 DEX:** use the existing dynamic venue name `hyperliquidf-{dex}`. Do not add a venue constant, backend variant, or factory branch for each DEX. Confirm that live metadata resolves the DEX and its markets.
+- **New Hyperliquid HIP-3 DEX:** keep the venue `hyperliquidf` and carry the DEX in the symbol as `{dex}:{coin}`, for example `xyz:TSLA`. Do not add a venue constant, backend variant, factory branch, or separate market snapshot for each DEX. Confirm that live metadata resolves the DEX and its markets.
 - **New venue using an existing execution transport:** add a `VenueSpec` in `src/venues.rs` and reuse its existing execution, authentication, and market-data backends.
 - **New execution API:** add a provider implementation, factory registration, venue specification, credentials when required, market metadata, and normalized private events.
 
@@ -66,7 +66,8 @@ Add the venue to `src/venues.rs`:
 - `AuthBackend` only for a genuinely new credential flow
 - the correct `VenueMarket` and `NetworkPolicy`
 - `market_data_venue` when execution deliberately reuses another venue's public feed
-- `dex` only for HIP-3 routing
+
+HIP-3 routing is instrument-scoped, not venue-scoped. Parse the DEX from the canonical symbol at the Hyperliquid provider boundary.
 
 Venue parsing, display names, execution routing, and market-data routing must come from `VenueSpec`. Do not duplicate venue-name helpers elsewhere.
 

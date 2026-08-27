@@ -5,13 +5,12 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 const MAX_VENUE_ID_LEN: usize = 63;
-const HIP3_PREFIX: &str = "hyperliquidf-";
+const LEGACY_HIP3_PREFIX: &str = "hyperliquidf-";
 
 /// Stable, serializable identity for an execution venue.
 ///
 /// Venue IDs are deliberately data rather than enum variants. This keeps job
-/// records and command plumbing independent from the set of registered venues,
-/// and lets every HIP-3 DEX use `hyperliquidf-{dex}` without a code change.
+/// records and command plumbing independent from the set of registered venues.
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct VenueId {
     bytes: [u8; MAX_VENUE_ID_LEN],
@@ -101,11 +100,6 @@ impl VenueId {
     pub fn is_hyperliquid(self) -> bool {
         self.spec()
             .is_ok_and(|spec| spec.execution == ExecutionBackend::Hyperliquid)
-    }
-
-    pub fn is_hip3(self) -> bool {
-        self.spec()
-            .is_ok_and(|spec| spec.market == VenueMarket::Hip3)
     }
 
     pub fn market_data_id(self) -> Self {
@@ -217,14 +211,13 @@ pub enum AuthBackend {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VenueMarket {
     Perpetual,
-    Hip3,
     Spot,
     Outcome,
 }
 
 impl VenueMarket {
     pub const fn is_perpetual(self) -> bool {
-        matches!(self, Self::Perpetual | Self::Hip3)
+        matches!(self, Self::Perpetual)
     }
 }
 
@@ -247,8 +240,6 @@ pub struct VenueSpec {
     pub network: NetworkPolicy,
     /// Market-data identity used when execution and price discovery differ.
     pub market_data_venue: VenueId,
-    /// HIP-3 DEX name, stored without the `hyperliquidf-` prefix.
-    pub dex: Option<VenueId>,
 }
 
 impl VenueSpec {
@@ -259,7 +250,7 @@ impl VenueSpec {
             VenueId::Hyperlink => "HyperLink".to_string(),
             VenueId::HyperliquidSpot => "Hyperliquid Spot".to_string(),
             VenueId::HyperliquidOutcomes => "Hyperliquid Outcomes".to_string(),
-            _ => format!("Hyperliquid HIP-3 ({})", self.dex.expect("HIP-3 DEX")),
+            _ => self.id.to_string(),
         }
     }
 
@@ -292,7 +283,6 @@ const BULK: VenueSpec = VenueSpec {
     market: VenueMarket::Perpetual,
     network: NetworkPolicy::TestnetOnly,
     market_data_venue: VenueId::Bulk,
-    dex: None,
 };
 
 const HYPERLIQUID: VenueSpec = VenueSpec {
@@ -302,7 +292,6 @@ const HYPERLIQUID: VenueSpec = VenueSpec {
     market: VenueMarket::Perpetual,
     network: NetworkPolicy::Selectable,
     market_data_venue: VenueId::Hyperliquid,
-    dex: None,
 };
 
 const HYPERLINK: VenueSpec = VenueSpec {
@@ -312,7 +301,6 @@ const HYPERLINK: VenueSpec = VenueSpec {
     market: VenueMarket::Perpetual,
     network: NetworkPolicy::MainnetOnly,
     market_data_venue: VenueId::Hyperliquid,
-    dex: None,
 };
 
 const HYPERLIQUID_SPOT: VenueSpec = VenueSpec {
@@ -322,7 +310,6 @@ const HYPERLIQUID_SPOT: VenueSpec = VenueSpec {
     market: VenueMarket::Spot,
     network: NetworkPolicy::Selectable,
     market_data_venue: VenueId::HyperliquidSpot,
-    dex: None,
 };
 
 const HYPERLIQUID_OUTCOMES: VenueSpec = VenueSpec {
@@ -332,7 +319,6 @@ const HYPERLIQUID_OUTCOMES: VenueSpec = VenueSpec {
     market: VenueMarket::Outcome,
     network: NetworkPolicy::Selectable,
     market_data_venue: VenueId::HyperliquidOutcomes,
-    dex: None,
 };
 
 pub const BUILTIN_VENUES: &[VenueSpec] = &[
@@ -348,44 +334,18 @@ pub fn resolve(venue: VenueId) -> Result<VenueSpec> {
         return Ok(*spec);
     }
 
-    if let Some(dex) = venue.as_str().strip_prefix(HIP3_PREFIX) {
-        if dex.is_empty() {
-            bail!("HIP-3 venue must include a DEX name after `{HIP3_PREFIX}`");
-        }
-        let dex = VenueId::parse_unregistered(dex)?;
-        return Ok(VenueSpec {
-            id: venue,
-            execution: ExecutionBackend::Hyperliquid,
-            auth: AuthBackend::Hyperliquid,
-            market: VenueMarket::Hip3,
-            network: NetworkPolicy::Selectable,
-            market_data_venue: venue,
-            dex: Some(dex),
-        });
+    if let Some(dex) = venue.as_str().strip_prefix(LEGACY_HIP3_PREFIX) {
+        let example = if dex.is_empty() {
+            "xyz:TSLA".to_string()
+        } else {
+            format!("{dex}:COIN")
+        };
+        bail!(
+            "venue `{venue}` was removed; use venue `hyperliquidf` with a DEX-qualified symbol such as `{example}`"
+        );
     }
 
     bail!("unsupported execution venue `{venue}`")
-}
-
-impl VenueId {
-    fn parse_unregistered(value: &str) -> Result<Self> {
-        let normalized = value.trim().to_ascii_lowercase();
-        if normalized.is_empty() || normalized.len() > MAX_VENUE_ID_LEN {
-            bail!("invalid venue component `{value}`");
-        }
-        if !normalized
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        {
-            bail!("invalid venue component `{value}`");
-        }
-        let mut bytes = [0; MAX_VENUE_ID_LEN];
-        bytes[..normalized.len()].copy_from_slice(normalized.as_bytes());
-        Ok(Self {
-            bytes,
-            len: normalized.len() as u8,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -400,19 +360,9 @@ mod tests {
     }
 
     #[test]
-    fn resolves_any_well_formed_hip3_dex_without_a_new_variant() {
-        let venue = VenueId::parse("hyperliquidf-example").expect("dynamic HIP-3 venue");
-        let spec = resolve(venue).expect("HIP-3 venue resolves");
-        assert_eq!(spec.market, VenueMarket::Hip3);
-        assert_eq!(spec.dex.expect("DEX").as_str(), "example");
-        assert_eq!(spec.market_data_venue, venue);
-    }
-
-    #[test]
-    fn venue_ids_round_trip_as_plain_strings() {
-        let venue = VenueId::parse("hyperliquidf-xyz").expect("venue");
-        let encoded = serde_json::to_string(&venue).expect("serialize");
-        assert_eq!(encoded, "\"hyperliquidf-xyz\"");
-        assert_eq!(serde_json::from_str::<VenueId>(&encoded).unwrap(), venue);
+    fn legacy_hip3_venues_explain_the_symbol_migration() {
+        let error = VenueId::parse("hyperliquidf-xyz").expect_err("legacy venue must fail");
+        assert!(error.to_string().contains("xyz:COIN"));
+        assert!(error.to_string().contains("venue `hyperliquidf`"));
     }
 }

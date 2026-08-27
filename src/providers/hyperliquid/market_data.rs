@@ -19,7 +19,7 @@ impl HyperliquidProvider {
     pub fn capabilities() -> serde_json::Value {
         serde_json::json!({
             "network": "mainnet",
-            "products": ["spot", "outcomes", "native_perpetuals", "xyz_perpetuals"],
+            "products": ["spot", "outcomes", "native_perpetuals", "hip3_perpetuals"],
             "authentication": {
                 "market_data_requires_api_key": false,
                 "execution_requires_agent_wallet": true
@@ -207,8 +207,9 @@ impl HyperliquidProvider {
     ) -> Result<MarketTicker> {
         let (market, variant) = require_market(product, network, symbol).await?;
         match product {
-            HyperliquidProduct::Perpetual | HyperliquidProduct::Hip3(_) => {
-                let (meta, contexts) = meta_and_contexts(network, product).await?;
+            HyperliquidProduct::Perpetual => {
+                let dex = super::perpetual_dex(&market.symbol)?;
+                let (meta, contexts) = meta_and_contexts(network, dex.as_deref()).await?;
                 let index = meta
                     .universe
                     .iter()
@@ -359,7 +360,13 @@ impl HyperliquidProvider {
             Some(selected) => Some(selected.await?.0),
             None => None,
         };
-        let (meta, contexts) = meta_and_contexts(HyperliquidNetwork::Mainnet, product).await?;
+        let dex = selected
+            .as_ref()
+            .map(|market| super::perpetual_dex(&market.symbol))
+            .transpose()?
+            .flatten();
+        let (meta, contexts) =
+            meta_and_contexts(HyperliquidNetwork::Mainnet, dex.as_deref()).await?;
         let timestamp_ms = now_ms()?;
         let mut markets_out = Vec::new();
         let mut funding = Vec::new();
@@ -533,10 +540,10 @@ fn parse(value: &str, name: &str) -> Result<f64> {
 
 async fn meta_and_contexts(
     network: HyperliquidNetwork,
-    product: HyperliquidProduct,
+    dex: Option<&str>,
 ) -> Result<(HyperliquidMeta, Vec<HyperliquidContext>)> {
     let mut request = serde_json::json!({ "type": "metaAndAssetCtxs" });
-    if let Some(dex) = product.dex()
+    if let Some(dex) = dex
         && let Some(request) = request.as_object_mut()
     {
         request.insert(

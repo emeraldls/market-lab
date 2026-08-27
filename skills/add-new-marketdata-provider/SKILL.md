@@ -63,6 +63,8 @@ mlab markets --exchange <exchange> --refresh
 
 Never force a universal quote asset. Normalize only what is semantically equivalent; preserve real spot quote assets and provider-specific market identity.
 
+Hyperliquid HIP-3 perpetuals share the public exchange `hyperliquidf`. Preserve the DEX in the canonical symbol as `{dex}:{coin}` and translate that symbol to the provider's DEX-specific route only at the provider boundary.
+
 ## 4. Implement `MarketDataProvider`
 
 Add the provider to `src/providers/market_data.rs` and implement:

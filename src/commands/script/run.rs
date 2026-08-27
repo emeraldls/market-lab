@@ -1563,7 +1563,7 @@ async fn subscribe_mmt_sources(ws: &MmtWsClient, source_configs: &SourceConfigs)
     for config in configs {
         let exchange = config.exchange.as_str();
         let provider_symbol = normalize_symbol_for_mmt(exchange, &config.market_symbol())?;
-        let provider_exchange = normalize_exchange_for_mmt(exchange)?;
+        let provider_exchange = normalize_exchange_for_mmt(exchange, &config.market_symbol())?;
         match &config.source {
             ScriptSource::Candles | ScriptSource::Trades => {
                 if raw_trade_subscriptions
@@ -1817,7 +1817,9 @@ fn mmt_update_config<'a>(
         .filter(|config| &config.source == source)
     {
         let matches_exchange = match &exchange {
-            Some(value) => normalize_exchange_for_mmt(&config.exchange)? == *value,
+            Some(value) => {
+                normalize_exchange_for_mmt(&config.exchange, &config.market_symbol())? == *value
+            }
             None => true,
         };
         let matches_symbol = match symbol {

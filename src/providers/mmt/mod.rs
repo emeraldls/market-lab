@@ -67,7 +67,7 @@ impl MmtProvider {
         let api_key = mmt_api_key()?;
         let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
         let canonical_exchange = exchange.trim().to_ascii_lowercase();
-        let exchange = normalize_exchange_for_mmt(exchange)?;
+        let exchange = normalize_exchange_for_mmt(exchange, symbol)?;
         let from_s = normalize_to_seconds(from);
         let to_s = normalize_to_seconds(to);
 
@@ -121,7 +121,7 @@ impl MmtProvider {
         let api_key = mmt_api_key()?;
         let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
         let canonical_exchange = exchange.trim().to_ascii_lowercase();
-        let exchange = normalize_exchange_for_mmt(exchange)?;
+        let exchange = normalize_exchange_for_mmt(exchange, symbol)?;
         let from_s = normalize_to_seconds(from);
         let to_s = normalize_to_seconds(to);
 
@@ -173,7 +173,7 @@ impl MmtProvider {
         let api_key = mmt_api_key()?;
         let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
         let canonical_exchange = exchange.trim().to_ascii_lowercase();
-        let exchange = normalize_exchange_for_mmt(exchange)?;
+        let exchange = normalize_exchange_for_mmt(exchange, symbol)?;
         let from_s = normalize_to_seconds(from);
         let to_s = normalize_to_seconds(to);
 
@@ -223,7 +223,7 @@ impl MmtProvider {
         to: u64,
     ) -> Result<VolumeProfileSeries> {
         let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
-        let provider_exchange = normalize_exchange_for_mmt(exchange)?;
+        let provider_exchange = normalize_exchange_for_mmt(exchange, symbol)?;
         fetch_volumes(
             exchange.trim().to_ascii_lowercase(),
             provider_exchange,
@@ -258,7 +258,7 @@ impl MmtProvider {
             }
             normalized_symbol.get_or_insert(candidate);
             canonical_exchanges.push(exchange.trim().to_ascii_lowercase());
-            normalized_exchanges.push(normalize_exchange_for_mmt(exchange)?);
+            normalized_exchanges.push(normalize_exchange_for_mmt(exchange, symbol)?);
         }
         canonical_exchanges.sort();
         normalized_exchanges.sort();
@@ -421,7 +421,7 @@ async fn fetch_orderbook_snapshot(
     let api_key = mmt_api_key()?;
     let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
     let canonical_exchange = exchange.trim().to_ascii_lowercase();
-    let exchange = normalize_exchange_for_mmt(exchange)?;
+    let exchange = normalize_exchange_for_mmt(exchange, symbol)?;
 
     let levels = levels_param(depth);
     let url = format!("{MMT_BASE_URL}/orderbook");
@@ -518,7 +518,7 @@ async fn fetch_flat_heatmap_hd_snapshot(
     let api_key = mmt_api_key()?;
     let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
     let canonical_exchange = exchange.trim().to_ascii_lowercase();
-    let exchange = normalize_exchange_for_mmt(exchange)?;
+    let exchange = normalize_exchange_for_mmt(exchange, symbol)?;
 
     let tf = "1m";
     let from = at_seconds.saturating_sub(3600);
@@ -576,7 +576,7 @@ async fn fetch_flat_heatmap_hd_series(
     let api_key = mmt_api_key()?;
     let normalized_symbol = normalize_symbol_for_mmt(exchange, symbol)?;
     let canonical_exchange = exchange.trim().to_ascii_lowercase();
-    let exchange = normalize_exchange_for_mmt(exchange)?;
+    let exchange = normalize_exchange_for_mmt(exchange, symbol)?;
     let from_s = normalize_to_seconds(from);
     let to_s = normalize_to_seconds(to);
 
