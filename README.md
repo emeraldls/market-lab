@@ -234,7 +234,7 @@ Provider work must stay behind the shared provider contracts. Read the repositor
 
 ## Project status
 
-Market Lab is under active development and remains pre-1.0. Interfaces and venue support may change between releases. Review the [release notes](https://github.com/emeraldls/market-lab/releases) before upgrading a machine that runs live jobs.
+Market Lab is under active development and remains pre-1.0. Interfaces and venue support may change between releases. Review the [release notes](https://docs.marketlab.sh/changelog) before upgrading a machine that runs live jobs.
 
 Bug reports and focused pull requests are welcome. Include the command, version, venue or provider, expected behavior, and sanitized logs when reporting an issue. Never post credentials or wallet keys.
 
