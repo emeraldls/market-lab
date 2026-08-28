@@ -143,10 +143,10 @@ async fn resolve_notebook_dependencies(
 }
 
 fn find_jupyter(runtime: &PythonRuntime) -> Option<JupyterCommand> {
-    if let Some(directory) = runtime.interpreter.parent() {
-        if let Some(command) = jupyter_command_at(directory.join("jupyter-lab")) {
-            return Some(command);
-        }
+    if let Some(directory) = runtime.interpreter.parent()
+        && let Some(command) = jupyter_command_at(directory.join("jupyter-lab"))
+    {
+        return Some(command);
     }
     if let Some(program) = find_on_path("jupyter-lab") {
         return jupyter_command_at(program);
