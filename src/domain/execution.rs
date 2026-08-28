@@ -359,6 +359,10 @@ mod tests {
             serde_json::to_value(ExecutionVenue::Hyperlink).expect("HyperLink venue serializes");
         assert_eq!(hyperlink, serde_json::json!("hyperlinkf"));
 
+        let hyperlink_spot = serde_json::to_value(ExecutionVenue::HyperlinkSpot)
+            .expect("HyperLink Spot venue serializes");
+        assert_eq!(hyperlink_spot, serde_json::json!("hyperlink"));
+
         let spot = serde_json::to_value(ExecutionVenue::HyperliquidSpot).expect("venue serializes");
         assert_eq!(spot, serde_json::json!("hyperliquid"));
 

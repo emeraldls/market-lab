@@ -88,25 +88,46 @@ impl HyperliquidExecutionAdapter {
         }
     }
 
+    pub fn capabilities_for_route(&self) -> VenueCapabilities {
+        let mut capabilities = Self::capabilities_for(self.product);
+        capabilities.venue = self.venue();
+        capabilities
+    }
+
     pub async fn new(network: HyperliquidNetwork) -> Result<Self> {
         Self::new_for(HyperliquidProduct::Perpetual, network).await
     }
 
     pub async fn new_hyperlink() -> Result<Self> {
-        Self::with_hyperlink_credential(credentials::active_hyperlink_credential()?).await
+        Self::new_hyperlink_for(HyperliquidProduct::Perpetual).await
+    }
+
+    pub async fn new_hyperlink_for(product: HyperliquidProduct) -> Result<Self> {
+        Self::with_hyperlink_credential_for(credentials::active_hyperlink_credential()?, product)
+            .await
     }
 
     pub async fn with_hyperlink_credential(
         credential: ActiveHyperliquidCredential,
     ) -> Result<Self> {
+        Self::with_hyperlink_credential_for(credential, HyperliquidProduct::Perpetual).await
+    }
+
+    pub async fn with_hyperlink_credential_for(
+        credential: ActiveHyperliquidCredential,
+        product: HyperliquidProduct,
+    ) -> Result<Self> {
         if credential.vault_address.is_some() {
             bail!("HyperLink subaccounts are not supported");
+        }
+        if product == HyperliquidProduct::Outcome {
+            bail!("HyperLink does not support outcome-market execution");
         }
         Ok(Self {
             exchange: HyperliquidExchangeClient::for_hyperlink(credential.agent)?,
             account: credential.account,
             network: HyperliquidNetwork::Mainnet,
-            product: HyperliquidProduct::Perpetual,
+            product,
             route: ExecutionRoute::Hyperlink,
         })
     }
@@ -162,8 +183,7 @@ impl HyperliquidExecutionAdapter {
         account: &str,
         symbol: &str,
     ) -> Result<AccountSnapshot> {
-        if self.product != HyperliquidProduct::Perpetual || self.route == ExecutionRoute::Hyperlink
-        {
+        if self.product != HyperliquidProduct::Perpetual {
             return self.account_snapshot(account).await;
         }
         let dex = super::perpetual_dex(symbol)?;
@@ -187,9 +207,13 @@ impl HyperliquidExecutionAdapter {
         });
         attach_dex(&mut request, dex);
         let raw: ClearinghouseState = if self.route == ExecutionRoute::Hyperlink {
+            ensure_account(account, &self.account)?;
             serde_json::from_value(
                 self.exchange
-                    .signed_read(serde_json::json!({ "type": "clearinghouseState", "dex": "" }))
+                    .signed_read(serde_json::json!({
+                        "type": "clearinghouseState",
+                        "dex": dex.unwrap_or_default()
+                    }))
                     .await?,
             )
             .context("HyperLink clearinghouseState returned an unexpected payload")?
@@ -207,7 +231,7 @@ impl HyperliquidExecutionAdapter {
             .collect::<Result<Vec<_>>>()?;
         if self.route == ExecutionRoute::Hyperlink {
             for position in &mut positions {
-                position.venue = ExecutionVenue::Hyperlink;
+                position.venue = self.venue();
             }
         }
         let unrealized_pnl = positions
@@ -251,16 +275,26 @@ impl HyperliquidExecutionAdapter {
     }
 
     async fn spot_account_snapshot(&self, account: &str) -> Result<AccountSnapshot> {
-        let raw: SpotClearinghouseState = HyperliquidClient::for_network(self.network)?
-            .info(&serde_json::json!({
-                "type": "spotClearinghouseState",
-                "user": account
-            }))
-            .await?;
+        let raw: SpotClearinghouseState = if self.route == ExecutionRoute::Hyperlink {
+            ensure_account(account, &self.account)?;
+            serde_json::from_value(
+                self.exchange
+                    .signed_read(serde_json::json!({ "type": "spotClearinghouseState" }))
+                    .await?,
+            )
+            .context("HyperLink spotClearinghouseState returned an unexpected payload")?
+        } else {
+            HyperliquidClient::for_network(self.network)?
+                .info(&serde_json::json!({
+                    "type": "spotClearinghouseState",
+                    "user": account
+                }))
+                .await?
+        };
         let balances = raw
             .balances
             .into_iter()
-            .map(|balance| normalize_spot_balance(self.network, balance))
+            .map(|balance| normalize_spot_balance(self.venue(), self.network, balance))
             .collect::<Result<Vec<_>>>()?;
         let quote = balances.iter().find(|balance| balance.asset == "USDT");
         Ok(AccountSnapshot {
@@ -404,7 +438,7 @@ impl HyperliquidExecutionAdapter {
     const fn venue(&self) -> ExecutionVenue {
         match self.route {
             ExecutionRoute::Hyperliquid => venue_for_product(self.product),
-            ExecutionRoute::Hyperlink => ExecutionVenue::Hyperlink,
+            ExecutionRoute::Hyperlink => hyperlink_venue_for_product(self.product),
         }
     }
 
@@ -417,8 +451,7 @@ impl HyperliquidExecutionAdapter {
         account: &str,
         symbol: &str,
     ) -> Result<Vec<OpenOrder>> {
-        if self.product != HyperliquidProduct::Perpetual || self.route == ExecutionRoute::Hyperlink
-        {
+        if self.product != HyperliquidProduct::Perpetual {
             return self.open_orders(account).await;
         }
         let dex = super::perpetual_dex(symbol)?;
@@ -430,7 +463,10 @@ impl HyperliquidExecutionAdapter {
             ensure_account(account, &self.account)?;
             serde_json::from_value(
                 self.exchange
-                    .signed_read(serde_json::json!({ "type": "openOrders", "dex": "" }))
+                    .signed_read(serde_json::json!({
+                        "type": "openOrders",
+                        "dex": dex.unwrap_or_default()
+                    }))
                     .await?,
             )
             .context("HyperLink openOrders returned an unexpected payload")?
@@ -450,7 +486,7 @@ impl HyperliquidExecutionAdapter {
             .collect::<Result<Vec<_>>>()?;
         if self.route == ExecutionRoute::Hyperlink {
             for order in &mut orders {
-                order.venue = ExecutionVenue::Hyperlink;
+                order.venue = self.venue();
             }
         }
         Ok(orders)
@@ -479,7 +515,7 @@ impl HyperliquidExecutionAdapter {
             .collect::<Result<Vec<_>>>()?;
         if self.route == ExecutionRoute::Hyperlink {
             for fill in &mut fills {
-                fill.venue = ExecutionVenue::Hyperlink;
+                fill.venue = self.venue();
             }
         }
         Ok(fills)
@@ -862,7 +898,7 @@ impl HyperliquidExecutionAdapter {
                 }
             }
         }?;
-        if self.route == ExecutionRoute::Hyperlink {
+        if self.route == ExecutionRoute::Hyperlink && self.product.is_perpetual() {
             resolved.max_leverage = self
                 .hyperlink_asset_max_leverage(symbol, resolved.asset)
                 .await?;
@@ -1410,6 +1446,16 @@ const fn venue_for_product(product: HyperliquidProduct) -> ExecutionVenue {
     }
 }
 
+const fn hyperlink_venue_for_product(product: HyperliquidProduct) -> ExecutionVenue {
+    match product {
+        HyperliquidProduct::Spot => ExecutionVenue::HyperlinkSpot,
+        HyperliquidProduct::Perpetual => ExecutionVenue::Hyperlink,
+        HyperliquidProduct::Outcome => {
+            panic!("HyperLink does not support outcome-market execution")
+        }
+    }
+}
+
 fn attach_dex(request: &mut serde_json::Value, dex: Option<&str>) {
     if let Some(dex) = dex
         && let Some(request) = request.as_object_mut()
@@ -1422,6 +1468,7 @@ fn attach_dex(request: &mut serde_json::Value, dex: Option<&str>) {
 }
 
 fn normalize_spot_balance(
+    venue: ExecutionVenue,
     network: HyperliquidNetwork,
     balance: HyperliquidSpotBalance,
 ) -> Result<SpotBalance> {
@@ -1436,7 +1483,7 @@ fn normalize_spot_balance(
     let total = parse(&balance.total, "spot balance total")?;
     let held = parse(&balance.hold, "spot balance hold")?;
     Ok(SpotBalance {
-        venue: ExecutionVenue::HyperliquidSpot,
+        venue,
         asset,
         venue_asset,
         token_index,
@@ -1632,10 +1679,23 @@ impl HyperliquidAssetPosition {
         network: HyperliquidNetwork,
     ) -> Result<Position> {
         let signed_size = self.position.size()?;
+        let notional = parse(&self.position.position_value, "position value")?.abs();
         let market = markets::market_for_wire(product, network, &self.position.coin).ok();
-        let mark = marks.get(&self.position.coin).copied().unwrap_or_default();
+        let mark = marks
+            .get(&self.position.coin)
+            .copied()
+            .or_else(|| (signed_size != 0.0).then_some(notional / signed_size.abs()))
+            .unwrap_or_default();
         let internal_symbol = market.as_ref().map_or_else(
-            || self.position.coin.to_ascii_uppercase(),
+            || {
+                if product == HyperliquidProduct::Perpetual {
+                    super::parse_perpetual_symbol(&self.position.coin)
+                        .map(|symbol| symbol.canonical)
+                        .unwrap_or_else(|_| self.position.coin.to_ascii_uppercase())
+                } else {
+                    self.position.coin.to_ascii_uppercase()
+                }
+            },
             |market| market.symbol.clone(),
         );
         Ok(Position {
@@ -1655,7 +1715,7 @@ impl HyperliquidAssetPosition {
                 .as_deref()
                 .map_or(Ok(0.0), |value| parse(value, "entry price"))?,
             mark_price: mark,
-            notional: parse(&self.position.position_value, "position value")?.abs(),
+            notional,
             realized_pnl: 0.0,
             unrealized_pnl: parse(&self.position.unrealized_pnl, "unrealized PnL")?,
             leverage: f64::from(self.position.leverage.value),
@@ -1669,6 +1729,49 @@ impl HyperliquidAssetPosition {
             maintenance_margin: 0.0,
         })
     }
+}
+
+pub(crate) fn all_dex_account_event_positions(
+    product: HyperliquidProduct,
+    network: HyperliquidNetwork,
+    value: &serde_json::Value,
+) -> Result<Option<Vec<Position>>> {
+    if value.get("channel").and_then(serde_json::Value::as_str) != Some("allDexsClearinghouseState")
+    {
+        return Ok(None);
+    }
+    if product != HyperliquidProduct::Perpetual {
+        bail!("allDexsClearinghouseState is only valid for perpetual execution");
+    }
+    let states = value
+        .pointer("/data/clearinghouseStates")
+        .and_then(serde_json::Value::as_array)
+        .context("Hyperliquid allDexsClearinghouseState omitted clearinghouseStates")?;
+    let mut positions = Vec::new();
+    for entry in states {
+        let entry = entry
+            .as_array()
+            .context("Hyperliquid clearinghouse-state entry must be [dex, state]")?;
+        if entry.len() != 2 {
+            bail!("Hyperliquid clearinghouse-state entry must contain exactly two values");
+        }
+        let dex = entry[0]
+            .as_str()
+            .context("Hyperliquid clearinghouse-state dex must be a string")?
+            .to_ascii_lowercase();
+        let state: ClearinghouseState = serde_json::from_value(entry[1].clone())
+            .context("Hyperliquid clearinghouse-state update returned an unexpected payload")?;
+        for mut asset in state.asset_positions {
+            if asset.position.size()? == 0.0 {
+                continue;
+            }
+            if !dex.is_empty() && !asset.position.coin.contains(':') {
+                asset.position.coin = format!("{dex}:{}", asset.position.coin);
+            }
+            positions.push(asset.into_position(&HashMap::new(), product, network)?);
+        }
+    }
+    Ok(Some(positions))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2050,6 +2153,7 @@ mod tests {
     #[test]
     fn spot_balances_are_distinct_from_perpetual_positions() {
         let balance = normalize_spot_balance(
+            ExecutionVenue::HyperliquidSpot,
             HyperliquidNetwork::Mainnet,
             HyperliquidSpotBalance {
                 coin: "UBTC".to_string(),

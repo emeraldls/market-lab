@@ -6,7 +6,9 @@ use serde_json::Value;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::domain::execution::ExecutionVenue;
 use crate::providers::hyperliquid::HyperliquidNetwork;
+use crate::providers::hyperliquid::HyperliquidProduct;
 use crate::providers::hyperliquid::exchange::next_nonce;
 use crate::providers::hyperliquid::signing::HyperliquidWallet;
 
@@ -20,14 +22,30 @@ pub struct HyperlinkAccountStream {
 }
 
 impl HyperlinkAccountStream {
-    pub async fn connect(account: &str, wallet: &HyperliquidWallet) -> Result<Self> {
+    pub async fn connect(
+        venue: ExecutionVenue,
+        account: &str,
+        wallet: &HyperliquidWallet,
+    ) -> Result<Self> {
         let (mut stream, _) = connect_async(super::WS_URL)
             .await
             .context("failed to connect to HyperLink account WebSocket")?;
-        for subscription in [
+        let product = HyperliquidProduct::from_venue(venue.market_data_id())?;
+        let mut subscriptions = vec![
             serde_json::json!({ "type": "orderUpdates", "user": account }),
             serde_json::json!({ "type": "userFills", "user": account }),
-        ] {
+        ];
+        match product {
+            HyperliquidProduct::Perpetual => subscriptions
+                .push(serde_json::json!({ "type": "allDexsClearinghouseState", "user": account })),
+            HyperliquidProduct::Spot => {
+                subscriptions.push(serde_json::json!({ "type": "spotState", "user": account }))
+            }
+            HyperliquidProduct::Outcome => {
+                bail!("HyperLink does not support outcome-market account streams")
+            }
+        }
+        for subscription in subscriptions {
             let nonce = next_nonce()?;
             let signature =
                 wallet.sign_l1_action(&subscription, nonce, HyperliquidNetwork::Mainnet)?;
@@ -103,6 +121,7 @@ fn normalize_account_event(value: Value) -> Result<Option<Value>> {
                 "data": { "fills": fills },
             })))
         }
+        Some("allDexsClearinghouseState" | "spotState") => Ok(Some(value)),
         Some("error") => bail!("HyperLink account WebSocket error: {value}"),
         Some("pong" | "subscriptionResponse") | None => Ok(None),
         Some(_) => Ok(None),
@@ -142,5 +161,21 @@ mod tests {
                 .expect("runtime event"),
             input
         );
+    }
+
+    #[test]
+    fn preserves_hyperlink_product_state_updates() {
+        for channel in ["allDexsClearinghouseState", "spotState"] {
+            let input = serde_json::json!({
+                "channel": channel,
+                "data": { "user": "0xabc" }
+            });
+            assert_eq!(
+                normalize_account_event(input.clone())
+                    .expect("valid state update")
+                    .expect("runtime event"),
+                input
+            );
+        }
     }
 }

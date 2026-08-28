@@ -16,7 +16,7 @@ use crate::markets::Market;
 use crate::providers::execution::ExecutionAdapter;
 use crate::providers::hyperliquid::{HyperliquidNetwork, MARKET_ORDER_SLIPPAGE};
 use crate::providers::market_data::MarketDataAdapter;
-use crate::venues::{NetworkPolicy, VenueMarket};
+use crate::venues::{ExecutionBackend, NetworkPolicy, VenueMarket};
 
 const HYPERLINK_RECONCILIATION_ATTEMPTS: usize = 3;
 const HYPERLINK_RECONCILIATION_DELAY: Duration = Duration::from_millis(250);
@@ -98,7 +98,7 @@ async fn reconcile_post_trade_state(
             };
         }
     };
-    let attempts = if plan.venue == ExecutionVenue::Hyperlink {
+    let attempts = if plan.venue.execution_backend() == ExecutionBackend::Hyperlink {
         HYPERLINK_RECONCILIATION_ATTEMPTS
     } else {
         1
@@ -565,6 +565,7 @@ async fn build_trade_plan_with_price_normalization(
     }
     if venue.is_spot() {
         validate_spot_funds(
+            venue,
             args.testnet,
             &account,
             &market,
@@ -734,6 +735,7 @@ fn normalize_hyperliquid_price(
 }
 
 async fn validate_spot_funds(
+    venue: ExecutionVenue,
     testnet: bool,
     account: &str,
     market: &Market,
@@ -741,7 +743,7 @@ async fn validate_spot_funds(
     size: f64,
     execution_price: f64,
 ) -> Result<()> {
-    let snapshot = ExecutionAdapter::new(ExecutionVenue::HyperliquidSpot, testnet)
+    let snapshot = ExecutionAdapter::new(venue, testnet)
         .await?
         .account_snapshot(account)
         .await?;
@@ -758,7 +760,8 @@ async fn validate_spot_funds(
     let tolerance = 1e-12_f64.max(required.abs() * 1e-12);
     if available + tolerance < required {
         bail!(
-            "insufficient Hyperliquid spot {venue_asset} balance: {available:.8} available, {required:.8} {unit} amount required"
+            "insufficient {} {venue_asset} balance: {available:.8} available, {required:.8} {unit} amount required",
+            venue.label()
         );
     }
     Ok(())
@@ -875,7 +878,7 @@ fn validate_market_rules(venue: ExecutionVenue, market: &Market, args: &TradeArg
         );
     }
     if !venue.is_perpetual() && args.leverage.is_some() {
-        bail!("--leverage is not supported for Hyperliquid spot or outcome markets");
+        bail!("--leverage is not supported for {}", venue.label());
     }
     let leverage = args.leverage.unwrap_or(1.0);
     if leverage > f64::from(rules.max_leverage) {
@@ -894,11 +897,12 @@ fn validate_market_rules(venue: ExecutionVenue, market: &Market, args: &TradeArg
     }
     if !venue.is_perpetual() {
         if args.reduce_only {
-            bail!("Hyperliquid spot and outcome orders do not support --reduce-only");
+            bail!("{} orders do not support --reduce-only", venue.label());
         }
         if args.sl.is_some() || args.tp.is_some() {
             bail!(
-                "Hyperliquid spot and outcome markets do not support attached --sl or --tp orders"
+                "{} does not support attached --sl or --tp orders",
+                venue.label()
             );
         }
     }

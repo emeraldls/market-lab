@@ -2189,6 +2189,13 @@ def on_data(ctx):
         "position": "open-short",
         "margin": 10,
     })
+    ctx.order({
+        "exchange": "hyperlink",
+        "symbol": "HYPE/USDC",
+        "side": "buy",
+        "size": 1,
+        "price": 44,
+    })
 "#,
             "execution-venues",
         );
@@ -2200,7 +2207,11 @@ def on_data(ctx):
         let script = Script::load(&path).expect("load Python script");
         assert_eq!(
             script.execution_venues(),
-            [ExecutionVenue::Hyperlink, ExecutionVenue::Hyperliquid]
+            [
+                ExecutionVenue::Hyperlink,
+                ExecutionVenue::Hyperliquid,
+                ExecutionVenue::HyperlinkSpot,
+            ]
         );
 
         let _ = fs::remove_file(path);

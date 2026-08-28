@@ -2093,10 +2093,7 @@ impl StrategyLogsArgs {
 
 impl RunTwapArgs {
     pub fn validate(&self) -> Result<()> {
-        if matches!(
-            self.venue,
-            ExecutionVenueArg::HyperliquidSpot | ExecutionVenueArg::HyperliquidOutcomes
-        ) {
+        if !self.venue.is_perpetual() {
             bail!("TWAP does not support spot or outcome-market execution");
         }
         validate_execution_symbol(self.venue, &self.symbol)?;
@@ -2201,10 +2198,7 @@ impl RunVwapArgs {
 
 impl RunOiwapArgs {
     pub fn validate(&self) -> Result<()> {
-        if matches!(
-            self.venue,
-            ExecutionVenueArg::HyperliquidSpot | ExecutionVenueArg::HyperliquidOutcomes
-        ) {
+        if !self.venue.is_perpetual() {
             bail!("OIWAP does not support spot or outcome-market execution");
         }
         validate_execution_symbol(self.venue, &self.symbol)?;
@@ -2254,7 +2248,7 @@ impl RunOiwapArgs {
 
 impl RunMidPriceArgs {
     pub fn validate(&self) -> Result<()> {
-        if self.venue == ExecutionVenueArg::HyperliquidSpot {
+        if self.venue.is_spot() {
             bail!("market-making bots do not support spot execution");
         }
         validate_bot_execution_symbol(self.venue, &self.symbol)?;
@@ -2336,7 +2330,7 @@ impl RunVolumeMidArgs {
 
 impl RunGridArgs {
     pub fn validate(&self) -> Result<()> {
-        if self.venue == ExecutionVenueArg::HyperliquidSpot {
+        if self.venue.is_spot() {
             bail!("grid does not support spot execution");
         }
         validate_bot_execution_symbol(self.venue, &self.symbol)?;
@@ -3028,6 +3022,30 @@ mod tests {
                 assert_eq!(args.venue, ExecutionVenueArg::Hyperlink);
             }
             _ => panic!("expected HyperLink trade command"),
+        }
+
+        let spot = Cli::try_parse_from([
+            "mlab",
+            "trade",
+            "long",
+            "HYPE/USDC",
+            "--venue",
+            "hyperlink",
+            "--margin",
+            "100",
+            "--dry-run",
+        ])
+        .expect("HyperLink Spot trade should parse");
+        match spot.command {
+            Commands::Trade {
+                command: TradeCommands::Long(args),
+            } => {
+                args.validate_shape()
+                    .expect("HyperLink Spot trade validates");
+                assert_eq!(args.venue, ExecutionVenueArg::HyperlinkSpot);
+                assert!(args.leverage.is_none());
+            }
+            _ => panic!("expected HyperLink Spot trade command"),
         }
 
         let testnet = Cli::try_parse_from([

@@ -25,6 +25,8 @@ impl VenueId {
     #[allow(non_upper_case_globals)]
     pub const Hyperlink: Self = Self::from_static("hyperlinkf");
     #[allow(non_upper_case_globals)]
+    pub const HyperlinkSpot: Self = Self::from_static("hyperlink");
+    #[allow(non_upper_case_globals)]
     pub const HyperliquidSpot: Self = Self::from_static("hyperliquid");
     #[allow(non_upper_case_globals)]
     pub const HyperliquidOutcomes: Self = Self::from_static("hyperliquid-outcomes");
@@ -248,6 +250,7 @@ impl VenueSpec {
             VenueId::Bulk => "BULK".to_string(),
             VenueId::Hyperliquid => "Hyperliquid".to_string(),
             VenueId::Hyperlink => "HyperLink".to_string(),
+            VenueId::HyperlinkSpot => "HyperLink Spot".to_string(),
             VenueId::HyperliquidSpot => "Hyperliquid Spot".to_string(),
             VenueId::HyperliquidOutcomes => "Hyperliquid Outcomes".to_string(),
             _ => self.id.to_string(),
@@ -303,6 +306,15 @@ const HYPERLINK: VenueSpec = VenueSpec {
     market_data_venue: VenueId::Hyperliquid,
 };
 
+const HYPERLINK_SPOT: VenueSpec = VenueSpec {
+    id: VenueId::HyperlinkSpot,
+    execution: ExecutionBackend::Hyperlink,
+    auth: AuthBackend::Hyperlink,
+    market: VenueMarket::Spot,
+    network: NetworkPolicy::MainnetOnly,
+    market_data_venue: VenueId::HyperliquidSpot,
+};
+
 const HYPERLIQUID_SPOT: VenueSpec = VenueSpec {
     id: VenueId::HyperliquidSpot,
     execution: ExecutionBackend::Hyperliquid,
@@ -325,6 +337,7 @@ pub const BUILTIN_VENUES: &[VenueSpec] = &[
     BULK,
     HYPERLIQUID,
     HYPERLINK,
+    HYPERLINK_SPOT,
     HYPERLIQUID_SPOT,
     HYPERLIQUID_OUTCOMES,
 ];
@@ -357,6 +370,12 @@ mod tests {
         let spec = resolve(VenueId::Hyperlink).expect("HyperLink is registered");
         assert_eq!(spec.execution, ExecutionBackend::Hyperlink);
         assert_eq!(spec.market_data_venue, VenueId::Hyperliquid);
+
+        let spot = resolve(VenueId::HyperlinkSpot).expect("HyperLink Spot is registered");
+        assert_eq!(spot.execution, ExecutionBackend::Hyperlink);
+        assert_eq!(spot.auth, AuthBackend::Hyperlink);
+        assert_eq!(spot.market, VenueMarket::Spot);
+        assert_eq!(spot.market_data_venue, VenueId::HyperliquidSpot);
     }
 
     #[test]

@@ -2445,13 +2445,22 @@ mod tests {
 
     #[test]
     fn hyperlink_execution_uses_hyperliquid_public_price_references() {
-        let references = BTreeMap::from([(
-            execution_reference_key("hyperliquidf", "BTC"),
-            LiveExecutionReference {
-                price: 65_000.0,
-                timestamp_ms: 1,
-            },
-        )]);
+        let references = BTreeMap::from([
+            (
+                execution_reference_key("hyperliquidf", "BTC"),
+                LiveExecutionReference {
+                    price: 65_000.0,
+                    timestamp_ms: 1,
+                },
+            ),
+            (
+                execution_reference_key("hyperliquid", "HYPE/USDC"),
+                LiveExecutionReference {
+                    price: 44.0,
+                    timestamp_ms: 2,
+                },
+            ),
+        ]);
 
         assert_eq!(
             script_execution_reference(Some(ExecutionVenue::Hyperlink), "BTC", &references),
@@ -2460,6 +2469,18 @@ mod tests {
         assert_eq!(
             live_execution_exchange(ExecutionVenue::Hyperlink),
             "hyperlinkf"
+        );
+        assert_eq!(
+            script_execution_reference(
+                Some(ExecutionVenue::HyperlinkSpot),
+                "HYPE/USDC",
+                &references,
+            ),
+            Some(44.0)
+        );
+        assert_eq!(
+            live_execution_exchange(ExecutionVenue::HyperlinkSpot),
+            "hyperlink"
         );
     }
 }

@@ -207,7 +207,7 @@ impl ExecutionProvider for BulkExecutionAdapter {
 #[async_trait]
 impl ExecutionProvider for HyperliquidExecutionAdapter {
     fn venue_capabilities(&self) -> VenueCapabilities {
-        Self::capabilities()
+        self.capabilities_for_route()
     }
 
     fn validate_order_id(&self, order_id: &str) -> Result<()> {
@@ -483,16 +483,17 @@ impl ExecutionProviderFactory for HyperliquidFactory {
 
 #[async_trait]
 impl ExecutionProviderFactory for HyperlinkFactory {
-    fn capabilities(&self, _venue: ExecutionVenue) -> VenueCapabilities {
-        VenueCapabilities {
-            venue: ExecutionVenue::Hyperlink,
-            ..HyperliquidExecutionAdapter::capabilities()
-        }
+    fn capabilities(&self, venue: ExecutionVenue) -> VenueCapabilities {
+        let product = HyperliquidProduct::from_venue(venue.market_data_id())
+            .expect("registered HyperLink venue has a market-data product");
+        let mut capabilities = HyperliquidExecutionAdapter::capabilities_for(product);
+        capabilities.venue = venue;
+        capabilities
     }
 
     async fn adapter(
         &self,
-        _venue: ExecutionVenue,
+        venue: ExecutionVenue,
         testnet: bool,
         account_name: &str,
     ) -> Result<Box<dyn ExecutionProvider>> {
@@ -503,13 +504,16 @@ impl ExecutionProviderFactory for HyperlinkFactory {
             bail!("HyperLink subaccounts are not supported");
         }
         Ok(Box::new(
-            HyperliquidExecutionAdapter::new_hyperlink().await?,
+            HyperliquidExecutionAdapter::new_hyperlink_for(HyperliquidProduct::from_venue(
+                venue.market_data_id(),
+            )?)
+            .await?,
         ))
     }
 
     async fn account_stream(
         &self,
-        _venue: ExecutionVenue,
+        venue: ExecutionVenue,
         _testnet: bool,
         account: &str,
     ) -> Result<Box<dyn AccountEvents>> {
@@ -518,7 +522,7 @@ impl ExecutionProviderFactory for HyperlinkFactory {
             bail!("HyperLink stream account does not match the configured account");
         }
         Ok(Box::new(
-            HyperlinkAccountStream::connect(account, &credential.agent).await?,
+            HyperlinkAccountStream::connect(venue, account, &credential.agent).await?,
         ))
     }
 
@@ -762,6 +766,24 @@ fn normalize_hyperliquid_runtime_updates(
                     );
                 }
                 updates.push(AccountRuntimeUpdate::ScriptEvent(normalized));
+            }
+        }
+        Some("allDexsClearinghouseState") => {
+            let product = HyperliquidProduct::from_venue(venue.market_data_id())?;
+            if let Some(mut positions) =
+                crate::providers::hyperliquid::execution::all_dex_account_event_positions(
+                    product,
+                    HyperliquidNetwork::from_testnet(testnet),
+                    data,
+                )?
+            {
+                for position in &mut positions {
+                    position.venue = venue;
+                }
+                updates.push(AccountRuntimeUpdate::Positions {
+                    positions,
+                    incremental: false,
+                });
             }
         }
         _ => {}
@@ -1079,10 +1101,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hyperlink_capabilities_follow_the_registered_product() {
+        let perpetual = ExecutionAdapter::capabilities(ExecutionVenue::Hyperlink);
+        assert_eq!(perpetual.venue, ExecutionVenue::Hyperlink);
+        assert!(perpetual.reduce_only);
+        assert!(perpetual.integer_leverage);
+
+        let spot = ExecutionAdapter::capabilities(ExecutionVenue::HyperlinkSpot);
+        assert_eq!(spot.venue, ExecutionVenue::HyperlinkSpot);
+        assert!(!spot.reduce_only);
+        assert!(!spot.integer_leverage);
+        assert!(!spot.configure_leverage_before_orders);
+    }
+
+    #[test]
+    fn hyperlink_hip3_state_replaces_positions_across_dexes() {
+        let event = serde_json::json!({
+            "channel": "allDexsClearinghouseState",
+            "data": {
+                "user": "0xabc",
+                "clearinghouseStates": [[
+                    "xyz",
+                    {
+                        "marginSummary": {
+                            "accountValue": "1000",
+                            "totalNtlPos": "2000",
+                            "totalMarginUsed": "200"
+                        },
+                        "withdrawable": "800",
+                        "assetPositions": [{
+                            "position": {
+                                "coin": "TSLA",
+                                "entryPx": "190",
+                                "leverage": { "type": "cross", "value": 10 },
+                                "liquidationPx": "100",
+                                "positionValue": "2000",
+                                "szi": "10",
+                                "unrealizedPnl": "100",
+                                "cumFunding": { "sinceOpen": "-1" }
+                            }
+                        }],
+                        "time": 1_785_000_000_000_u64
+                    }
+                ]]
+            }
+        });
+
+        let updates =
+            normalize_hyperliquid_runtime_updates(ExecutionVenue::Hyperlink, false, &event)
+                .expect("valid HyperLink all-dex state");
+        let AccountRuntimeUpdate::Positions {
+            positions,
+            incremental,
+        } = &updates[0]
+        else {
+            panic!("expected a position snapshot");
+        };
+        assert!(!incremental);
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].venue, ExecutionVenue::Hyperlink);
+        assert_eq!(positions[0].internal_symbol, "xyz:TSLA");
+        assert_eq!(positions[0].venue_symbol, "xyz:TSLA");
+        assert_eq!(positions[0].mark_price, 200.0);
+    }
+
+    #[test]
     fn execution_transport_selection_is_targeted_and_deduplicated() {
         assert_eq!(
             execution_transports(&[
                 ExecutionVenue::Hyperlink,
+                ExecutionVenue::HyperlinkSpot,
                 ExecutionVenue::Hyperliquid,
                 ExecutionVenue::Hyperliquid,
             ]),
