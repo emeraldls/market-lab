@@ -4,13 +4,22 @@ use anyhow::{Context, Result, bail};
 use dialoguer::{FuzzySelect, Select, theme::ColorfulTheme};
 
 use crate::cli::{CliDataProvider, MarketsArgs};
-use crate::markets::{ExchangeMarkets, Market, MarketSnapshot};
 use crate::markets::outcomes::{OutcomeInstrument, parse_symbol};
-use crate::providers::hyperliquid::{HyperliquidNetwork, OUTCOMES_EXCHANGE};
+use crate::markets::{ExchangeMarkets, Market, MarketSnapshot};
+use crate::providers::hyperliquid::{HyperliquidNetwork, SPOT_EXCHANGE};
 
 pub async fn handle(args: MarketsArgs) -> Result<()> {
     args.validate()?;
-    if args.provider.is_none() && args.exchange.eq_ignore_ascii_case(OUTCOMES_EXCHANGE) {
+    let outcome_request = args.provider.is_none()
+        && args.exchange.eq_ignore_ascii_case(SPOT_EXCHANGE)
+        && (args.symbol.is_none()
+            || args
+                .symbol
+                .as_deref()
+                .is_some_and(crate::markets::outcomes::looks_like_symbol)
+            || args.search.is_some()
+            || args.deployer.is_some());
+    if outcome_request {
         return handle_outcomes(args).await;
     }
     if args.refresh {
@@ -42,7 +51,7 @@ pub async fn handle(args: MarketsArgs) -> Result<()> {
 async fn handle_outcomes(args: MarketsArgs) -> Result<()> {
     if args.refresh {
         anyhow::bail!(
-            "hyperliquid-outcomes is discovered live; --refresh is unnecessary and no static snapshot is written"
+            "Hyperliquid outcomes are discovered live; --refresh is unnecessary and no static snapshot is written"
         );
     }
     let network = HyperliquidNetwork::from_testnet(args.testnet);
@@ -181,9 +190,7 @@ fn outcome_search_text(instrument: &OutcomeInstrument) -> String {
     .to_ascii_lowercase()
 }
 
-pub async fn select_outcome_interactive(
-    network: HyperliquidNetwork,
-) -> Result<OutcomeInstrument> {
+pub async fn select_outcome_interactive(network: HyperliquidNetwork) -> Result<OutcomeInstrument> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("outcome selection needs an interactive terminal; pass a symbol such as `1001:0`");
     }

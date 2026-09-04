@@ -1914,7 +1914,10 @@ fn normalized_market_identity(
         return crate::markets::outcomes::parse_wire_symbol(coin)
             .ok()
             .map(|(outcome, side)| {
-                (crate::markets::outcomes::canonical_symbol(outcome, side), true)
+                (
+                    crate::markets::outcomes::canonical_symbol(outcome, side),
+                    true,
+                )
             });
     }
     markets::market_for_wire(product, network, coin)

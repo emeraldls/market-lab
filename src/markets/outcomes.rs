@@ -10,7 +10,7 @@ use super::{ExecutionRules, Market, NetworkMarket};
 use crate::providers::hyperliquid::outcomes::{
     OutcomeMetadata, OutcomeSpec, OutcomeTemplate, OutcomeTemplateRole, QuestionSpec,
 };
-use crate::providers::hyperliquid::{HyperliquidNetwork, OUTCOMES_EXCHANGE};
+use crate::providers::hyperliquid::{HyperliquidNetwork, SPOT_EXCHANGE};
 
 pub const OUTCOME_ASSET_OFFSET: u32 = 100_000_000;
 pub const OUTCOME_MIN_NOTIONAL: f64 = 10.0;
@@ -141,7 +141,7 @@ pub fn instruments_from_metadata(
         for side in 0_u8..=1 {
             let encoding = encoding(outcome.outcome, side)?;
             instruments.push(OutcomeInstrument {
-                exchange: OUTCOMES_EXCHANGE.to_string(),
+                exchange: SPOT_EXCHANGE.to_string(),
                 network: network.label().to_string(),
                 symbol: canonical_symbol(outcome.outcome, side),
                 question_id: parent.map(|question| question.question),
@@ -523,6 +523,14 @@ pub fn parse_market_id(symbol: &str) -> Result<u32> {
     value
         .parse::<u32>()
         .context("outcome market ID must be numeric, e.g. 10225")
+}
+
+pub fn looks_like_symbol(symbol: &str) -> bool {
+    let value = symbol.trim();
+    value.parse::<u32>().is_ok()
+        || value
+            .split_once(':')
+            .is_some_and(|(outcome, _)| outcome.parse::<u32>().is_ok())
 }
 
 pub fn parse_symbol(symbol: &str) -> Result<(u32, u8)> {

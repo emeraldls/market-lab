@@ -87,7 +87,7 @@ async fn handle_mmt(args: SourceOiArgs) -> Result<()> {
 
 async fn handle_direct(args: SourceOiArgs) -> Result<()> {
     let exchange = args.exchange_name()?.to_string();
-    let adapter = MarketDataAdapter::for_exchange(&exchange, false)?;
+    let adapter = MarketDataAdapter::for_exchange_market(&exchange, false, &args.symbol)?;
     if args.stream {
         if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("stream mode currently supports only --output terminal|json|jsonl");
@@ -232,7 +232,7 @@ fn parse_oi_message(value: serde_json::Value) -> Result<Option<OiCandle>> {
 }
 
 async fn stream_direct_oi(args: SourceOiArgs, exchange: &str) -> Result<()> {
-    let adapter = MarketDataAdapter::for_exchange(exchange, false)?;
+    let adapter = MarketDataAdapter::for_exchange_market(exchange, false, &args.symbol)?;
     let mut stream = VenueTickerStream::connect(exchange, &args.symbol, false).await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest = None;

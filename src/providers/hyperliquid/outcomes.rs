@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use super::client::HyperliquidClient;
 use super::HyperliquidNetwork;
+use super::client::HyperliquidClient;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]

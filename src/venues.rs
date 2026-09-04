@@ -83,11 +83,6 @@ impl VenueId {
         resolve(self)
     }
 
-    pub fn is_outcome(self) -> bool {
-        self.spec()
-            .is_ok_and(|spec| spec.market == VenueMarket::Outcome)
-    }
-
     pub fn is_spot(self) -> bool {
         self.spec()
             .is_ok_and(|spec| spec.market == VenueMarket::Spot)
@@ -249,7 +244,7 @@ impl VenueSpec {
             VenueId::Hyperliquid => "Hyperliquid".to_string(),
             VenueId::Hyperlink => "HyperLink".to_string(),
             VenueId::HyperlinkSpot => "HyperLink Spot".to_string(),
-            VenueId::HyperliquidSpot => "Hyperliquid Spot".to_string(),
+            VenueId::HyperliquidSpot => "Hyperliquid".to_string(),
             _ => self.id.to_string(),
         }
     }
@@ -342,12 +337,6 @@ pub fn resolve(venue: VenueId) -> Result<VenueSpec> {
         };
         bail!(
             "venue `{venue}` was removed; use venue `hyperliquidf` with a DEX-qualified symbol such as `{example}`"
-        );
-    }
-
-    if venue.as_str() == "hyperliquid-outcomes" {
-        bail!(
-            "execution venue `hyperliquid-outcomes` was removed; use venue `hyperliquid` with an outcome symbol such as `1001:0`"
         );
     }
 

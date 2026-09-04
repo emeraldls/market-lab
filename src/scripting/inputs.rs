@@ -334,7 +334,9 @@ fn validate_source_config(config: &SourceConfig, historical: bool) -> Result<()>
             }
         },
         ProviderKind::Direct => {
-            let adapter = MarketDataAdapter::for_exchange(&config.exchange, false)?;
+            let market_symbol = config.market_symbol();
+            let adapter =
+                MarketDataAdapter::for_exchange_market(&config.exchange, false, &market_symbol)?;
             let capabilities = adapter.capabilities();
             match &config.source {
                 ScriptSource::Candles => {
@@ -535,7 +537,9 @@ pub fn script_symbol_to_market(symbol: &str) -> String {
 }
 
 fn validate_source_market(_provider: ProviderKind, exchange: &str, symbol: &str) -> Result<()> {
-    if exchange.eq_ignore_ascii_case("hyperliquid-outcomes") {
+    if exchange.eq_ignore_ascii_case("hyperliquid")
+        && crate::markets::outcomes::looks_like_symbol(symbol)
+    {
         return crate::markets::outcomes::parse_symbol(symbol).map(|_| ());
     }
     if exchange.eq_ignore_ascii_case("hyperliquidf") {
@@ -994,37 +998,34 @@ mod tests {
             ScriptSource::Volumes,
         ]);
         let configs = parse_source_configs(&[
-            "1001:0@candles@hyperliquid-outcomes:timeframe=60".to_string(),
-            "1001:0@orderbook@hyperliquid-outcomes:depth=20".to_string(),
-            "1001:0@trades@hyperliquid-outcomes".to_string(),
-            "1001:0@vd@hyperliquid-outcomes".to_string(),
-            "1001:0@volumes@hyperliquid-outcomes:timeframe=60".to_string(),
+            "1001:0@candles@hyperliquid:timeframe=60".to_string(),
+            "1001:0@orderbook@hyperliquid:depth=20".to_string(),
+            "1001:0@trades@hyperliquid".to_string(),
+            "1001:0@vd@hyperliquid".to_string(),
+            "1001:0@volumes@hyperliquid:timeframe=60".to_string(),
         ])
         .expect("outcome selectors should preserve the side separator");
 
         validate_source_configs_for_run(&live_manifest, &configs)
             .expect("outcome live configs should validate");
         assert_eq!(
-            configs["1001:0@candles@hyperliquid-outcomes"].market_symbol(),
+            configs["1001:0@candles@hyperliquid"].market_symbol(),
             "1001:0"
         );
-        assert_eq!(
-            configs["1001:0@orderbook@hyperliquid-outcomes"].depth,
-            Some(20)
-        );
+        assert_eq!(configs["1001:0@orderbook@hyperliquid"].depth, Some(20));
 
         let historical_manifest = manifest(vec![ScriptSource::Candles, ScriptSource::Volumes]);
         validate_source_configs(
             &historical_manifest,
             &parse_source_configs(&[
-                "1001:1@candles@hyperliquid-outcomes:timeframe=60".to_string(),
-                "1001:1@volumes@hyperliquid-outcomes:timeframe=60".to_string(),
+                "1001:1@candles@hyperliquid:timeframe=60".to_string(),
+                "1001:1@volumes@hyperliquid:timeframe=60".to_string(),
             ])
             .expect("historical outcome selectors should parse"),
         )
         .expect("outcome candles and volume should support backtests");
 
-        assert!(parse_source_configs(&["1001:2@trades@hyperliquid-outcomes".to_string()]).is_err());
+        assert!(parse_source_configs(&["1001:2@trades@hyperliquid".to_string()]).is_err());
     }
 
     #[test]

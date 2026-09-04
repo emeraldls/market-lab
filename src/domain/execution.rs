@@ -368,8 +368,6 @@ mod tests {
 
         assert!(ExecutionVenue::parse("hyperliquidf-xyz").is_err());
         assert!(ExecutionVenue::parse("hyperliquidf-io").is_err());
-
-        assert!(ExecutionVenue::parse("hyperliquid-outcomes").is_err());
     }
 
     #[test]

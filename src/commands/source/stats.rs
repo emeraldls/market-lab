@@ -14,7 +14,10 @@ pub async fn handle(args: SourceStatsArgs) -> Result<()> {
 }
 
 async fn handle_direct(args: SourceStatsArgs) -> Result<()> {
-    let adapter = MarketDataAdapter::for_exchange(&args.exchange, false)?;
+    let adapter = match args.symbol.as_deref() {
+        Some(symbol) => MarketDataAdapter::for_exchange_market(&args.exchange, false, symbol)?,
+        None => MarketDataAdapter::for_exchange(&args.exchange, false)?,
+    };
     if args.stream {
         return stream_stats(args).await;
     }
@@ -76,7 +79,7 @@ async fn stream_stats(args: SourceStatsArgs) -> Result<()> {
         .symbol
         .as_deref()
         .expect("validation requires a symbol when streaming");
-    let adapter = MarketDataAdapter::for_exchange(&args.exchange, false)?;
+    let adapter = MarketDataAdapter::for_exchange_market(&args.exchange, false, symbol)?;
     let mut stream = VenueTickerStream::connect(&args.exchange, symbol, false).await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest = None;

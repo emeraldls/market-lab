@@ -507,11 +507,11 @@ impl MarketsArgs {
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
-        if self.testnet && !self.exchange.eq_ignore_ascii_case("hyperliquid-outcomes") {
-            bail!("--testnet is currently supported by markets only for hyperliquid-outcomes");
+        if self.testnet && !self.exchange.eq_ignore_ascii_case("hyperliquid") {
+            bail!("--testnet is currently supported by markets only for Hyperliquid");
         }
-        if self.deployer.is_some() && !self.exchange.eq_ignore_ascii_case("hyperliquid-outcomes") {
-            bail!("--deployer is available only for hyperliquid-outcomes");
+        if self.deployer.is_some() && !self.exchange.eq_ignore_ascii_case("hyperliquid") {
+            bail!("--deployer is available only for Hyperliquid outcome discovery");
         }
         if self
             .search
@@ -2503,7 +2503,9 @@ fn validate_source_identity(
 }
 
 fn validate_exchange_symbol(exchange: &str, symbol: &str) -> Result<()> {
-    if exchange.eq_ignore_ascii_case("hyperliquid-outcomes") {
+    if exchange.eq_ignore_ascii_case("hyperliquid")
+        && crate::markets::outcomes::looks_like_symbol(symbol)
+    {
         return crate::markets::outcomes::parse_symbol(symbol).map(|_| ());
     }
     let market_type = if crate::markets::is_futures_exchange(exchange)? {
@@ -3110,7 +3112,7 @@ mod tests {
             "source",
             "orderbook",
             "--exchange",
-            "hyperliquid-outcomes",
+            "hyperliquid",
             "--symbol",
             "1001:0",
             "--depth",
@@ -3136,7 +3138,7 @@ mod tests {
             "buy",
             "1001:1",
             "--venue",
-            "hyperliquid-outcomes",
+            "hyperliquid",
             "--size",
             "10",
             "--dry-run",
@@ -3148,7 +3150,7 @@ mod tests {
             } => {
                 args.validate_shape().expect("outcome trade validates");
                 assert_eq!(args.symbol, "1001:1");
-                assert_eq!(args.venue, ExecutionVenueArg::HyperliquidOutcomes);
+                assert_eq!(args.venue, ExecutionVenueArg::HyperliquidSpot);
                 assert!(args.leverage.is_none());
             }
             _ => panic!("expected outcome buy command"),
@@ -3159,7 +3161,7 @@ mod tests {
             "trade",
             "buy",
             "--venue",
-            "hyperliquid-outcomes",
+            "hyperliquid",
             "--symbol",
             "1001:0",
             "--size",
@@ -3208,7 +3210,7 @@ mod tests {
             "trade",
             "buy",
             "--venue",
-            "hyperliquid-outcomes",
+            "hyperliquid",
             "--margin",
             "100",
         ])
@@ -3225,7 +3227,7 @@ mod tests {
             "trade",
             "buy",
             "--venue",
-            "hyperliquid-outcomes",
+            "hyperliquid",
             "--margin",
             "100",
             "--yes",
@@ -4069,7 +4071,7 @@ mod tests {
             "mid-price",
             "1009",
             "--venue",
-            "hyperliquid-outcomes",
+            "hyperliquid",
             "--margin",
             "100",
             "--duration",
@@ -4090,7 +4092,7 @@ mod tests {
         };
         mid.validate()
             .expect("outcome mid-price arguments should validate");
-        assert_eq!(mid.venue, ExecutionVenueArg::HyperliquidOutcomes);
+        assert_eq!(mid.venue, ExecutionVenueArg::HyperliquidSpot);
         assert_eq!(mid.leverage, None);
 
         let volume = Cli::try_parse_from([
@@ -4100,7 +4102,7 @@ mod tests {
             "volume-mid",
             "1009",
             "--venue",
-            "hyperliquid-outcomes",
+            "hyperliquid",
             "--margin",
             "100",
             "--duration",
@@ -4136,7 +4138,7 @@ mod tests {
             "grid",
             "1009",
             "--venue",
-            "hyperliquid-outcomes",
+            "hyperliquid",
             "--margin",
             "100",
             "--duration",
@@ -4159,7 +4161,7 @@ mod tests {
         };
         grid.validate()
             .expect("outcome grid arguments should validate");
-        assert_eq!(grid.venue, ExecutionVenueArg::HyperliquidOutcomes);
+        assert_eq!(grid.venue, ExecutionVenueArg::HyperliquidSpot);
         assert_eq!(grid.leverage, None);
     }
 
@@ -4172,7 +4174,7 @@ mod tests {
             "mid-price",
             "1009",
             "--venue",
-            "hyperliquid-outcomes",
+            "hyperliquid",
             "--margin",
             "100",
             "--duration",

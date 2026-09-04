@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 
 pub const EXCHANGE: &str = "hyperliquidf";
 pub const SPOT_EXCHANGE: &str = "hyperliquid";
-pub const OUTCOMES_EXCHANGE: &str = "hyperliquid-outcomes";
 pub const MAINNET_HTTP_URL: &str = "https://api.hyperliquid.xyz";
 pub const MAINNET_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 pub const TESTNET_HTTP_URL: &str = "https://api.hyperliquid-testnet.xyz";
@@ -37,13 +36,20 @@ impl HyperliquidProduct {
     pub fn from_exchange(exchange: &str) -> anyhow::Result<Self> {
         if exchange.eq_ignore_ascii_case(SPOT_EXCHANGE) {
             Ok(Self::Spot)
-        } else if exchange.eq_ignore_ascii_case(OUTCOMES_EXCHANGE) {
-            Ok(Self::Outcome)
         } else if exchange.eq_ignore_ascii_case(EXCHANGE) {
             Ok(Self::Perpetual)
         } else {
             anyhow::bail!("`{exchange}` is not a Hyperliquid market-data exchange")
         }
+    }
+
+    pub fn from_exchange_symbol(exchange: &str, symbol: &str) -> anyhow::Result<Self> {
+        if exchange.eq_ignore_ascii_case(SPOT_EXCHANGE)
+            && crate::markets::outcomes::looks_like_symbol(symbol)
+        {
+            return Ok(Self::Outcome);
+        }
+        Self::from_exchange(exchange)
     }
 
     pub fn from_venue(venue: crate::venues::VenueId) -> anyhow::Result<Self> {
@@ -76,7 +82,7 @@ impl HyperliquidProduct {
     pub fn exchange(&self) -> &str {
         match self {
             Self::Spot => SPOT_EXCHANGE,
-            Self::Outcome => OUTCOMES_EXCHANGE,
+            Self::Outcome => SPOT_EXCHANGE,
             Self::Perpetual => EXCHANGE,
         }
     }

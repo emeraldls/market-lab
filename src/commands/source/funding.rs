@@ -15,7 +15,7 @@ pub async fn handle(args: SourceFundingArgs) -> Result<()> {
 }
 
 async fn handle_direct(args: SourceFundingArgs) -> Result<()> {
-    let adapter = MarketDataAdapter::for_exchange(&args.exchange, false)?;
+    let adapter = MarketDataAdapter::for_exchange_market(&args.exchange, false, &args.symbol)?;
     if args.stream {
         return stream_funding(args).await;
     }
@@ -72,7 +72,7 @@ fn render_funding(
 }
 
 async fn stream_funding(args: SourceFundingArgs) -> Result<()> {
-    let adapter = MarketDataAdapter::for_exchange(&args.exchange, false)?;
+    let adapter = MarketDataAdapter::for_exchange_market(&args.exchange, false, &args.symbol)?;
     let mut stream = VenueTickerStream::connect(&args.exchange, &args.symbol, false).await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest = None;

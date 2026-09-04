@@ -436,6 +436,22 @@ impl MarketDataAdapter {
         Ok(Self { provider })
     }
 
+    pub fn for_exchange_market(exchange: &str, testnet: bool, symbol: &str) -> Result<Self> {
+        if exchange.eq_ignore_ascii_case(crate::providers::hyperliquid::SPOT_EXCHANGE)
+            && crate::markets::outcomes::looks_like_symbol(symbol)
+        {
+            return Ok(Self {
+                provider: Box::new(HyperliquidMarketData {
+                    exchange: crate::providers::hyperliquid::SPOT_EXCHANGE.to_string(),
+                    label: "Hyperliquid Outcomes".to_string(),
+                    product: HyperliquidProduct::Outcome,
+                    network: HyperliquidNetwork::from_testnet(testnet),
+                }),
+            });
+        }
+        Self::for_exchange(exchange, testnet)
+    }
+
     pub fn for_venue(venue: ExecutionVenue, testnet: bool) -> Result<Self> {
         let spec = venue.spec()?;
         spec.validate_network(testnet)?;
@@ -466,14 +482,13 @@ impl MarketDataAdapter {
     ) -> Result<Self> {
         let spec = venue.spec()?;
         spec.validate_network(testnet)?;
-        if crate::markets::execution_market(venue, symbol)? == crate::venues::VenueMarket::Outcome
-        {
+        if crate::markets::execution_market(venue, symbol)? == crate::venues::VenueMarket::Outcome {
             if spec.execution != ExecutionBackend::Hyperliquid {
                 bail!("{} does not support outcome markets", spec.label());
             }
             return Ok(Self {
                 provider: Box::new(HyperliquidMarketData {
-                    exchange: crate::providers::hyperliquid::OUTCOMES_EXCHANGE.to_string(),
+                    exchange: crate::providers::hyperliquid::SPOT_EXCHANGE.to_string(),
                     label: "Hyperliquid Outcomes".to_string(),
                     product: HyperliquidProduct::Outcome,
                     network: HyperliquidNetwork::from_testnet(testnet),
@@ -593,7 +608,7 @@ impl VenueCandleStream {
         interval: &str,
         testnet: bool,
     ) -> Result<Self> {
-        let adapter = MarketDataAdapter::for_exchange(exchange, testnet)?;
+        let adapter = MarketDataAdapter::for_exchange_market(exchange, testnet, symbol)?;
         let inner = adapter.provider.connect_candles(symbol, interval).await?;
         Ok(Self { inner })
     }
@@ -628,7 +643,7 @@ pub struct VenueTickerStream {
 
 impl VenueTickerStream {
     pub async fn connect(exchange: &str, symbol: &str, testnet: bool) -> Result<Self> {
-        let adapter = MarketDataAdapter::for_exchange(exchange, testnet)?;
+        let adapter = MarketDataAdapter::for_exchange_market(exchange, testnet, symbol)?;
         let inner = adapter.provider.connect_ticker(symbol).await?;
         Ok(Self { inner })
     }
@@ -688,7 +703,7 @@ impl VenueOrderBookStream {
         depth: u16,
         testnet: bool,
     ) -> Result<Self> {
-        let adapter = MarketDataAdapter::for_exchange(exchange, testnet)?;
+        let adapter = MarketDataAdapter::for_exchange_market(exchange, testnet, symbol)?;
         let inner = adapter.provider.connect_orderbook(symbol, depth).await?;
         Ok(Self { inner })
     }
@@ -733,7 +748,7 @@ impl VenueTradesStream {
     }
 
     pub async fn connect_exchange(exchange: &str, symbol: &str, testnet: bool) -> Result<Self> {
-        let adapter = MarketDataAdapter::for_exchange(exchange, testnet)?;
+        let adapter = MarketDataAdapter::for_exchange_market(exchange, testnet, symbol)?;
         let inner = adapter.provider.connect_trades(symbol).await?;
         Ok(Self { inner })
     }

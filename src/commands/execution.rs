@@ -168,7 +168,9 @@ pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
     let symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
     let account = ExecutionAdapter::configured_account(venue)?;
     let adapter = match symbol.as_deref() {
-        Some(symbol) => ExecutionAdapter::new_for_market(venue, args.testnet, "main", symbol).await?,
+        Some(symbol) => {
+            ExecutionAdapter::new_for_market(venue, args.testnet, "main", symbol).await?
+        }
         None => ExecutionAdapter::new(venue, args.testnet).await?,
     };
     let snapshot = match symbol.as_deref() {
@@ -179,11 +181,9 @@ pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
         }
         None => adapter.account_snapshot(&account).await?,
     };
-    let market_kind = symbol
-        .as_deref()
-        .map_or(Ok(venue.market()), |symbol| {
-            crate::markets::execution_market(venue, symbol)
-        })?;
+    let market_kind = symbol.as_deref().map_or(Ok(venue.market()), |symbol| {
+        crate::markets::execution_market(venue, symbol)
+    })?;
     if market_kind == VenueMarket::Spot {
         let balances = snapshot
             .spot_balances
@@ -228,7 +228,9 @@ pub async fn handle_orders(args: AccountQueryArgs) -> Result<()> {
     let symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
     let account = ExecutionAdapter::configured_account(venue)?;
     let adapter = match symbol.as_deref() {
-        Some(symbol) => ExecutionAdapter::new_for_market(venue, args.testnet, "main", symbol).await?,
+        Some(symbol) => {
+            ExecutionAdapter::new_for_market(venue, args.testnet, "main", symbol).await?
+        }
         None => ExecutionAdapter::new(venue, args.testnet).await?,
     };
     let orders = match symbol.as_deref() {
@@ -251,7 +253,9 @@ pub async fn handle_fills(args: AccountQueryArgs) -> Result<()> {
     let symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
     let account = ExecutionAdapter::configured_account(venue)?;
     let adapter = match symbol.as_deref() {
-        Some(symbol) => ExecutionAdapter::new_for_market(venue, args.testnet, "main", symbol).await?,
+        Some(symbol) => {
+            ExecutionAdapter::new_for_market(venue, args.testnet, "main", symbol).await?
+        }
         None => ExecutionAdapter::new(venue, args.testnet).await?,
     };
     let fills = adapter
@@ -474,31 +478,24 @@ async fn build_trade_plan_with_price_normalization(
     };
     let market = outcome.as_ref().map_or_else(
         || execution_market(venue, &args.symbol),
-        |instrument| {
-            Ok(crate::markets::outcomes::market_from_instrument(instrument))
-        },
+        |instrument| Ok(crate::markets::outcomes::market_from_instrument(instrument)),
     )?;
     let normalized_args = normalize_prices
         .then(|| normalize_automated_prices(args, venue, &market, direction))
         .transpose()?;
     let args = normalized_args.as_ref().unwrap_or(args);
     validate_market_rules(venue, &market, args)?;
-    let venue_spec = venue.spec()?;
     let leverage = market_kind
         .is_perpetual()
         .then(|| args.leverage.unwrap_or(1.0));
     let sizing_leverage = leverage.unwrap_or(1.0);
     let mut rules = execution_rules(venue, args.testnet, &market)?;
     if market_kind.is_perpetual() {
-        let max_leverage = ExecutionAdapter::new_for_market(
-            venue,
-            args.testnet,
-            "main",
-            &market.symbol,
-        )
-            .await?
-            .max_leverage(&market.symbol)
-            .await?;
+        let max_leverage =
+            ExecutionAdapter::new_for_market(venue, args.testnet, "main", &market.symbol)
+                .await?
+                .max_leverage(&market.symbol)
+                .await?;
         rules.max_leverage = u16::try_from(max_leverage)
             .context("venue max leverage exceeds Market Lab's supported range")?;
         if leverage.is_some_and(|leverage| leverage > f64::from(rules.max_leverage)) {
@@ -807,9 +804,9 @@ async fn validate_outcome_funds(
         "main",
         &instrument.symbol,
     )
-        .await?
-        .account_snapshot(account)
-        .await?;
+    .await?
+    .account_snapshot(account)
+    .await?;
     let (available, required, asset) = match direction {
         PositionDirection::Long => {
             let available = snapshot
@@ -992,15 +989,14 @@ fn is_price_aligned(
 
 fn validate_optional_symbol(venue: ExecutionVenue, symbol: Option<&str>) -> Result<Option<String>> {
     if symbol.is_some_and(|symbol| {
-        crate::markets::execution_market(venue, symbol) == Ok(VenueMarket::Outcome)
+        crate::markets::execution_market(venue, symbol)
+            .is_ok_and(|kind| kind == VenueMarket::Outcome)
     }) {
         return symbol
             .map(|symbol| {
-                crate::markets::outcomes::parse_symbol(symbol).map(
-                    |(outcome, side)| {
-                        crate::markets::outcomes::canonical_symbol(outcome, side)
-                    },
-                )
+                crate::markets::outcomes::parse_symbol(symbol).map(|(outcome, side)| {
+                    crate::markets::outcomes::canonical_symbol(outcome, side)
+                })
             })
             .transpose();
     }
@@ -1019,12 +1015,12 @@ async fn execution_market_on(
     symbol: &str,
 ) -> Result<std::sync::Arc<Market>> {
     if crate::markets::execution_market(venue, symbol)? == VenueMarket::Outcome {
-        let instrument = crate::markets::outcomes::resolve(
-            HyperliquidNetwork::from_testnet(testnet),
-            symbol,
-        )
-        .await?;
-        return Ok(crate::markets::outcomes::market_from_instrument(&instrument));
+        let instrument =
+            crate::markets::outcomes::resolve(HyperliquidNetwork::from_testnet(testnet), symbol)
+                .await?;
+        return Ok(crate::markets::outcomes::market_from_instrument(
+            &instrument,
+        ));
     }
     execution_market(venue, symbol)
 }

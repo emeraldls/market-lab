@@ -45,7 +45,7 @@ use crate::venues::VenueMarket;
 use crate::volume::{FillVolumeInput, VolumeExporter};
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-pub const RUNTIME_VERSION: u8 = 45;
+pub const RUNTIME_VERSION: u8 = 46;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const ACCOUNT_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
@@ -4118,12 +4118,9 @@ async fn execute_bot_outcome_action(
     }
 
     let network = HyperliquidNetwork::from_testnet(job.definition.testnet());
-    let primary =
-        crate::markets::outcomes::resolve(network, &definition.primary_symbol)
-            .await?;
+    let primary = crate::markets::outcomes::resolve(network, &definition.primary_symbol).await?;
     let complement =
-        crate::markets::outcomes::resolve(network, &definition.complement_symbol)
-            .await?;
+        crate::markets::outcomes::resolve(network, &definition.complement_symbol).await?;
     if primary.metadata_fingerprint != definition.primary_market_fingerprint
         || complement.metadata_fingerprint != definition.complement_market_fingerprint
     {
@@ -6161,11 +6158,23 @@ async fn recover_account_gap(
 
     // These are one-shot gap-recovery calls after a proven disconnect. They are
     // never scheduled on a timer while the account WebSocket is healthy.
-    let recovery = ExecutionAdapter::new(venue, testnet)
-        .await?
-        .recover_account_gap(account, gap_started_ms)
-        .await?;
-    for order in recovery.orders {
+    let markets = if venue == ExecutionVenue::HyperliquidSpot {
+        vec![VenueMarket::Spot, VenueMarket::Outcome]
+    } else {
+        vec![venue.market()]
+    };
+    let mut recovered_orders = Vec::new();
+    let mut recovered_fills = Vec::new();
+    for market in markets {
+        let recovery = ExecutionAdapter::new_for_market_kind(venue, testnet, "main", market)
+            .await?
+            .recover_account_gap(account, gap_started_ms)
+            .await?;
+        recovered_orders.extend(recovery.orders);
+        recovered_fills.extend(recovery.fills);
+    }
+
+    for order in recovered_orders {
         apply_tracked_order_status(
             paths,
             state,
@@ -6186,7 +6195,7 @@ async fn recover_account_gap(
         )?;
     }
 
-    for fill in recovery.fills {
+    for fill in recovered_fills {
         record_fill_volume(
             paths,
             state,
@@ -6714,8 +6723,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_protocol_v45_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 45);
+    fn runtime_protocol_v46_decodes_oiwap_submissions() {
+        assert_eq!(RUNTIME_VERSION, 46);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",

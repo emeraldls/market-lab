@@ -640,11 +640,9 @@ async fn outcome_statistics(period: &str, symbol: Option<&str>) -> Result<Exchan
         bail!("Hyperliquid outcome statistics currently supports only period 1d");
     }
     let instruments = match symbol {
-        Some(symbol) => vec![crate::markets::outcomes::resolve(
-            HyperliquidNetwork::Mainnet,
-            symbol,
-        )
-        .await?],
+        Some(symbol) => {
+            vec![crate::markets::outcomes::resolve(HyperliquidNetwork::Mainnet, symbol).await?]
+        }
         None => crate::markets::outcomes::instruments(HyperliquidNetwork::Mainnet).await?,
     };
     let mids: std::collections::HashMap<String, String> =

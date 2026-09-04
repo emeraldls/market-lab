@@ -46,7 +46,7 @@ async fn handle_mmt(args: SourceOrderbookArgs) -> Result<()> {
 
 async fn handle_direct(args: SourceOrderbookArgs) -> Result<()> {
     let exchange = args.exchange_name()?.to_string();
-    let adapter = MarketDataAdapter::for_exchange(&exchange, false)?;
+    let adapter = MarketDataAdapter::for_exchange_market(&exchange, false, &args.symbol)?;
     if args.stream {
         if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("stream mode currently supports only --output terminal|json|jsonl");
@@ -106,7 +106,7 @@ async fn stream_mmt_orderbook(args: SourceOrderbookArgs) -> Result<()> {
 }
 
 async fn stream_direct_orderbook(args: SourceOrderbookArgs, exchange: &str) -> Result<()> {
-    let adapter = MarketDataAdapter::for_exchange(exchange, false)?;
+    let adapter = MarketDataAdapter::for_exchange_market(exchange, false, &args.symbol)?;
     let mut stream =
         VenueOrderBookStream::connect_exchange(exchange, &args.symbol, args.depth, false).await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));

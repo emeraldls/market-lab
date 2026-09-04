@@ -509,7 +509,7 @@ impl ExecutionProviderFactory for HyperlinkFactory {
 
     async fn adapter(
         &self,
-        venue: ExecutionVenue,
+        _venue: ExecutionVenue,
         market: VenueMarket,
         testnet: bool,
         account_name: &str,
@@ -762,10 +762,9 @@ fn normalize_hyperliquid_runtime_updates(
                     updates.push(AccountRuntimeUpdate::Fill(domain_fill));
                 }
                 let symbol = if product == HyperliquidProduct::Outcome {
-                    crate::markets::outcomes::parse_wire_symbol(coin)
-                        .map(|(outcome, side)| {
-                            crate::markets::outcomes::canonical_symbol(outcome, side)
-                        })?
+                    crate::markets::outcomes::parse_wire_symbol(coin).map(|(outcome, side)| {
+                        crate::markets::outcomes::canonical_symbol(outcome, side)
+                    })?
                 } else {
                     crate::providers::hyperliquid::markets::market_for_wire(
                         product,
@@ -1013,9 +1012,18 @@ impl ExecutionAdapter {
         account_name: &str,
         symbol: &str,
     ) -> Result<Self> {
+        let market = crate::markets::execution_market(venue, symbol)?;
+        Self::new_for_market_kind(venue, testnet, account_name, market).await
+    }
+
+    pub(crate) async fn new_for_market_kind(
+        venue: ExecutionVenue,
+        testnet: bool,
+        account_name: &str,
+        market: VenueMarket,
+    ) -> Result<Self> {
         let spec = venue.spec()?;
         spec.validate_network(testnet)?;
-        let market = crate::markets::execution_market(venue, symbol)?;
         let provider = execution_factory(venue)
             .adapter(venue, market, testnet, account_name)
             .await?;

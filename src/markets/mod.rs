@@ -24,12 +24,20 @@ pub fn execution_market(
     symbol: &str,
 ) -> Result<crate::venues::VenueMarket> {
     let configured = venue.market();
-    if venue == crate::venues::VenueId::HyperliquidSpot
-        && (outcomes::parse_symbol(symbol).is_ok() || outcomes::parse_market_id(symbol).is_ok())
-    {
+    if venue == crate::venues::VenueId::HyperliquidSpot && outcomes::looks_like_symbol(symbol) {
         return Ok(crate::venues::VenueMarket::Outcome);
     }
     Ok(configured)
+}
+
+pub fn canonical_exchange_symbol(exchange: &str, symbol: &str) -> Result<String> {
+    if exchange.eq_ignore_ascii_case(crate::providers::hyperliquid::SPOT_EXCHANGE)
+        && outcomes::looks_like_symbol(symbol)
+    {
+        let (outcome, side) = outcomes::parse_symbol(symbol)?;
+        return Ok(outcomes::canonical_symbol(outcome, side));
+    }
+    Ok(exchange_market(exchange, symbol)?.symbol.clone())
 }
 
 const SNAPSHOT_SCHEMA_VERSION: u8 = 1;

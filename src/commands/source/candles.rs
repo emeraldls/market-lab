@@ -84,7 +84,7 @@ async fn handle_mmt(args: SourceCandlesArgs) -> Result<()> {
 
 async fn handle_direct(args: SourceCandlesArgs) -> Result<()> {
     let exchange = args.exchange_name()?.to_string();
-    let adapter = MarketDataAdapter::for_exchange(&exchange, false)?;
+    let adapter = MarketDataAdapter::for_exchange_market(&exchange, false, &args.symbol)?;
     if args.stream {
         ensure_stream_output(args.output)?;
         return stream_direct_candles(args, &exchange).await;
@@ -221,10 +221,9 @@ async fn stream_mmt_candles(args: SourceCandlesArgs) -> Result<()> {
 }
 
 async fn stream_direct_candles(args: SourceCandlesArgs, exchange: &str) -> Result<()> {
-    let adapter = MarketDataAdapter::for_exchange(exchange, false)?;
-    let internal_symbol = crate::markets::exchange_market(adapter.exchange(), &args.symbol)?
-        .symbol
-        .clone();
+    let adapter = MarketDataAdapter::for_exchange_market(exchange, false, &args.symbol)?;
+    let internal_symbol =
+        crate::markets::canonical_exchange_symbol(adapter.exchange(), &args.symbol)?;
     let mut stream =
         VenueCandleStream::connect(exchange, &args.symbol, args.timeframe_name()?, false).await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));

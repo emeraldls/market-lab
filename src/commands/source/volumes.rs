@@ -87,7 +87,7 @@ async fn handle_mmt(args: SourceVolumesArgs) -> Result<()> {
 
 async fn handle_direct(args: SourceVolumesArgs) -> Result<()> {
     let exchange = args.exchange_name()?.to_string();
-    let adapter = MarketDataAdapter::for_exchange(&exchange, false)?;
+    let adapter = MarketDataAdapter::for_exchange_market(&exchange, false, &args.symbol)?;
     if args.stream {
         if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
             bail!("stream mode currently supports only --output terminal|json|jsonl");
@@ -249,8 +249,9 @@ fn parse_volumes_message(value: serde_json::Value) -> Result<Option<VolumeProfil
 }
 
 async fn stream_direct_volume_bars(args: SourceVolumesArgs, exchange: &str) -> Result<()> {
-    let adapter = MarketDataAdapter::for_exchange(exchange, false)?;
-    let market = crate::markets::exchange_market(adapter.exchange(), &args.symbol)?;
+    let adapter = MarketDataAdapter::for_exchange_market(exchange, false, &args.symbol)?;
+    let internal_symbol =
+        crate::markets::canonical_exchange_symbol(adapter.exchange(), &args.symbol)?;
     let mut stream =
         VenueCandleStream::connect(exchange, &args.symbol, args.timeframe_name()?, false).await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
@@ -279,7 +280,7 @@ async fn stream_direct_volume_bars(args: SourceVolumesArgs, exchange: &str) -> R
                     version: "1",
                     provider: adapter.exchange().to_string(),
                     exchange: adapter.exchange().to_string(),
-                    symbol: market.symbol.clone(),
+                    symbol: internal_symbol.clone(),
                     ts_ms: bar.t,
                     stream: true,
                     data: bar.clone(),

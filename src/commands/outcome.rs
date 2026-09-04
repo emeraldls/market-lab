@@ -164,16 +164,24 @@ async fn validate_action_funds(testnet: bool, plan: &OutcomeActionPlan) -> Resul
     let network = HyperliquidNetwork::from_testnet(testnet);
     let metadata = crate::providers::hyperliquid::outcomes::metadata(network).await?;
     let account = ExecutionAdapter::configured_account(ExecutionVenue::HyperliquidSpot)?;
-    let symbol = crate::markets::outcomes::canonical_symbol(plan.outcome, 0);
-    let snapshot = ExecutionAdapter::new_for_market(
-        ExecutionVenue::HyperliquidSpot,
-        testnet,
-        "main",
-        &symbol,
-    )
-        .await?
-        .account_snapshot(&account)
-        .await?;
+    let outcome_id = plan
+        .outcome
+        .or_else(|| {
+            plan.question.and_then(|question_id| {
+                metadata
+                    .questions
+                    .iter()
+                    .find(|question| question.question == question_id)
+                    .map(|question| question.fallback_outcome)
+            })
+        })
+        .context("outcome action does not identify an outcome market")?;
+    let symbol = crate::markets::outcomes::canonical_symbol(outcome_id, 0);
+    let snapshot =
+        ExecutionAdapter::new_for_market(ExecutionVenue::HyperliquidSpot, testnet, "main", &symbol)
+            .await?
+            .account_snapshot(&account)
+            .await?;
 
     match plan.action {
         "split" => {

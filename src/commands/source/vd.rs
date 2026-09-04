@@ -186,9 +186,9 @@ async fn stream_mmt_vd(args: SourceVdArgs) -> Result<()> {
 async fn stream_direct_vd(args: SourceVdArgs) -> Result<()> {
     ensure_stream_output(args.output)?;
     let exchange = args.exchange_name()?.to_string();
-    let adapter = MarketDataAdapter::for_exchange(&exchange, false)?;
-    let market = crate::markets::exchange_market(adapter.exchange(), &args.symbol)?;
-    let internal_symbol = market.symbol.clone();
+    let adapter = MarketDataAdapter::for_exchange_market(&exchange, false, &args.symbol)?;
+    let internal_symbol =
+        crate::markets::canonical_exchange_symbol(adapter.exchange(), &args.symbol)?;
     let mut stream = VenueTradesStream::connect_exchange(&exchange, &args.symbol, false).await?;
     let mut ticker = tokio::time::interval(Duration::from_millis(args.interval_ms));
     let mut latest: Option<VolumeDeltaTick> = None;

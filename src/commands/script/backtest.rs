@@ -734,9 +734,13 @@ fn validate_fetched_sources(
 
         let provider = match config.provider {
             ProviderKind::Mmt => "MMT".to_string(),
-            ProviderKind::Direct => MarketDataAdapter::for_exchange(&config.exchange, false)?
-                .label()
-                .to_string(),
+            ProviderKind::Direct => MarketDataAdapter::for_exchange_market(
+                &config.exchange,
+                false,
+                &config.market_symbol(),
+            )?
+            .label()
+            .to_string(),
             ProviderKind::MarketLab => "Market Lab".to_string(),
         };
         bail!(
@@ -990,7 +994,8 @@ async fn fetch_direct_sources(
         let source = &config.source;
         let market_symbol = config.market_symbol();
         let timeframe = config.require_timeframe(source)?;
-        let adapter = MarketDataAdapter::for_exchange(&config.exchange, false)?;
+        let adapter =
+            MarketDataAdapter::for_exchange_market(&config.exchange, false, &market_symbol)?;
         let provider_name = adapter.label();
         let interval = adapter.timeframe_from_seconds(timeframe)?;
         let phase = match source {

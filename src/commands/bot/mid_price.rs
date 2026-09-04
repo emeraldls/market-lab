@@ -15,8 +15,7 @@ use crate::bots::jobs::{
 };
 use crate::bots::mid_price::{MidPriceQuotes, quote_prices, quote_sizes};
 use crate::cli::{
-    ExecutionVenueArg, OutputFormat, RunMidPriceArgs, RunVolumeMidArgs, TradeArgs, TradeOrderKind,
-    TradeTimeInForce,
+    OutputFormat, RunMidPriceArgs, RunVolumeMidArgs, TradeArgs, TradeOrderKind, TradeTimeInForce,
 };
 use crate::commands::execution::build_trade_plan;
 use crate::domain::execution::{
@@ -854,7 +853,8 @@ pub(super) fn spawn_account_feed(
 ) -> mpsc::Receiver<AccountFeedEvent> {
     let (sender, receiver) = mpsc::channel(1024);
     tokio::spawn(async move {
-        let adapter = match ExecutionAdapter::new_for_market(venue, testnet, "main", &symbol).await {
+        let adapter = match ExecutionAdapter::new_for_market(venue, testnet, "main", &symbol).await
+        {
             Ok(adapter) => adapter,
             Err(error) => {
                 let _ = sender

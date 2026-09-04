@@ -8,9 +8,7 @@ use tokio::task::JoinSet;
 
 use crate::bots::grid::{GridQuote, GridSpec, quote_grid};
 use crate::bots::jobs::{BotJob, BotJobDefinition, BotJobSubmission, GridJobDefinition};
-use crate::cli::{
-    ExecutionVenueArg, OutputFormat, RunGridArgs, TradeArgs, TradeOrderKind, TradeTimeInForce,
-};
+use crate::cli::{OutputFormat, RunGridArgs, TradeArgs, TradeOrderKind, TradeTimeInForce};
 use crate::commands::bot::mid_price::{
     AccountFeedEvent, BotStopped, FillKey, FillLedger, ObservedFill, QuoteSide,
     account_symbol_is_flat, append_fill, append_market_data, append_stop_loss, cancel_plan,
