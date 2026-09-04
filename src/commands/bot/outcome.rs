@@ -2532,6 +2532,8 @@ mod tests {
             outcome_id: 10225,
             outcome_name: "Change market".to_string(),
             outcome_description: "Binary change outcome".to_string(),
+            template: None,
+            deployer: None,
             side,
             side_name: side_name.to_string(),
             quote_token: "USDC".to_string(),

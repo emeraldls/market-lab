@@ -235,7 +235,12 @@ fn named_side(outcome: &OutcomeSpec, name: &str) -> Result<u8> {
     outcome
         .side_specs
         .iter()
-        .position(|side| side.name.eq_ignore_ascii_case(name))
+        .position(|side| {
+            side.name
+                .strip_prefix("template:")
+                .unwrap_or(&side.name)
+                .eq_ignore_ascii_case(name)
+        })
         .map(|side| side as u8)
         .with_context(|| {
             format!(
@@ -373,8 +378,6 @@ fn render(plan: &OutcomeActionPlan, output: OutputFormat, dry_run: bool) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
     use crate::providers::hyperliquid::outcomes::OutcomeSideSpec;
 
@@ -386,15 +389,14 @@ mod tests {
             side_specs: [
                 OutcomeSideSpec {
                     name: "Yes".to_string(),
-                    extra: BTreeMap::new(),
                 },
                 OutcomeSideSpec {
                     name: "No".to_string(),
-                    extra: BTreeMap::new(),
                 },
             ],
             quote_token: "USDC".to_string(),
-            extra: BTreeMap::new(),
+            venue: None,
+            deployer_fee_scale: None,
         }
     }
 

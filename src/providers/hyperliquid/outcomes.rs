@@ -3,10 +3,9 @@ use std::io::{self, IsTerminal};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime};
 use dialoguer::{FuzzySelect, Select, theme::ColorfulTheme};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha3::{Digest, Keccak256};
 
 use crate::markets::{ExecutionRules, Market, NetworkMarket};
@@ -20,14 +19,9 @@ pub const OUTCOME_MIN_NOTIONAL: f64 = 10.0;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutcomeMetadata {
-    #[serde(default)]
     pub outcomes: Vec<OutcomeSpec>,
-    #[serde(default)]
     pub questions: Vec<QuestionSpec>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deployers: Vec<OutcomeDeployer>,
-    #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -38,15 +32,15 @@ pub struct OutcomeSpec {
     pub description: String,
     pub side_specs: [OutcomeSideSpec; 2],
     pub quote_token: String,
-    #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub venue: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployer_fee_scale: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OutcomeSideSpec {
     pub name: String,
-    #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -56,20 +50,50 @@ pub struct QuestionSpec {
     pub name: String,
     pub description: String,
     pub fallback_outcome: u32,
-    #[serde(default)]
     pub named_outcomes: Vec<u32>,
-    #[serde(default)]
     pub settled_named_outcomes: Vec<u32>,
-    #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OutcomeDeployer {
-    pub deployer: String,
+    #[serde(rename(deserialize = "deployer"))]
+    pub address: String,
     pub venue: String,
-    #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeTemplate {
+    pub id: String,
+    pub role: OutcomeTemplateRole,
+    pub name: String,
+    pub description: String,
+    pub keywords: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum OutcomeTemplateRole {
+    Name(String),
+    Standalone {
+        #[serde(rename = "standaloneOutcome")]
+        standalone: StandaloneOutcomeTemplate,
+    },
+    QuestionOutcome {
+        #[serde(rename = "questionOutcome")]
+        question_outcome: QuestionOutcomeTemplate,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StandaloneOutcomeTemplate {
+    pub side_names: [String; 2],
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct QuestionOutcomeTemplate {
+    pub parent: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -84,6 +108,10 @@ pub struct OutcomeInstrument {
     pub outcome_id: u32,
     pub outcome_name: String,
     pub outcome_description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployer: Option<OutcomeDeployer>,
     pub side: u8,
     pub side_name: String,
     pub quote_token: String,
@@ -141,8 +169,23 @@ pub async fn metadata(network: HyperliquidNetwork) -> Result<OutcomeMetadata> {
     Ok(metadata)
 }
 
+pub async fn templates(network: HyperliquidNetwork) -> Result<Vec<OutcomeTemplate>> {
+    let templates: Vec<OutcomeTemplate> = HyperliquidClient::for_network(network)?
+        .info(&serde_json::json!({ "type": "outcomeTemplates" }))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to fetch Hyperliquid {} outcome templates",
+                network.label()
+            )
+        })?;
+    validate_templates(&templates)?;
+    Ok(templates)
+}
+
 pub async fn instruments(network: HyperliquidNetwork) -> Result<Vec<OutcomeInstrument>> {
-    instruments_from_metadata(network, &metadata(network).await?)
+    let (metadata, templates) = tokio::try_join!(metadata(network), templates(network))?;
+    instruments_from_metadata(network, &metadata, &templates)
 }
 
 pub async fn resolve(network: HyperliquidNetwork, symbol: &str) -> Result<OutcomeInstrument> {
@@ -235,25 +278,49 @@ pub async fn select_interactive(network: HyperliquidNetwork) -> Result<OutcomeIn
 pub fn instruments_from_metadata(
     network: HyperliquidNetwork,
     metadata: &OutcomeMetadata,
+    templates: &[OutcomeTemplate],
 ) -> Result<Vec<OutcomeInstrument>> {
     validate_metadata(metadata)?;
+    validate_templates(templates)?;
     let mut parents = HashMap::<u32, &QuestionSpec>::new();
     let mut settled = HashSet::<u32>::new();
     for question in &metadata.questions {
-        parents.insert(question.fallback_outcome, question);
+        associate_question(&mut parents, question.fallback_outcome, question)?;
         for outcome in &question.named_outcomes {
-            parents.insert(*outcome, question);
+            associate_question(&mut parents, *outcome, question)?;
         }
         for outcome in &question.settled_named_outcomes {
-            parents.insert(*outcome, question);
+            associate_question(&mut parents, *outcome, question)?;
             settled.insert(*outcome);
         }
     }
 
+    let templates = templates
+        .iter()
+        .map(|template| (template.id.as_str(), template))
+        .collect::<HashMap<_, _>>();
+    let deployers = metadata
+        .deployers
+        .iter()
+        .map(|deployer| (deployer.venue.as_str(), deployer))
+        .collect::<HashMap<_, _>>();
+
     let mut instruments = Vec::with_capacity(metadata.outcomes.len() * 2);
     for outcome in &metadata.outcomes {
         let parent = parents.get(&outcome.outcome).copied();
-        let question_name = readable_question_name(parent, outcome);
+        let rendered = render_outcome(parent, outcome, &templates)?;
+        let deployer = outcome
+            .venue
+            .as_deref()
+            .map(|venue| {
+                deployers.get(venue).copied().with_context(|| {
+                    format!(
+                        "Hyperliquid outcome {} references unknown deployer venue `{venue}`",
+                        outcome.outcome
+                    )
+                })
+            })
+            .transpose()?;
         for side in 0_u8..=1 {
             let encoding = encoding(outcome.outcome, side)?;
             let fingerprint = fingerprint(parent, outcome, side)?;
@@ -262,13 +329,15 @@ pub fn instruments_from_metadata(
                 network: network.label().to_string(),
                 symbol: canonical_symbol(outcome.outcome, side),
                 question_id: parent.map(|question| question.question),
-                question_name: Some(question_name.clone()),
-                question_description: parent.map(|question| question.description.clone()),
+                question_name: Some(rendered.question_name.clone()),
+                question_description: rendered.question_description.clone(),
                 outcome_id: outcome.outcome,
-                outcome_name: outcome.name.clone(),
-                outcome_description: outcome.description.clone(),
+                outcome_name: rendered.outcome_name.clone(),
+                outcome_description: rendered.outcome_description.clone(),
+                template: rendered.template.clone(),
+                deployer: deployer.cloned(),
                 side,
-                side_name: outcome.side_specs[usize::from(side)].name.clone(),
+                side_name: rendered.side_names[usize::from(side)].clone(),
                 quote_token: outcome.quote_token.clone(),
                 coin: format!("#{encoding}"),
                 token_name: format!("+{encoding}"),
@@ -290,100 +359,323 @@ pub fn instruments_from_metadata(
     Ok(instruments)
 }
 
-fn readable_question_name(question: Option<&QuestionSpec>, outcome: &OutcomeSpec) -> String {
-    let description = question.map_or(outcome.description.as_str(), |value| {
-        value.description.as_str()
-    });
-    if let Some(name) = structured_question_name(description) {
-        return name;
+fn associate_question<'a>(
+    parents: &mut HashMap<u32, &'a QuestionSpec>,
+    outcome: u32,
+    question: &'a QuestionSpec,
+) -> Result<()> {
+    if let Some(existing) = parents.insert(outcome, question) {
+        bail!(
+            "Hyperliquid outcome {outcome} belongs to both question {} and {}",
+            existing.question,
+            question.question
+        );
     }
-
-    question.map_or_else(|| outcome.name.clone(), |value| value.name.clone())
+    Ok(())
 }
 
-fn structured_question_name(description: &str) -> Option<String> {
-    let fields = description_fields(description);
+#[derive(Debug)]
+struct RenderedOutcome {
+    question_name: String,
+    question_description: Option<String>,
+    outcome_name: String,
+    outcome_description: String,
+    side_names: [String; 2],
+    template: Option<String>,
+}
 
-    if fields
-        .get("class")
-        .is_some_and(|value| *value == "priceBinary")
+fn render_outcome(
+    question: Option<&QuestionSpec>,
+    outcome: &OutcomeSpec,
+    templates: &HashMap<&str, &OutcomeTemplate>,
+) -> Result<RenderedOutcome> {
+    let rendered_question = question
+        .map(|question| render_question(question, templates))
+        .transpose()?;
+
+    if outcome.name == "template fallback" {
+        let question = question.context("template fallback is not associated with a question")?;
+        if question.fallback_outcome != outcome.outcome || outcome.description != "other" {
+            bail!(
+                "Hyperliquid outcome {} has an invalid template fallback shape",
+                outcome.outcome
+            );
+        }
+        require_side_names(outcome, ["Yes", "No"])?;
+        let (question_name, question_description) =
+            rendered_question.context("template fallback omitted its question")?;
+        return Ok(RenderedOutcome {
+            question_name,
+            question_description: Some(question_description),
+            outcome_name: "Other".to_string(),
+            outcome_description: outcome.description.clone(),
+            side_names: ["Yes".to_string(), "No".to_string()],
+            template: None,
+        });
+    }
+
+    if let Some(template_id) = outcome.name.strip_prefix("template:") {
+        let template = templates.get(template_id).copied().with_context(|| {
+            format!(
+                "Hyperliquid outcome {} references unknown template `{template_id}`",
+                outcome.outcome
+            )
+        })?;
+        let values = keyword_values(&outcome.description)?;
+        let outcome_name = interpolate(template, &template.name, &values)?;
+        let outcome_description = interpolate(template, &template.description, &values)?;
+        let side_names = match &template.role {
+            OutcomeTemplateRole::Standalone { standalone } => {
+                if question.is_some() {
+                    bail!(
+                        "Hyperliquid outcome {} uses standalone template `{template_id}` inside a question",
+                        outcome.outcome
+                    );
+                }
+                let expected = [
+                    format!("template:{}", standalone.side_names[0]),
+                    format!("template:{}", standalone.side_names[1]),
+                ];
+                require_side_names(outcome, [&expected[0], &expected[1]])?;
+                standalone.side_names.clone()
+            }
+            OutcomeTemplateRole::QuestionOutcome { question_outcome } => {
+                let question = question.with_context(|| {
+                    format!(
+                        "Hyperliquid outcome {} uses question template `{template_id}` without a question",
+                        outcome.outcome
+                    )
+                })?;
+                let parent_template = question
+                    .name
+                    .strip_prefix("template:")
+                    .context("templated question outcome belongs to a non-template question")?;
+                if question_outcome.parent != parent_template {
+                    bail!(
+                        "Hyperliquid outcome {} template `{template_id}` expects question template `{}`, got `{parent_template}`",
+                        outcome.outcome,
+                        question_outcome.parent
+                    );
+                }
+                require_side_names(outcome, ["Yes", "No"])?;
+                ["Yes".to_string(), "No".to_string()]
+            }
+            OutcomeTemplateRole::Name(role) => bail!(
+                "Hyperliquid outcome {} references template `{template_id}` with role `{role}`",
+                outcome.outcome
+            ),
+        };
+        let (question_name, question_description) = rendered_question
+            .unwrap_or_else(|| (outcome_name.clone(), outcome_description.clone()));
+        return Ok(RenderedOutcome {
+            question_name,
+            question_description: Some(question_description),
+            outcome_name,
+            outcome_description,
+            side_names,
+            template: Some(template_id.to_string()),
+        });
+    }
+
+    let question_name = rendered_question.as_ref().map_or_else(
+        || legacy_outcome_name(outcome),
+        |(name, _)| Ok(name.clone()),
+    )?;
+    let question_description = rendered_question
+        .map(|(_, description)| description)
+        .or_else(|| Some(outcome.description.clone()));
+    Ok(RenderedOutcome {
+        question_name,
+        question_description,
+        outcome_name: outcome.name.clone(),
+        outcome_description: outcome.description.clone(),
+        side_names: [
+            outcome.side_specs[0].name.clone(),
+            outcome.side_specs[1].name.clone(),
+        ],
+        template: None,
+    })
+}
+
+fn render_question(
+    question: &QuestionSpec,
+    templates: &HashMap<&str, &OutcomeTemplate>,
+) -> Result<(String, String)> {
+    let Some(template_id) = question.name.strip_prefix("template:") else {
+        return Ok((
+            legacy_question_name(question)?,
+            question.description.clone(),
+        ));
+    };
+    let template = templates.get(template_id).copied().with_context(|| {
+        format!(
+            "Hyperliquid question {} references unknown template `{template_id}`",
+            question.question
+        )
+    })?;
+    match &template.role {
+        OutcomeTemplateRole::Name(role) if role == "question" => {}
+        _ => bail!(
+            "Hyperliquid question {} references non-question template `{template_id}`",
+            question.question
+        ),
+    }
+    let values = keyword_values(&question.description)?;
+    Ok((
+        interpolate(template, &template.name, &values)?,
+        interpolate(template, &template.description, &values)?,
+    ))
+}
+
+fn legacy_outcome_name(outcome: &OutcomeSpec) -> Result<String> {
+    let fields = keyword_values(&outcome.description)?;
+    if outcome.name == "Recurring" && fields.get("class").map(String::as_str) == Some("priceBinary")
     {
-        return price_binary_question(
-            fields.get("underlying")?,
-            fields.get("targetPrice")?,
-            fields.get("expiry")?,
+        return Ok(format!(
+            "{} above {} at {}?",
+            display_underlying(required_value(&fields, "underlying")?),
+            display_number(required_value(&fields, "targetPrice")?),
+            display_utc_time(required_value(&fields, "expiry")?)?
+        ));
+    }
+    Ok(outcome.name.clone())
+}
+
+fn legacy_question_name(question: &QuestionSpec) -> Result<String> {
+    let fields = keyword_values(&question.description)?;
+    if question.name == "Recurring"
+        && fields.get("class").map(String::as_str) == Some("priceBucket")
+    {
+        return Ok(format!(
+            "{} price at {}?",
+            display_underlying(required_value(&fields, "underlying")?),
+            display_utc_time(required_value(&fields, "expiry")?)?
+        ));
+    }
+    Ok(question.name.clone())
+}
+
+fn keyword_values(description: &str) -> Result<BTreeMap<String, String>> {
+    if description.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    description
+        .split('|')
+        .map(|entry| {
+            let (key, value) = entry
+                .split_once(':')
+                .with_context(|| format!("outcome template value `{entry}` is missing `:`"))?;
+            if key.is_empty() {
+                bail!("outcome template value `{entry}` has an empty key");
+            }
+            Ok((key.to_string(), value.to_string()))
+        })
+        .try_fold(BTreeMap::new(), |mut fields, field| {
+            let (key, value) = field?;
+            if fields.insert(key.clone(), value).is_some() {
+                bail!("outcome template description contains duplicate keyword `{key}`");
+            }
+            Ok(fields)
+        })
+}
+
+fn required_value<'a>(values: &'a BTreeMap<String, String>, key: &str) -> Result<&'a str> {
+    values
+        .get(key)
+        .map(String::as_str)
+        .with_context(|| format!("outcome metadata omitted `{key}`"))
+}
+
+fn require_side_names(outcome: &OutcomeSpec, expected: [&str; 2]) -> Result<()> {
+    if outcome.side_specs[0].name != expected[0] || outcome.side_specs[1].name != expected[1] {
+        bail!(
+            "Hyperliquid outcome {} side names do not match its template",
+            outcome.outcome
+        );
+    }
+    Ok(())
+}
+
+fn interpolate(
+    template: &OutcomeTemplate,
+    text: &str,
+    values: &BTreeMap<String, String>,
+) -> Result<String> {
+    let expected = template
+        .keywords
+        .iter()
+        .map(|(keyword, _)| keyword.as_str())
+        .collect::<HashSet<_>>();
+    let actual = values.keys().map(String::as_str).collect::<HashSet<_>>();
+    if expected != actual {
+        bail!(
+            "Hyperliquid outcome template `{}` expected keywords [{}], got [{}]",
+            template.id,
+            sorted_join(expected),
+            sorted_join(actual)
         );
     }
 
-    if fields
-        .get("class")
-        .is_some_and(|value| *value == "priceBucket")
-    {
-        return Some(format!(
-            "{} price at {}?",
-            display_underlying(fields.get("underlying")?),
-            display_utc_time(fields.get("expiry")?)?
-        ));
+    let mut rendered = text.to_string();
+    for (keyword, hint) in &template.keywords {
+        let value = required_value(values, keyword)?;
+        let display = display_template_value(hint, value).with_context(|| {
+            format!(
+                "invalid `{keyword}` value for Hyperliquid outcome template `{}`",
+                template.id
+            )
+        })?;
+        rendered = rendered.replace(&format!("{{{keyword}}}"), &display);
     }
-
-    if let (Some(underlying), Some(threshold), Some(time)) = (
-        fields.get("perp"),
-        fields.get("threshold"),
-        fields.get("time"),
-    ) {
-        return price_binary_question(underlying, threshold, time);
-    }
-
-    if let (Some(first), Some(second), Some(time)) = (
-        fields.get("participantA"),
-        fields.get("participantB"),
-        fields.get("scheduledStart"),
-    ) {
-        return Some(format!(
-            "{} vs {} at {}?",
-            first,
-            second,
-            display_utc_time(time)?
-        ));
-    }
-
-    None
+    Ok(rendered)
 }
 
-fn description_fields(description: &str) -> BTreeMap<&str, &str> {
-    description
-        .split('|')
-        .filter_map(|part| {
-            let (key, value) = part.trim().split_once(':')?;
-            let value = value
-                .split_once(" metadata=")
-                .map_or(value, |(value, _)| value);
-            (!key.is_empty() && !value.is_empty()).then_some((key, value))
-        })
-        .collect()
+fn sorted_join(values: HashSet<&str>) -> String {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    values.sort_unstable();
+    values.join(", ")
 }
 
-fn price_binary_question(underlying: &str, threshold: &str, time: &str) -> Option<String> {
-    Some(format!(
-        "{} above {} at {}?",
-        display_underlying(underlying),
-        display_number(threshold),
-        display_utc_time(time)?
-    ))
+fn display_template_value(hint: &str, value: &str) -> Result<String> {
+    match hint {
+        "dateTime" => display_utc_time(value),
+        "date" => NaiveDate::parse_from_str(value, "%Y%m%d")
+            .map(|date| date.format("%b %-d, %Y UTC").to_string())
+            .context("expected UTC date YYYYMMDD"),
+        "hlPerp" => Ok(display_underlying(value).to_string()),
+        "uInt" => {
+            value.parse::<u64>().context("expected unsigned integer")?;
+            Ok(display_number(value))
+        }
+        "uDecimal" => {
+            if value.starts_with(['+', '-'])
+                || value.parse::<f64>().is_err()
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte == b'.')
+            {
+                bail!("expected unsigned decimal");
+            }
+            Ok(display_number(value))
+        }
+        "shortString" if value.chars().count() <= 10 => Ok(value.to_string()),
+        "shortString" => bail!("expected at most 10 characters"),
+        "string" => Ok(value.to_string()),
+        _ => bail!("unknown outcome template keyword hint `{hint}`"),
+    }
 }
 
 fn display_underlying(value: &str) -> &str {
     value.rsplit(':').next().unwrap_or(value)
 }
 
-fn display_utc_time(value: &str) -> Option<String> {
+fn display_utc_time(value: &str) -> Result<String> {
     NaiveDateTime::parse_from_str(value, "%Y%m%d-%H%M")
-        .ok()
         .map(|time| time.format("%b %-d, %H:%M UTC").to_string())
+        .context("expected UTC time YYYYMMDD-HHMM")
 }
 
 fn display_number(value: &str) -> String {
-    let value = numeric_prefix(value).unwrap_or_else(|| value.trim());
     let (integer, fraction) = value.split_once('.').unwrap_or((value, ""));
     let (sign, digits) = integer
         .strip_prefix('-')
@@ -401,19 +693,6 @@ fn display_number(value: &str) -> String {
         grouped.push_str(fraction);
     }
     grouped
-}
-
-fn numeric_prefix(value: &str) -> Option<&str> {
-    let value = value.trim();
-    let length = value
-        .char_indices()
-        .take_while(|(index, character)| {
-            character.is_ascii_digit() || *character == '.' || (*index == 0 && *character == '-')
-        })
-        .map(|(index, character)| index + character.len_utf8())
-        .last()?;
-    let number = &value[..length];
-    number.parse::<f64>().is_ok().then_some(number)
 }
 
 pub fn parse_market_id(symbol: &str) -> Result<u32> {
@@ -530,6 +809,26 @@ pub fn clean_terminal_text(value: &str) -> String {
 }
 
 fn validate_metadata(metadata: &OutcomeMetadata) -> Result<()> {
+    let mut deployer_addresses = HashSet::new();
+    let mut deployer_venues = HashSet::new();
+    for deployer in &metadata.deployers {
+        if deployer.address.trim().is_empty() || deployer.venue.trim().is_empty() {
+            bail!("Hyperliquid outcomeMeta contains an empty deployer address or venue");
+        }
+        if !deployer_addresses.insert(deployer.address.as_str()) {
+            bail!(
+                "Hyperliquid outcomeMeta contains duplicate deployer {}",
+                deployer.address
+            );
+        }
+        if !deployer_venues.insert(deployer.venue.as_str()) {
+            bail!(
+                "Hyperliquid outcomeMeta contains duplicate deployer venue `{}`",
+                deployer.venue
+            );
+        }
+    }
+
     let mut ids = HashSet::new();
     for outcome in &metadata.outcomes {
         if !ids.insert(outcome.outcome) {
@@ -541,7 +840,69 @@ fn validate_metadata(metadata: &OutcomeMetadata) -> Result<()> {
         if outcome.quote_token.trim().is_empty() {
             bail!("Hyperliquid outcome {} omitted quoteToken", outcome.outcome);
         }
+        if let Some(venue) = outcome.venue.as_deref()
+            && !deployer_venues.contains(venue)
+        {
+            bail!(
+                "Hyperliquid outcome {} references unknown deployer venue `{venue}`",
+                outcome.outcome
+            );
+        }
         encoding(outcome.outcome, 1)?;
+    }
+    Ok(())
+}
+
+fn validate_templates(templates: &[OutcomeTemplate]) -> Result<()> {
+    let mut ids = HashSet::new();
+    for template in templates {
+        if template.id.is_empty() || !ids.insert(template.id.as_str()) {
+            bail!(
+                "Hyperliquid outcomeTemplates contains an empty or duplicate template id `{}`",
+                template.id
+            );
+        }
+        match &template.role {
+            OutcomeTemplateRole::Name(role) if role == "question" => {}
+            OutcomeTemplateRole::Name(role) => bail!(
+                "Hyperliquid outcome template `{}` has unknown role `{role}`",
+                template.id
+            ),
+            OutcomeTemplateRole::Standalone { standalone } => {
+                if standalone.side_names.iter().any(String::is_empty) {
+                    bail!(
+                        "Hyperliquid outcome template `{}` has an empty side name",
+                        template.id
+                    );
+                }
+            }
+            OutcomeTemplateRole::QuestionOutcome { question_outcome } => {
+                if question_outcome.parent.is_empty() {
+                    bail!(
+                        "Hyperliquid outcome template `{}` omitted its parent template",
+                        template.id
+                    );
+                }
+            }
+        }
+        let mut keywords = HashSet::new();
+        for (keyword, hint) in &template.keywords {
+            if keyword.is_empty() || !keywords.insert(keyword.as_str()) {
+                bail!(
+                    "Hyperliquid outcome template `{}` contains an empty or duplicate keyword `{keyword}`",
+                    template.id
+                );
+            }
+            if !matches!(
+                hint.as_str(),
+                "dateTime" | "date" | "string" | "shortString" | "hlPerp" | "uInt" | "uDecimal"
+            ) {
+                bail!(
+                    "Hyperliquid outcome template `{}` contains unknown keyword hint `{hint}`",
+                    template.id
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -556,36 +917,80 @@ fn fingerprint(question: Option<&QuestionSpec>, outcome: &OutcomeSpec, side: u8)
 mod tests {
     use super::*;
 
-    fn fixture() -> OutcomeMetadata {
-        serde_json::from_value(serde_json::json!({
+    fn permissionless_fixture() -> (OutcomeMetadata, Vec<OutcomeTemplate>) {
+        let metadata = serde_json::from_value(serde_json::json!({
             "outcomes": [{
-                "outcome": 1001,
-                "name": "Above",
-                "description": "BTC above threshold",
-                "sideSpecs": [{"name":"Yes"},{"name":"No"}],
-                "quoteToken": "USDC"
+                "outcome": 1210,
+                "name": "template:binaryPrice",
+                "description": "perp:BTC|priceDescription:BTC-USDC mark|seconds:1|threshold:100000|time:20261001-0000",
+                "sideSpecs": [{"name":"template:Yes"},{"name":"template:No"}],
+                "quoteToken": "USDC",
+                "venue": "out",
+                "deployerFeeScale": "1.0"
             }],
-            "questions": [{
-                "question": 165,
-                "name": "BTC bucket",
-                "description": "bucket question",
-                "fallbackOutcome": 1001,
-                "namedOutcomes": [],
-                "settledNamedOutcomes": []
+            "questions": [],
+            "deployers": [{
+                "deployer": "0x08e9c89f46dccee91bdb85c6532eb93a4c335efe",
+                "venue": "out",
+                "subDeployers": []
             }]
         }))
-        .expect("fixture")
+        .expect("metadata");
+        let templates = serde_json::from_value(serde_json::json!([{
+            "id": "binaryPrice",
+            "role": {"standaloneOutcome": {"sideNames": ["Yes", "No"]}},
+            "name": "{perp} above {threshold} at {time}?",
+            "description": "The market resolves to Yes if {perp} is above {threshold} at {time}.",
+            "keywords": [
+                ["perp", "hlPerp"],
+                ["priceDescription", "string"],
+                ["seconds", "uInt"],
+                ["threshold", "uDecimal"],
+                ["time", "dateTime"]
+            ]
+        }]))
+        .expect("templates");
+        (metadata, templates)
     }
 
     #[test]
-    fn encodes_all_three_hyperliquid_outcome_identities() {
-        let instrument = instruments_from_metadata(HyperliquidNetwork::Mainnet, &fixture())
-            .expect("instruments")
-            .remove(0);
-        assert_eq!(instrument.symbol, "1001:0");
-        assert_eq!(instrument.coin, "#10010");
-        assert_eq!(instrument.token_name, "+10010");
-        assert_eq!(instrument.asset_id, 100_010_010);
+    fn renders_templates_and_joins_the_exact_deployer() {
+        let (metadata, templates) = permissionless_fixture();
+        let instruments =
+            instruments_from_metadata(HyperliquidNetwork::Mainnet, &metadata, &templates)
+                .expect("instruments");
+        let instrument = &instruments[0];
+
+        assert_eq!(
+            instrument.question_name.as_deref(),
+            Some("BTC above 100,000 at Oct 1, 00:00 UTC?")
+        );
+        assert_eq!(
+            instrument.outcome_name,
+            "BTC above 100,000 at Oct 1, 00:00 UTC?"
+        );
+        assert_eq!(instrument.side_name, "Yes");
+        assert_eq!(instrument.template.as_deref(), Some("binaryPrice"));
+        assert_eq!(
+            instrument
+                .deployer
+                .as_ref()
+                .map(|value| value.venue.as_str()),
+            Some("out")
+        );
+        assert_eq!(instrument.coin, "#12100");
+        assert_eq!(instrument.asset_id, 100_012_100);
+    }
+
+    #[test]
+    fn rejects_template_instances_with_a_different_keyword_set() {
+        let (mut metadata, templates) = permissionless_fixture();
+        metadata.outcomes[0].description =
+            "perp:BTC|threshold:100000|time:20261001-0000".to_string();
+
+        let error = instruments_from_metadata(HyperliquidNetwork::Mainnet, &metadata, &templates)
+            .expect_err("missing template keywords must fail");
+        assert!(error.to_string().contains("expected keywords"));
     }
 
     #[test]
@@ -595,98 +1000,5 @@ mod tests {
         assert_eq!(parse_symbol("+10011").expect("token"), (1001, 1));
         assert!(parse_symbol("1001").is_err());
         assert!(parse_symbol("1001:2").is_err());
-    }
-
-    #[test]
-    fn fingerprints_change_when_contract_metadata_changes() {
-        let first =
-            instruments_from_metadata(HyperliquidNetwork::Mainnet, &fixture()).expect("first");
-        let mut changed = fixture();
-        changed.outcomes[0].description = "different contract".to_string();
-        let second =
-            instruments_from_metadata(HyperliquidNetwork::Mainnet, &changed).expect("second");
-        assert_ne!(
-            first[0].metadata_fingerprint,
-            second[0].metadata_fingerprint
-        );
-    }
-
-    #[test]
-    fn derives_a_readable_question_from_recurring_price_metadata() {
-        let metadata: OutcomeMetadata = serde_json::from_value(serde_json::json!({
-            "outcomes": [{
-                "outcome": 1009,
-                "name": "Recurring",
-                "description": "class:priceBinary|underlying:BTC|expiry:20260806-0600|targetPrice:64315|period:1d",
-                "sideSpecs": [{"name":"Yes"},{"name":"No"}],
-                "quoteToken": "USDC"
-            }],
-            "questions": []
-        }))
-        .expect("metadata");
-
-        let instruments =
-            instruments_from_metadata(HyperliquidNetwork::Mainnet, &metadata).expect("instruments");
-
-        assert_eq!(
-            instruments[0].question_name.as_deref(),
-            Some("BTC above 64,315 at Aug 6, 06:00 UTC?")
-        );
-    }
-
-    #[test]
-    fn derives_a_readable_question_from_colon_qualified_perp_metadata() {
-        assert_eq!(
-            structured_question_name("perp:xyz:SKHX|threshold:1180|time:20260801-1400").as_deref(),
-            Some("SKHX above 1,180 at Aug 1, 14:00 UTC?")
-        );
-    }
-
-    #[test]
-    fn ignores_prose_appended_to_a_structured_threshold() {
-        assert_eq!(
-            structured_question_name(
-                "perp:BTC|threshold:65000 (expires 20260807-1600) metadata=category:economics|time:20260807-1600"
-            )
-            .as_deref(),
-            Some("BTC above 65,000 at Aug 7, 16:00 UTC?")
-        );
-    }
-
-    #[test]
-    fn derives_a_readable_parent_question_for_price_buckets() {
-        assert_eq!(
-            structured_question_name(
-                "class:priceBucket|underlying:BTC|expiry:20260806-0600|priceThresholds:63028,65601|period:1d"
-            )
-            .as_deref(),
-            Some("BTC price at Aug 6, 06:00 UTC?")
-        );
-    }
-
-    #[test]
-    fn keeps_human_authored_question_names() {
-        let outcome = OutcomeSpec {
-            outcome: 1,
-            name: "June Fed rate change".to_string(),
-            description: "The market resolves to Change if rates change.".to_string(),
-            side_specs: [
-                OutcomeSideSpec {
-                    name: "Change".to_string(),
-                    extra: BTreeMap::new(),
-                },
-                OutcomeSideSpec {
-                    name: "No Change".to_string(),
-                    extra: BTreeMap::new(),
-                },
-            ],
-            quote_token: "USDC".to_string(),
-            extra: BTreeMap::new(),
-        };
-
-        assert_eq!(
-            readable_question_name(None, &outcome),
-            "June Fed rate change"
-        );
     }
 }

@@ -1,8 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::cli::{CliDataProvider, MarketsArgs};
 use crate::markets::{ExchangeMarkets, Market, MarketSnapshot};
-use crate::providers::hyperliquid::outcomes::{OutcomeInstrument, clean_terminal_text};
+use crate::providers::hyperliquid::outcomes::{
+    OutcomeInstrument, clean_terminal_text, parse_symbol,
+};
 use crate::providers::hyperliquid::{HyperliquidNetwork, OUTCOMES_EXCHANGE};
 
 pub async fn handle(args: MarketsArgs) -> Result<()> {
@@ -44,9 +46,27 @@ async fn handle_outcomes(args: MarketsArgs) -> Result<()> {
     }
     let network = HyperliquidNetwork::from_testnet(args.testnet);
     let mut instruments = crate::providers::hyperliquid::outcomes::instruments(network).await?;
+    if let Some(deployer) = args.deployer.as_deref() {
+        let deployer = deployer.trim();
+        instruments.retain(|instrument| {
+            instrument.deployer.as_ref().is_some_and(|candidate| {
+                candidate.venue.eq_ignore_ascii_case(deployer)
+                    || candidate.address.eq_ignore_ascii_case(deployer)
+            })
+        });
+    }
     if let Some(symbol) = args.symbol.as_deref() {
-        let selected = crate::providers::hyperliquid::outcomes::resolve(network, symbol).await?;
-        return print_outcome_instrument(&selected, args.json);
+        let (outcome, side) = parse_symbol(symbol)?;
+        let selected = instruments
+            .iter()
+            .find(|instrument| instrument.outcome_id == outcome && instrument.side == side)
+            .with_context(|| {
+                format!(
+                    "Hyperliquid {} outcome instrument `{symbol}` does not match the requested filters",
+                    network.label()
+                )
+            })?;
+        return print_outcome_instrument(selected, args.json);
     }
     if let Some(search) = args.search.as_deref() {
         let needle = search.trim().to_ascii_lowercase();
@@ -64,13 +84,17 @@ async fn handle_outcomes(args: MarketsArgs) -> Result<()> {
     );
     println!();
     println!(
-        "{:<12} {:<10} {:<46} {:<22} {:<16} {:<8}",
-        "SYMBOL", "QUESTION", "QUESTION NAME", "OUTCOME", "SIDE", "QUOTE"
+        "{:<12} {:<10} {:<10} {:<46} {:<22} {:<16} {:<8}",
+        "SYMBOL", "DEPLOYER", "QUESTION", "QUESTION NAME", "OUTCOME", "SIDE", "QUOTE"
     );
     for instrument in &instruments {
         println!(
-            "{:<12} {:<10} {:<46} {:<22} {:<16} {:<8}",
+            "{:<12} {:<10} {:<10} {:<46} {:<22} {:<16} {:<8}",
             instrument.symbol,
+            instrument
+                .deployer
+                .as_ref()
+                .map_or("-", |deployer| deployer.venue.as_str()),
             instrument
                 .question_id
                 .map_or_else(|| "-".to_string(), |id| id.to_string()),
@@ -94,6 +118,12 @@ fn print_outcome_instrument(instrument: &OutcomeInstrument, json: bool) -> Resul
     println!("Hyperliquid outcome instrument");
     println!("  network:       {}", instrument.network);
     println!("  symbol:        {}", instrument.symbol);
+    if let Some(deployer) = &instrument.deployer {
+        println!("  deployer:      {} ({})", deployer.venue, deployer.address);
+    }
+    if let Some(template) = &instrument.template {
+        println!("  template:      {template}");
+    }
     println!(
         "  question:      {}",
         instrument
@@ -128,21 +158,25 @@ fn print_outcome_instrument(instrument: &OutcomeInstrument, json: bool) -> Resul
 }
 
 fn outcome_search_text(instrument: &OutcomeInstrument) -> String {
-    format!(
-        "{} {} {} {} {} {} {}",
-        instrument.symbol,
+    [
+        instrument.symbol.clone(),
+        instrument
+            .deployer
+            .as_ref()
+            .map_or_else(String::new, |deployer| deployer.venue.clone()),
+        instrument
+            .deployer
+            .as_ref()
+            .map_or_else(String::new, |deployer| deployer.address.clone()),
         instrument
             .question_id
             .map_or_else(String::new, |id| id.to_string()),
-        instrument.question_name.as_deref().unwrap_or_default(),
-        instrument
-            .question_description
-            .as_deref()
-            .unwrap_or_default(),
-        instrument.outcome_name,
-        instrument.outcome_description,
-        instrument.side_name,
-    )
+        instrument.question_name.clone().unwrap_or_default(),
+        instrument.outcome_name.clone(),
+        instrument.template.clone().unwrap_or_default(),
+        instrument.side_name.clone(),
+    ]
+    .join(" ")
     .to_ascii_lowercase()
 }
 

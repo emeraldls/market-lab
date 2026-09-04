@@ -489,6 +489,9 @@ pub struct MarketsArgs {
     /// Filter dynamic outcome markets by question, outcome, side, or id.
     #[arg(long)]
     pub search: Option<String>,
+    /// Filter outcome markets by exact deployer venue or address.
+    #[arg(long)]
+    pub deployer: Option<String>,
     /// Fetch Hyperliquid testnet markets instead of the default mainnet.
     #[arg(long, default_value_t = false)]
     pub testnet: bool,
@@ -507,12 +510,22 @@ impl MarketsArgs {
         if self.testnet && !self.exchange.eq_ignore_ascii_case("hyperliquid-outcomes") {
             bail!("--testnet is currently supported by markets only for hyperliquid-outcomes");
         }
+        if self.deployer.is_some() && !self.exchange.eq_ignore_ascii_case("hyperliquid-outcomes") {
+            bail!("--deployer is available only for hyperliquid-outcomes");
+        }
         if self
             .search
             .as_ref()
             .is_some_and(|search| search.trim().is_empty())
         {
             bail!("--search cannot be empty");
+        }
+        if self
+            .deployer
+            .as_ref()
+            .is_some_and(|deployer| deployer.trim().is_empty())
+        {
+            bail!("--deployer cannot be empty");
         }
         Ok(())
     }
