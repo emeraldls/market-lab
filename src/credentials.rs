@@ -15,7 +15,8 @@ use crate::providers::bulk;
 use crate::providers::hyperliquid::HyperliquidNetwork;
 use crate::providers::hyperliquid::exchange::{
     HYPERLINK_API_WALLET_NAME, LEGACY_TESTNET_API_WALLET_NAME, MAINNET_API_WALLET_NAME,
-    TESTNET_API_WALLET_NAME, approve_agent, approve_hyperlink_agent, response_error,
+    TESTNET_API_WALLET_NAME, approve_agent, approve_builder_fee, approve_hyperlink_agent,
+    response_error,
 };
 use crate::providers::hyperliquid::signing::{HyperliquidWallet, canonical_address};
 
@@ -30,7 +31,8 @@ const LEGACY_BULK_CREDENTIAL_VERSION: u8 = 1;
 const BULK_CREDENTIAL_VERSION: u8 = 2;
 const LEGACY_HYPERLIQUID_CREDENTIAL_VERSION: u8 = 1;
 const LEGACY_NETWORKED_HYPERLIQUID_CREDENTIAL_VERSION: u8 = 2;
-const HYPERLIQUID_CREDENTIAL_VERSION: u8 = 3;
+const LEGACY_SUBACCOUNT_HYPERLIQUID_CREDENTIAL_VERSION: u8 = 3;
+const HYPERLIQUID_CREDENTIAL_VERSION: u8 = 4;
 const HYPERLINK_CREDENTIAL_VERSION: u8 = 1;
 
 static MMT_API_KEY: OnceLock<String> = OnceLock::new();
@@ -45,6 +47,7 @@ pub struct ActiveHyperliquidCredential {
     pub account: String,
     pub agent: HyperliquidWallet,
     pub vault_address: Option<String>,
+    pub builder: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -125,6 +128,8 @@ struct HyperliquidCredential {
     mainnet_subaccounts: Vec<NamedSubaccount>,
     #[serde(default)]
     testnet_subaccounts: Vec<NamedSubaccount>,
+    #[serde(default)]
+    builder: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -192,6 +197,13 @@ impl HyperliquidCredential {
             &self.testnet_subaccounts,
             NamedSubaccount::validate_hyperliquid,
         )?;
+        if let Some(builder) = &self.builder {
+            let canonical =
+                canonical_address(builder).context("stored builder address is invalid")?;
+            if canonical != *builder {
+                bail!("stored Hyperliquid builder address is not canonical");
+            }
+        }
         Ok(())
     }
 
@@ -250,6 +262,7 @@ impl LegacyHyperliquidCredential {
             }),
             mainnet_subaccounts: Vec::new(),
             testnet_subaccounts: Vec::new(),
+            builder: None,
         };
         credential.validate()?;
         Ok(credential)
@@ -453,6 +466,9 @@ pub fn active_hyperliquid_credential_for(
         vault_address: (account != credential.account).then(|| account.clone()),
         account,
         agent: agent.wallet()?,
+        builder: (network == HyperliquidNetwork::Mainnet)
+            .then(|| credential.builder.clone())
+            .flatten(),
     })
 }
 
@@ -493,6 +509,7 @@ pub fn active_hyperlink_credential() -> Result<ActiveHyperliquidCredential> {
         account: credential.account,
         agent: credential.agent.wallet()?,
         vault_address: None,
+        builder: None,
     })
 }
 
@@ -510,6 +527,17 @@ pub fn hyperlink_accounts() -> Result<Vec<(String, String)>> {
 pub async fn handle_set(args: AuthSetArgs) -> Result<()> {
     if args.reauthorize && args.subaccount.is_some() {
         bail!("`--reauthorize` and `--subaccount` cannot be used together");
+    }
+    if args.subaccount.is_some() && (args.builder.is_some() || args.clear_builder) {
+        bail!("`--subaccount` cannot be used with `--builder` or `--clear-builder`");
+    }
+    if args.clear_builder && args.reauthorize {
+        bail!("`--clear-builder` and `--reauthorize` cannot be used together");
+    }
+    if !matches!(args.provider, AuthProvider::Hyperliquid)
+        && (args.builder.is_some() || args.clear_builder)
+    {
+        bail!("`--builder` and `--clear-builder` are available only for Hyperliquid");
     }
     match args.provider {
         AuthProvider::Mmt => {
@@ -531,7 +559,13 @@ pub async fn handle_set(args: AuthSetArgs) -> Result<()> {
         }
         AuthProvider::Bulk => handle_set_bulk(args.reauthorize, args.subaccount.as_deref()).await?,
         AuthProvider::Hyperliquid => {
-            handle_set_hyperliquid(args.reauthorize, args.subaccount.as_deref()).await?
+            handle_set_hyperliquid(
+                args.reauthorize,
+                args.subaccount.as_deref(),
+                args.builder.as_deref(),
+                args.clear_builder,
+            )
+            .await?
         }
         AuthProvider::Hyperlink => {
             handle_set_hyperlink(args.reauthorize, args.subaccount.as_deref()).await?
@@ -592,6 +626,10 @@ fn print_hyperliquid_status() -> Result<()> {
             }
             print_subaccounts("mainnet subaccounts", &credential.mainnet_subaccounts);
             print_subaccounts("testnet subaccounts", &credential.testnet_subaccounts);
+            match &credential.builder {
+                Some(builder) => println!("  builder: {builder} (0 fee, mainnet)"),
+                None => println!("  builder: not configured"),
+            }
         }
         None => println!("hyperliquid: not configured"),
     }
@@ -970,26 +1008,64 @@ async fn handle_remove_hyperlink() -> Result<()> {
     Ok(())
 }
 
-async fn handle_set_hyperliquid(reauthorize: bool, subaccount: Option<&str>) -> Result<()> {
+async fn handle_set_hyperliquid(
+    reauthorize: bool,
+    subaccount: Option<&str>,
+    builder: Option<&str>,
+    clear_builder: bool,
+) -> Result<()> {
     if let Some(name) = subaccount {
         return handle_create_hyperliquid_subaccount(name).await;
     }
     let mut existing = load_hyperliquid_credential()?;
-    let replacing_existing = reauthorize && existing.is_some();
-    if existing
+    if clear_builder {
+        let credential = existing.as_mut().context(
+            "Hyperliquid credentials are not configured; run `mlab auth set hyperliquid`",
+        )?;
+        if credential.builder.take().is_none() {
+            println!("hyperliquid: builder is already disabled");
+            return Ok(());
+        }
+        save_hyperliquid_credential(credential)?;
+        println!("hyperliquid: builder disabled");
+        return Ok(());
+    }
+
+    let builder = builder
+        .map(canonical_address)
+        .transpose()
+        .context("invalid Hyperliquid builder address")?;
+    let agents_complete = existing
         .as_ref()
-        .is_some_and(|credential| credential.validate_complete().is_ok())
-        && !reauthorize
-    {
+        .is_some_and(|credential| credential.validate_complete().is_ok());
+    let replacing_existing = reauthorize && existing.is_some();
+    if agents_complete && !reauthorize && builder.is_none() {
         let credential = existing.as_ref().expect("checked above");
         println!("hyperliquid: already configured for mainnet and testnet");
         println!("  account: {}", credential.account);
         print_hyperliquid_agents(credential);
+        print_hyperliquid_builder(credential);
         println!("  use `mlab auth set hyperliquid --reauthorize` to replace the API wallet");
         return Ok(());
     }
+    if agents_complete
+        && !reauthorize
+        && existing
+            .as_ref()
+            .and_then(|credential| credential.builder.as_ref())
+            == builder.as_ref()
+    {
+        let credential = existing.as_ref().expect("checked above");
+        println!("hyperliquid: builder already configured");
+        print_hyperliquid_builder(credential);
+        return Ok(());
+    }
 
-    println!("Hyperliquid mainnet and testnet API-wallet setup.");
+    if agents_complete && !reauthorize {
+        println!("Hyperliquid mainnet builder setup.");
+    } else {
+        println!("Hyperliquid mainnet and testnet API-wallet setup.");
+    }
     println!("The main wallet private key is used only for approval and is never stored.");
     let master = {
         let private_key = Zeroizing::new(rpassword::prompt_password(
@@ -1063,6 +1139,14 @@ async fn handle_set_hyperliquid(reauthorize: bool, subaccount: Option<&str>) -> 
         }
     };
 
+    if let Some(builder) = &builder {
+        println!("hyperliquid: approving mainnet builder `{builder}` with zero fee");
+        let response = approve_builder_fee(&master, HyperliquidNetwork::Mainnet, builder, "0%")
+            .await
+            .context("Hyperliquid mainnet builder approval failed")?;
+        ensure_hyperliquid_exchange_ok(&response, "mainnet builder approval")?;
+    }
+
     let credential = HyperliquidCredential {
         version: HYPERLIQUID_CREDENTIAL_VERSION,
         account: account.clone(),
@@ -1074,17 +1158,29 @@ async fn handle_set_hyperliquid(reauthorize: bool, subaccount: Option<&str>) -> 
         testnet_subaccounts: existing.as_mut().map_or_else(Vec::new, |credential| {
             std::mem::take(&mut credential.testnet_subaccounts)
         }),
+        builder: builder.or_else(|| {
+            existing
+                .as_mut()
+                .and_then(|credential| credential.builder.take())
+        }),
     };
     credential.validate_complete()?;
     save_hyperliquid_credential(&credential)?;
-    crate::markets::refresh_hyperliquid()
-        .await
-        .context("Hyperliquid was configured, but its market snapshot could not be initialized")?;
-    crate::runtime::reload_markets_if_running().await?;
+    if !agents_complete || reauthorize {
+        crate::markets::refresh_hyperliquid().await.context(
+            "Hyperliquid was configured, but its market snapshot could not be initialized",
+        )?;
+        crate::runtime::reload_markets_if_running().await?;
+    }
 
-    println!("hyperliquid: configured for mainnet and testnet");
+    if agents_complete && !reauthorize {
+        println!("hyperliquid: builder configured");
+    } else {
+        println!("hyperliquid: configured for mainnet and testnet");
+    }
     println!("  account: {account}");
     print_hyperliquid_agents(&credential);
+    print_hyperliquid_builder(&credential);
     print_credential_location(HYPERLIQUID_CREDENTIAL_FILE)?;
     Ok(())
 }
@@ -1169,6 +1265,13 @@ fn print_hyperliquid_agents(credential: &HyperliquidCredential) {
     }
     if let Some(agent) = &credential.testnet_agent {
         println!("  testnet agent: {} ({})", agent.address, agent.name);
+    }
+}
+
+fn print_hyperliquid_builder(credential: &HyperliquidCredential) {
+    match &credential.builder {
+        Some(builder) => println!("  builder: {builder} (0 fee, mainnet)"),
+        None => println!("  builder: not configured"),
     }
 }
 
@@ -1370,7 +1473,9 @@ fn load_hyperliquid_credential() -> Result<Option<HyperliquidCredential>> {
                 .context("stored legacy Hyperliquid agent credential is malformed")?
                 .upgrade()?
         }
-        LEGACY_NETWORKED_HYPERLIQUID_CREDENTIAL_VERSION | HYPERLIQUID_CREDENTIAL_VERSION => {
+        LEGACY_NETWORKED_HYPERLIQUID_CREDENTIAL_VERSION
+        | LEGACY_SUBACCOUNT_HYPERLIQUID_CREDENTIAL_VERSION
+        | HYPERLIQUID_CREDENTIAL_VERSION => {
             let mut credential = serde_json::from_str::<HyperliquidCredential>(encoded.as_str())
                 .context("stored Hyperliquid agent credential is malformed")?;
             credential.version = HYPERLIQUID_CREDENTIAL_VERSION;
@@ -1799,6 +1904,7 @@ mod tests {
             )),
             mainnet_subaccounts: Vec::new(),
             testnet_subaccounts: Vec::new(),
+            builder: None,
         };
 
         credential

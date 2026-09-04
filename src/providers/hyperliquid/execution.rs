@@ -160,10 +160,13 @@ impl HyperliquidExecutionAdapter {
         product: HyperliquidProduct,
     ) -> Result<Self> {
         let exchange = match credential.vault_address {
-            Some(vault_address) => {
-                HyperliquidExchangeClient::for_subaccount(credential.agent, network, vault_address)?
-            }
-            None => HyperliquidExchangeClient::new(credential.agent, network)?,
+            Some(vault_address) => HyperliquidExchangeClient::for_subaccount(
+                credential.agent,
+                network,
+                vault_address,
+                credential.builder,
+            )?,
+            None => HyperliquidExchangeClient::new(credential.agent, network, credential.builder)?,
         };
         Ok(Self {
             exchange,
@@ -1212,11 +1215,17 @@ pub fn normalize_price_for(
     let significant_decimals = (4 - magnitude).max(0) as u8;
     let decimals = max_decimals.min(significant_decimals);
     let scale = 10_f64.powi(i32::from(decimals));
-    if round_up {
-        (price * scale).ceil() / scale
+    let scaled = price * scale;
+    let nearest = scaled.round();
+    let boundary_tolerance = 1e-9_f64.max(scaled.abs() * f64::EPSILON * 4.0);
+    let units = if (scaled - nearest).abs() <= boundary_tolerance {
+        nearest
+    } else if round_up {
+        scaled.ceil()
     } else {
-        (price * scale).floor() / scale
-    }
+        scaled.floor()
+    };
+    units / scale
 }
 
 pub(crate) fn validate_price_for(
@@ -1952,6 +1961,8 @@ mod tests {
         assert_eq!(normalize_price(66_632.064, 5, false), 66_632.0);
         assert_eq!(normalize_price(1_927.806, 4, true), 1_927.9);
         assert_eq!(normalize_price(0.60914, 2, false), 0.6091);
+        assert_eq!(normalize_price_for(0.52033, 0, 8, false), 0.52033);
+        validate_price_for(0.52033, 0, 8).expect("valid outcome price remains on its boundary");
     }
 
     #[test]

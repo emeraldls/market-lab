@@ -121,6 +121,21 @@ impl HyperliquidWallet {
         self.sign_hash(digest)
     }
 
+    pub fn sign_approve_builder_fee(
+        &self,
+        builder: &str,
+        max_fee_rate: &str,
+        nonce: u64,
+        network: HyperliquidNetwork,
+    ) -> Result<WireSignature> {
+        let builder = address_bytes(builder).context("invalid builder address")?;
+        let digest = typed_data_digest(
+            transaction_domain_separator(SIGNATURE_CHAIN_ID),
+            approve_builder_fee_struct_hash(network.approval_chain(), max_fee_rate, builder, nonce),
+        );
+        self.sign_hash(digest)
+    }
+
     fn sign_hash(&self, hash: [u8; 32]) -> Result<WireSignature> {
         let (signature, recovery_id) = self
             .key
@@ -186,6 +201,30 @@ fn approve_agent_struct_hash(
         keccak(agent_name.as_bytes()),
         uint_word(nonce),
     ]))
+}
+
+fn approve_builder_fee_struct_hash(
+    chain: &str,
+    max_fee_rate: &str,
+    builder: [u8; 20],
+    nonce: u64,
+) -> [u8; 32] {
+    keccak(abi_words([
+        keccak(b"HyperliquidTransaction:ApproveBuilderFee(string hyperliquidChain,string maxFeeRate,address builder,uint64 nonce)"),
+        keccak(chain.as_bytes()),
+        keccak(max_fee_rate.as_bytes()),
+        address_word(builder),
+        uint_word(nonce),
+    ]))
+}
+
+fn address_bytes(value: &str) -> Result<[u8; 20]> {
+    let canonical = canonical_address(value)?;
+    let bytes = hex::decode(canonical.trim_start_matches("0x"))
+        .context("failed to decode canonical address")?;
+    let mut address = [0_u8; 20];
+    address.copy_from_slice(&bytes);
+    Ok(address)
 }
 
 fn typed_data_digest(domain: [u8; 32], structure: [u8; 32]) -> [u8; 32] {
@@ -340,5 +379,31 @@ mod tests {
             .expect("testnet agent signs");
         assert_ne!(mainnet.r, testnet.r);
         assert_ne!(mainnet.s, testnet.s);
+    }
+
+    #[test]
+    fn builder_approval_signature_matches_the_official_sdk_vector() {
+        let wallet = HyperliquidWallet::from_private_key(
+            "e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e",
+        )
+        .expect("wallet parses");
+        let signature = wallet
+            .sign_approve_builder_fee(
+                "0x1234567890123456789012345678901234567890",
+                "0.001%",
+                1_583_838,
+                HyperliquidNetwork::Mainnet,
+            )
+            .expect("builder approval signs");
+
+        assert_eq!(
+            signature.r,
+            "0x343c9078af7c3d6683abefd0ca3b2960de5b669b716863e6dc49090853a4a3cd"
+        );
+        assert_eq!(
+            signature.s,
+            "0x6c016301239461091a8ca3ea5ac783362526c4d9e9e624ffc563aea93d6ac239"
+        );
+        assert_eq!(signature.v, 27);
     }
 }

@@ -29,16 +29,22 @@ pub struct HyperliquidExchangeClient {
     wallet: HyperliquidWallet,
     network: HyperliquidNetwork,
     vault_address: Option<String>,
+    builder: Option<BuilderRequest>,
     backend: ExchangeBackend,
 }
 
 impl HyperliquidExchangeClient {
-    pub fn new(wallet: HyperliquidWallet, network: HyperliquidNetwork) -> Result<Self> {
+    pub fn new(
+        wallet: HyperliquidWallet,
+        network: HyperliquidNetwork,
+        builder: Option<String>,
+    ) -> Result<Self> {
         Ok(Self {
             trading: HyperliquidTradingClient::shared(network),
             wallet,
             network,
             vault_address: None,
+            builder: builder.map(BuilderRequest::new).transpose()?,
             backend: ExchangeBackend::Hyperliquid,
         })
     }
@@ -47,6 +53,7 @@ impl HyperliquidExchangeClient {
         wallet: HyperliquidWallet,
         network: HyperliquidNetwork,
         vault_address: String,
+        builder: Option<String>,
     ) -> Result<Self> {
         let vault_address = super::signing::canonical_address(&vault_address)?;
         Ok(Self {
@@ -54,6 +61,7 @@ impl HyperliquidExchangeClient {
             wallet,
             network,
             vault_address: Some(vault_address),
+            builder: builder.map(BuilderRequest::new).transpose()?,
             backend: ExchangeBackend::Hyperliquid,
         })
     }
@@ -64,6 +72,7 @@ impl HyperliquidExchangeClient {
             wallet,
             network: HyperliquidNetwork::Mainnet,
             vault_address: None,
+            builder: None,
             backend: ExchangeBackend::Hyperlink,
         })
     }
@@ -87,7 +96,12 @@ impl HyperliquidExchangeClient {
         orders: Vec<OrderRequest>,
         grouping: OrderGrouping,
     ) -> Result<ExchangeResponseStatus> {
-        self.post_l1(Action::Order { orders, grouping }).await
+        self.post_l1(Action::Order {
+            orders,
+            grouping,
+            builder: self.builder.clone(),
+        })
+        .await
     }
 
     pub async fn user_outcome(&self, action: UserOutcomeAction) -> Result<ExchangeResponseStatus> {
@@ -324,6 +338,30 @@ pub async fn approve_agent(
     Ok((agent, response))
 }
 
+pub async fn approve_builder_fee(
+    master: &HyperliquidWallet,
+    network: HyperliquidNetwork,
+    builder: &str,
+    max_fee_rate: &str,
+) -> Result<ExchangeResponseStatus> {
+    let builder = super::signing::canonical_address(builder)
+        .context("invalid Hyperliquid builder address")?;
+    let nonce = next_nonce()?;
+    let action = Action::ApproveBuilderFee {
+        signature_chain_id: "0x66eee".to_string(),
+        hyperliquid_chain: network.approval_chain().to_string(),
+        max_fee_rate: max_fee_rate.to_string(),
+        builder: builder.clone(),
+        nonce,
+    };
+    let signature = master.sign_approve_builder_fee(&builder, max_fee_rate, nonce, network)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .context("failed to construct Hyperliquid builder authorization client")?;
+    post_exchange_http(&client, network, action, signature, nonce).await
+}
+
 pub async fn approve_hyperlink_agent(
     master: &HyperliquidWallet,
     agent: &HyperliquidWallet,
@@ -515,6 +553,8 @@ pub enum Action {
     Order {
         orders: Vec<OrderRequest>,
         grouping: OrderGrouping,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        builder: Option<BuilderRequest>,
     },
     Cancel {
         cancels: Vec<CancelRequest>,
@@ -533,6 +573,33 @@ pub enum Action {
         agent_name: Option<String>,
         nonce: u64,
     },
+    ApproveBuilderFee {
+        #[serde(rename = "signatureChainId")]
+        signature_chain_id: String,
+        #[serde(rename = "hyperliquidChain")]
+        hyperliquid_chain: String,
+        #[serde(rename = "maxFeeRate")]
+        max_fee_rate: String,
+        builder: String,
+        nonce: u64,
+    },
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BuilderRequest {
+    #[serde(rename = "b")]
+    address: String,
+    #[serde(rename = "f")]
+    fee: u32,
+}
+
+impl BuilderRequest {
+    fn new(address: String) -> Result<Self> {
+        Ok(Self {
+            address: super::signing::canonical_address(&address)?,
+            fee: 0,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -708,12 +775,33 @@ mod tests {
                 },
             }],
             grouping: OrderGrouping::None,
+            builder: None,
         };
         let value = serde_json::to_value(action).expect("serializes");
         assert_eq!(value["type"], "order");
         assert_eq!(value["orders"][0]["a"], 0);
         assert_eq!(value["orders"][0]["t"]["limit"]["tif"], "Alo");
         assert_eq!(value["grouping"], "na");
+        assert!(value.get("builder").is_none());
+    }
+
+    #[test]
+    fn order_action_attaches_a_zero_fee_builder() {
+        let action = Action::Order {
+            orders: Vec::new(),
+            grouping: OrderGrouping::None,
+            builder: Some(
+                BuilderRequest::new("0x1234567890123456789012345678901234567890".to_string())
+                    .expect("builder is valid"),
+            ),
+        };
+        let value = serde_json::to_value(action).expect("serializes");
+
+        assert_eq!(
+            value["builder"]["b"],
+            "0x1234567890123456789012345678901234567890"
+        );
+        assert_eq!(value["builder"]["f"], 0);
     }
 
     #[test]
@@ -731,6 +819,7 @@ mod tests {
                 },
             }],
             grouping: OrderGrouping::None,
+            builder: None,
         };
         let value = serde_json::to_value(action).expect("serializes");
 
@@ -759,6 +848,7 @@ mod tests {
                 client_order_id: Some("0x00000000000000000000000000000001".to_string()),
             }],
             grouping: OrderGrouping::None,
+            builder: None,
         };
 
         let signature = wallet

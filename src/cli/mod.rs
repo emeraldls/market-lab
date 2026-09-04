@@ -658,6 +658,12 @@ pub struct AuthSetArgs {
     /// Create a named execution subaccount under the configured main account.
     #[arg(long, value_name = "NAME")]
     pub subaccount: Option<String>,
+    /// Approve and use this builder address for Hyperliquid orders.
+    #[arg(long, value_name = "ADDRESS", conflicts_with = "clear_builder")]
+    pub builder: Option<String>,
+    /// Stop attaching the configured builder to Hyperliquid orders.
+    #[arg(long, default_value_t = false, conflicts_with = "builder")]
+    pub clear_builder: bool,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -3565,6 +3571,8 @@ mod tests {
                     provider: AuthProvider::Mmt,
                     reauthorize: false,
                     subaccount: None,
+                    builder: None,
+                    clear_builder: false,
                 })
             }
         ));
@@ -3587,6 +3595,8 @@ mod tests {
                     provider: AuthProvider::Bulk,
                     reauthorize: false,
                     subaccount: None,
+                    builder: None,
+                    clear_builder: false,
                 })
             }
         ));
@@ -3601,6 +3611,8 @@ mod tests {
                     provider: AuthProvider::Bulk,
                     reauthorize: true,
                     subaccount: None,
+                    builder: None,
+                    clear_builder: false,
                 })
             }
         ));
@@ -3621,8 +3633,48 @@ mod tests {
                     provider: AuthProvider::Hyperliquid,
                     reauthorize: false,
                     subaccount: Some(name),
+                    builder: None,
+                    clear_builder: false,
                 })
             } if name == "trading-2"
+        ));
+
+        let builder = Cli::try_parse_from([
+            "mlab",
+            "auth",
+            "set",
+            "hyperliquid",
+            "--builder",
+            "0x1234567890123456789012345678901234567890",
+        ])
+        .expect("builder should parse");
+        assert!(matches!(
+            builder.command,
+            Commands::Auth {
+                command: AuthCommands::Set(AuthSetArgs {
+                    provider: AuthProvider::Hyperliquid,
+                    reauthorize: false,
+                    subaccount: None,
+                    builder: Some(address),
+                    clear_builder: false,
+                })
+            } if address == "0x1234567890123456789012345678901234567890"
+        ));
+
+        let clear_builder =
+            Cli::try_parse_from(["mlab", "auth", "set", "hyperliquid", "--clear-builder"])
+                .expect("clear builder should parse");
+        assert!(matches!(
+            clear_builder.command,
+            Commands::Auth {
+                command: AuthCommands::Set(AuthSetArgs {
+                    provider: AuthProvider::Hyperliquid,
+                    reauthorize: false,
+                    subaccount: None,
+                    builder: None,
+                    clear_builder: true,
+                })
+            }
         ));
     }
 
