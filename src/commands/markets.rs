@@ -1,10 +1,11 @@
-use anyhow::{Context, Result};
+use std::io::{self, IsTerminal};
+
+use anyhow::{Context, Result, bail};
+use dialoguer::{FuzzySelect, Select, theme::ColorfulTheme};
 
 use crate::cli::{CliDataProvider, MarketsArgs};
 use crate::markets::{ExchangeMarkets, Market, MarketSnapshot};
-use crate::providers::hyperliquid::outcomes::{
-    OutcomeInstrument, clean_terminal_text, parse_symbol,
-};
+use crate::markets::outcomes::{OutcomeInstrument, parse_symbol};
 use crate::providers::hyperliquid::{HyperliquidNetwork, OUTCOMES_EXCHANGE};
 
 pub async fn handle(args: MarketsArgs) -> Result<()> {
@@ -45,7 +46,7 @@ async fn handle_outcomes(args: MarketsArgs) -> Result<()> {
         );
     }
     let network = HyperliquidNetwork::from_testnet(args.testnet);
-    let mut instruments = crate::providers::hyperliquid::outcomes::instruments(network).await?;
+    let mut instruments = crate::markets::outcomes::instruments(network).await?;
     if let Some(deployer) = args.deployer.as_deref() {
         let deployer = deployer.trim();
         instruments.retain(|instrument| {
@@ -178,6 +179,79 @@ fn outcome_search_text(instrument: &OutcomeInstrument) -> String {
     ]
     .join(" ")
     .to_ascii_lowercase()
+}
+
+pub async fn select_outcome_interactive(
+    network: HyperliquidNetwork,
+) -> Result<OutcomeInstrument> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!("outcome selection needs an interactive terminal; pass a symbol such as `1001:0`");
+    }
+    let instruments = crate::markets::outcomes::instruments(network).await?;
+    let mut outcomes = Vec::<OutcomeInstrument>::new();
+    let mut seen = std::collections::HashSet::<u32>::new();
+    for instrument in instruments.iter().filter(|instrument| !instrument.settled) {
+        if seen.insert(instrument.outcome_id) {
+            outcomes.push(instrument.clone());
+        }
+    }
+    if outcomes.is_empty() {
+        bail!(
+            "Hyperliquid {} currently exposes no active outcomes",
+            network.label()
+        );
+    }
+    let labels = outcomes
+        .iter()
+        .map(|instrument| {
+            let question = instrument.question_name.as_deref().unwrap_or("Standalone");
+            format!(
+                "{} — {} [outcome {}]",
+                clean_terminal_text(question),
+                clean_terminal_text(&instrument.outcome_name),
+                instrument.outcome_id
+            )
+        })
+        .collect::<Vec<_>>();
+    let theme = ColorfulTheme::default();
+    let selected = FuzzySelect::with_theme(&theme)
+        .with_prompt("Search or select an outcome")
+        .items(&labels)
+        .default(0)
+        .interact_opt()?
+        .context("outcome selection was cancelled")?;
+    let outcome = &outcomes[selected];
+    let matching = instruments
+        .into_iter()
+        .filter(|instrument| instrument.outcome_id == outcome.outcome_id)
+        .collect::<Vec<_>>();
+    let labels = matching
+        .iter()
+        .map(|instrument| {
+            format!(
+                "{} (side {})",
+                clean_terminal_text(&instrument.side_name),
+                instrument.side
+            )
+        })
+        .collect::<Vec<_>>();
+    let selected = Select::with_theme(&theme)
+        .with_prompt(format!(
+            "Select a side for {}",
+            clean_terminal_text(&outcome.outcome_name)
+        ))
+        .items(&labels)
+        .default(0)
+        .interact_opt()?
+        .context("outcome side selection was cancelled")?;
+    Ok(matching[selected].clone())
+}
+
+fn clean_terminal_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect()
 }
 
 fn truncate(value: &str, width: usize) -> String {

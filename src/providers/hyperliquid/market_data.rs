@@ -462,7 +462,8 @@ async fn require_market(
     markets::HyperliquidNetworkMarket,
 )> {
     let (market, variant) = if product == HyperliquidProduct::Outcome {
-        let (market, variant, _) = super::outcomes::market_and_variant(network, symbol).await?;
+        let (market, variant, _) =
+            crate::markets::outcomes::market_and_variant(network, symbol).await?;
         (market, variant)
     } else {
         markets::network_market(product, network, symbol)?
@@ -639,8 +640,12 @@ async fn outcome_statistics(period: &str, symbol: Option<&str>) -> Result<Exchan
         bail!("Hyperliquid outcome statistics currently supports only period 1d");
     }
     let instruments = match symbol {
-        Some(symbol) => vec![super::outcomes::resolve(HyperliquidNetwork::Mainnet, symbol).await?],
-        None => super::outcomes::instruments(HyperliquidNetwork::Mainnet).await?,
+        Some(symbol) => vec![crate::markets::outcomes::resolve(
+            HyperliquidNetwork::Mainnet,
+            symbol,
+        )
+        .await?],
+        None => crate::markets::outcomes::instruments(HyperliquidNetwork::Mainnet).await?,
     };
     let mids: std::collections::HashMap<String, String> =
         HyperliquidClient::for_network(HyperliquidNetwork::Mainnet)?

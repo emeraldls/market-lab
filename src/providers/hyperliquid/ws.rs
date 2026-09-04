@@ -28,7 +28,8 @@ async fn network_market_for_stream(
     markets::HyperliquidNetworkMarket,
 )> {
     if product == HyperliquidProduct::Outcome {
-        let (market, variant, _) = super::outcomes::market_and_variant(network, symbol).await?;
+        let (market, variant, _) =
+            crate::markets::outcomes::market_and_variant(network, symbol).await?;
         Ok((market, variant))
     } else {
         markets::network_market(product, network, symbol)

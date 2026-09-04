@@ -459,6 +459,30 @@ impl MarketDataAdapter {
         Ok(Self { provider })
     }
 
+    pub fn for_execution_market(
+        venue: ExecutionVenue,
+        testnet: bool,
+        symbol: &str,
+    ) -> Result<Self> {
+        let spec = venue.spec()?;
+        spec.validate_network(testnet)?;
+        if crate::markets::execution_market(venue, symbol)? == crate::venues::VenueMarket::Outcome
+        {
+            if spec.execution != ExecutionBackend::Hyperliquid {
+                bail!("{} does not support outcome markets", spec.label());
+            }
+            return Ok(Self {
+                provider: Box::new(HyperliquidMarketData {
+                    exchange: crate::providers::hyperliquid::OUTCOMES_EXCHANGE.to_string(),
+                    label: "Hyperliquid Outcomes".to_string(),
+                    product: HyperliquidProduct::Outcome,
+                    network: HyperliquidNetwork::from_testnet(testnet),
+                }),
+            });
+        }
+        Self::for_venue(venue, testnet)
+    }
+
     pub fn exchange(&self) -> &str {
         self.provider.exchange()
     }
@@ -653,7 +677,9 @@ impl VenueOrderBookStream {
         depth: u16,
         testnet: bool,
     ) -> Result<Self> {
-        Self::connect_exchange(venue.as_str(), symbol, depth, testnet).await
+        let adapter = MarketDataAdapter::for_execution_market(venue, testnet, symbol)?;
+        let inner = adapter.provider.connect_orderbook(symbol, depth).await?;
+        Ok(Self { inner })
     }
 
     pub async fn connect_exchange(
@@ -701,7 +727,9 @@ pub struct VenueTradesStream {
 
 impl VenueTradesStream {
     pub async fn connect(venue: ExecutionVenue, symbol: &str, testnet: bool) -> Result<Self> {
-        Self::connect_exchange(venue.as_str(), symbol, testnet).await
+        let adapter = MarketDataAdapter::for_execution_market(venue, testnet, symbol)?;
+        let inner = adapter.provider.connect_trades(symbol).await?;
+        Ok(Self { inner })
     }
 
     pub async fn connect_exchange(exchange: &str, symbol: &str, testnet: bool) -> Result<Self> {

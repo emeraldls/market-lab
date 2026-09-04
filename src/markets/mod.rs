@@ -14,6 +14,24 @@ use serde_json::Value;
 
 use crate::credentials::mmt_api_key;
 
+pub mod outcomes;
+
+/// Resolves the product traded by an execution request. Hyperliquid exposes
+/// HIP-1 spot and HIP-4 outcomes through one execution venue; their canonical
+/// symbol shapes select the product deterministically.
+pub fn execution_market(
+    venue: crate::venues::VenueId,
+    symbol: &str,
+) -> Result<crate::venues::VenueMarket> {
+    let configured = venue.market();
+    if venue == crate::venues::VenueId::HyperliquidSpot
+        && (outcomes::parse_symbol(symbol).is_ok() || outcomes::parse_market_id(symbol).is_ok())
+    {
+        return Ok(crate::venues::VenueMarket::Outcome);
+    }
+    Ok(configured)
+}
+
 const SNAPSHOT_SCHEMA_VERSION: u8 = 1;
 const BULK_MARKETS_URL: &str = "https://exchange-api.bulk.trade/api/v1/exchangeInfo";
 const BINANCE_SPOT_MARKETS_URL: &str = "https://api.binance.com/api/v3/exchangeInfo";

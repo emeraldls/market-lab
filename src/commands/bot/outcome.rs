@@ -24,7 +24,7 @@ use crate::providers::execution::ExecutionAdapter;
 use crate::providers::hyperliquid::HyperliquidNetwork;
 use crate::providers::hyperliquid::exchange::{UserOutcomeAction, wire_number};
 use crate::providers::hyperliquid::execution::{normalize_price_for, validate_price_for};
-use crate::providers::hyperliquid::outcomes::{
+use crate::markets::outcomes::{
     OUTCOME_MIN_NOTIONAL, OutcomeInstrument, outcome_execution_rules,
 };
 
@@ -444,7 +444,7 @@ pub(super) async fn handle_mid(
 ) -> Result<()> {
     args.validate()?;
     let network = HyperliquidNetwork::from_testnet(args.testnet);
-    let outcome_id = crate::providers::hyperliquid::outcomes::parse_market_id(&args.symbol)?;
+    let outcome_id = crate::markets::outcomes::parse_market_id(&args.symbol)?;
     let pair = resolve_pair(network, outcome_id, 0).await?;
     let rules = outcome_execution_rules();
     let pair_size = args
@@ -459,7 +459,7 @@ pub(super) async fn handle_mid(
         );
     }
     let book = live_orderbook(
-        ExecutionVenue::HyperliquidOutcomes,
+        ExecutionVenue::HyperliquidSpot,
         &pair.primary.symbol,
         args.testnet,
     )
@@ -485,7 +485,7 @@ pub(super) async fn handle_mid(
         pair_size,
     };
     let definition = MidPriceJobDefinition {
-        venue: ExecutionVenue::HyperliquidOutcomes,
+        venue: ExecutionVenue::HyperliquidSpot,
         testnet: args.testnet,
         symbol: pair.primary.symbol.clone(),
         max_inventory_size: pair_size * 2.0,
@@ -507,14 +507,14 @@ pub(super) async fn handle_mid(
     if args.dry_run {
         return render_plan(&view, args.output);
     }
-    let account = ExecutionAdapter::configured_account(ExecutionVenue::HyperliquidOutcomes)?;
+    let account = ExecutionAdapter::configured_account(ExecutionVenue::HyperliquidSpot)?;
     require_quote_balance(args.testnet, &account, &pair.primary.quote_token, pair_size).await?;
     if !args.yes && !matches!(args.output, OutputFormat::Terminal) {
         bail!("live bot execution with structured output requires --yes");
     }
     if matches!(args.output, OutputFormat::Terminal) {
         render_plan(&view, args.output)?;
-        if !args.yes && !confirm_live_execution(ExecutionVenue::HyperliquidOutcomes, args.testnet)?
+        if !args.yes && !confirm_live_execution(ExecutionVenue::HyperliquidSpot, args.testnet)?
         {
             println!("cancelled; no bot job was submitted");
             return Ok(());
@@ -534,7 +534,7 @@ pub(super) async fn handle_mid(
 pub(super) async fn handle_grid(args: RunGridArgs) -> Result<()> {
     args.validate()?;
     let network = HyperliquidNetwork::from_testnet(args.testnet);
-    let outcome_id = crate::providers::hyperliquid::outcomes::parse_market_id(&args.symbol)?;
+    let outcome_id = crate::markets::outcomes::parse_market_id(&args.symbol)?;
     let pair = resolve_pair(network, outcome_id, 0).await?;
     let rules = outcome_execution_rules();
     let requested = args
@@ -551,7 +551,7 @@ pub(super) async fn handle_grid(args: RunGridArgs) -> Result<()> {
     }
     let pair_size = per_level * f64::from(args.levels);
     let book = live_orderbook(
-        ExecutionVenue::HyperliquidOutcomes,
+        ExecutionVenue::HyperliquidSpot,
         &pair.primary.symbol,
         args.testnet,
     )
@@ -573,7 +573,7 @@ pub(super) async fn handle_grid(args: RunGridArgs) -> Result<()> {
         pair_size,
     };
     let definition = GridJobDefinition {
-        venue: ExecutionVenue::HyperliquidOutcomes,
+        venue: ExecutionVenue::HyperliquidSpot,
         testnet: args.testnet,
         symbol: pair.primary.symbol.clone(),
         // Half of each split side backs the initial ladder. The other half is
@@ -594,14 +594,14 @@ pub(super) async fn handle_grid(args: RunGridArgs) -> Result<()> {
     if args.dry_run {
         return render_outcome_grid_plan(&view, args.output);
     }
-    let account = ExecutionAdapter::configured_account(ExecutionVenue::HyperliquidOutcomes)?;
+    let account = ExecutionAdapter::configured_account(ExecutionVenue::HyperliquidSpot)?;
     require_quote_balance(args.testnet, &account, &pair.primary.quote_token, pair_size).await?;
     if !args.yes && !matches!(args.output, OutputFormat::Terminal) {
         bail!("live bot execution with structured output requires --yes");
     }
     if matches!(args.output, OutputFormat::Terminal) {
         render_outcome_grid_plan(&view, args.output)?;
-        if !args.yes && !confirm_live_execution(ExecutionVenue::HyperliquidOutcomes, args.testnet)?
+        if !args.yes && !confirm_live_execution(ExecutionVenue::HyperliquidSpot, args.testnet)?
         {
             println!("cancelled; no bot job was submitted");
             return Ok(());
@@ -623,10 +623,16 @@ pub(super) async fn run_mid_worker(
     let definition = OutcomeRunDefinition::from_mid(bot, definition)?;
     let network = HyperliquidNetwork::from_testnet(definition.testnet);
     let (_, primary_side) =
-        crate::providers::hyperliquid::outcomes::parse_symbol(&definition.primary_symbol)?;
+        crate::markets::outcomes::parse_symbol(&definition.primary_symbol)?;
     let pair = resolve_pair(network, definition.outcome_id, primary_side).await?;
     ensure_pair_identity(&definition, &pair)?;
-    let adapter = ExecutionAdapter::new(definition.venue, definition.testnet).await?;
+    let adapter = ExecutionAdapter::new_for_market(
+        definition.venue,
+        definition.testnet,
+        "main",
+        &definition.symbol,
+    )
+    .await?;
     let account = ExecutionAdapter::configured_account(definition.venue)?;
     let baseline = adapter.account_snapshot(&account).await?;
     let baseline_primary = holding_total(&baseline, &pair.primary.symbol);
@@ -962,10 +968,16 @@ pub(super) async fn run_grid_worker(job_id: &str, definition: &GridJobDefinition
     let run = OutcomeRunDefinition::from_grid(definition)?;
     let network = HyperliquidNetwork::from_testnet(definition.testnet);
     let (_, primary_side) =
-        crate::providers::hyperliquid::outcomes::parse_symbol(&run.primary_symbol)?;
+        crate::markets::outcomes::parse_symbol(&run.primary_symbol)?;
     let pair = resolve_pair(network, run.outcome_id, primary_side).await?;
     ensure_pair_identity(&run, &pair)?;
-    let adapter = ExecutionAdapter::new(definition.venue, definition.testnet).await?;
+    let adapter = ExecutionAdapter::new_for_market(
+        definition.venue,
+        definition.testnet,
+        "main",
+        &definition.symbol,
+    )
+    .await?;
     let account = ExecutionAdapter::configured_account(definition.venue)?;
     let baseline = adapter.account_snapshot(&account).await?;
     let baseline_primary = holding_total(&baseline, &pair.primary.symbol);
@@ -1390,7 +1402,7 @@ async fn resolve_pair(
     if primary_side > 1 {
         bail!("outcome {outcome_id} side must be 0 or 1");
     }
-    let instruments = crate::providers::hyperliquid::outcomes::instruments(network).await?;
+    let instruments = crate::markets::outcomes::instruments(network).await?;
     let candidates = instruments
         .into_iter()
         .filter(|instrument| instrument.outcome_id == outcome_id)
@@ -1446,7 +1458,7 @@ fn plan_view<'a>(
     OutcomePlanView {
         r#type: "bot.plan",
         bot: definition.bot,
-        venue: "hyperliquid-outcomes",
+        venue: "hyperliquid",
         network: HyperliquidNetwork::from_testnet(definition.testnet).label(),
         outcome_id: definition.outcome_id,
         question: pair.question(),
@@ -1565,7 +1577,7 @@ fn outcome_grid_plan_view<'a>(
     Ok(OutcomeGridPlanView {
         r#type: "bot.plan",
         bot: "grid",
-        venue: "hyperliquid-outcomes",
+        venue: "hyperliquid",
         network: HyperliquidNetwork::from_testnet(definition.testnet).label(),
         symbol: &definition.symbol,
         outcome_id: outcome.outcome_id,
@@ -1836,7 +1848,12 @@ async fn require_quote_balance(
     quote_token: &str,
     required: f64,
 ) -> Result<()> {
-    let snapshot = ExecutionAdapter::new(ExecutionVenue::HyperliquidOutcomes, testnet)
+    let snapshot = ExecutionAdapter::new_for_market(
+        ExecutionVenue::HyperliquidSpot,
+        testnet,
+        "main",
+        symbol,
+    )
         .await?
         .account_snapshot(account)
         .await?;
@@ -2062,7 +2079,7 @@ fn sell_plan(
 ) -> Result<TradePlan> {
     Ok(TradePlan {
         created_at_ms: now_ms()?,
-        venue: ExecutionVenue::HyperliquidOutcomes,
+        venue: ExecutionVenue::HyperliquidSpot,
         testnet,
         account: account.to_string(),
         internal_symbol: instrument.symbol.clone(),
@@ -2109,7 +2126,7 @@ fn apply_account_value(
                 return Ok(());
             };
             let fill = Fill {
-                venue: ExecutionVenue::HyperliquidOutcomes,
+                venue: ExecutionVenue::HyperliquidSpot,
                 internal_symbol: working
                     .get(&side)
                     .map_or_else(String::new, |order| order.symbol.clone()),
@@ -2557,7 +2574,7 @@ mod tests {
 
     fn fill(order_id: &str, amount: f64, price: f64, fee: f64) -> Fill {
         Fill {
-            venue: ExecutionVenue::HyperliquidOutcomes,
+            venue: ExecutionVenue::HyperliquidSpot,
             internal_symbol: String::new(),
             venue_symbol: String::new(),
             registry_supported: true,
@@ -2593,7 +2610,7 @@ mod tests {
 
     #[test]
     fn outcome_bots_accept_only_a_bare_market_id() {
-        let parse = crate::providers::hyperliquid::outcomes::parse_market_id;
+        let parse = crate::markets::outcomes::parse_market_id;
         assert_eq!(parse("10225").expect("market ID"), 10225);
         assert!(parse("10225:0").is_err());
         assert!(parse("10225:1").is_err());

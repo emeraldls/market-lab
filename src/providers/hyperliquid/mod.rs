@@ -35,8 +35,15 @@ pub enum HyperliquidProduct {
 
 impl HyperliquidProduct {
     pub fn from_exchange(exchange: &str) -> anyhow::Result<Self> {
-        let venue = crate::venues::VenueId::parse(exchange)?;
-        Self::from_venue(venue)
+        if exchange.eq_ignore_ascii_case(SPOT_EXCHANGE) {
+            Ok(Self::Spot)
+        } else if exchange.eq_ignore_ascii_case(OUTCOMES_EXCHANGE) {
+            Ok(Self::Outcome)
+        } else if exchange.eq_ignore_ascii_case(EXCHANGE) {
+            Ok(Self::Perpetual)
+        } else {
+            anyhow::bail!("`{exchange}` is not a Hyperliquid market-data exchange")
+        }
     }
 
     pub fn from_venue(venue: crate::venues::VenueId) -> anyhow::Result<Self> {
@@ -49,6 +56,20 @@ impl HyperliquidProduct {
                 Ok(Self::Perpetual)
             }
             _ => anyhow::bail!("`{venue}` is not a Hyperliquid market-data venue"),
+        }
+    }
+
+    pub fn from_execution_market(
+        venue: crate::venues::VenueId,
+        market: crate::venues::VenueMarket,
+    ) -> anyhow::Result<Self> {
+        if venue.execution_backend() != crate::venues::ExecutionBackend::Hyperliquid {
+            anyhow::bail!("`{venue}` is not a Hyperliquid execution venue");
+        }
+        match market {
+            crate::venues::VenueMarket::Spot => Ok(Self::Spot),
+            crate::venues::VenueMarket::Outcome => Ok(Self::Outcome),
+            crate::venues::VenueMarket::Perpetual => Ok(Self::Perpetual),
         }
     }
 

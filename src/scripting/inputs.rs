@@ -536,7 +536,7 @@ pub fn script_symbol_to_market(symbol: &str) -> String {
 
 fn validate_source_market(_provider: ProviderKind, exchange: &str, symbol: &str) -> Result<()> {
     if exchange.eq_ignore_ascii_case("hyperliquid-outcomes") {
-        return crate::providers::hyperliquid::outcomes::parse_symbol(symbol).map(|_| ());
+        return crate::markets::outcomes::parse_symbol(symbol).map(|_| ());
     }
     if exchange.eq_ignore_ascii_case("hyperliquidf") {
         return crate::providers::hyperliquid::parse_perpetual_symbol(symbol).map(|_| ());

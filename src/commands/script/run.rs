@@ -1132,7 +1132,7 @@ async fn resolve_direct_market_symbol(
         let market_data_venue = venue.market_data_id();
         let product = HyperliquidProduct::from_venue(market_data_venue).ok();
         if product == Some(HyperliquidProduct::Outcome) {
-            return Ok(crate::providers::hyperliquid::outcomes::resolve(
+            return Ok(crate::markets::outcomes::resolve(
                 HyperliquidNetwork::from_testnet(testnet),
                 requested,
             )

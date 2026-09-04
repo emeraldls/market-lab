@@ -28,8 +28,6 @@ impl VenueId {
     pub const HyperlinkSpot: Self = Self::from_static("hyperlink");
     #[allow(non_upper_case_globals)]
     pub const HyperliquidSpot: Self = Self::from_static("hyperliquid");
-    #[allow(non_upper_case_globals)]
-    pub const HyperliquidOutcomes: Self = Self::from_static("hyperliquid-outcomes");
 
     const fn from_static(value: &str) -> Self {
         let source = value.as_bytes();
@@ -252,7 +250,6 @@ impl VenueSpec {
             VenueId::Hyperlink => "HyperLink".to_string(),
             VenueId::HyperlinkSpot => "HyperLink Spot".to_string(),
             VenueId::HyperliquidSpot => "Hyperliquid Spot".to_string(),
-            VenueId::HyperliquidOutcomes => "Hyperliquid Outcomes".to_string(),
             _ => self.id.to_string(),
         }
     }
@@ -324,22 +321,12 @@ const HYPERLIQUID_SPOT: VenueSpec = VenueSpec {
     market_data_venue: VenueId::HyperliquidSpot,
 };
 
-const HYPERLIQUID_OUTCOMES: VenueSpec = VenueSpec {
-    id: VenueId::HyperliquidOutcomes,
-    execution: ExecutionBackend::Hyperliquid,
-    auth: AuthBackend::Hyperliquid,
-    market: VenueMarket::Outcome,
-    network: NetworkPolicy::Selectable,
-    market_data_venue: VenueId::HyperliquidOutcomes,
-};
-
 pub const BUILTIN_VENUES: &[VenueSpec] = &[
     BULK,
     HYPERLIQUID,
     HYPERLINK,
     HYPERLINK_SPOT,
     HYPERLIQUID_SPOT,
-    HYPERLIQUID_OUTCOMES,
 ];
 
 pub fn resolve(venue: VenueId) -> Result<VenueSpec> {
@@ -355,6 +342,12 @@ pub fn resolve(venue: VenueId) -> Result<VenueSpec> {
         };
         bail!(
             "venue `{venue}` was removed; use venue `hyperliquidf` with a DEX-qualified symbol such as `{example}`"
+        );
+    }
+
+    if venue.as_str() == "hyperliquid-outcomes" {
+        bail!(
+            "execution venue `hyperliquid-outcomes` was removed; use venue `hyperliquid` with an outcome symbol such as `1001:0`"
         );
     }
 

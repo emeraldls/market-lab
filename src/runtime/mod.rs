@@ -2914,9 +2914,11 @@ async fn create_bot_job(
     if ExecutionAdapter::capabilities(submission.definition.venue())
         .configure_leverage_before_orders
     {
-        crate::providers::execution::ExecutionAdapter::new(
+        crate::providers::execution::ExecutionAdapter::new_for_market(
             submission.definition.venue(),
             submission.definition.testnet(),
+            "main",
+            submission.definition.symbol(),
         )
         .await?
         .configure_leverage(
@@ -3447,10 +3449,11 @@ async fn execute_script_order(
         crate::scripting::execution::ScriptTimeInForce::Ioc => crate::cli::TradeTimeInForce::Ioc,
         crate::scripting::execution::ScriptTimeInForce::Alo => crate::cli::TradeTimeInForce::Alo,
     };
-    let venue_adapter = match crate::providers::execution::ExecutionAdapter::new_for_account(
+    let venue_adapter = match crate::providers::execution::ExecutionAdapter::new_for_market(
         venue,
         job.definition.testnet,
         &account_name,
+        &internal_symbol,
     )
     .await
     {
@@ -4116,10 +4119,10 @@ async fn execute_bot_outcome_action(
 
     let network = HyperliquidNetwork::from_testnet(job.definition.testnet());
     let primary =
-        crate::providers::hyperliquid::outcomes::resolve(network, &definition.primary_symbol)
+        crate::markets::outcomes::resolve(network, &definition.primary_symbol)
             .await?;
     let complement =
-        crate::providers::hyperliquid::outcomes::resolve(network, &definition.complement_symbol)
+        crate::markets::outcomes::resolve(network, &definition.complement_symbol)
             .await?;
     if primary.metadata_fingerprint != definition.primary_market_fingerprint
         || complement.metadata_fingerprint != definition.complement_market_fingerprint
@@ -4131,9 +4134,11 @@ async fn execute_bot_outcome_action(
     if let Some(value) = state.bot_outcome_actions.get(&key) {
         return Ok(value.clone());
     }
-    let value = crate::providers::execution::ExecutionAdapter::new(
-        ExecutionVenue::HyperliquidOutcomes,
+    let value = crate::providers::execution::ExecutionAdapter::new_for_market(
+        ExecutionVenue::HyperliquidSpot,
         job.definition.testnet(),
+        "main",
+        &definition.primary_symbol,
     )
     .await?
     .submit_user_outcome(action)
@@ -4220,9 +4225,11 @@ async fn execute_bot_trades(
         }
     }
     if !pending_plans.is_empty() {
-        let batch = crate::providers::execution::ExecutionAdapter::new(
+        let batch = crate::providers::execution::ExecutionAdapter::new_for_market(
             pending_plans[0].venue,
             pending_plans[0].testnet,
+            "main",
+            &pending_plans[0].internal_symbol,
         )
         .await?
         .submit_trades(&pending_plans)
@@ -4297,9 +4304,11 @@ async fn execute_bot_cancels(
         }
     }
     if !pending_plans.is_empty() {
-        let batch = crate::providers::execution::ExecutionAdapter::new(
+        let batch = crate::providers::execution::ExecutionAdapter::new_for_market(
             pending_plans[0].venue,
             pending_plans[0].testnet,
+            "main",
+            &pending_plans[0].internal_symbol,
         )
         .await?
         .cancel_orders_fast(&pending_plans)
@@ -5068,10 +5077,11 @@ async fn execute_trade(
     script_order_id: Option<String>,
     account_name: Option<&str>,
 ) -> Result<ExecutionReceipt> {
-    let receipt = crate::providers::execution::ExecutionAdapter::new_for_account(
+    let receipt = crate::providers::execution::ExecutionAdapter::new_for_market(
         plan.venue,
         plan.testnet,
         account_name.unwrap_or("main"),
+        &plan.internal_symbol,
     )
     .await?
     .submit_trade(plan)
@@ -5177,8 +5187,9 @@ async fn execute_cancel_with_priority(
     fast: bool,
     account_name: Option<&str>,
 ) -> Result<ExecutionReceipt> {
-    let expected_venue_symbol = if plan.venue.market() == VenueMarket::Outcome {
-        crate::providers::hyperliquid::outcomes::resolve(
+    let market_kind = crate::markets::execution_market(plan.venue, &plan.internal_symbol)?;
+    let expected_venue_symbol = if market_kind == VenueMarket::Outcome {
+        crate::markets::outcomes::resolve(
             crate::providers::hyperliquid::HyperliquidNetwork::from_testnet(plan.testnet),
             &plan.internal_symbol,
         )
@@ -5189,7 +5200,7 @@ async fn execute_cancel_with_priority(
             plan.venue.market_data_id().as_str(),
             &plan.internal_symbol,
         )?;
-        if plan.venue.market() == VenueMarket::Spot || !market.network_variants.is_empty() {
+        if market_kind == VenueMarket::Spot || !market.network_variants.is_empty() {
             market
                 .network_variant(HyperliquidNetwork::from_testnet(plan.testnet).label())?
                 .venue_symbol
@@ -5208,10 +5219,11 @@ async fn execute_cancel_with_priority(
     if !configured.eq_ignore_ascii_case(&plan.account) {
         bail!("cancel plan account no longer matches the configured venue account");
     }
-    let adapter = crate::providers::execution::ExecutionAdapter::new_for_account(
+    let adapter = crate::providers::execution::ExecutionAdapter::new_for_market(
         plan.venue,
         plan.testnet,
         account_name.unwrap_or("main"),
+        &plan.internal_symbol,
     )
     .await?;
     let receipt = if fast {
@@ -5525,7 +5537,15 @@ async fn refresh_account_positions(
     {
         return Ok(());
     }
-    let adapter = crate::providers::execution::ExecutionAdapter::new(venue, testnet).await?;
+    let adapter = match market_symbol {
+        Some(symbol) => {
+            crate::providers::execution::ExecutionAdapter::new_for_market(
+                venue, testnet, "main", symbol,
+            )
+            .await?
+        }
+        None => crate::providers::execution::ExecutionAdapter::new(venue, testnet).await?,
+    };
     let snapshot = match market_symbol {
         Some(symbol) => adapter.account_snapshot_for_market(account, symbol).await?,
         None => adapter.account_snapshot(account).await?,

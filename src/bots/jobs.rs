@@ -296,16 +296,16 @@ fn validate_outcome_mode(
     outcome: Option<&OutcomeExecutionDefinition>,
 ) -> Result<()> {
     match (venue, outcome) {
-        (ExecutionVenue::HyperliquidOutcomes, Some(outcome)) => {
+        (ExecutionVenue::HyperliquidSpot, Some(outcome)) => {
             outcome.validate()?;
             if leverage.is_some() {
                 bail!("outcome execution does not use leverage");
             }
         }
-        (ExecutionVenue::HyperliquidOutcomes, None) => {
+        (ExecutionVenue::HyperliquidSpot, None) => {
             bail!("outcome execution metadata is required");
         }
-        (_, Some(_)) => bail!("outcome execution metadata requires hyperliquid-outcomes"),
+        (_, Some(_)) => bail!("outcome execution metadata requires venue `hyperliquid`"),
         (_, None) => {
             if leverage.is_none_or(|value| !value.is_finite() || value < 1.0) {
                 bail!("bot leverage must be at least 1");
@@ -439,7 +439,7 @@ mod tests {
         let definition: BotJobDefinition = serde_json::from_value(serde_json::json!({
             "name": "mid_price",
             "config": {
-                "venue": "hyperliquid-outcomes",
+                "venue": "hyperliquid",
                 "testnet": false,
                 "symbol": "1009:0",
                 "maxInventorySize": 50.0,

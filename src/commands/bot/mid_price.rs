@@ -132,7 +132,9 @@ async fn handle(
     refresh_tolerance_bps: f64,
 ) -> Result<()> {
     args.validate()?;
-    if args.venue == ExecutionVenueArg::HyperliquidOutcomes {
+    if crate::markets::execution_market(args.venue, &args.symbol)?
+        == crate::venues::VenueMarket::Outcome
+    {
         return super::outcome::handle_mid(
             args,
             mode.name(),
@@ -469,7 +471,7 @@ pub(super) async fn live_orderbook(
     symbol: &str,
     testnet: bool,
 ) -> Result<OrderBookSnapshot> {
-    MarketDataAdapter::for_venue(venue, testnet)?
+    MarketDataAdapter::for_execution_market(venue, testnet, symbol)?
         .orderbook(symbol, BOOK_DEPTH, None)
         .await
 }
@@ -852,7 +854,7 @@ pub(super) fn spawn_account_feed(
 ) -> mpsc::Receiver<AccountFeedEvent> {
     let (sender, receiver) = mpsc::channel(1024);
     tokio::spawn(async move {
-        let adapter = match ExecutionAdapter::new(venue, testnet).await {
+        let adapter = match ExecutionAdapter::new_for_market(venue, testnet, "main", &symbol).await {
             Ok(adapter) => adapter,
             Err(error) => {
                 let _ = sender
@@ -962,7 +964,13 @@ async fn run_worker(job_id: &str, mode: MidMode, definition: &MidPriceJobDefinit
     let parent = build_trade_plan(&worker_trade_args(definition), PositionDirection::Long).await?;
     let market = execution_market(definition.venue, &definition.symbol)?;
     let rules = market.execution_rules()?;
-    let adapter = ExecutionAdapter::new(definition.venue, definition.testnet).await?;
+    let adapter = ExecutionAdapter::new_for_market(
+        definition.venue,
+        definition.testnet,
+        "main",
+        &definition.symbol,
+    )
+    .await?;
 
     let initial_book =
         live_orderbook(definition.venue, &definition.symbol, definition.testnet).await?;

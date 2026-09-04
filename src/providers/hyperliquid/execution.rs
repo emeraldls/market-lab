@@ -326,7 +326,7 @@ impl HyperliquidExecutionAdapter {
                 "user": account
             }))
             .await?;
-        let instruments = super::outcomes::instruments(self.network).await?;
+        let instruments = crate::markets::outcomes::instruments(self.network).await?;
         let by_token = instruments
             .iter()
             .map(|instrument| (instrument.token_name.as_str(), instrument))
@@ -354,7 +354,7 @@ impl HyperliquidExecutionAdapter {
                 available_balance += (total - held).max(0.0);
                 margin_used += held;
                 quote_balances.push(SpotBalance {
-                    venue: ExecutionVenue::HyperliquidOutcomes,
+                    venue: ExecutionVenue::HyperliquidSpot,
                     asset: balance.coin.clone(),
                     venue_asset: balance.coin.clone(),
                     token_index,
@@ -376,7 +376,7 @@ impl HyperliquidExecutionAdapter {
                 .map_or(Ok(0.0), |value| parse(value, "outcome entry notional"))?;
             if let Some(instrument) = by_token.get(balance.coin.as_str()) {
                 holdings.push(OutcomeHolding {
-                    venue: ExecutionVenue::HyperliquidOutcomes,
+                    venue: ExecutionVenue::HyperliquidSpot,
                     symbol: instrument.symbol.clone(),
                     outcome_id: instrument.outcome_id,
                     side: instrument.side,
@@ -392,11 +392,12 @@ impl HyperliquidExecutionAdapter {
                     entry_notional,
                     metadata_fingerprint: instrument.metadata_fingerprint.clone(),
                 });
-            } else if let Ok((outcome_id, side)) = super::outcomes::parse_wire_symbol(&balance.coin)
+            } else if let Ok((outcome_id, side)) =
+                crate::markets::outcomes::parse_wire_symbol(&balance.coin)
             {
                 holdings.push(OutcomeHolding {
-                    venue: ExecutionVenue::HyperliquidOutcomes,
-                    symbol: super::outcomes::canonical_symbol(outcome_id, side),
+                    venue: ExecutionVenue::HyperliquidSpot,
+                    symbol: crate::markets::outcomes::canonical_symbol(outcome_id, side),
                     outcome_id,
                     side,
                     side_name: format!("Side {side}"),
@@ -791,7 +792,7 @@ impl HyperliquidExecutionAdapter {
             .parse::<u64>()
             .context("Hyperliquid order id must be an unsigned integer")?;
         let asset = if self.product == HyperliquidProduct::Outcome {
-            super::outcomes::resolve_wire(self.network, venue_symbol)
+            crate::markets::outcomes::resolve_wire(self.network, venue_symbol)
                 .await?
                 .asset_id
         } else {
@@ -842,7 +843,7 @@ impl HyperliquidExecutionAdapter {
                 .parse::<u64>()
                 .context("Hyperliquid order id must be an unsigned integer")?;
             let asset = if self.product == HyperliquidProduct::Outcome {
-                super::outcomes::resolve_wire(self.network, &plan.venue_symbol)
+                crate::markets::outcomes::resolve_wire(self.network, &plan.venue_symbol)
                     .await?
                     .asset_id
             } else {
@@ -876,7 +877,7 @@ impl HyperliquidExecutionAdapter {
         let mut resolved = match (self.product, self.network) {
             (HyperliquidProduct::Spot, network) => resolved_spot_market(network, symbol),
             (HyperliquidProduct::Outcome, network) => {
-                let instrument = super::outcomes::resolve(network, symbol).await?;
+                let instrument = crate::markets::outcomes::resolve(network, symbol).await?;
                 Ok(ResolvedMarket {
                     asset: instrument.asset_id,
                     size_precision: 0,
@@ -1000,7 +1001,7 @@ async fn validate_trade_plan(
     }
     let (market, variant, fingerprint) = if product == HyperliquidProduct::Outcome {
         let (market, variant, instrument) =
-            super::outcomes::market_and_variant(network, &plan.internal_symbol).await?;
+            crate::markets::outcomes::market_and_variant(network, &plan.internal_symbol).await?;
         (market, variant, Some(instrument.metadata_fingerprint))
     } else {
         let (market, variant) = markets::network_market(product, network, &plan.internal_symbol)?;
@@ -1441,7 +1442,7 @@ fn market_order_slippage(requested: Option<f64>) -> Result<f64> {
 const fn venue_for_product(product: HyperliquidProduct) -> ExecutionVenue {
     match product {
         HyperliquidProduct::Spot => ExecutionVenue::HyperliquidSpot,
-        HyperliquidProduct::Outcome => ExecutionVenue::HyperliquidOutcomes,
+        HyperliquidProduct::Outcome => ExecutionVenue::HyperliquidSpot,
         HyperliquidProduct::Perpetual => ExecutionVenue::Hyperliquid,
     }
 }
@@ -1910,9 +1911,11 @@ fn normalized_market_identity(
     coin: &str,
 ) -> Option<(String, bool)> {
     if product == HyperliquidProduct::Outcome {
-        return super::outcomes::parse_wire_symbol(coin)
+        return crate::markets::outcomes::parse_wire_symbol(coin)
             .ok()
-            .map(|(outcome, side)| (super::outcomes::canonical_symbol(outcome, side), true));
+            .map(|(outcome, side)| {
+                (crate::markets::outcomes::canonical_symbol(outcome, side), true)
+            });
     }
     markets::market_for_wire(product, network, coin)
         .ok()
@@ -2116,7 +2119,7 @@ mod tests {
     fn outcome_orders_and_fills_use_canonical_side_identity() {
         assert_eq!(
             venue_for_product(HyperliquidProduct::Outcome),
-            ExecutionVenue::HyperliquidOutcomes
+            ExecutionVenue::HyperliquidSpot
         );
         assert_eq!(
             normalized_market_identity(
@@ -2145,7 +2148,7 @@ mod tests {
             .expect("normalized fill")
             .expect("outcome fill");
 
-        assert_eq!(fill.venue, ExecutionVenue::HyperliquidOutcomes);
+        assert_eq!(fill.venue, ExecutionVenue::HyperliquidSpot);
         assert_eq!(fill.internal_symbol, "1001:1");
         assert_eq!(fill.venue_symbol, "#10011");
     }

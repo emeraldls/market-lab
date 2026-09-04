@@ -30,7 +30,7 @@ pub async fn handle_split(args: OutcomeAmountArgs) -> Result<()> {
     execute(
         args.common,
         OutcomeActionPlan {
-            venue: "hyperliquid-outcomes",
+            venue: "hyperliquid",
             network: "",
             action: "split",
             outcome: Some(args.outcome),
@@ -52,7 +52,7 @@ pub async fn handle_merge(args: OutcomeOptionalAmountArgs) -> Result<()> {
     execute(
         args.common,
         OutcomeActionPlan {
-            venue: "hyperliquid-outcomes",
+            venue: "hyperliquid",
             network: "",
             action: "merge",
             outcome: Some(args.outcome),
@@ -74,7 +74,7 @@ pub async fn handle_merge_question(args: OutcomeQuestionArgs) -> Result<()> {
     execute(
         args.common,
         OutcomeActionPlan {
-            venue: "hyperliquid-outcomes",
+            venue: "hyperliquid",
             network: "",
             action: "mergeQuestion",
             outcome: None,
@@ -94,7 +94,7 @@ pub async fn handle_negate(args: OutcomeNegateArgs) -> Result<()> {
     execute(
         args.common,
         OutcomeActionPlan {
-            venue: "hyperliquid-outcomes",
+            venue: "hyperliquid",
             network: "",
             action: "negate",
             outcome: Some(args.outcome),
@@ -163,8 +163,14 @@ async fn execute(
 async fn validate_action_funds(testnet: bool, plan: &OutcomeActionPlan) -> Result<()> {
     let network = HyperliquidNetwork::from_testnet(testnet);
     let metadata = crate::providers::hyperliquid::outcomes::metadata(network).await?;
-    let account = ExecutionAdapter::configured_account(ExecutionVenue::HyperliquidOutcomes)?;
-    let snapshot = ExecutionAdapter::new(ExecutionVenue::HyperliquidOutcomes, testnet)
+    let account = ExecutionAdapter::configured_account(ExecutionVenue::HyperliquidSpot)?;
+    let symbol = crate::markets::outcomes::canonical_symbol(plan.outcome, 0);
+    let snapshot = ExecutionAdapter::new_for_market(
+        ExecutionVenue::HyperliquidSpot,
+        testnet,
+        "main",
+        &symbol,
+    )
         .await?
         .account_snapshot(&account)
         .await?;

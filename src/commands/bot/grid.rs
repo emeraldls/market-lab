@@ -67,7 +67,9 @@ struct GridPlanView<'a> {
 
 pub async fn handle(args: RunGridArgs) -> Result<()> {
     args.validate()?;
-    if args.venue == ExecutionVenueArg::HyperliquidOutcomes {
+    if crate::markets::execution_market(args.venue, &args.symbol)?
+        == crate::venues::VenueMarket::Outcome
+    {
         return super::outcome::handle_grid(args).await;
     }
     let parent = build_trade_plan(
@@ -503,7 +505,13 @@ async fn run_worker(job_id: &str, definition: &GridJobDefinition) -> Result<()> 
     let parent = build_trade_plan(&worker_trade_args(definition), PositionDirection::Long).await?;
     let market = execution_market(definition.venue, &definition.symbol)?;
     let rules = market.execution_rules()?;
-    let adapter = ExecutionAdapter::new(definition.venue, definition.testnet).await?;
+    let adapter = ExecutionAdapter::new_for_market(
+        definition.venue,
+        definition.testnet,
+        "main",
+        &definition.symbol,
+    )
+    .await?;
     let initial_book =
         live_orderbook(definition.venue, &definition.symbol, definition.testnet).await?;
     let initial_bid = initial_book

@@ -369,9 +369,7 @@ mod tests {
         assert!(ExecutionVenue::parse("hyperliquidf-xyz").is_err());
         assert!(ExecutionVenue::parse("hyperliquidf-io").is_err());
 
-        let outcomes = serde_json::to_value(ExecutionVenue::HyperliquidOutcomes)
-            .expect("outcome venue serializes");
-        assert_eq!(outcomes, serde_json::json!("hyperliquid-outcomes"));
+        assert!(ExecutionVenue::parse("hyperliquid-outcomes").is_err());
     }
 
     #[test]

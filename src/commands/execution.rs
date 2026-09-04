@@ -32,8 +32,8 @@ async fn handle_trade_with_position(
 ) -> Result<()> {
     args.apply_symbol_flag();
     args.validate_shape()?;
-    if args.venue.is_outcome() && args.symbol.trim().is_empty() {
-        args.symbol = crate::providers::hyperliquid::outcomes::select_interactive(
+    if args.venue == ExecutionVenue::HyperliquidSpot && args.symbol.trim().is_empty() {
+        args.symbol = crate::commands::markets::select_outcome_interactive(
             HyperliquidNetwork::from_testnet(args.testnet),
         )
         .await?
@@ -89,7 +89,14 @@ async fn reconcile_post_trade_state(
         return PostTradeState::default();
     }
 
-    let adapter = match ExecutionAdapter::new(plan.venue, plan.testnet).await {
+    let adapter = match ExecutionAdapter::new_for_market(
+        plan.venue,
+        plan.testnet,
+        "main",
+        &plan.internal_symbol,
+    )
+    .await
+    {
         Ok(adapter) => adapter,
         Err(error) => {
             return PostTradeState {
@@ -160,7 +167,10 @@ pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
     let venue = args.venue;
     let symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
     let account = ExecutionAdapter::configured_account(venue)?;
-    let adapter = ExecutionAdapter::new(venue, args.testnet).await?;
+    let adapter = match symbol.as_deref() {
+        Some(symbol) => ExecutionAdapter::new_for_market(venue, args.testnet, "main", symbol).await?,
+        None => ExecutionAdapter::new(venue, args.testnet).await?,
+    };
     let snapshot = match symbol.as_deref() {
         Some(symbol) => {
             adapter
@@ -169,7 +179,12 @@ pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
         }
         None => adapter.account_snapshot(&account).await?,
     };
-    if venue.is_spot() {
+    let market_kind = symbol
+        .as_deref()
+        .map_or(Ok(venue.market()), |symbol| {
+            crate::markets::execution_market(venue, symbol)
+        })?;
+    if market_kind == VenueMarket::Spot {
         let balances = snapshot
             .spot_balances
             .into_iter()
@@ -183,7 +198,7 @@ pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
             .collect::<Vec<_>>();
         return render_spot_balances(&balances, args.output);
     }
-    if venue.is_outcome() {
+    if market_kind == VenueMarket::Outcome {
         let holdings = snapshot
             .outcome_holdings
             .into_iter()
@@ -212,7 +227,10 @@ pub async fn handle_orders(args: AccountQueryArgs) -> Result<()> {
     let venue = args.venue;
     let symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
     let account = ExecutionAdapter::configured_account(venue)?;
-    let adapter = ExecutionAdapter::new(venue, args.testnet).await?;
+    let adapter = match symbol.as_deref() {
+        Some(symbol) => ExecutionAdapter::new_for_market(venue, args.testnet, "main", symbol).await?,
+        None => ExecutionAdapter::new(venue, args.testnet).await?,
+    };
     let orders = match symbol.as_deref() {
         Some(symbol) => adapter.open_orders_for_market(&account, symbol).await?,
         None => adapter.open_orders(&account).await?,
@@ -232,8 +250,11 @@ pub async fn handle_fills(args: AccountQueryArgs) -> Result<()> {
     let venue = args.venue;
     let symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
     let account = ExecutionAdapter::configured_account(venue)?;
-    let fills = ExecutionAdapter::new(venue, args.testnet)
-        .await?
+    let adapter = match symbol.as_deref() {
+        Some(symbol) => ExecutionAdapter::new_for_market(venue, args.testnet, "main", symbol).await?,
+        None => ExecutionAdapter::new(venue, args.testnet).await?,
+    };
+    let fills = adapter
         .fills(&account)
         .await?
         .into_iter()
@@ -267,7 +288,7 @@ pub async fn handle_cancel(args: CancelOrderArgs) -> Result<()> {
     args.validate()?;
     let venue = args.venue;
     let market = execution_market_on(venue, args.testnet, &args.symbol).await?;
-    ExecutionAdapter::new(venue, args.testnet)
+    ExecutionAdapter::new_for_market(venue, args.testnet, "main", &market.symbol)
         .await?
         .validate_order_id(&args.order_id)?;
     let account = ExecutionAdapter::configured_account(venue)?;
@@ -439,9 +460,10 @@ async fn build_trade_plan_with_price_normalization(
     max_slippage: Option<f64>,
 ) -> Result<TradePlan> {
     let venue = args.venue;
-    let outcome = if venue.is_outcome() {
+    let market_kind = crate::markets::execution_market(venue, &args.symbol)?;
+    let outcome = if market_kind == VenueMarket::Outcome {
         Some(
-            crate::providers::hyperliquid::outcomes::resolve(
+            crate::markets::outcomes::resolve(
                 HyperliquidNetwork::from_testnet(args.testnet),
                 &args.symbol,
             )
@@ -453,7 +475,7 @@ async fn build_trade_plan_with_price_normalization(
     let market = outcome.as_ref().map_or_else(
         || execution_market(venue, &args.symbol),
         |instrument| {
-            Ok(crate::providers::hyperliquid::outcomes::market_from_instrument(instrument))
+            Ok(crate::markets::outcomes::market_from_instrument(instrument))
         },
     )?;
     let normalized_args = normalize_prices
@@ -462,14 +484,18 @@ async fn build_trade_plan_with_price_normalization(
     let args = normalized_args.as_ref().unwrap_or(args);
     validate_market_rules(venue, &market, args)?;
     let venue_spec = venue.spec()?;
-    let leverage = venue_spec
-        .market
+    let leverage = market_kind
         .is_perpetual()
         .then(|| args.leverage.unwrap_or(1.0));
     let sizing_leverage = leverage.unwrap_or(1.0);
     let mut rules = execution_rules(venue, args.testnet, &market)?;
-    if venue.is_perpetual() {
-        let max_leverage = ExecutionAdapter::new(venue, args.testnet)
+    if market_kind.is_perpetual() {
+        let max_leverage = ExecutionAdapter::new_for_market(
+            venue,
+            args.testnet,
+            "main",
+            &market.symbol,
+        )
             .await?
             .max_leverage(&market.symbol)
             .await?;
@@ -496,7 +522,7 @@ async fn build_trade_plan_with_price_normalization(
             market_reference_price.expect("guarded script market reference")
         }
         TradeOrderKind::Market => {
-            MarketDataAdapter::for_venue(venue, args.testnet)?
+            MarketDataAdapter::for_execution_market(venue, args.testnet, &market.symbol)?
                 .ticker(&market.symbol)
                 .await?
                 .mark_price
@@ -526,7 +552,7 @@ async fn build_trade_plan_with_price_normalization(
         let margin = args
             .margin
             .context("one of --size or --margin is required")?;
-        let sizing_price = if !venue.is_perpetual()
+        let sizing_price = if !market_kind.is_perpetual()
             && direction == PositionDirection::Long
             && matches!(args.order_kind, TradeOrderKind::Market)
         {
@@ -538,7 +564,7 @@ async fn build_trade_plan_with_price_normalization(
         floor_to_step(raw_size, rules.lot_size, rules.size_precision)
     };
     if size <= 0.0 {
-        if !venue.is_perpetual() {
+        if !market_kind.is_perpetual() {
             bail!(
                 "requested amount produces a size below {} spot lot size {} on {}",
                 venue.label(),
@@ -563,7 +589,7 @@ async fn build_trade_plan_with_price_normalization(
             market.symbol
         );
     }
-    if venue.is_spot() {
+    if market_kind == VenueMarket::Spot {
         validate_spot_funds(
             venue,
             args.testnet,
@@ -580,7 +606,7 @@ async fn build_trade_plan_with_price_normalization(
         )
         .await?;
     }
-    if venue.is_outcome() {
+    if market_kind == VenueMarket::Outcome {
         validate_outcome_funds(
             args.testnet,
             &account,
@@ -770,12 +796,17 @@ async fn validate_spot_funds(
 async fn validate_outcome_funds(
     testnet: bool,
     account: &str,
-    instrument: &crate::providers::hyperliquid::outcomes::OutcomeInstrument,
+    instrument: &crate::markets::outcomes::OutcomeInstrument,
     direction: PositionDirection,
     size: f64,
     execution_price: f64,
 ) -> Result<()> {
-    let snapshot = ExecutionAdapter::new(ExecutionVenue::HyperliquidOutcomes, testnet)
+    let snapshot = ExecutionAdapter::new_for_market(
+        ExecutionVenue::HyperliquidSpot,
+        testnet,
+        "main",
+        &instrument.symbol,
+    )
         .await?
         .account_snapshot(account)
         .await?;
@@ -960,12 +991,14 @@ fn is_price_aligned(
 }
 
 fn validate_optional_symbol(venue: ExecutionVenue, symbol: Option<&str>) -> Result<Option<String>> {
-    if venue.is_outcome() {
+    if symbol.is_some_and(|symbol| {
+        crate::markets::execution_market(venue, symbol) == Ok(VenueMarket::Outcome)
+    }) {
         return symbol
             .map(|symbol| {
-                crate::providers::hyperliquid::outcomes::parse_symbol(symbol).map(
+                crate::markets::outcomes::parse_symbol(symbol).map(
                     |(outcome, side)| {
-                        crate::providers::hyperliquid::outcomes::canonical_symbol(outcome, side)
+                        crate::markets::outcomes::canonical_symbol(outcome, side)
                     },
                 )
             })
@@ -985,13 +1018,13 @@ async fn execution_market_on(
     testnet: bool,
     symbol: &str,
 ) -> Result<std::sync::Arc<Market>> {
-    if venue.is_outcome() {
-        let instrument = crate::providers::hyperliquid::outcomes::resolve(
+    if crate::markets::execution_market(venue, symbol)? == VenueMarket::Outcome {
+        let instrument = crate::markets::outcomes::resolve(
             HyperliquidNetwork::from_testnet(testnet),
             symbol,
         )
         .await?;
-        return Ok(crate::providers::hyperliquid::outcomes::market_from_instrument(&instrument));
+        return Ok(crate::markets::outcomes::market_from_instrument(&instrument));
     }
     execution_market(venue, symbol)
 }
@@ -1001,8 +1034,7 @@ fn execution_rules(
     testnet: bool,
     market: &Market,
 ) -> Result<crate::markets::ExecutionRules> {
-    let spec = venue.spec()?;
-    match spec.market {
+    match crate::markets::execution_market(venue, &market.symbol)? {
         VenueMarket::Spot => market
             .network_variant(HyperliquidNetwork::from_testnet(testnet).label())
             .map(|variant| variant.execution),
@@ -1014,8 +1046,7 @@ fn execution_rules(
 }
 
 fn execution_venue_symbol(venue: ExecutionVenue, testnet: bool, market: &Market) -> Result<String> {
-    let spec = venue.spec()?;
-    match spec.market {
+    match crate::markets::execution_market(venue, &market.symbol)? {
         VenueMarket::Spot => market
             .network_variant(HyperliquidNetwork::from_testnet(testnet).label())
             .map(|variant| variant.venue_symbol),
@@ -1354,7 +1385,7 @@ fn render_outcome_holdings(holdings: &[OutcomeHolding], output: OutputFormat) ->
 }
 
 fn truncate_terminal(value: &str, width: usize) -> String {
-    let clean = crate::providers::hyperliquid::outcomes::clean_terminal_text(value);
+    let clean = clean_terminal_text(value);
     if clean.chars().count() <= width {
         clean
     } else {
@@ -1364,6 +1395,13 @@ fn truncate_terminal(value: &str, width: usize) -> String {
             .collect::<String>()
             + "…"
     }
+}
+
+fn clean_terminal_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect()
 }
 
 fn render_orders(orders: &[OpenOrder], output: OutputFormat) -> Result<()> {

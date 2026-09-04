@@ -265,14 +265,14 @@ impl TradeArgs {
     }
 
     pub fn validate_shape(&self) -> Result<()> {
-        if self.symbol_flag.is_some() && self.venue != ExecutionVenueArg::HyperliquidOutcomes {
+        if self.symbol_flag.is_some() && self.venue != ExecutionVenueArg::HyperliquidSpot {
             bail!(
-                "--symbol is available only for hyperliquid-outcomes; other venues use the positional symbol"
+                "--symbol is available only for Hyperliquid outcome execution; other markets use the positional symbol"
             );
         }
         let symbol = self.requested_symbol();
         if symbol.trim().is_empty() {
-            if self.venue != ExecutionVenueArg::HyperliquidOutcomes {
+            if self.venue != ExecutionVenueArg::HyperliquidSpot {
                 bail!("a symbol is required for this execution venue");
             }
             if self.yes || !matches!(self.output, OutputFormat::Terminal) {
@@ -2261,7 +2261,8 @@ impl RunOiwapArgs {
 
 impl RunMidPriceArgs {
     pub fn validate(&self) -> Result<()> {
-        if self.venue.is_spot() {
+        let market = crate::markets::execution_market(self.venue, &self.symbol)?;
+        if market == crate::venues::VenueMarket::Spot {
             bail!("market-making bots do not support spot execution");
         }
         validate_bot_execution_symbol(self.venue, &self.symbol)?;
@@ -2292,7 +2293,7 @@ impl RunMidPriceArgs {
         {
             bail!("--directional-bias must be between -100 and 100 percent");
         }
-        if self.venue == ExecutionVenueArg::HyperliquidOutcomes {
+        if market == crate::venues::VenueMarket::Outcome {
             if self.leverage.is_some() {
                 bail!("--leverage is not used with outcome markets");
             }
@@ -2343,7 +2344,8 @@ impl RunVolumeMidArgs {
 
 impl RunGridArgs {
     pub fn validate(&self) -> Result<()> {
-        if self.venue.is_spot() {
+        let market = crate::markets::execution_market(self.venue, &self.symbol)?;
+        if market == crate::venues::VenueMarket::Spot {
             bail!("grid does not support spot execution");
         }
         validate_bot_execution_symbol(self.venue, &self.symbol)?;
@@ -2373,7 +2375,7 @@ impl RunGridArgs {
         if !self.step_bps.is_finite() || self.step_bps <= 0.0 {
             bail!("--step-bps must be greater than zero");
         }
-        if self.venue == ExecutionVenueArg::HyperliquidOutcomes {
+        if market == crate::venues::VenueMarket::Outcome {
             if self.leverage.is_some() {
                 bail!("--leverage is not used with outcome markets");
             }
@@ -2471,11 +2473,11 @@ impl VampArgs {
 }
 
 fn validate_execution_symbol(venue: ExecutionVenueArg, symbol: &str) -> Result<()> {
-    let venue = venue.spec()?;
-    if venue.market == crate::venues::VenueMarket::Outcome {
-        return crate::providers::hyperliquid::outcomes::parse_symbol(symbol).map(|_| ());
+    let market = crate::markets::execution_market(venue, symbol)?;
+    if market == crate::venues::VenueMarket::Outcome {
+        return crate::markets::outcomes::parse_symbol(symbol).map(|_| ());
     }
-    let market_type = match venue.market {
+    let market_type = match market {
         crate::venues::VenueMarket::Spot => crate::markets::MarketType::Spot,
         crate::venues::VenueMarket::Perpetual => crate::markets::MarketType::Futures,
         crate::venues::VenueMarket::Outcome => unreachable!("handled above"),
@@ -2484,8 +2486,8 @@ fn validate_execution_symbol(venue: ExecutionVenueArg, symbol: &str) -> Result<(
 }
 
 fn validate_bot_execution_symbol(venue: ExecutionVenueArg, symbol: &str) -> Result<()> {
-    if venue == ExecutionVenueArg::HyperliquidOutcomes {
-        return crate::providers::hyperliquid::outcomes::parse_market_id(symbol).map(|_| ());
+    if crate::markets::execution_market(venue, symbol)? == crate::venues::VenueMarket::Outcome {
+        return crate::markets::outcomes::parse_market_id(symbol).map(|_| ());
     }
     validate_execution_symbol(venue, symbol)
 }
@@ -2502,7 +2504,7 @@ fn validate_source_identity(
 
 fn validate_exchange_symbol(exchange: &str, symbol: &str) -> Result<()> {
     if exchange.eq_ignore_ascii_case("hyperliquid-outcomes") {
-        return crate::providers::hyperliquid::outcomes::parse_symbol(symbol).map(|_| ());
+        return crate::markets::outcomes::parse_symbol(symbol).map(|_| ());
     }
     let market_type = if crate::markets::is_futures_exchange(exchange)? {
         crate::markets::MarketType::Futures

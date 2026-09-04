@@ -12,7 +12,7 @@ use crate::providers::hyperlink::ws::HyperlinkAccountStream;
 use crate::providers::hyperliquid::execution::HyperliquidExecutionAdapter;
 use crate::providers::hyperliquid::ws::{HyperliquidAccountStream, HyperliquidTradingClient};
 use crate::providers::hyperliquid::{HyperliquidNetwork, HyperliquidProduct};
-use crate::venues::{AuthBackend, ExecutionBackend};
+use crate::venues::{AuthBackend, ExecutionBackend, VenueMarket};
 
 /// Common contract implemented by every execution exchange.
 ///
@@ -335,6 +335,7 @@ trait ExecutionProviderFactory: Send + Sync {
     async fn adapter(
         &self,
         venue: ExecutionVenue,
+        market: VenueMarket,
         testnet: bool,
         account_name: &str,
     ) -> Result<Box<dyn ExecutionProvider>>;
@@ -382,6 +383,7 @@ impl ExecutionProviderFactory for BulkFactory {
     async fn adapter(
         &self,
         _venue: ExecutionVenue,
+        _market: VenueMarket,
         _testnet: bool,
         _account_name: &str,
     ) -> Result<Box<dyn ExecutionProvider>> {
@@ -429,12 +431,13 @@ impl ExecutionProviderFactory for HyperliquidFactory {
     async fn adapter(
         &self,
         venue: ExecutionVenue,
+        market: VenueMarket,
         testnet: bool,
         account_name: &str,
     ) -> Result<Box<dyn ExecutionProvider>> {
         Ok(Box::new(
             HyperliquidExecutionAdapter::new_for_account(
-                HyperliquidProduct::from_venue(venue)?,
+                HyperliquidProduct::from_execution_market(venue, market)?,
                 HyperliquidNetwork::from_testnet(testnet),
                 account_name,
             )
@@ -465,8 +468,21 @@ impl ExecutionProviderFactory for HyperliquidFactory {
         raw: serde_json::Value,
     ) -> Result<AccountRuntimeEvent> {
         let updates = normalize_hyperliquid_runtime_updates(venue, testnet, &raw)?;
-        let refresh_positions = !venue.is_outcome()
-            && raw.get("channel").and_then(serde_json::Value::as_str) == Some("user");
+        let user_event = raw.get("channel").and_then(serde_json::Value::as_str) == Some("user");
+        let outcome_only = raw
+            .pointer("/data/fills")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|fills| {
+                !fills.is_empty()
+                    && fills.iter().all(|fill| {
+                        fill.get("coin")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|coin| {
+                                crate::markets::outcomes::parse_wire_symbol(coin).is_ok()
+                            })
+                    })
+            });
+        let refresh_positions = user_event && !outcome_only;
         Ok(AccountRuntimeEvent {
             raw,
             updates,
@@ -494,6 +510,7 @@ impl ExecutionProviderFactory for HyperlinkFactory {
     async fn adapter(
         &self,
         venue: ExecutionVenue,
+        market: VenueMarket,
         testnet: bool,
         account_name: &str,
     ) -> Result<Box<dyn ExecutionProvider>> {
@@ -504,9 +521,11 @@ impl ExecutionProviderFactory for HyperlinkFactory {
             bail!("HyperLink subaccounts are not supported");
         }
         Ok(Box::new(
-            HyperliquidExecutionAdapter::new_hyperlink_for(HyperliquidProduct::from_venue(
-                venue.market_data_id(),
-            )?)
+            HyperliquidExecutionAdapter::new_hyperlink_for(match market {
+                VenueMarket::Spot => HyperliquidProduct::Spot,
+                VenueMarket::Perpetual => HyperliquidProduct::Perpetual,
+                VenueMarket::Outcome => bail!("HyperLink does not support outcome markets"),
+            })
             .await?,
         ))
     }
@@ -729,7 +748,9 @@ fn normalize_hyperliquid_runtime_updates(
                 if !hyperliquid_event_matches_venue(venue, testnet, coin) {
                     continue;
                 }
-                let product = HyperliquidProduct::from_venue(venue.market_data_id())?;
+                let Some(product) = hyperliquid_product_for_wire(venue, testnet, coin) else {
+                    continue;
+                };
                 if let Some(mut domain_fill) =
                     crate::providers::hyperliquid::execution::account_event_fill(
                         product,
@@ -740,13 +761,20 @@ fn normalize_hyperliquid_runtime_updates(
                     domain_fill.venue = venue;
                     updates.push(AccountRuntimeUpdate::Fill(domain_fill));
                 }
-                let symbol = crate::providers::hyperliquid::markets::market_for_wire(
-                    product,
-                    HyperliquidNetwork::from_testnet(testnet),
-                    coin,
-                )
-                .map(|market| market.symbol.clone())
-                .unwrap_or_else(|_| coin.to_string());
+                let symbol = if product == HyperliquidProduct::Outcome {
+                    crate::markets::outcomes::parse_wire_symbol(coin)
+                        .map(|(outcome, side)| {
+                            crate::markets::outcomes::canonical_symbol(outcome, side)
+                        })?
+                } else {
+                    crate::providers::hyperliquid::markets::market_for_wire(
+                        product,
+                        HyperliquidNetwork::from_testnet(testnet),
+                        coin,
+                    )?
+                    .symbol
+                    .clone()
+                };
                 let mut normalized = serde_json::json!({
                     "type": "fill",
                     "venue": venue,
@@ -792,18 +820,27 @@ fn normalize_hyperliquid_runtime_updates(
 }
 
 fn hyperliquid_event_matches_venue(venue: ExecutionVenue, testnet: bool, coin: &str) -> bool {
-    if venue.is_outcome() {
-        return crate::providers::hyperliquid::outcomes::parse_wire_symbol(coin).is_ok();
+    hyperliquid_product_for_wire(venue, testnet, coin).is_some()
+}
+
+fn hyperliquid_product_for_wire(
+    venue: ExecutionVenue,
+    testnet: bool,
+    coin: &str,
+) -> Option<HyperliquidProduct> {
+    if venue == ExecutionVenue::HyperliquidSpot
+        && crate::markets::outcomes::parse_wire_symbol(coin).is_ok()
+    {
+        return Some(HyperliquidProduct::Outcome);
     }
-    let Ok(product) = HyperliquidProduct::from_venue(venue.market_data_id()) else {
-        return false;
-    };
+    let product = HyperliquidProduct::from_venue(venue.market_data_id()).ok()?;
     crate::providers::hyperliquid::markets::market_for_wire(
         product,
         HyperliquidNetwork::from_testnet(testnet),
         coin,
     )
     .is_ok()
+    .then_some(product)
 }
 
 pub(crate) fn normalize_hyperliquid_account_events(
@@ -965,7 +1002,22 @@ impl ExecutionAdapter {
         let spec = venue.spec()?;
         spec.validate_network(testnet)?;
         let provider = execution_factory(venue)
-            .adapter(venue, testnet, account_name)
+            .adapter(venue, spec.market, testnet, account_name)
+            .await?;
+        Ok(Self { provider })
+    }
+
+    pub async fn new_for_market(
+        venue: ExecutionVenue,
+        testnet: bool,
+        account_name: &str,
+        symbol: &str,
+    ) -> Result<Self> {
+        let spec = venue.spec()?;
+        spec.validate_network(testnet)?;
+        let market = crate::markets::execution_market(venue, symbol)?;
+        let provider = execution_factory(venue)
+            .adapter(venue, market, testnet, account_name)
             .await?;
         Ok(Self { provider })
     }
