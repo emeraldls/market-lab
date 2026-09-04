@@ -2066,10 +2066,13 @@ fn key(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
-fn ensure_public_exchange_id(exchange: &str) -> Result<()> {
+pub(crate) fn ensure_public_exchange_id(exchange: &str) -> Result<()> {
     let exchange = key(exchange);
     if exchange == "bulk" {
         bail!("exchange `bulk` is not available; use `bulkf` for BULK perpetuals");
+    }
+    if exchange == "hyperliquid-outcomes" {
+        bail!("exchange `hyperliquid-outcomes` was removed; use `hyperliquid` with `--hip 4`");
     }
     if let Some(dex) = exchange.strip_prefix("hyperliquidf-") {
         let example = if dex.is_empty() {

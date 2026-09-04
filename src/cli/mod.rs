@@ -510,6 +510,7 @@ impl MarketsArgs {
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
+        crate::markets::ensure_public_exchange_id(&self.exchange)?;
         if let Some(hip) = self.hip
             && !matches!(hip, 1 | 4)
         {
@@ -3255,6 +3256,21 @@ mod tests {
         let invalid = validate(&["mlab", "markets", "--exchange", "hyperliquid", "--hip", "3"])
             .expect_err("unknown HIP must fail");
         assert!(invalid.to_string().contains("must be 1"));
+
+        let removed = validate(&[
+            "mlab",
+            "markets",
+            "--exchange",
+            "hyperliquid-outcomes",
+            "--deployer",
+            "out",
+        ])
+        .expect_err("the removed outcome exchange must fail before filter validation");
+        assert!(
+            removed
+                .to_string()
+                .contains("use `hyperliquid` with `--hip 4`")
+        );
 
         validate(&["mlab", "markets", "--exchange", "hyperliquid", "--hip", "1"])
             .expect("HIP-1 market discovery validates");
