@@ -484,6 +484,9 @@ pub struct MarketsArgs {
     pub provider: Option<CliDataProvider>,
     #[arg(long)]
     pub exchange: String,
+    /// Select the Hyperliquid market protocol: 1 for spot or 4 for outcomes.
+    #[arg(long, value_name = "1|4")]
+    pub hip: Option<u8>,
     #[arg(long)]
     pub symbol: Option<String>,
     /// Filter dynamic outcome markets by question, outcome, side, or id.
@@ -507,11 +510,42 @@ impl MarketsArgs {
         if self.exchange.trim().is_empty() {
             bail!("--exchange cannot be empty");
         }
-        if self.testnet && !self.exchange.eq_ignore_ascii_case("hyperliquid") {
-            bail!("--testnet is currently supported by markets only for Hyperliquid");
+        if let Some(hip) = self.hip
+            && !matches!(hip, 1 | 4)
+        {
+            bail!("--hip must be 1 for Hyperliquid spot or 4 for Hyperliquid outcomes");
         }
-        if self.deployer.is_some() && !self.exchange.eq_ignore_ascii_case("hyperliquid") {
-            bail!("--deployer is available only for Hyperliquid outcome discovery");
+        let hyperliquid = self.exchange.eq_ignore_ascii_case("hyperliquid");
+        if hyperliquid && self.hip.is_none() {
+            bail!("Hyperliquid market discovery requires --hip 1 for spot or --hip 4 for outcomes");
+        }
+        if self.hip.is_some() && !hyperliquid {
+            bail!("--hip is supported only with --exchange hyperliquid");
+        }
+        if self.hip.is_some() && self.provider.is_some() {
+            bail!("--hip uses Hyperliquid's standalone market catalog; omit --provider");
+        }
+        if let Some(symbol) = self.symbol.as_deref() {
+            let outcome = crate::markets::outcomes::looks_like_symbol(symbol);
+            if self.hip == Some(1) && outcome {
+                bail!(
+                    "--hip 1 accepts spot symbols such as HYPE/USDC; use --hip 4 for outcome symbols"
+                );
+            }
+            if self.hip == Some(4) && !outcome {
+                bail!(
+                    "--hip 4 accepts outcome symbols such as 1210:0; use --hip 1 for spot symbols"
+                );
+            }
+        }
+        if self.testnet && self.hip != Some(4) {
+            bail!("--testnet is supported by markets only for Hyperliquid HIP-4 outcomes");
+        }
+        if self.deployer.is_some() && self.hip != Some(4) {
+            bail!("--deployer is available only with --exchange hyperliquid --hip 4");
+        }
+        if self.search.is_some() && self.hip != Some(4) {
+            bail!("--search is available only with --exchange hyperliquid --hip 4");
         }
         if self
             .search
@@ -3201,6 +3235,31 @@ mod tests {
             }
             _ => panic!("expected outcome split command"),
         }
+    }
+
+    #[test]
+    fn hyperliquid_market_discovery_requires_hip_one_or_four() {
+        let validate = |arguments: &[&str]| {
+            let cli = Cli::try_parse_from(arguments).expect("markets command parses");
+            let Commands::Markets(args) = cli.command else {
+                panic!("expected markets command");
+            };
+            args.validate()
+        };
+
+        let missing = validate(&["mlab", "markets", "--exchange", "hyperliquid"])
+            .expect_err("Hyperliquid markets require an explicit HIP");
+        assert!(missing.to_string().contains("--hip 1"));
+        assert!(missing.to_string().contains("--hip 4"));
+
+        let invalid = validate(&["mlab", "markets", "--exchange", "hyperliquid", "--hip", "3"])
+            .expect_err("unknown HIP must fail");
+        assert!(invalid.to_string().contains("must be 1"));
+
+        validate(&["mlab", "markets", "--exchange", "hyperliquid", "--hip", "1"])
+            .expect("HIP-1 market discovery validates");
+        validate(&["mlab", "markets", "--exchange", "hyperliquid", "--hip", "4"])
+            .expect("HIP-4 market discovery validates");
     }
 
     #[test]

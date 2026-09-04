@@ -157,6 +157,8 @@ Market Lab uses normalized symbols and domain types while preserving the provide
 | Hyperliquid HIP-3 perpetuals | `hyperliquidf` with `{dex}:{coin}`, e.g. `xyz:TSLA` | Mainnet or testnet |
 | HyperLink perpetuals | `hyperlinkf` | Mainnet; access controlled by HyperLink |
 
+List Hyperliquid products explicitly with `mlab markets --exchange hyperliquid --hip 1` for HIP-1 Spot or `--hip 4` for HIP-4 outcomes.
+
 Use the [market catalog](https://marketlab.sh/markets) instead of guessing symbols, collateral assets, or venue names.
 
 ## How Market Lab runs

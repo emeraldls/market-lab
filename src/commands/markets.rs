@@ -12,13 +12,7 @@ pub async fn handle(args: MarketsArgs) -> Result<()> {
     args.validate()?;
     let outcome_request = args.provider.is_none()
         && args.exchange.eq_ignore_ascii_case(SPOT_EXCHANGE)
-        && (args.symbol.is_none()
-            || args
-                .symbol
-                .as_deref()
-                .is_some_and(crate::markets::outcomes::looks_like_symbol)
-            || args.search.is_some()
-            || args.deployer.is_some());
+        && args.hip == Some(4);
     if outcome_request {
         return handle_outcomes(args).await;
     }
