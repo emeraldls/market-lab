@@ -71,7 +71,7 @@ pub struct TradePlan {
     pub created_at_ms: u64,
     pub venue: ExecutionVenue,
     /// Selects testnet for venues whose network policy permits it.
-    #[serde(default = "legacy_hyperliquid_testnet")]
+    #[serde(default = "legacy_testnet")]
     pub testnet: bool,
     pub account: String,
     pub internal_symbol: String,
@@ -324,8 +324,8 @@ impl ExecutionOutcome {
 pub struct CancelPlan {
     pub created_at_ms: u64,
     pub venue: ExecutionVenue,
-    /// Routes Hyperliquid execution to testnet. Ignored by other venues.
-    #[serde(default = "legacy_hyperliquid_testnet")]
+    /// Selects testnet for venues whose network policy permits it.
+    #[serde(default = "legacy_testnet")]
     pub testnet: bool,
     pub account: String,
     pub internal_symbol: String,
@@ -333,9 +333,8 @@ pub struct CancelPlan {
     pub order_id: String,
 }
 
-// Persisted plans created before mainnet became the default were always
-// Hyperliquid testnet plans. Keep them on testnet when they are deserialized.
-const fn legacy_hyperliquid_testnet() -> bool {
+// Persisted plans created before mainnet became the default used testnet.
+const fn legacy_testnet() -> bool {
     true
 }
 

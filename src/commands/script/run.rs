@@ -831,7 +831,7 @@ fn validate_execution_routing(args: &ScriptRunArgs, language: ScriptLanguage) ->
             )
         }
         ScriptLanguage::JavaScriptV1 if args.testnet && args.venue.is_none() => {
-            bail!("--testnet requires a Hyperliquid execution venue for JavaScript Scripting V1")
+            bail!("--testnet requires an explicit execution venue for JavaScript Scripting V1")
         }
         _ => Ok(()),
     }

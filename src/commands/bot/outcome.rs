@@ -505,7 +505,11 @@ pub(super) async fn handle_mid(
     if args.dry_run {
         return render_plan(&view, args.output);
     }
-    let account = ExecutionAdapter::configured_account(ExecutionVenue::HyperliquidSpot)?;
+    let account = ExecutionAdapter::configured_account_for(
+        ExecutionVenue::HyperliquidSpot,
+        args.testnet,
+        "main",
+    )?;
     require_quote_balance(
         args.testnet,
         &account,
@@ -598,7 +602,11 @@ pub(super) async fn handle_grid(args: RunGridArgs) -> Result<()> {
     if args.dry_run {
         return render_outcome_grid_plan(&view, args.output);
     }
-    let account = ExecutionAdapter::configured_account(ExecutionVenue::HyperliquidSpot)?;
+    let account = ExecutionAdapter::configured_account_for(
+        ExecutionVenue::HyperliquidSpot,
+        args.testnet,
+        "main",
+    )?;
     require_quote_balance(
         args.testnet,
         &account,
@@ -642,7 +650,8 @@ pub(super) async fn run_mid_worker(
         &definition.symbol,
     )
     .await?;
-    let account = ExecutionAdapter::configured_account(definition.venue)?;
+    let account =
+        ExecutionAdapter::configured_account_for(definition.venue, definition.testnet, "main")?;
     let baseline = adapter.account_snapshot(&account).await?;
     let baseline_primary = holding_total(&baseline, &pair.primary.symbol);
     let baseline_complement = holding_total(&baseline, &pair.complement.symbol);
@@ -986,7 +995,8 @@ pub(super) async fn run_grid_worker(job_id: &str, definition: &GridJobDefinition
         &definition.symbol,
     )
     .await?;
-    let account = ExecutionAdapter::configured_account(definition.venue)?;
+    let account =
+        ExecutionAdapter::configured_account_for(definition.venue, definition.testnet, "main")?;
     let baseline = adapter.account_snapshot(&account).await?;
     let baseline_primary = holding_total(&baseline, &pair.primary.symbol);
     let baseline_complement = holding_total(&baseline, &pair.complement.symbol);
@@ -2249,7 +2259,8 @@ async fn cancel_all(
     cancel_sequence: &mut u64,
     working: &mut HashMap<OutcomeSide, WorkingOrder>,
 ) -> Result<()> {
-    let account = ExecutionAdapter::configured_account(definition.venue)?;
+    let account =
+        ExecutionAdapter::configured_account_for(definition.venue, definition.testnet, "main")?;
     let orders = working.values().cloned().collect::<Vec<_>>();
     for order in orders {
         *cancel_sequence = cancel_sequence.saturating_add(1);

@@ -219,7 +219,7 @@ pub struct TradeArgs {
     pub config: Option<PathBuf>,
     #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
-    /// Use Hyperliquid testnet instead of the default mainnet.
+    /// Use the venue's testnet instead of its default mainnet.
     #[arg(long, default_value_t = false)]
     pub testnet: bool,
     /// Exact base-asset exposure; leverage does not multiply an explicit size.
@@ -352,7 +352,7 @@ impl TradeArgs {
 pub struct AccountQueryArgs {
     #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
-    /// Query Hyperliquid testnet instead of the default mainnet.
+    /// Query the venue's testnet instead of its default mainnet.
     #[arg(long, default_value_t = false)]
     pub testnet: bool,
     #[arg(long)]
@@ -367,7 +367,7 @@ pub struct CancelOrderArgs {
     pub order_id: String,
     #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
-    /// Cancel on Hyperliquid testnet instead of the default mainnet.
+    /// Cancel on the venue's testnet instead of its default mainnet.
     #[arg(long, default_value_t = false)]
     pub testnet: bool,
     #[arg(long, default_value_t = false)]
@@ -400,7 +400,7 @@ pub struct ClosePositionArgs {
     pub symbol: Option<String>,
     #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
-    /// Close on Hyperliquid testnet instead of the default mainnet.
+    /// Close on the venue's testnet instead of its default mainnet.
     #[arg(long, default_value_t = false)]
     pub testnet: bool,
     #[arg(long, default_value_t = false)]
@@ -495,7 +495,7 @@ pub struct MarketsArgs {
     /// Filter outcome markets by exact deployer venue or address.
     #[arg(long)]
     pub deployer: Option<String>,
-    /// Fetch Hyperliquid testnet markets instead of the default mainnet.
+    /// Fetch testnet markets instead of the default mainnet where supported.
     #[arg(long, default_value_t = false)]
     pub testnet: bool,
     /// Replace the installed snapshot with current provider markets.
@@ -539,8 +539,8 @@ impl MarketsArgs {
                 );
             }
         }
-        if self.testnet && self.hip != Some(4) {
-            bail!("--testnet is supported by markets only for Hyperliquid HIP-4 outcomes");
+        if self.testnet && self.hip != Some(4) && !self.exchange.eq_ignore_ascii_case("bulkf") {
+            bail!("--testnet is supported by markets for BULK and Hyperliquid HIP-4 outcomes");
         }
         if self.deployer.is_some() && self.hip != Some(4) {
             bail!("--deployer is available only with --exchange hyperliquid --hip 4");
@@ -664,6 +664,9 @@ pub struct AuthSetArgs {
     /// Stop attaching the configured builder to Hyperliquid orders.
     #[arg(long, default_value_t = false, conflicts_with = "builder")]
     pub clear_builder: bool,
+    /// Configure BULK testnet instead of the default mainnet.
+    #[arg(long, default_value_t = false)]
+    pub testnet: bool,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -781,7 +784,7 @@ pub struct ScriptRunArgs {
     /// JavaScript Scripting V1 execution venue. Python V2 selects exchange per request.
     #[arg(long, value_enum)]
     pub venue: Option<ExecutionVenueArg>,
-    /// Route all Hyperliquid execution and data in this job through testnet.
+    /// Route supported execution and data in this job through testnet.
     #[arg(long, default_value_t = false)]
     pub testnet: bool,
     /// JavaScript Scripting V1 source declaration. Python V2 uses history.source literals.
@@ -877,7 +880,7 @@ impl ScriptRunArgs {
         } else if let Some(venue) = self.venue {
             validate_execution_network(venue, self.testnet)?;
         } else if self.testnet {
-            bail!("--testnet requires a Hyperliquid execution venue");
+            bail!("--testnet requires an explicit execution venue");
         }
         Ok(())
     }
@@ -1851,7 +1854,7 @@ pub struct RunTwapArgs {
     pub symbol: String,
     #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
-    /// Execute through Hyperliquid testnet instead of the default mainnet.
+    /// Execute through the venue's testnet instead of its default mainnet.
     #[arg(long, default_value_t = false)]
     pub testnet: bool,
     #[arg(long, value_enum)]
@@ -1886,7 +1889,7 @@ pub struct RunVwapArgs {
     pub symbol: String,
     #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
-    /// Execute through Hyperliquid testnet instead of the default mainnet.
+    /// Execute through the venue's testnet instead of its default mainnet.
     #[arg(long, default_value_t = false)]
     pub testnet: bool,
     #[arg(long, value_enum)]
@@ -1921,7 +1924,7 @@ pub struct RunOiwapArgs {
     pub symbol: String,
     #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
-    /// Execute through Hyperliquid testnet instead of the default mainnet.
+    /// Execute through the venue's testnet instead of its default mainnet.
     #[arg(long, default_value_t = false)]
     pub testnet: bool,
     #[arg(long, value_enum)]
@@ -1956,7 +1959,7 @@ pub struct RunMidPriceArgs {
     pub symbol: String,
     #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
-    /// Execute through Hyperliquid testnet instead of the default mainnet.
+    /// Execute through the venue's testnet instead of its default mainnet.
     #[arg(long, default_value_t = false)]
     pub testnet: bool,
     /// Total base-asset quantity allocated across both initial grid ladders.
@@ -2005,7 +2008,7 @@ pub struct RunGridArgs {
     pub symbol: String,
     #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
     pub venue: ExecutionVenueArg,
-    /// Execute through Hyperliquid testnet instead of the default mainnet.
+    /// Execute through the venue's testnet instead of its default mainnet.
     #[arg(long, default_value_t = false)]
     pub testnet: bool,
     /// Hard one-sided inventory limit in base-asset units.
@@ -3573,6 +3576,7 @@ mod tests {
                     subaccount: None,
                     builder: None,
                     clear_builder: false,
+                    testnet: false,
                 })
             }
         ));
@@ -3597,6 +3601,20 @@ mod tests {
                     subaccount: None,
                     builder: None,
                     clear_builder: false,
+                    testnet: false,
+                })
+            }
+        ));
+
+        let bulk_testnet = Cli::try_parse_from(["mlab", "auth", "set", "bulk", "--testnet"])
+            .expect("BULK testnet auth should parse");
+        assert!(matches!(
+            bulk_testnet.command,
+            Commands::Auth {
+                command: AuthCommands::Set(AuthSetArgs {
+                    provider: AuthProvider::Bulk,
+                    testnet: true,
+                    ..
                 })
             }
         ));
@@ -3613,6 +3631,7 @@ mod tests {
                     subaccount: None,
                     builder: None,
                     clear_builder: false,
+                    testnet: false,
                 })
             }
         ));
@@ -3635,6 +3654,7 @@ mod tests {
                     subaccount: Some(name),
                     builder: None,
                     clear_builder: false,
+                    testnet: false,
                 })
             } if name == "trading-2"
         ));
@@ -3657,6 +3677,7 @@ mod tests {
                     subaccount: None,
                     builder: Some(address),
                     clear_builder: false,
+                    testnet: false,
                 })
             } if address == "0x1234567890123456789012345678901234567890"
         ));
@@ -3673,6 +3694,7 @@ mod tests {
                     subaccount: None,
                     builder: None,
                     clear_builder: true,
+                    testnet: false,
                 })
             }
         ));

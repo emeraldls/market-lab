@@ -16,10 +16,10 @@ use crate::domain::types::{
     MarketTicker, OhlcvCandle, OrderBookLevel, OrderBookSnapshot, TopOfBook, TradeTick,
 };
 
+use super::BulkNetwork;
 use super::market_data::{BulkKline, BulkTicker, normalize_timestamp_ms};
 use super::markets;
 
-const BULK_WS_URL: &str = "wss://exchange-ws1.bulk.trade";
 const BULK_TRADING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const BULK_TRADING_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -30,8 +30,8 @@ struct BulkWsClient {
     stream: WsStream,
 }
 
-#[derive(Default)]
 pub struct BulkTradingClient {
+    network: BulkNetwork,
     connection: Arc<Mutex<Option<mpsc::Sender<TradingCommand>>>>,
 }
 
@@ -41,8 +41,11 @@ struct TradingCommand {
 }
 
 impl BulkTradingClient {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(network: BulkNetwork) -> Self {
+        Self {
+            network,
+            connection: Arc::default(),
+        }
     }
 
     pub async fn connect(&self) -> Result<()> {
@@ -84,7 +87,7 @@ impl BulkTradingClient {
             return Ok(sender.clone());
         }
 
-        let (stream, _) = connect_async(BULK_WS_URL)
+        let (stream, _) = connect_async(self.network.websocket_url())
             .await
             .context("failed to connect to BULK trading WebSocket")?;
         let (sender, receiver) = mpsc::channel(1024);
@@ -221,8 +224,8 @@ fn decode_trading_response(value: &Value) -> Result<Value> {
 }
 
 impl BulkWsClient {
-    async fn subscribe(subscription: Value) -> Result<Self> {
-        let (mut stream, _) = connect_async(BULK_WS_URL)
+    async fn subscribe(network: BulkNetwork, subscription: Value) -> Result<Self> {
+        let (mut stream, _) = connect_async(network.websocket_url())
             .await
             .context("failed to connect to BULK WebSocket")?;
         let request = serde_json::json!({
@@ -312,13 +315,16 @@ pub struct BulkCandleStream {
 }
 
 impl BulkCandleStream {
-    pub async fn connect(symbol: &str, interval: &str) -> Result<Self> {
+    pub async fn connect(network: BulkNetwork, symbol: &str, interval: &str) -> Result<Self> {
         let market = markets::market(symbol)?;
-        let client = BulkWsClient::subscribe(serde_json::json!({
-            "type": "candle",
-            "symbol": market.provider_symbol,
-            "interval": interval,
-        }))
+        let client = BulkWsClient::subscribe(
+            network,
+            serde_json::json!({
+                "type": "candle",
+                "symbol": market.provider_symbol,
+                "interval": interval,
+            }),
+        )
         .await?;
         Ok(Self { client })
     }
@@ -352,12 +358,15 @@ pub struct BulkTickerStream {
 }
 
 impl BulkTickerStream {
-    pub async fn connect(symbol: &str) -> Result<Self> {
+    pub async fn connect(network: BulkNetwork, symbol: &str) -> Result<Self> {
         let market = markets::market(symbol)?;
-        let client = BulkWsClient::subscribe(serde_json::json!({
-            "type": "ticker",
-            "symbol": market.provider_symbol,
-        }))
+        let client = BulkWsClient::subscribe(
+            network,
+            serde_json::json!({
+                "type": "ticker",
+                "symbol": market.provider_symbol,
+            }),
+        )
         .await?;
         Ok(Self {
             client,
@@ -395,12 +404,15 @@ pub struct BulkOrderBookStream {
 }
 
 impl BulkOrderBookStream {
-    pub async fn connect(symbol: &str, depth: u16) -> Result<Self> {
+    pub async fn connect(network: BulkNetwork, symbol: &str, depth: u16) -> Result<Self> {
         let market = markets::market(symbol)?;
-        let client = BulkWsClient::subscribe(serde_json::json!({
-            "type": "l2Delta",
-            "symbol": market.provider_symbol,
-        }))
+        let client = BulkWsClient::subscribe(
+            network,
+            serde_json::json!({
+                "type": "l2Delta",
+                "symbol": market.provider_symbol,
+            }),
+        )
         .await?;
         Ok(Self {
             client,
@@ -528,14 +540,17 @@ pub struct BulkAccountStream {
 }
 
 impl BulkAccountStream {
-    pub async fn connect(account: &str) -> Result<Self> {
+    pub async fn connect(network: BulkNetwork, account: &str) -> Result<Self> {
         if account.trim().is_empty() {
             bail!("BULK account WebSocket requires an account public key");
         }
-        let client = BulkWsClient::subscribe(serde_json::json!({
-            "type": "account",
-            "user": account,
-        }))
+        let client = BulkWsClient::subscribe(
+            network,
+            serde_json::json!({
+                "type": "account",
+                "user": account,
+            }),
+        )
         .await?;
         Ok(Self {
             client,
@@ -576,12 +591,15 @@ impl BulkAccountStream {
 }
 
 impl BulkTradesStream {
-    pub async fn connect(symbol: &str) -> Result<Self> {
+    pub async fn connect(network: BulkNetwork, symbol: &str) -> Result<Self> {
         let market = markets::market(symbol)?;
-        let client = BulkWsClient::subscribe(serde_json::json!({
-            "type": "trades",
-            "symbol": market.provider_symbol,
-        }))
+        let client = BulkWsClient::subscribe(
+            network,
+            serde_json::json!({
+                "type": "trades",
+                "symbol": market.provider_symbol,
+            }),
+        )
         .await?;
         Ok(Self {
             client,

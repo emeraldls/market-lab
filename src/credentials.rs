@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::cli::{AuthProvider, AuthProviderArgs, AuthSetArgs};
-use crate::providers::bulk;
+use crate::providers::bulk::{self, BulkNetwork};
 use crate::providers::hyperliquid::HyperliquidNetwork;
 use crate::providers::hyperliquid::exchange::{
     HYPERLINK_API_WALLET_NAME, LEGACY_TESTNET_API_WALLET_NAME, MAINNET_API_WALLET_NAME,
@@ -28,7 +28,8 @@ const BULK_CREDENTIAL_FILE: &str = "bulk-agent.json";
 const HYPERLIQUID_CREDENTIAL_FILE: &str = "hyperliquid-agents.json";
 const HYPERLINK_CREDENTIAL_FILE: &str = "hyperlink-agent.json";
 const LEGACY_BULK_CREDENTIAL_VERSION: u8 = 1;
-const BULK_CREDENTIAL_VERSION: u8 = 2;
+const LEGACY_NETWORKED_BULK_CREDENTIAL_VERSION: u8 = 2;
+const BULK_CREDENTIAL_VERSION: u8 = 3;
 const LEGACY_HYPERLIQUID_CREDENTIAL_VERSION: u8 = 1;
 const LEGACY_NETWORKED_HYPERLIQUID_CREDENTIAL_VERSION: u8 = 2;
 const LEGACY_SUBACCOUNT_HYPERLIQUID_CREDENTIAL_VERSION: u8 = 3;
@@ -315,7 +316,15 @@ struct BulkCredential {
     agent_public_key: String,
     agent_private_key: String,
     #[serde(default)]
-    subaccounts: Vec<NamedSubaccount>,
+    mainnet_authorized: bool,
+    #[serde(default)]
+    testnet_authorized: bool,
+    #[serde(default)]
+    mainnet_subaccounts: Vec<NamedSubaccount>,
+    #[serde(default)]
+    testnet_subaccounts: Vec<NamedSubaccount>,
+    #[serde(default, rename = "subaccounts", skip_serializing)]
+    legacy_subaccounts: Vec<NamedSubaccount>,
 }
 
 impl BulkCredential {
@@ -327,7 +336,11 @@ impl BulkCredential {
             account: None,
             agent_public_key: agent.pubkey().to_base58(),
             agent_private_key: agent.to_base58(),
-            subaccounts: Vec::new(),
+            mainnet_authorized: false,
+            testnet_authorized: false,
+            mainnet_subaccounts: Vec::new(),
+            testnet_subaccounts: Vec::new(),
+            legacy_subaccounts: Vec::new(),
         }
     }
 
@@ -349,8 +362,15 @@ impl BulkCredential {
         } else if self.status == BulkCredentialStatus::Active {
             bail!("stored active BULK credential is missing its account public key");
         }
+        if self.status == BulkCredentialStatus::Active
+            && !self.mainnet_authorized
+            && !self.testnet_authorized
+        {
+            bail!("stored active BULK credential has no authorized network");
+        }
 
-        validate_named_subaccounts(&self.subaccounts, NamedSubaccount::validate_bulk)?;
+        validate_named_subaccounts(&self.mainnet_subaccounts, NamedSubaccount::validate_bulk)?;
+        validate_named_subaccounts(&self.testnet_subaccounts, NamedSubaccount::validate_bulk)?;
 
         Ok(())
     }
@@ -358,6 +378,45 @@ impl BulkCredential {
     fn agent_keypair(&self) -> Result<Keypair> {
         Keypair::from_base58(&self.agent_private_key)
             .context("stored BULK agent private key is invalid")
+    }
+
+    fn is_authorized(&self, network: BulkNetwork) -> bool {
+        match network {
+            BulkNetwork::Mainnet => self.mainnet_authorized,
+            BulkNetwork::Testnet => self.testnet_authorized,
+        }
+    }
+
+    fn set_authorized(&mut self, network: BulkNetwork, authorized: bool) {
+        match network {
+            BulkNetwork::Mainnet => self.mainnet_authorized = authorized,
+            BulkNetwork::Testnet => self.testnet_authorized = authorized,
+        }
+    }
+
+    fn subaccounts(&self, network: BulkNetwork) -> &[NamedSubaccount] {
+        match network {
+            BulkNetwork::Mainnet => &self.mainnet_subaccounts,
+            BulkNetwork::Testnet => &self.testnet_subaccounts,
+        }
+    }
+
+    fn subaccounts_mut(&mut self, network: BulkNetwork) -> &mut Vec<NamedSubaccount> {
+        match network {
+            BulkNetwork::Mainnet => &mut self.mainnet_subaccounts,
+            BulkNetwork::Testnet => &mut self.testnet_subaccounts,
+        }
+    }
+
+    fn upgrade(&mut self) {
+        if matches!(
+            self.version,
+            LEGACY_BULK_CREDENTIAL_VERSION | LEGACY_NETWORKED_BULK_CREDENTIAL_VERSION
+        ) {
+            self.version = BULK_CREDENTIAL_VERSION;
+            self.testnet_authorized = self.status == BulkCredentialStatus::Active;
+            self.testnet_subaccounts = std::mem::take(&mut self.legacy_subaccounts);
+        }
     }
 }
 
@@ -368,20 +427,32 @@ impl Drop for BulkCredential {
 }
 
 pub fn active_bulk_credential() -> Result<ActiveBulkCredential> {
-    active_bulk_credential_for("main")
+    active_bulk_credential_for(BulkNetwork::Mainnet, "main")
 }
 
-pub fn active_bulk_credential_for(name: &str) -> Result<ActiveBulkCredential> {
+pub fn active_bulk_credential_for(
+    network: BulkNetwork,
+    name: &str,
+) -> Result<ActiveBulkCredential> {
     let credential = load_bulk_credential()?
         .context("BULK credentials are not configured; run `mlab auth set bulk`")?;
-    if credential.status != BulkCredentialStatus::Active {
-        bail!("BULK agent registration is pending; run `mlab auth set bulk` to finish it");
+    if !credential.is_authorized(network) {
+        bail!(
+            "BULK {} agent is not authorized; run `mlab auth set bulk{}`",
+            network.label(),
+            if network == BulkNetwork::Testnet {
+                " --testnet"
+            } else {
+                ""
+            }
+        );
     }
     let main_account = credential
         .account
         .as_deref()
         .context("stored BULK credential is missing its account public key")?;
-    let account = resolve_named_account(main_account, &credential.subaccounts, name, "BULK")?;
+    let account =
+        resolve_named_account(main_account, credential.subaccounts(network), name, "BULK")?;
     Ok(ActiveBulkCredential {
         account: Pubkey::from_base58(&account)
             .context("stored BULK account public key is invalid")?,
@@ -389,11 +460,14 @@ pub fn active_bulk_credential_for(name: &str) -> Result<ActiveBulkCredential> {
     })
 }
 
-pub fn active_bulk_credential_for_account(account: &str) -> Result<ActiveBulkCredential> {
+pub fn active_bulk_credential_for_account(
+    network: BulkNetwork,
+    account: &str,
+) -> Result<ActiveBulkCredential> {
     let credential = load_bulk_credential()?
         .context("BULK credentials are not configured; run `mlab auth set bulk`")?;
-    if credential.status != BulkCredentialStatus::Active {
-        bail!("BULK agent registration is pending; run `mlab auth set bulk` to finish it");
+    if !credential.is_authorized(network) {
+        bail!("BULK {} agent is not authorized", network.label());
     }
     let main = credential
         .account
@@ -401,7 +475,7 @@ pub fn active_bulk_credential_for_account(account: &str) -> Result<ActiveBulkCre
         .context("stored BULK credential is missing its account public key")?;
     let configured = main == account
         || credential
-            .subaccounts
+            .subaccounts(network)
             .iter()
             .any(|subaccount| subaccount.account == account);
     if !configured {
@@ -417,21 +491,26 @@ pub fn bulk_account() -> Result<String> {
     Ok(active_bulk_credential()?.account.to_base58())
 }
 
-pub fn bulk_account_for(name: &str) -> Result<String> {
-    Ok(active_bulk_credential_for(name)?.account.to_base58())
+pub fn bulk_account_for(network: BulkNetwork, name: &str) -> Result<String> {
+    Ok(active_bulk_credential_for(network, name)?
+        .account
+        .to_base58())
 }
 
-pub fn bulk_accounts() -> Result<Vec<(String, String)>> {
+pub fn bulk_accounts(network: BulkNetwork) -> Result<Vec<(String, String)>> {
     let credential = load_bulk_credential()?
         .context("BULK credentials are not configured; run `mlab auth set bulk`")?;
     let main = credential
         .account
         .clone()
         .context("stored BULK credential is missing its account public key")?;
+    if !credential.is_authorized(network) {
+        bail!("BULK {} agent is not authorized", network.label());
+    }
     Ok(std::iter::once(("main".to_string(), main))
         .chain(
             credential
-                .subaccounts
+                .subaccounts(network)
                 .iter()
                 .map(|subaccount| (subaccount.name.clone(), subaccount.account.clone())),
         )
@@ -539,6 +618,9 @@ pub async fn handle_set(args: AuthSetArgs) -> Result<()> {
     {
         bail!("`--builder` and `--clear-builder` are available only for Hyperliquid");
     }
+    if args.testnet && !matches!(args.provider, AuthProvider::Bulk) {
+        bail!("`--testnet` is available here only for BULK");
+    }
     match args.provider {
         AuthProvider::Mmt => {
             if args.subaccount.is_some() {
@@ -557,7 +639,14 @@ pub async fn handle_set(args: AuthSetArgs) -> Result<()> {
             println!("mmt: configured");
             print_credential_location(MMT_CREDENTIAL_FILE)?;
         }
-        AuthProvider::Bulk => handle_set_bulk(args.reauthorize, args.subaccount.as_deref()).await?,
+        AuthProvider::Bulk => {
+            handle_set_bulk(
+                args.reauthorize,
+                args.subaccount.as_deref(),
+                BulkNetwork::from_testnet(args.testnet),
+            )
+            .await?
+        }
         AuthProvider::Hyperliquid => {
             handle_set_hyperliquid(
                 args.reauthorize,
@@ -663,7 +752,24 @@ fn print_bulk_status() -> Result<()> {
                 println!("  account: {account}");
             }
             println!("  agent: {}", credential.agent_public_key);
-            print_subaccounts("subaccounts", &credential.subaccounts);
+            println!(
+                "  mainnet: {}",
+                if credential.mainnet_authorized {
+                    "authorized"
+                } else {
+                    "not configured"
+                }
+            );
+            println!(
+                "  testnet: {}",
+                if credential.testnet_authorized {
+                    "authorized"
+                } else {
+                    "not configured"
+                }
+            );
+            print_subaccounts("mainnet subaccounts", &credential.mainnet_subaccounts);
+            print_subaccounts("testnet subaccounts", &credential.testnet_subaccounts);
         }
         None => println!("bulk: not configured"),
     }
@@ -819,16 +925,19 @@ async fn handle_create_hyperliquid_subaccount(name: &str) -> Result<()> {
     Ok(())
 }
 
-async fn handle_create_bulk_subaccount(name: &str) -> Result<()> {
+async fn handle_create_bulk_subaccount(name: &str, network: BulkNetwork) -> Result<()> {
     let name = validate_subaccount_name(name)?.to_string();
     let mut credential = load_bulk_credential()?.context(
         "configure the BULK main account before creating a subaccount with `mlab auth set bulk`",
     )?;
-    if credential.status != BulkCredentialStatus::Active {
-        bail!("finish BULK main-account authorization before creating a subaccount");
+    if !credential.is_authorized(network) {
+        bail!(
+            "configure BULK {} before creating a subaccount",
+            network.label()
+        );
     }
     if credential
-        .subaccounts
+        .subaccounts(network)
         .iter()
         .any(|subaccount| subaccount.name.eq_ignore_ascii_case(&name))
     {
@@ -853,14 +962,15 @@ async fn handle_create_bulk_subaccount(name: &str) -> Result<()> {
             master.pubkey().to_base58()
         );
     }
-    println!("bulk: creating subaccount `{name}`");
-    let account = bulk::create_subaccount(master, &name).await?;
-    credential.subaccounts.push(NamedSubaccount {
+    println!("bulk: creating {} subaccount `{name}`", network.label());
+    let account = bulk::create_subaccount(network, master, &name).await?;
+    credential.subaccounts_mut(network).push(NamedSubaccount {
         name: name.clone(),
         account: account.clone(),
     });
     save_bulk_credential(&credential)?;
     println!("bulk: subaccount created");
+    println!("  network: {}", network.label());
     println!("  name: {name}");
     println!("  account: {account}");
     Ok(())
@@ -1285,29 +1395,41 @@ fn ensure_hyperliquid_exchange_ok(
     Ok(())
 }
 
-async fn handle_set_bulk(reauthorize: bool, subaccount: Option<&str>) -> Result<()> {
+async fn handle_set_bulk(
+    reauthorize: bool,
+    subaccount: Option<&str>,
+    network: BulkNetwork,
+) -> Result<()> {
     if let Some(name) = subaccount {
-        return handle_create_bulk_subaccount(name).await;
+        return handle_create_bulk_subaccount(name, network).await;
     }
     let mut credential = match load_bulk_credential()? {
-        Some(credential) if credential.status == BulkCredentialStatus::Active && !reauthorize => {
-            println!("bulk: already configured");
+        Some(credential) if credential.is_authorized(network) && !reauthorize => {
+            println!("bulk: {} already configured", network.label());
             println!(
                 "  account: {}",
                 credential.account.as_deref().unwrap_or("unknown")
             );
             println!("  agent: {}", credential.agent_public_key);
             println!(
-                "  use `mlab auth set bulk --reauthorize` if BULK rejects this agent as unauthorized"
+                "  use `mlab auth set bulk{} --reauthorize` if BULK rejects this agent as unauthorized",
+                if network == BulkNetwork::Testnet {
+                    " --testnet"
+                } else {
+                    ""
+                }
             );
             return Ok(());
         }
-        Some(credential) if credential.status == BulkCredentialStatus::Active => {
-            println!("bulk: reauthorizing the existing agent");
+        Some(credential) if credential.is_authorized(network) => {
+            println!("bulk: reauthorizing the existing {} agent", network.label());
             credential
         }
         Some(credential) => {
-            println!("bulk: retrying registration for the pending agent");
+            println!(
+                "bulk: authorizing the existing agent on {}",
+                network.label()
+            );
             credential
         }
         None => {
@@ -1344,16 +1466,25 @@ async fn handle_set_bulk(reauthorize: bool, subaccount: Option<&str>) -> Result<
         credential.account = Some(account.clone());
         save_bulk_credential(&credential)?;
     }
-    println!("bulk: authorizing the agent for account {account}");
+    println!(
+        "bulk: authorizing the agent for account {account} on {}",
+        network.label()
+    );
 
-    let registration = bulk::register_agent(master, agent).await.map_err(|error| {
-        let recovery = if reauthorize {
-            "BULK agent reauthorization was not confirmed; the existing local agent was preserved and `mlab auth set bulk --reauthorize` can safely retry it"
-        } else {
-            "BULK agent registration was not confirmed; the pending agent remains in the local credential store and `mlab auth set bulk` can safely retry it"
-        };
-        error.context(recovery)
-    })?;
+    let registration = bulk::register_agent(network, master, agent)
+        .await
+        .with_context(|| {
+            format!(
+                "BULK {} agent authorization was not confirmed; the local agent was preserved and `mlab auth set bulk{}{}` can safely retry it",
+                network.label(),
+                if network == BulkNetwork::Testnet {
+                    " --testnet"
+                } else {
+                    ""
+                },
+                if reauthorize { " --reauthorize" } else { "" }
+            )
+        })?;
 
     if registration.account != account
         || registration.agent_public_key != credential.agent_public_key
@@ -1362,6 +1493,7 @@ async fn handle_set_bulk(reauthorize: bool, subaccount: Option<&str>) -> Result<
     }
 
     credential.status = BulkCredentialStatus::Active;
+    credential.set_authorized(network, true);
     save_bulk_credential(&credential).with_context(|| {
         if reauthorize {
             "BULK reauthorized the agent, but Market Lab could not refresh it in the local credential store; the existing credential was preserved"
@@ -1380,12 +1512,13 @@ async fn handle_set_bulk(reauthorize: bool, subaccount: Option<&str>) -> Result<
     );
     println!("  account: {account}");
     println!("  agent: {}", credential.agent_public_key);
+    println!("  network: {}", network.label());
     print_credential_location(BULK_CREDENTIAL_FILE)?;
     Ok(())
 }
 
 async fn handle_remove_bulk() -> Result<()> {
-    let Some(credential) = load_bulk_credential()? else {
+    let Some(mut credential) = load_bulk_credential()? else {
         println!("bulk: not configured");
         return Ok(());
     };
@@ -1404,15 +1537,15 @@ async fn handle_remove_bulk() -> Result<()> {
 
     let account = credential
         .account
-        .as_deref()
+        .clone()
         .context("stored BULK credential is missing its account public key")?;
     let agent = credential.agent_keypair()?.pubkey();
 
     println!("The main wallet private key is used once for revocation and is never stored.");
-    let master = {
-        let private_key = Zeroizing::new(rpassword::prompt_password(
-            "BULK main wallet private key (hidden): ",
-        )?);
+    let private_key = Zeroizing::new(rpassword::prompt_password(
+        "BULK main wallet private key (hidden): ",
+    )?);
+    {
         let master = Keypair::from_base58(private_key.trim())
             .context("invalid BULK main wallet private key")?;
         let supplied_account = master.pubkey().to_base58();
@@ -1421,13 +1554,28 @@ async fn handle_remove_bulk() -> Result<()> {
                 "the supplied key belongs to BULK account {supplied_account}, but this agent belongs to {account}"
             );
         }
-        master
-    };
+    }
 
     println!("bulk: revoking agent {}", credential.agent_public_key);
-    bulk::revoke_agent(master, agent).await.context(
-        "BULK agent revocation was not confirmed; the agent remains in the local credential store",
-    )?;
+    for network in [BulkNetwork::Mainnet, BulkNetwork::Testnet] {
+        if !credential.is_authorized(network) {
+            continue;
+        }
+        let master = Keypair::from_base58(private_key.trim())
+            .context("invalid BULK main wallet private key")?;
+        bulk::revoke_agent(network, master, agent)
+            .await
+            .with_context(|| {
+                format!(
+                    "BULK {} agent revocation was not confirmed; the agent remains in the local credential store",
+                    network.label()
+                )
+            })?;
+        credential.set_authorized(network, false);
+        if credential.mainnet_authorized || credential.testnet_authorized {
+            save_bulk_credential(&credential)?;
+        }
+    }
 
     delete_bulk_credential()?;
     println!("bulk: revoked and removed");
@@ -1445,9 +1593,7 @@ fn load_bulk_credential() -> Result<Option<BulkCredential>> {
 
     let mut credential: BulkCredential = serde_json::from_str(encoded.as_str())
         .context("stored BULK agent credential is malformed")?;
-    if credential.version == LEGACY_BULK_CREDENTIAL_VERSION {
-        credential.version = BULK_CREDENTIAL_VERSION;
-    }
+    credential.upgrade();
     credential.validate()?;
     Ok(Some(credential))
 }
@@ -1862,6 +2008,33 @@ mod tests {
             .validate()
             .expect_err("active credential without account must fail");
         assert!(error.to_string().contains("missing its account"));
+    }
+
+    #[test]
+    fn existing_bulk_credentials_remain_testnet_credentials() {
+        let account = Keypair::generate().pubkey().to_base58();
+        let agent = Keypair::generate();
+        let subaccount = Keypair::generate().pubkey().to_base58();
+        let encoded = serde_json::json!({
+            "version": LEGACY_NETWORKED_BULK_CREDENTIAL_VERSION,
+            "status": "active",
+            "account": account,
+            "agent_public_key": agent.pubkey().to_base58(),
+            "agent_private_key": agent.to_base58(),
+            "subaccounts": [{"name": "maker", "account": subaccount}],
+        });
+        let mut credential: BulkCredential =
+            serde_json::from_value(encoded).expect("legacy credential decodes");
+
+        credential.upgrade();
+
+        credential.validate().expect("upgraded credential is valid");
+        assert!(!credential.is_authorized(BulkNetwork::Mainnet));
+        assert!(credential.is_authorized(BulkNetwork::Testnet));
+        assert_eq!(
+            credential.subaccounts(BulkNetwork::Testnet)[0].name,
+            "maker"
+        );
     }
 
     #[test]

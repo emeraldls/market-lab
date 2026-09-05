@@ -166,7 +166,7 @@ pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
     args.validate()?;
     let venue = args.venue;
     let symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
-    let account = ExecutionAdapter::configured_account(venue)?;
+    let account = ExecutionAdapter::configured_account_for(venue, args.testnet, "main")?;
     let adapter = match symbol.as_deref() {
         Some(symbol) => {
             ExecutionAdapter::new_for_market(venue, args.testnet, "main", symbol).await?
@@ -226,7 +226,7 @@ pub async fn handle_orders(args: AccountQueryArgs) -> Result<()> {
     args.validate()?;
     let venue = args.venue;
     let symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
-    let account = ExecutionAdapter::configured_account(venue)?;
+    let account = ExecutionAdapter::configured_account_for(venue, args.testnet, "main")?;
     let adapter = match symbol.as_deref() {
         Some(symbol) => {
             ExecutionAdapter::new_for_market(venue, args.testnet, "main", symbol).await?
@@ -251,7 +251,7 @@ pub async fn handle_fills(args: AccountQueryArgs) -> Result<()> {
     args.validate()?;
     let venue = args.venue;
     let symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
-    let account = ExecutionAdapter::configured_account(venue)?;
+    let account = ExecutionAdapter::configured_account_for(venue, args.testnet, "main")?;
     let adapter = match symbol.as_deref() {
         Some(symbol) => {
             ExecutionAdapter::new_for_market(venue, args.testnet, "main", symbol).await?
@@ -295,7 +295,7 @@ pub async fn handle_cancel(args: CancelOrderArgs) -> Result<()> {
     ExecutionAdapter::new_for_market(venue, args.testnet, "main", &market.symbol)
         .await?
         .validate_order_id(&args.order_id)?;
-    let account = ExecutionAdapter::configured_account(venue)?;
+    let account = ExecutionAdapter::configured_account_for(venue, args.testnet, "main")?;
     let plan = CancelPlan {
         created_at_ms: now_ms()?,
         venue,
@@ -325,7 +325,7 @@ pub async fn handle_close(args: ClosePositionArgs) -> Result<()> {
     args.validate()?;
     let venue = args.venue;
     let requested_symbol = validate_optional_symbol(venue, args.symbol.as_deref())?;
-    let account = ExecutionAdapter::configured_account(venue)?;
+    let account = ExecutionAdapter::configured_account_for(venue, args.testnet, "main")?;
     let adapter = ExecutionAdapter::new(venue, args.testnet).await?;
     let snapshot = match requested_symbol.as_deref() {
         Some(symbol) => {
@@ -508,7 +508,7 @@ async fn build_trade_plan_with_price_normalization(
         }
     }
     let account = account.map_or_else(
-        || ExecutionAdapter::configured_account(venue),
+        || ExecutionAdapter::configured_account_for(venue, args.testnet, "main"),
         |account| Ok(account.to_string()),
     )?;
     let reference_price = match args.order_kind {

@@ -9,14 +9,27 @@ use crate::domain::types::{
     TopOfBook, VolumeBar, VolumeBarSeries,
 };
 
+use super::BulkNetwork;
 use super::client::BulkClient;
 use super::markets;
 
 const EXCHANGE: &str = "bulkf";
 
-pub struct BulkProvider;
+pub struct BulkProvider {
+    network: BulkNetwork,
+}
 
 impl BulkProvider {
+    pub const fn new(testnet: bool) -> Self {
+        Self {
+            network: BulkNetwork::from_testnet(testnet),
+        }
+    }
+
+    pub const fn network(&self) -> BulkNetwork {
+        self.network
+    }
+
     pub fn capabilities() -> serde_json::Value {
         serde_json::json!({
             "authentication": {
@@ -67,8 +80,8 @@ impl BulkProvider {
         })
     }
 
-    pub async fn health() -> Result<ProviderHealth> {
-        let ticker = Self::ticker("BTC").await?;
+    pub async fn health(&self) -> Result<ProviderHealth> {
+        let ticker = self.ticker("BTC").await?;
         Ok(ProviderHealth {
             provider: EXCHANGE.to_string(),
             status: "ok".to_string(),
@@ -81,7 +94,13 @@ impl BulkProvider {
         })
     }
 
-    pub async fn candles(symbol: &str, interval: &str, from: u64, to: u64) -> Result<OhlcvSeries> {
+    pub async fn candles(
+        &self,
+        symbol: &str,
+        interval: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<OhlcvSeries> {
         let market = require_market(symbol)?;
         require_app_timestamp_ms(from, "candle start time")?;
         require_app_timestamp_ms(to, "candle end time")?;
@@ -95,7 +114,7 @@ impl BulkProvider {
             ("startTime", from.to_string()),
             ("endTime", to.to_string()),
         ];
-        let client = BulkClient::new()?;
+        let client = BulkClient::new(self.network)?;
         let raw: Vec<BulkKline> = client.get("klines", &query).await?;
         let mut data = raw.into_iter().map(OhlcvCandle::from).collect::<Vec<_>>();
         data.sort_by_key(|candle| candle.t);
@@ -112,12 +131,13 @@ impl BulkProvider {
     }
 
     pub async fn volume_bars(
+        &self,
         symbol: &str,
         interval: &str,
         from: u64,
         to: u64,
     ) -> Result<VolumeBarSeries> {
-        let candles = Self::candles(symbol, interval, from, to).await?;
+        let candles = self.candles(symbol, interval, from, to).await?;
         let data = candles
             .data
             .into_iter()
@@ -140,6 +160,7 @@ impl BulkProvider {
     }
 
     pub async fn live_orderbook(
+        &self,
         symbol: &str,
         depth: u16,
         aggregation: Option<f64>,
@@ -160,22 +181,22 @@ impl BulkProvider {
             query.push(("aggregation", aggregation.to_string()));
         }
 
-        let client = BulkClient::new()?;
+        let client = BulkClient::new(self.network)?;
         let raw: BulkL2Book = client.get("l2book", &query).await?;
         raw.into_snapshot(&market.symbol, depth)
     }
 
-    pub async fn ticker(symbol: &str) -> Result<MarketTicker> {
+    pub async fn ticker(&self, symbol: &str) -> Result<MarketTicker> {
         let market = require_market(symbol)?;
-        let client = BulkClient::new()?;
+        let client = BulkClient::new(self.network)?;
         let raw: BulkTicker = client
             .get_without_query(&format!("ticker/{}", market.provider_symbol))
             .await?;
         raw.into_ticker(&market.symbol)
     }
 
-    pub async fn open_interest(symbol: &str) -> Result<OpenInterestSnapshot> {
-        let ticker = Self::ticker(symbol).await?;
+    pub async fn open_interest(&self, symbol: &str) -> Result<OpenInterestSnapshot> {
+        let ticker = self.ticker(symbol).await?;
         Ok(OpenInterestSnapshot {
             exchange: ticker.exchange,
             symbol: ticker.symbol,
@@ -186,8 +207,8 @@ impl BulkProvider {
         })
     }
 
-    pub async fn funding(symbol: &str) -> Result<FundingRateSnapshot> {
-        let ticker = Self::ticker(symbol).await?;
+    pub async fn funding(&self, symbol: &str) -> Result<FundingRateSnapshot> {
+        let ticker = self.ticker(symbol).await?;
         Ok(FundingRateSnapshot {
             exchange: ticker.exchange,
             symbol: ticker.symbol,
@@ -197,12 +218,16 @@ impl BulkProvider {
         })
     }
 
-    pub async fn statistics(period: &str, symbol: Option<&str>) -> Result<ExchangeStatistics> {
+    pub async fn statistics(
+        &self,
+        period: &str,
+        symbol: Option<&str>,
+    ) -> Result<ExchangeStatistics> {
         let mut query = vec![("period", period.to_string())];
         if let Some(symbol) = symbol {
             query.push(("symbol", require_market(symbol)?.provider_symbol.clone()));
         }
-        let client = BulkClient::new()?;
+        let client = BulkClient::new(self.network)?;
         let raw: BulkStatistics = client.get("stats", &query).await?;
         raw.into_statistics()
     }

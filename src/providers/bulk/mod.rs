@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use bulk_keychain::{
     CreateSubAccount, Keypair, Pubkey, SignatureDomain, SignedTransaction, Signer,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use self::client::BulkClient;
@@ -17,10 +18,54 @@ pub mod ws;
 
 const AGENT_CONFIRMATION_ATTEMPTS: usize = 10;
 const AGENT_CONFIRMATION_DELAY: Duration = Duration::from_millis(250);
-pub(crate) const SIGNATURE_DOMAIN: SignatureDomain = SignatureDomain::Testnet;
 
-pub(crate) fn signer(keypair: Keypair) -> Signer {
-    Signer::new(keypair, SIGNATURE_DOMAIN)
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BulkNetwork {
+    Mainnet,
+    Testnet,
+}
+
+impl BulkNetwork {
+    pub const fn from_testnet(testnet: bool) -> Self {
+        if testnet {
+            Self::Testnet
+        } else {
+            Self::Mainnet
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Mainnet => "mainnet",
+            Self::Testnet => "testnet",
+        }
+    }
+
+    pub const fn api_url(self) -> &'static str {
+        match self {
+            Self::Mainnet => "https://mainnet-api1.bulk.trade/api/v1",
+            Self::Testnet => "https://exchange-api.bulk.trade/api/v1",
+        }
+    }
+
+    pub const fn websocket_url(self) -> &'static str {
+        match self {
+            Self::Mainnet => "wss://mainnet-ws1.bulk.trade",
+            Self::Testnet => "wss://exchange-ws1.bulk.trade",
+        }
+    }
+
+    const fn signature_domain(self) -> SignatureDomain {
+        match self {
+            Self::Mainnet => SignatureDomain::Mainnet,
+            Self::Testnet => SignatureDomain::Testnet,
+        }
+    }
+}
+
+pub(crate) fn signer(network: BulkNetwork, keypair: Keypair) -> Signer {
+    Signer::new(keypair, network.signature_domain())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,21 +74,33 @@ pub struct AgentRegistration {
     pub agent_public_key: String,
 }
 
-pub async fn register_agent(master: Keypair, agent: Pubkey) -> Result<AgentRegistration> {
-    set_agent_authorization(master, agent, false).await
+pub async fn register_agent(
+    network: BulkNetwork,
+    master: Keypair,
+    agent: Pubkey,
+) -> Result<AgentRegistration> {
+    set_agent_authorization(network, master, agent, false).await
 }
 
-pub async fn revoke_agent(master: Keypair, agent: Pubkey) -> Result<AgentRegistration> {
-    set_agent_authorization(master, agent, true).await
+pub async fn revoke_agent(
+    network: BulkNetwork,
+    master: Keypair,
+    agent: Pubkey,
+) -> Result<AgentRegistration> {
+    set_agent_authorization(network, master, agent, true).await
 }
 
-pub async fn create_subaccount(master: Keypair, name: &str) -> Result<String> {
+pub async fn create_subaccount(
+    network: BulkNetwork,
+    master: Keypair,
+    name: &str,
+) -> Result<String> {
     let main_account = master.pubkey().to_base58();
-    let mut signer = signer(master).without_order_id();
+    let mut signer = signer(network, master).without_order_id();
     let signed = signer
         .sign_create_sub_account(CreateSubAccount::new(name), Some(unique_nonce()?))
         .context("failed to sign BULK subaccount creation")?;
-    let body = submit_transaction(&signed)
+    let body = submit_transaction(network, &signed)
         .await
         .context("failed to submit BULK subaccount creation")?;
     if body.get("status").and_then(Value::as_str) != Some("ok") {
@@ -103,16 +160,17 @@ fn extract_created_subaccount(body: &Value, main_account: &str) -> Result<String
 }
 
 async fn set_agent_authorization(
+    network: BulkNetwork,
     master: Keypair,
     agent: Pubkey,
     delete: bool,
 ) -> Result<AgentRegistration> {
     let expected_agent = agent.to_base58();
-    let signed = sign_agent_authorization(master, agent, delete)?;
+    let signed = sign_agent_authorization(network, master, agent, delete)?;
     let account = signed.account.clone();
-    let body = submit_transaction(&signed).await?;
+    let body = submit_transaction(network, &signed).await?;
     if is_trading_acknowledgement(&body) {
-        confirm_agent_authorization(&account, &expected_agent, delete).await?;
+        confirm_agent_authorization(network, &account, &expected_agent, delete).await?;
     } else {
         validate_agent_response(&body, &expected_agent, delete)?;
     }
@@ -123,8 +181,13 @@ async fn set_agent_authorization(
     })
 }
 
-async fn confirm_agent_authorization(account: &str, agent: &str, delete: bool) -> Result<()> {
-    let client = BulkClient::new()?;
+async fn confirm_agent_authorization(
+    network: BulkNetwork,
+    account: &str,
+    agent: &str,
+    delete: bool,
+) -> Result<()> {
+    let client = BulkClient::new(network)?;
     for attempt in 0..AGENT_CONFIRMATION_ATTEMPTS {
         let body: Value = client
             .post(
@@ -161,18 +224,22 @@ fn agent_authorization_matches(body: &Value, agent: &str, delete: bool) -> Resul
 }
 
 fn sign_agent_authorization(
+    network: BulkNetwork,
     master: Keypair,
     agent: Pubkey,
     delete: bool,
 ) -> Result<SignedTransaction> {
-    let mut signer = signer(master).without_order_id();
+    let mut signer = signer(network, master).without_order_id();
     signer
         .sign_agent_wallet(agent, delete, Some(unique_nonce()?))
         .context("failed to sign BULK agent-wallet authorization")
 }
 
-async fn submit_transaction(transaction: &SignedTransaction) -> Result<Value> {
-    BulkTradingClient::new()
+async fn submit_transaction(
+    network: BulkNetwork,
+    transaction: &SignedTransaction,
+) -> Result<Value> {
+    BulkTradingClient::new(network)
         .post(transaction)
         .await
         .context("failed to submit BULK agent-wallet authorization")
@@ -254,10 +321,14 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn configured_bulk_signer_uses_testnet_domain() {
-        let signer = signer(Keypair::generate());
+    fn bulk_network_selects_matching_endpoints_and_signature_domains() {
+        let mainnet = signer(BulkNetwork::Mainnet, Keypair::generate());
+        let testnet = signer(BulkNetwork::Testnet, Keypair::generate());
 
-        assert_eq!(signer.signature_domain(), SignatureDomain::Testnet);
+        assert_eq!(mainnet.signature_domain(), SignatureDomain::Mainnet);
+        assert_eq!(testnet.signature_domain(), SignatureDomain::Testnet);
+        assert!(BulkNetwork::Mainnet.api_url().contains("mainnet-api1"));
+        assert!(BulkNetwork::Testnet.api_url().contains("exchange-api"));
     }
 
     #[test]
@@ -267,7 +338,8 @@ mod tests {
         let agent = Keypair::generate().pubkey();
         let agent_public_key = agent.to_base58();
 
-        let signed = sign_agent_authorization(master, agent, false).expect("authorization signs");
+        let signed = sign_agent_authorization(BulkNetwork::Mainnet, master, agent, false)
+            .expect("authorization signs");
 
         assert_eq!(signed.account, account);
         assert_eq!(signed.signer, account);

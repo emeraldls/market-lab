@@ -218,7 +218,7 @@ impl VenueMarket {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkPolicy {
-    /// The venue is always the public BULK testnet; `--testnet` is unnecessary.
+    /// The venue is fixed to testnet.
     TestnetOnly,
     /// The venue exposes only mainnet.
     MainnetOnly,
@@ -264,7 +264,7 @@ impl VenueSpec {
                 bail!("--testnet is not supported by {}", self.label())
             }
             (NetworkPolicy::TestnetOnly, true) => {
-                bail!("--testnet is only valid with a Hyperliquid venue")
+                bail!("--testnet is unnecessary for this testnet-only venue")
             }
             _ => Ok(()),
         }
@@ -276,7 +276,7 @@ const BULK: VenueSpec = VenueSpec {
     execution: ExecutionBackend::Bulk,
     auth: AuthBackend::Bulk,
     market: VenueMarket::Perpetual,
-    network: NetworkPolicy::TestnetOnly,
+    network: NetworkPolicy::Selectable,
     market_data_venue: VenueId::Bulk,
 };
 
@@ -349,6 +349,10 @@ mod tests {
 
     #[test]
     fn resolves_execution_and_market_data_as_separate_concerns() {
+        let bulk = resolve(VenueId::Bulk).expect("BULK is registered");
+        assert_eq!(bulk.network_label(false), "mainnet");
+        assert_eq!(bulk.network_label(true), "testnet");
+
         let spec = resolve(VenueId::Hyperlink).expect("HyperLink is registered");
         assert_eq!(spec.execution, ExecutionBackend::Hyperlink);
         assert_eq!(spec.market_data_venue, VenueId::Hyperliquid);

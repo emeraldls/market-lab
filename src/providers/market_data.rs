@@ -109,7 +109,9 @@ pub trait MarketDataProvider: Send + Sync {
     async fn connect_ticker(&self, symbol: &str) -> Result<Box<dyn TickerEvents>>;
 }
 
-struct BulkMarketData;
+struct BulkMarketData {
+    provider: BulkProvider,
+}
 
 #[async_trait]
 impl MarketDataProvider for BulkMarketData {
@@ -137,7 +139,7 @@ impl MarketDataProvider for BulkMarketData {
     }
 
     async fn health(&self) -> Result<ProviderHealth> {
-        BulkProvider::health().await
+        self.provider.health().await
     }
 
     async fn candles(
@@ -147,7 +149,7 @@ impl MarketDataProvider for BulkMarketData {
         from: u64,
         to: u64,
     ) -> Result<OhlcvSeries> {
-        BulkProvider::candles(symbol, interval, from, to).await
+        self.provider.candles(symbol, interval, from, to).await
     }
 
     async fn volume_bars(
@@ -157,7 +159,7 @@ impl MarketDataProvider for BulkMarketData {
         from: u64,
         to: u64,
     ) -> Result<VolumeBarSeries> {
-        BulkProvider::volume_bars(symbol, interval, from, to).await
+        self.provider.volume_bars(symbol, interval, from, to).await
     }
 
     async fn orderbook(
@@ -166,23 +168,25 @@ impl MarketDataProvider for BulkMarketData {
         depth: u16,
         aggregation: Option<f64>,
     ) -> Result<OrderBookSnapshot> {
-        BulkProvider::live_orderbook(symbol, depth, aggregation).await
+        self.provider
+            .live_orderbook(symbol, depth, aggregation)
+            .await
     }
 
     async fn ticker(&self, symbol: &str) -> Result<MarketTicker> {
-        BulkProvider::ticker(symbol).await
+        self.provider.ticker(symbol).await
     }
 
     async fn open_interest(&self, symbol: &str) -> Result<OpenInterestSnapshot> {
-        BulkProvider::open_interest(symbol).await
+        self.provider.open_interest(symbol).await
     }
 
     async fn funding(&self, symbol: &str) -> Result<FundingRateSnapshot> {
-        BulkProvider::funding(symbol).await
+        self.provider.funding(symbol).await
     }
 
     async fn statistics(&self, period: &str, symbol: Option<&str>) -> Result<ExchangeStatistics> {
-        BulkProvider::statistics(period, symbol).await
+        self.provider.statistics(period, symbol).await
     }
 
     async fn connect_orderbook(
@@ -190,19 +194,27 @@ impl MarketDataProvider for BulkMarketData {
         symbol: &str,
         depth: u16,
     ) -> Result<Box<dyn OrderBookEvents>> {
-        Ok(Box::new(BulkOrderBookStream::connect(symbol, depth).await?))
+        Ok(Box::new(
+            BulkOrderBookStream::connect(self.provider.network(), symbol, depth).await?,
+        ))
     }
 
     async fn connect_trades(&self, symbol: &str) -> Result<Box<dyn TradeEvents>> {
-        Ok(Box::new(BulkTradesStream::connect(symbol).await?))
+        Ok(Box::new(
+            BulkTradesStream::connect(self.provider.network(), symbol).await?,
+        ))
     }
 
     async fn connect_candles(&self, symbol: &str, interval: &str) -> Result<Box<dyn CandleEvents>> {
-        Ok(Box::new(BulkCandleStream::connect(symbol, interval).await?))
+        Ok(Box::new(
+            BulkCandleStream::connect(self.provider.network(), symbol, interval).await?,
+        ))
     }
 
     async fn connect_ticker(&self, symbol: &str) -> Result<Box<dyn TickerEvents>> {
-        Ok(Box::new(BulkTickerStream::connect(symbol).await?))
+        Ok(Box::new(
+            BulkTickerStream::connect(self.provider.network(), symbol).await?,
+        ))
     }
 }
 
@@ -457,7 +469,9 @@ impl MarketDataAdapter {
         spec.validate_network(testnet)?;
         let market_data = spec.market_data_venue.spec()?;
         let provider: Box<dyn MarketDataProvider> = match market_data.execution {
-            ExecutionBackend::Bulk => Box::new(BulkMarketData),
+            ExecutionBackend::Bulk => Box::new(BulkMarketData {
+                provider: BulkProvider::new(testnet),
+            }),
             ExecutionBackend::Hyperliquid | ExecutionBackend::Hyperlink => {
                 let network = if spec.execution == ExecutionBackend::Hyperlink {
                     HyperliquidNetwork::Mainnet

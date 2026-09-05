@@ -163,7 +163,8 @@ async fn execute(
 async fn validate_action_funds(testnet: bool, plan: &OutcomeActionPlan) -> Result<()> {
     let network = HyperliquidNetwork::from_testnet(testnet);
     let metadata = crate::providers::hyperliquid::outcomes::metadata(network).await?;
-    let account = ExecutionAdapter::configured_account(ExecutionVenue::HyperliquidSpot)?;
+    let account =
+        ExecutionAdapter::configured_account_for(ExecutionVenue::HyperliquidSpot, testnet, "main")?;
     let outcome_id = plan
         .outcome
         .or_else(|| {

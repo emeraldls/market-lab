@@ -611,7 +611,7 @@ pub async fn serve() -> Result<()> {
     state.started_at_ms = now_ms()?;
     state.account_stream_connected = false;
     persist_state(&paths, &state)?;
-    let adapter = BulkExecutionAdapter::new()?;
+    let adapter = BulkExecutionAdapter::new(false)?;
     let volume_exporter = match VolumeExporter::start(&daemon::market_lab_home()?) {
         Ok(exporter) => exporter,
         Err(error) => {
@@ -2318,14 +2318,17 @@ fn create_script_job(
     }
     submission.validate()?;
     if let Some(venue) = submission.venue {
-        crate::providers::execution::ExecutionAdapter::configured_account(venue).with_context(
-            || {
-                format!(
-                    "{} authentication is required when a script enables execution",
-                    venue
-                )
-            },
-        )?;
+        crate::providers::execution::ExecutionAdapter::configured_account_for(
+            venue,
+            submission.testnet,
+            "main",
+        )
+        .with_context(|| {
+            format!(
+                "{} authentication is required when a script enables execution",
+                venue
+            )
+        })?;
     }
 
     fs::create_dir_all(&paths.jobs)
@@ -2681,8 +2684,10 @@ fn create_strategy_job(
     submission: StrategyJobSubmission,
 ) -> Result<StrategyJob> {
     submission.validate()?;
-    crate::providers::execution::ExecutionAdapter::configured_account(
+    crate::providers::execution::ExecutionAdapter::configured_account_for(
         submission.definition.venue(),
+        submission.definition.testnet(),
+        "main",
     )
     .with_context(|| {
         format!(
@@ -2901,8 +2906,10 @@ async fn create_bot_job(
     submission: BotJobSubmission,
 ) -> Result<BotJob> {
     submission.validate()?;
-    crate::providers::execution::ExecutionAdapter::configured_account(
+    crate::providers::execution::ExecutionAdapter::configured_account_for(
         submission.definition.venue(),
+        submission.definition.testnet(),
+        "main",
     )
     .with_context(|| {
         format!(
@@ -4499,7 +4506,11 @@ async fn handle_connection(
         RuntimeRequest::SubmitScriptJob { submission } => {
             if let Some(venue) = submission.venue
                 && let Ok(account) =
-                    crate::providers::execution::ExecutionAdapter::configured_account(venue)
+                    crate::providers::execution::ExecutionAdapter::configured_account_for(
+                        venue,
+                        submission.testnet,
+                        "main",
+                    )
             {
                 ensure_account_supervisor(
                     venue,
@@ -4752,7 +4763,9 @@ async fn handle_connection(
             let venue = submission.definition.venue();
             let testnet = submission.definition.testnet();
             if let Ok(account) =
-                crate::providers::execution::ExecutionAdapter::configured_account(venue)
+                crate::providers::execution::ExecutionAdapter::configured_account_for(
+                    venue, testnet, "main",
+                )
             {
                 ensure_account_supervisor(
                     venue,
@@ -4883,7 +4896,9 @@ async fn handle_connection(
             let venue = submission.definition.venue();
             let testnet = submission.definition.testnet();
             if let Ok(account) =
-                crate::providers::execution::ExecutionAdapter::configured_account(venue)
+                crate::providers::execution::ExecutionAdapter::configured_account_for(
+                    venue, testnet, "main",
+                )
             {
                 ensure_account_supervisor(
                     venue,

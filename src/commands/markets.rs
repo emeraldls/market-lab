@@ -6,6 +6,7 @@ use dialoguer::{FuzzySelect, Select, theme::ColorfulTheme};
 use crate::cli::{CliDataProvider, MarketsArgs};
 use crate::markets::outcomes::{OutcomeInstrument, parse_symbol};
 use crate::markets::{ExchangeMarkets, Market, MarketSnapshot};
+use crate::providers::bulk::BulkNetwork;
 use crate::providers::hyperliquid::{HyperliquidNetwork, SPOT_EXCHANGE};
 
 pub async fn handle(args: MarketsArgs) -> Result<()> {
@@ -15,6 +16,9 @@ pub async fn handle(args: MarketsArgs) -> Result<()> {
         && args.hip == Some(4);
     if outcome_request {
         return handle_outcomes(args).await;
+    }
+    if args.provider.is_none() && args.exchange.eq_ignore_ascii_case("bulkf") && args.testnet {
+        return handle_bulk_testnet(args).await;
     }
     if args.refresh {
         let provider = args.provider.map(|provider| match provider {
@@ -39,6 +43,27 @@ pub async fn handle(args: MarketsArgs) -> Result<()> {
         return print_market(&snapshot, &exchange, &market, args.json);
     }
 
+    print_exchange(&snapshot, &exchange, args.json)
+}
+
+async fn handle_bulk_testnet(args: MarketsArgs) -> Result<()> {
+    let snapshot = crate::markets::fetch_bulk_snapshot(BulkNetwork::Testnet).await?;
+    let exchange = snapshot
+        .exchanges
+        .first()
+        .cloned()
+        .context("BULK testnet returned no market catalog")?;
+    if let Some(symbol) = args.symbol.as_deref() {
+        let symbol =
+            crate::markets::canonical_market_symbol(symbol, crate::markets::MarketType::Futures)?;
+        let market = exchange
+            .markets
+            .iter()
+            .find(|market| market.symbol.eq_ignore_ascii_case(&symbol))
+            .cloned()
+            .with_context(|| format!("BULK testnet does not provide `{symbol}`"))?;
+        return print_market(&snapshot, &exchange, &market, args.json);
+    }
     print_exchange(&snapshot, &exchange, args.json)
 }
 

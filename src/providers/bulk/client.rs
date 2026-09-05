@@ -6,7 +6,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-const BULK_API_URL: &str = "https://exchange-api.bulk.trade/api/v1";
+use super::BulkNetwork;
+
 const BULK_HTTP_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Clone)]
@@ -16,8 +17,8 @@ pub struct BulkClient {
 }
 
 impl BulkClient {
-    pub fn new() -> Result<Self> {
-        Self::with_base_url(BULK_API_URL)
+    pub fn new(network: BulkNetwork) -> Result<Self> {
+        Self::with_base_url(network.api_url())
     }
 
     pub fn with_base_url(base_url: impl Into<String>) -> Result<Self> {

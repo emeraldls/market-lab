@@ -41,7 +41,6 @@ pub fn canonical_exchange_symbol(exchange: &str, symbol: &str) -> Result<String>
 }
 
 const SNAPSHOT_SCHEMA_VERSION: u8 = 1;
-const BULK_MARKETS_URL: &str = "https://exchange-api.bulk.trade/api/v1/exchangeInfo";
 const BINANCE_SPOT_MARKETS_URL: &str = "https://api.binance.com/api/v3/exchangeInfo";
 const BINANCE_FUTURES_MARKETS_URL: &str = "https://fapi.binance.com/fapi/v1/exchangeInfo";
 const HYPERLIQUID_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
@@ -855,7 +854,9 @@ pub async fn refresh_route(provider: Option<&str>, exchange: &str) -> Result<Mar
     let snapshot = match provider.map(key).as_deref() {
         Some("mmt") => fetch_mmt_snapshot().await?,
         Some(provider) => bail!("market refresh is not implemented for provider `{provider}`"),
-        None if exchange.eq_ignore_ascii_case("bulkf") => fetch_bulk_snapshot().await?,
+        None if exchange.eq_ignore_ascii_case("bulkf") => {
+            fetch_bulk_snapshot(crate::providers::bulk::BulkNetwork::Mainnet).await?
+        }
         None if exchange.eq_ignore_ascii_case("hyperliquidf") => {
             fetch_hyperliquid_snapshot().await?
         }
@@ -935,9 +936,12 @@ fn load_registry() -> Result<MarketRegistry> {
     MarketRegistry::new(test_snapshots())
 }
 
-async fn fetch_bulk_snapshot() -> Result<MarketSnapshot> {
+pub(crate) async fn fetch_bulk_snapshot(
+    network: crate::providers::bulk::BulkNetwork,
+) -> Result<MarketSnapshot> {
+    let markets_url = format!("{}/exchangeInfo", network.api_url());
     let response = Client::new()
-        .get(BULK_MARKETS_URL)
+        .get(&markets_url)
         .timeout(Duration::from_secs(MARKET_HTTP_TIMEOUT_SECS))
         .send()
         .await
@@ -989,7 +993,7 @@ async fn fetch_bulk_snapshot() -> Result<MarketSnapshot> {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         provider: "bulkf".to_string(),
         provider_type: ProviderType::Standalone,
-        source_url: BULK_MARKETS_URL.to_string(),
+        source_url: markets_url,
         fetched_at: fetched_at(),
         exchanges: vec![ExchangeMarkets {
             exchange: "bulkf".to_string(),
@@ -2474,7 +2478,10 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             provider: "bulkf".to_string(),
             provider_type: ProviderType::Standalone,
-            source_url: BULK_MARKETS_URL.to_string(),
+            source_url: format!(
+                "{}/exchangeInfo",
+                crate::providers::bulk::BulkNetwork::Mainnet.api_url()
+            ),
             fetched_at: "2026-07-19T00:00:00Z".to_string(),
             exchanges: vec![ExchangeMarkets {
                 exchange: "bulkf".to_string(),

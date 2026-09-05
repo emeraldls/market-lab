@@ -21,14 +21,15 @@ use crate::domain::execution::{
 use super::client::BulkClient;
 use super::market_data::normalize_timestamp_ms;
 use super::markets;
-use super::signer;
 use super::ws::{BulkTradingClient, is_trading_acknowledgement};
+use super::{BulkNetwork, signer};
 
 static LAST_NONCE: AtomicU64 = AtomicU64::new(0);
 const ORDER_RECONCILIATION_ATTEMPTS: usize = 4;
 const ORDER_RECONCILIATION_DELAY: Duration = Duration::from_millis(500);
 
 pub struct BulkExecutionAdapter {
+    pub(crate) network: BulkNetwork,
     client: BulkClient,
     trading: BulkTradingClient,
     leverage_settings: Mutex<HashMap<(String, String), f64>>,
@@ -56,10 +57,12 @@ impl BulkExecutionAdapter {
         }
     }
 
-    pub fn new() -> Result<Self> {
+    pub fn new(testnet: bool) -> Result<Self> {
+        let network = BulkNetwork::from_testnet(testnet);
         Ok(Self {
-            client: BulkClient::new()?,
-            trading: BulkTradingClient::new(),
+            network,
+            client: BulkClient::new(network)?,
+            trading: BulkTradingClient::new(network),
             leverage_settings: Mutex::new(HashMap::new()),
         })
     }
@@ -277,7 +280,7 @@ impl BulkExecutionAdapter {
         if account.to_base58() != plan.account {
             bail!("trade plan account no longer matches the configured BULK account");
         }
-        let mut signer = signer(credential.agent);
+        let mut signer = signer(self.network, credential.agent);
 
         if !plan.reduce_only {
             self.ensure_leverage(&mut signer, &account, plan).await?;
@@ -322,7 +325,7 @@ impl BulkExecutionAdapter {
             return Ok(Vec::new());
         }
         let account = credential.account;
-        let mut signer = signer(credential.agent).with_batch_order_ids();
+        let mut signer = signer(self.network, credential.agent).with_batch_order_ids();
         let mut orders = Vec::with_capacity(plans.len());
         for plan in plans {
             validate_trade_plan(plan)?;
@@ -436,7 +439,7 @@ impl BulkExecutionAdapter {
         let action = Action::Order {
             orders: vec![OrderItem::Cancel(Cancel::new(venue_symbol, hash))],
         };
-        let mut signer = signer(credential.agent);
+        let mut signer = signer(self.network, credential.agent);
         let signed = signer
             .sign_action(&action, next_nonce()?, &account)
             .context("failed to sign BULK order cancellation")?;
@@ -475,7 +478,7 @@ impl BulkExecutionAdapter {
             )));
             order_ids.push(plan.order_id.clone());
         }
-        let mut signer = signer(credential.agent);
+        let mut signer = signer(self.network, credential.agent);
         let signed = signer
             .sign_action(&Action::Order { orders }, next_nonce()?, &account)
             .context("failed to sign BULK cancellation batch")?;
@@ -1963,7 +1966,7 @@ mod tests {
         let account = master.pubkey();
         let agent = bulk_keychain::Keypair::generate();
         let agent_public_key = agent.pubkey().to_base58();
-        let mut signer = signer(agent);
+        let mut signer = signer(BulkNetwork::Mainnet, agent);
         let plan = TradePlan {
             created_at_ms: 1_784_158_000_000,
             venue: ExecutionVenue::Bulk,
@@ -2117,7 +2120,8 @@ mod tests {
     #[test]
     fn signed_batch_ids_cover_single_and_multi_order_actions() {
         let account = bulk_keychain::Keypair::generate().pubkey();
-        let mut signer = signer(bulk_keychain::Keypair::generate()).with_batch_order_ids();
+        let mut signer =
+            signer(BulkNetwork::Mainnet, bulk_keychain::Keypair::generate()).with_batch_order_ids();
         let order = || {
             OrderItem::Order(Order::limit(
                 "BTC-USD",

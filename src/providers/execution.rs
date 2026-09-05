@@ -6,6 +6,7 @@ use crate::domain::execution::{
     AccountSnapshot, CancelPlan, ExecutionOutcome, ExecutionReceipt, ExecutionVenue, Fill,
     OpenOrder, Position, TradePlan, VenueCapabilities,
 };
+use crate::providers::bulk::BulkNetwork;
 use crate::providers::bulk::execution::BulkExecutionAdapter;
 use crate::providers::bulk::ws::BulkAccountStream;
 use crate::providers::hyperlink::ws::HyperlinkAccountStream;
@@ -129,7 +130,7 @@ impl ExecutionProvider for BulkExecutionAdapter {
     async fn submit_trade(&self, plan: &TradePlan) -> Result<ExecutionReceipt> {
         Self::submit_trade(
             self,
-            credentials::active_bulk_credential_for_account(&plan.account)?,
+            credentials::active_bulk_credential_for_account(self.network, &plan.account)?,
             plan,
         )
         .await
@@ -138,7 +139,7 @@ impl ExecutionProvider for BulkExecutionAdapter {
     async fn cancel_order(&self, plan: &CancelPlan) -> Result<ExecutionReceipt> {
         Self::cancel_order(
             self,
-            credentials::active_bulk_credential_for_account(&plan.account)?,
+            credentials::active_bulk_credential_for_account(self.network, &plan.account)?,
             &plan.venue_symbol,
             &plan.order_id,
         )
@@ -151,7 +152,7 @@ impl ExecutionProvider for BulkExecutionAdapter {
         };
         Self::submit_trades(
             self,
-            credentials::active_bulk_credential_for_account(&first.account)?,
+            credentials::active_bulk_credential_for_account(self.network, &first.account)?,
             plans,
         )
         .await
@@ -163,7 +164,7 @@ impl ExecutionProvider for BulkExecutionAdapter {
         };
         Self::cancel_orders(
             self,
-            credentials::active_bulk_credential_for_account(&first.account)?,
+            credentials::active_bulk_credential_for_account(self.network, &first.account)?,
             plans,
         )
         .await
@@ -384,19 +385,21 @@ impl ExecutionProviderFactory for BulkFactory {
         &self,
         _venue: ExecutionVenue,
         _market: VenueMarket,
-        _testnet: bool,
+        testnet: bool,
         _account_name: &str,
     ) -> Result<Box<dyn ExecutionProvider>> {
-        Ok(Box::new(BulkExecutionAdapter::new()?))
+        Ok(Box::new(BulkExecutionAdapter::new(testnet)?))
     }
 
     async fn account_stream(
         &self,
         _venue: ExecutionVenue,
-        _testnet: bool,
+        testnet: bool,
         account: &str,
     ) -> Result<Box<dyn AccountEvents>> {
-        Ok(Box::new(BulkAccountStream::connect(account).await?))
+        Ok(Box::new(
+            BulkAccountStream::connect(BulkNetwork::from_testnet(testnet), account).await?,
+        ))
     }
 
     fn normalize_runtime_event(
@@ -414,8 +417,8 @@ impl ExecutionProviderFactory for BulkFactory {
         })
     }
 
-    async fn connect_transport(&self, _testnet: bool) -> Result<()> {
-        BulkExecutionAdapter::new()?.connect_trading().await
+    async fn connect_transport(&self, testnet: bool) -> Result<()> {
+        BulkExecutionAdapter::new(testnet)?.connect_trading().await
     }
 }
 
@@ -1042,10 +1045,6 @@ impl ExecutionAdapter {
         self.provider.validate_order_id(order_id)
     }
 
-    pub fn configured_account(venue: ExecutionVenue) -> Result<String> {
-        Self::configured_account_for(venue, false, "main")
-    }
-
     pub fn configured_account_for(
         venue: ExecutionVenue,
         testnet: bool,
@@ -1054,7 +1053,9 @@ impl ExecutionAdapter {
         let spec = venue.spec()?;
         spec.validate_network(testnet)?;
         match spec.auth {
-            AuthBackend::Bulk => credentials::bulk_account_for(account_name),
+            AuthBackend::Bulk => {
+                credentials::bulk_account_for(BulkNetwork::from_testnet(testnet), account_name)
+            }
             AuthBackend::Hyperliquid => credentials::hyperliquid_account_for(
                 HyperliquidNetwork::from_testnet(testnet),
                 account_name,
@@ -1070,7 +1071,7 @@ impl ExecutionAdapter {
         let spec = venue.spec()?;
         spec.validate_network(testnet)?;
         match spec.auth {
-            AuthBackend::Bulk => credentials::bulk_accounts(),
+            AuthBackend::Bulk => credentials::bulk_accounts(BulkNetwork::from_testnet(testnet)),
             AuthBackend::Hyperliquid => {
                 credentials::hyperliquid_accounts(HyperliquidNetwork::from_testnet(testnet))
             }
