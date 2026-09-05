@@ -1,6 +1,6 @@
 [package]
 name = "market-lab"
-version = "0.1.7"
+version = "0.1.71"
 edition = "2024"
 default-run = "mlab"
 
