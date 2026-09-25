@@ -831,9 +831,7 @@ fn process_group_usage(_process_group: u32) -> Option<(usize, u64)> {
 }
 
 fn artifact_directory(job_id: &str) -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME is required for Python script artifacts")?;
+    let home = crate::daemon::market_lab_home()?;
     let mut name = job_id
         .chars()
         .map(|character| {
@@ -851,7 +849,7 @@ fn artifact_directory(job_id: &str) -> Result<PathBuf> {
             .as_millis();
         name = format!("{name}-{now}-{}", std::process::id());
     }
-    let path = home.join(".market-lab").join("artifacts").join(name);
+    let path = home.join("artifacts").join(name);
     fs::create_dir_all(&path)
         .with_context(|| format!("failed to create artifact directory {}", path.display()))?;
     #[cfg(unix)]

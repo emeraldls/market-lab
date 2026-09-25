@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -909,8 +908,7 @@ pub fn reload() -> Result<()> {
 }
 
 pub fn snapshot_directory() -> Result<PathBuf> {
-    let home = env::var_os("HOME").context("HOME is required for the market snapshot directory")?;
-    Ok(PathBuf::from(home).join(".market-lab").join("markets"))
+    Ok(crate::daemon::market_lab_home()?.join("markets"))
 }
 
 fn market_registry() -> Result<Arc<MarketRegistry>> {
@@ -939,23 +937,17 @@ fn load_registry() -> Result<MarketRegistry> {
 pub(crate) async fn fetch_bulk_snapshot(
     network: crate::providers::bulk::BulkNetwork,
 ) -> Result<MarketSnapshot> {
-    let markets_url = format!("{}/exchangeInfo", network.api_url());
-    let response = Client::new()
-        .get(&markets_url)
-        .timeout(Duration::from_secs(MARKET_HTTP_TIMEOUT_SECS))
-        .send()
+    let client = crate::providers::bulk::client::BulkClient::new(network)?;
+    let markets_url = client.url("exchangeInfo");
+    let raw: Vec<BulkMarket> = client
+        .get_without_query("exchangeInfo")
         .await
-        .context("failed to fetch BULK markets")?;
-    let status = response.status();
-    let body: Value = response
-        .json()
-        .await
-        .context("failed to decode BULK markets response")?;
-    if !status.is_success() {
-        bail!("BULK markets returned HTTP {status} body={body}");
-    }
-    let raw =
-        serde_json::from_value::<Vec<BulkMarket>>(body).context("invalid BULK markets response")?;
+        .with_context(|| {
+            format!(
+                "failed to fetch BULK {} markets from {markets_url}",
+                network.label()
+            )
+        })?;
     let markets = raw
         .into_iter()
         .map(|market| {

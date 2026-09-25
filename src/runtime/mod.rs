@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::bots::jobs::{BotJob, BotJobDefinition, BotJobStatus, BotJobSubmission, BotPerformance};
 use crate::credentials;
-use crate::daemon::{self, DaemonBackend, DaemonConfig};
+use crate::daemon::{self, DaemonBackend, DaemonConfig, validate_docker_image_reference};
 use crate::domain::execution::{
     CancelPlan, ExecutionOutcome, ExecutionReceipt, ExecutionVenue, Fill, OrderSide, Position,
     TradePlan,
@@ -717,6 +717,16 @@ pub async fn serve() -> Result<()> {
 }
 
 pub async fn ensure_running() -> Result<RuntimeStatus> {
+    // Workers inside Docker connect to their parent; they never manage containers.
+    if std::env::var_os("MLAB_DAEMON_ENDPOINT").is_some() {
+        let status = try_status()
+            .await?
+            .context("configured mlabd endpoint is not reachable")?;
+        if status.version != RUNTIME_VERSION {
+            bail!("configured mlabd endpoint has an incompatible runtime version");
+        }
+        return Ok(status);
+    }
     let config = daemon::load()?;
     match config.backend {
         DaemonBackend::Native => ensure_native_running().await,
@@ -788,6 +798,11 @@ async fn ensure_native_running() -> Result<RuntimeStatus> {
 }
 
 async fn ensure_docker_running(config: &DaemonConfig) -> Result<RuntimeStatus> {
+    config.validate()?;
+    let container = docker_container_info(config).await?;
+    if let Some(container) = &container {
+        validate_docker_container_settings(config, container)?;
+    }
     if let Ok(Some(status)) = try_status().await {
         if status.version == RUNTIME_VERSION {
             return Ok(status);
@@ -803,20 +818,11 @@ async fn ensure_docker_running(config: &DaemonConfig) -> Result<RuntimeStatus> {
         .await;
     }
     ensure_docker_available().await?;
-    if !docker_container_exists(&config.docker.container).await? {
+    if container.is_none() {
         ensure_docker_image_available(&config.docker.image).await?;
         create_docker_container(config).await?;
-    } else {
-        let image = docker_container_image(&config.docker.container).await?;
-        if image != config.docker.image {
-            bail!(
-                "Docker container `{}` uses `{image}`, expected `{}`; run `mlab daemon backend docker` to replace it",
-                config.docker.container,
-                config.docker.image
-            );
-        }
     }
-    run_docker(&["start", &config.docker.container]).await?;
+    run_docker(&["start", &docker_container_id(config).await?]).await?;
     match wait_for_runtime().await {
         Ok(status) => Ok(status),
         Err(error) => {
@@ -882,16 +888,11 @@ async fn wait_for_runtime() -> Result<RuntimeStatus> {
     bail!("mlabd did not become ready within 15 seconds")
 }
 
-pub async fn configure_backend(
-    backend: DaemonBackend,
-    docker_image: Option<String>,
-) -> Result<DaemonConfig> {
+pub async fn configure_backend(target: DaemonConfig) -> Result<DaemonConfig> {
+    target.validate()?;
     let previous = daemon::load()?;
-    let target = match backend {
+    match target.backend {
         DaemonBackend::Native => {
-            if docker_image.is_some() {
-                bail!("a custom Docker image cannot be used with the native daemon backend");
-            }
             let binary = daemon_binary()?;
             if !binary.exists() {
                 bail!(
@@ -899,27 +900,17 @@ pub async fn configure_backend(
                     binary.display()
                 );
             }
-            DaemonConfig::default()
         }
         DaemonBackend::Docker => {
             ensure_docker_available().await?;
-            let image = match docker_image {
-                Some(image) => validate_docker_image_reference(&image)?.to_string(),
-                None if previous.backend == DaemonBackend::Docker => previous.docker.image.clone(),
-                None => daemon::docker_image_for_version(env!("CARGO_PKG_VERSION")),
-            };
-            let mut target = if previous.backend == DaemonBackend::Docker {
-                previous.clone()
-            } else {
-                DaemonConfig::docker_for_version(env!("CARGO_PKG_VERSION"))
-            };
-            target.backend = DaemonBackend::Docker;
-            target.docker.image = image;
+            // Reject another profile's container before stopping or changing this profile.
+            docker_container_info(&target).await?;
+            ensure_docker_limits_supported(&target).await?;
             daemon::ensure_token()?;
+            docker_home()?;
             ensure_docker_image_available(&target.docker.image).await?;
-            target
         }
-    };
+    }
 
     if let Some(status) = try_status().await?
         && runtime_has_active_work(&status)
@@ -965,9 +956,7 @@ pub async fn configure_backend(
     if let Err(error) = configured {
         let cleanup_error = match target.backend {
             DaemonBackend::Native => stop_backend(&target).await.err(),
-            DaemonBackend::Docker => remove_docker_container(&target.docker.container)
-                .await
-                .err(),
+            DaemonBackend::Docker => remove_docker_container(&target).await.err(),
         };
         daemon::save(&previous).context("failed to restore the previous daemon configuration")?;
         let rollback = match previous.backend {
@@ -1080,17 +1069,6 @@ async fn ensure_docker_available() -> Result<()> {
     Ok(())
 }
 
-fn validate_docker_image_reference(image: &str) -> Result<&str> {
-    let image = image.trim();
-    if image.is_empty() {
-        bail!("Docker image cannot be empty");
-    }
-    if image.starts_with('-') || image.chars().any(char::is_whitespace) {
-        bail!("invalid Docker image reference `{image}`");
-    }
-    Ok(image)
-}
-
 async fn ensure_docker_image_available(image: &str) -> Result<()> {
     validate_docker_image_reference(image)?;
     let local = tokio::process::Command::new("docker")
@@ -1120,28 +1098,47 @@ async fn pull_docker_image(image: &str) -> Result<()> {
 }
 
 async fn replace_docker_container(config: &DaemonConfig) -> Result<()> {
-    remove_docker_container(&config.docker.container).await?;
+    ensure_docker_limits_supported(config).await?;
+    docker_home()?;
+    remove_docker_container(config).await?;
     create_docker_container(config).await?;
-    run_docker(&["start", &config.docker.container]).await
+    run_docker(&["start", &docker_container_id(config).await?]).await
 }
 
-async fn remove_docker_container(container: &str) -> Result<()> {
-    if docker_container_exists(container).await? {
-        run_docker(&["rm", "--force", container]).await?;
+async fn remove_docker_container(config: &DaemonConfig) -> Result<()> {
+    if let Some(container) = docker_container_info(config).await? {
+        let id = container["Id"]
+            .as_str()
+            .context("Docker container has no ID")?;
+        run_docker(&["rm", "--force", id]).await?;
     }
     Ok(())
 }
 
 async fn create_docker_container(config: &DaemonConfig) -> Result<()> {
-    let home = daemon::market_lab_home()?;
-    fs::create_dir_all(&home).with_context(|| format!("failed to create {}", home.display()))?;
-    fs::set_permissions(&home, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("failed to secure {}", home.display()))?;
+    config.validate()?;
+    ensure_docker_limits_supported(config).await?;
     daemon::ensure_token()?;
+    let home = docker_home()?;
     let args = docker_create_args(config, &home, unsafe { libc::geteuid() }, unsafe {
         libc::getegid()
     });
     run_docker_owned(&args).await
+}
+
+fn docker_home() -> Result<PathBuf> {
+    let home = daemon::market_lab_home()?;
+    fs::create_dir_all(&home).with_context(|| format!("failed to create {}", home.display()))?;
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to secure {}", home.display()))?;
+    let home = fs::canonicalize(&home).context("failed to resolve Docker MLAB_HOME")?;
+    if home
+        .to_str()
+        .is_none_or(|value| value.contains([',', '"', '\n', '\r']))
+    {
+        bail!("Docker MLAB_HOME must be UTF-8 and cannot contain commas, quotes, or newlines");
+    }
+    Ok(home)
 }
 
 fn docker_create_args(config: &DaemonConfig, home: &Path, uid: u32, gid: u32) -> Vec<String> {
@@ -1150,15 +1147,14 @@ fn docker_create_args(config: &DaemonConfig, home: &Path, uid: u32, gid: u32) ->
         home.display()
     );
     let publish = format!(
-        "{}:{}:{}",
-        config.docker.host,
-        config.docker.port,
+        "{}:{}",
+        config.docker.endpoint(),
         daemon::DOCKER_CONTAINER_PORT
     );
     let user = format!("{uid}:{gid}");
     let listen = format!("0.0.0.0:{}", daemon::DOCKER_CONTAINER_PORT);
     let endpoint = format!("127.0.0.1:{}", daemon::DOCKER_CONTAINER_PORT);
-    vec![
+    let mut args = vec![
         "create".to_string(),
         "--name".to_string(),
         config.docker.container.clone(),
@@ -1192,48 +1188,166 @@ fn docker_create_args(config: &DaemonConfig, home: &Path, uid: u32, gid: u32) ->
         publish,
         "--mount".to_string(),
         mount,
-        config.docker.image.clone(),
-        "serve".to_string(),
-    ]
+    ];
+    if let Some(cpus) = config.docker.cpus {
+        args.extend(["--cpus".to_string(), cpus.to_string()]);
+    }
+    if let Some(memory) = config.docker.memory_mib {
+        args.extend([
+            "--memory".to_string(),
+            format!("{memory}m"),
+            "--memory-swap".to_string(),
+            format!("{memory}m"),
+        ]);
+    }
+    if let Some(pids) = config.docker.pids_limit {
+        args.extend(["--pids-limit".to_string(), pids.to_string()]);
+    }
+    args.extend([config.docker.image.clone(), "serve".to_string()]);
+    args
 }
 
-async fn docker_container_exists(container: &str) -> Result<bool> {
-    let status = tokio::process::Command::new("docker")
-        .args(["container", "inspect", container])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .context("failed to inspect Docker daemon container")?;
-    Ok(status.success())
-}
-
-async fn docker_container_image(container: &str) -> Result<String> {
+async fn docker_container_info(config: &DaemonConfig) -> Result<Option<serde_json::Value>> {
+    config.validate()?;
     let output = tokio::process::Command::new("docker")
-        .args([
-            "container",
-            "inspect",
-            "--format",
-            "{{.Config.Image}}",
-            container,
-        ])
+        .args(["container", "inspect", &config.docker.container])
         .output()
         .await
-        .context("failed to inspect Docker daemon image")?;
+        .context("failed to inspect Docker daemon container")?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        if error.contains("No such container:") || error.contains("No such object:") {
+            return Ok(None);
+        }
+        bail!(
+            "failed to inspect Docker container `{}`: {}",
+            config.docker.container,
+            error.trim()
+        );
+    }
+    let containers: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+        .context("invalid Docker container inspection response")?;
+    let container = containers
+        .into_iter()
+        .next()
+        .context("Docker returned no container")?;
+    validate_docker_container_owner(&container, &daemon::market_lab_home()?).with_context(
+        || {
+            format!(
+                "refusing to use Docker container `{}`",
+                config.docker.container
+            )
+        },
+    )?;
+    Ok(Some(container))
+}
+
+async fn docker_container_id(config: &DaemonConfig) -> Result<String> {
+    let container = docker_container_info(config)
+        .await?
+        .context("Docker daemon container does not exist")?;
+    Ok(container["Id"]
+        .as_str()
+        .context("Docker container has no ID")?
+        .to_string())
+}
+
+fn validate_docker_container_owner(container: &serde_json::Value, home: &Path) -> Result<()> {
+    let home = fs::canonicalize(home).context("failed to resolve Docker MLAB_HOME")?;
+    let owned = container["Config"]["Labels"]["io.marketlab.runtime"] == "mlabd"
+        && container["Mounts"].as_array().is_some_and(|mounts| {
+            mounts.iter().any(|mount| {
+                mount["Type"] == "bind"
+                    && mount["Destination"] == "/home/marketlab/.market-lab"
+                    && mount["Source"].as_str().is_some_and(|source| {
+                        fs::canonicalize(source).is_ok_and(|source| source == home)
+                    })
+            })
+        });
+    if !owned {
+        bail!("container does not belong to this MLAB_HOME; choose a unique --container name");
+    }
+    container["Id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .context("Docker container has no ID")?;
+    Ok(())
+}
+
+fn validate_docker_container_settings(
+    config: &DaemonConfig,
+    container: &serde_json::Value,
+) -> Result<()> {
+    let limits = &container["HostConfig"];
+    let matches = container["Config"]["Image"] == config.docker.image
+        && config
+            .docker
+            .cpus
+            .is_none_or(|cpus| limits["NanoCpus"].as_i64() == Some((cpus * 1e9).round() as i64))
+        && config.docker.memory_mib.is_none_or(|memory| {
+            let bytes = u64::from(memory) * 1024 * 1024;
+            limits["Memory"].as_u64() == Some(bytes) && limits["MemorySwap"].as_u64() == Some(bytes)
+        })
+        && config
+            .docker
+            .pids_limit
+            .is_none_or(|pids| limits["PidsLimit"].as_u64() == Some(u64::from(pids)));
+    if !matches {
+        bail!(
+            "Docker container image or limits differ from daemon.json; run `mlab daemon backend docker` to apply the configuration"
+        );
+    }
+    Ok(())
+}
+
+async fn ensure_docker_limits_supported(config: &DaemonConfig) -> Result<()> {
+    if config.docker.cpus.is_none()
+        && config.docker.memory_mib.is_none()
+        && config.docker.pids_limit.is_none()
+    {
+        return Ok(());
+    }
+    let output = tokio::process::Command::new("docker")
+        .args(["info", "--format", "{{json .}}"])
+        .output()
+        .await
+        .context("failed to inspect Docker resource-limit support")?;
     if !output.status.success() {
         bail!(
-            "failed to inspect Docker container `{container}`: {}",
+            "failed to inspect Docker resource-limit support: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let info: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("invalid Docker resource-limit support response")?;
+    validate_docker_limit_support(config, &info)
+}
+
+fn validate_docker_limit_support(config: &DaemonConfig, info: &serde_json::Value) -> Result<()> {
+    for (required, capability) in [
+        (config.docker.cpus.is_some(), "CpuCfsQuota"),
+        (config.docker.cpus.is_some(), "CpuCfsPeriod"),
+        (config.docker.memory_mib.is_some(), "MemoryLimit"),
+        (config.docker.memory_mib.is_some(), "SwapLimit"),
+        (config.docker.pids_limit.is_some(), "PidsLimit"),
+    ] {
+        if required && info[capability] != true {
+            bail!(
+                "Docker host cannot enforce {capability}; enable the required cgroup controller before configuring this runtime"
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn stop_docker_container(config: &DaemonConfig) -> Result<()> {
-    if !docker_container_exists(&config.docker.container).await? {
-        return Ok(());
+    if let Some(container) = docker_container_info(config).await? {
+        let id = container["Id"]
+            .as_str()
+            .context("Docker container has no ID")?;
+        run_docker(&["stop", "--time", "60", id]).await?;
     }
-    run_docker(&["stop", "--time", "60", &config.docker.container]).await
+    Ok(())
 }
 
 async fn run_docker(args: &[&str]) -> Result<()> {
@@ -1287,7 +1401,7 @@ pub async fn stop() -> Result<bool> {
     let config = daemon::load()?;
     if config.backend == DaemonBackend::Docker {
         ensure_docker_available().await?;
-        if !docker_container_exists(&config.docker.container).await? {
+        if docker_container_info(&config).await?.is_none() {
             return Ok(false);
         }
         if try_status().await?.is_none() {
@@ -1501,7 +1615,7 @@ async fn docker_python_available(config: &DaemonConfig, interpreter: &Path) -> R
     let status = tokio::process::Command::new("docker")
         .args([
             "exec",
-            &config.docker.container,
+            &docker_container_id(config).await?,
             &interpreter,
             "-c",
             "import sys; assert sys.version_info >= (3, 9)",
@@ -1557,7 +1671,7 @@ async fn run_docker_uv(
         "UV_CACHE_DIR=/home/marketlab/.market-lab/cache/uv".to_string(),
         "--env".to_string(),
         "UV_PYTHON_INSTALL_DIR=/home/marketlab/.market-lab/python".to_string(),
-        config.docker.container.clone(),
+        docker_container_id(config).await?,
         "/usr/local/bin/uv".to_string(),
     ];
     args.extend_from_slice(uv_args);
@@ -6303,8 +6417,7 @@ async fn try_request(request: RuntimeRequest) -> Result<Option<RuntimeResponse>>
     let config = daemon::load()?;
     let endpoint_override = std::env::var("MLAB_DAEMON_ENDPOINT").ok();
     if config.backend == DaemonBackend::Docker || endpoint_override.is_some() {
-        let endpoint = endpoint_override
-            .unwrap_or_else(|| format!("{}:{}", config.docker.host, config.docker.port));
+        let endpoint = endpoint_override.unwrap_or_else(|| config.docker.endpoint());
         let stream = match TcpStream::connect(&endpoint).await {
             Ok(stream) => stream,
             Err(error)
@@ -6555,6 +6668,92 @@ mod tests {
         );
         assert!(command.contains("ghcr.io/emeraldls/market-lab-daemon:v1.2.3 serve"));
         assert!(!command.contains("docker.sock"));
+        assert!(!args.contains(&"--cpus".to_string()));
+        assert!(!args.contains(&"--memory".to_string()));
+        assert!(!args.contains(&"--pids-limit".to_string()));
+    }
+
+    #[test]
+    fn docker_profiles_have_separate_storage_ports_and_bounded_resources() {
+        for (name, port) in [("alice", 48001), ("bob", 48002)] {
+            let mut config = DaemonConfig::docker_for_version("1.2.3");
+            config.docker.container = format!("mlab-{name}");
+            config.docker.port = port;
+            config.docker.cpus = Some(0.5);
+            config.docker.memory_mib = Some(512);
+            config.docker.pids_limit = Some(128);
+            let home = PathBuf::from(format!("/srv/mlab/{name}"));
+            let args = docker_create_args(&config, &home, 1000, 1000);
+            let command = args.join(" ");
+            assert!(command.contains(&format!("--name mlab-{name}")));
+            assert!(command.contains(&format!("--publish 127.0.0.1:{port}:47831")));
+            assert!(command.contains(&format!("source=/srv/mlab/{name},")));
+            assert!(
+                command.contains("--cpus 0.5 --memory 512m --memory-swap 512m --pids-limit 128")
+            );
+            assert_eq!(&args[args.len() - 2], &config.docker.image);
+        }
+    }
+
+    #[test]
+    fn container_ownership_requires_runtime_label_and_matching_home() {
+        let home = std::env::temp_dir().join(format!(
+            "mlab-owner-{}-{}",
+            std::process::id(),
+            now_ms().unwrap()
+        ));
+        fs::create_dir_all(home.join("alice")).unwrap();
+        fs::create_dir_all(home.join("bob")).unwrap();
+        let alice = home.join("alice");
+        let mut container = serde_json::json!({
+            "Id": "immutable-id",
+            "Config": { "Labels": { "io.marketlab.runtime": "mlabd" } },
+            "Mounts": [{ "Type": "bind", "Source": alice, "Destination": "/home/marketlab/.market-lab" }]
+        });
+        validate_docker_container_owner(&container, &alice).unwrap();
+        assert!(validate_docker_container_owner(&container, &home.join("bob")).is_err());
+        std::os::unix::fs::symlink(&alice, home.join("alias")).unwrap();
+        validate_docker_container_owner(&container, &home.join("alias")).unwrap();
+        container["Config"]["Labels"] = serde_json::Value::Null;
+        assert!(validate_docker_container_owner(&container, &alice).is_err());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn configured_limits_must_be_supported_and_applied() {
+        let mut config = DaemonConfig::docker_for_version("1.2.3");
+        config.docker.cpus = Some(0.5);
+        config.docker.memory_mib = Some(512);
+        config.docker.pids_limit = Some(128);
+        let capabilities = serde_json::json!({
+            "CpuCfsQuota": true, "CpuCfsPeriod": true, "MemoryLimit": true,
+            "SwapLimit": true, "PidsLimit": true
+        });
+        validate_docker_limit_support(&config, &capabilities).unwrap();
+        for key in [
+            "CpuCfsQuota",
+            "CpuCfsPeriod",
+            "MemoryLimit",
+            "SwapLimit",
+            "PidsLimit",
+        ] {
+            let mut unsupported = capabilities.clone();
+            unsupported[key] = false.into();
+            assert!(validate_docker_limit_support(&config, &unsupported).is_err());
+        }
+        assert!(validate_docker_limit_support(&config, &serde_json::json!({})).is_err());
+        validate_docker_limit_support(&DaemonConfig::default(), &serde_json::json!({})).unwrap();
+        let container = serde_json::json!({
+            "Config": { "Image": config.docker.image },
+            "HostConfig": { "NanoCpus": 500_000_000, "Memory": 536_870_912,
+                "MemorySwap": 536_870_912, "PidsLimit": 128 }
+        });
+        validate_docker_container_settings(&config, &container).unwrap();
+        for key in ["NanoCpus", "Memory", "MemorySwap", "PidsLimit"] {
+            let mut unlimited = container.clone();
+            unlimited["HostConfig"][key] = 0.into();
+            assert!(validate_docker_container_settings(&config, &unlimited).is_err());
+        }
     }
 
     #[test]

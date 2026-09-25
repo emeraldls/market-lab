@@ -188,6 +188,21 @@ pub struct DaemonBackendArgs {
     /// Docker image to run. Valid only when selecting the Docker backend.
     #[arg(long, value_name = "IMAGE")]
     pub image: Option<String>,
+    /// Docker container name for this MLAB_HOME. Requires the Docker backend.
+    #[arg(long, requires = "backend")]
+    pub container: Option<String>,
+    /// Loopback host port for this Docker daemon. Must be unique on the host.
+    #[arg(long, requires = "backend", value_parser = clap::value_parser!(u16).range(1..))]
+    pub port: Option<u16>,
+    /// Maximum CPU cores for the container, for example 0.5 or 2.
+    #[arg(long, requires = "backend")]
+    pub cpus: Option<f64>,
+    /// Maximum container memory in MiB; also disables container swap.
+    #[arg(long, requires = "backend", value_parser = clap::value_parser!(u32).range(6..))]
+    pub memory_mib: Option<u32>,
+    /// Maximum processes/threads in the container.
+    #[arg(long, requires = "backend", value_parser = clap::value_parser!(u32).range(1..))]
+    pub pids_limit: Option<u32>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
 }

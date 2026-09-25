@@ -263,10 +263,7 @@ pub fn write_runtime_report(report: &ScriptRuntimeReport) -> Result<PathBuf> {
 }
 
 pub fn report_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME is required to write script runtime reports")?;
-    Ok(home.join(".market-lab").join("runs"))
+    Ok(crate::daemon::market_lab_home()?.join("runs"))
 }
 
 fn sanitize(value: &str) -> String {

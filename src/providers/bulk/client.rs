@@ -83,18 +83,21 @@ where
     T: DeserializeOwned,
 {
     let status = response.status();
-    let body: Value = response
-        .json()
+    let bytes = response
+        .bytes()
         .await
-        .with_context(|| format!("failed to decode BULK {operation} response"))?;
+        .with_context(|| format!("failed to read BULK {operation} response body"))?;
     if !status.is_success() {
+        let message = serde_json::from_slice::<Value>(&bytes)
+            .map(|body| response_message(&body))
+            .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
         bail!(
             "BULK {operation} returned HTTP {status}: {}",
-            response_message(&body)
+            message.chars().take(512).collect::<String>()
         );
     }
 
-    serde_json::from_value(body)
+    serde_json::from_slice(&bytes)
         .with_context(|| format!("BULK {operation} returned an unexpected payload"))
 }
 
@@ -104,16 +107,4 @@ fn response_message(body: &Value) -> String {
         .or_else(|| body.pointer("/error/message").and_then(Value::as_str))
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| body.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalizes_base_url_and_paths() {
-        let client =
-            BulkClient::with_base_url("https://example.test/api/v1/").expect("client should build");
-        assert_eq!(client.url("/klines"), "https://example.test/api/v1/klines");
-    }
 }

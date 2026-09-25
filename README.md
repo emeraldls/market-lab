@@ -180,6 +180,28 @@ mlab daemon backend docker
 
 The Docker backend keeps the daemon and managed Python runtimes inside containers. The native backend runs directly under the current operating-system user.
 
+### Independent Docker runtimes
+
+Use a separate `MLAB_HOME`, container name, and loopback port for each runtime. Multiple strategy jobs can share one runtime. The Docker image is shared; Market Lab is not reinstalled for each user.
+
+```bash
+MLAB_HOME="$HOME/mlab-runtimes/alice" mlab daemon backend docker \
+  --container mlab-alice --port 48001 \
+  --cpus 1 --memory-mib 512 --pids-limit 256
+
+MLAB_HOME="$HOME/mlab-runtimes/bob" mlab daemon backend docker \
+  --container mlab-bob --port 48002 \
+  --cpus 1 --memory-mib 512 --pids-limit 256
+
+MLAB_HOME="$HOME/mlab-runtimes/alice" mlab daemon status --output json
+MLAB_HOME="$HOME/mlab-runtimes/alice" mlab daemon stop
+MLAB_HOME="$HOME/mlab-runtimes/bob" mlab daemon status --output json
+```
+
+These commands start, inspect, and stop daemons; they do not submit trades. Use the same `MLAB_HOME` for every command targeting that runtime, including authentication and market refreshes. Credentials, snapshots, jobs, reports, and the daemon token stay in that home. Without this variable, the default remains `~/.market-lab`.
+
+Limits are per container, shared by its jobs. Memory is in MiB with swap disabled; the PID limit includes threads. Docker must support the requested limits or setup fails. Omitted options preserve existing settings; existing configurations without limits remain unchanged. Containers share the host kernel and these limits do not impose a disk quota or restrict outbound network access.
+
 ## Run close to the exchange
 
 Market Lab can route commands to another installation over ordinary SSH:

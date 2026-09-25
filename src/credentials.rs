@@ -1673,8 +1673,7 @@ fn save_hyperlink_credential(credential: &HyperlinkCredential) -> Result<()> {
 }
 
 fn credential_directory() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is required for the credential directory")?;
-    Ok(PathBuf::from(home).join(".market-lab").join("credentials"))
+    Ok(crate::daemon::market_lab_home()?.join("credentials"))
 }
 
 fn credential_path(file_name: &str) -> Result<PathBuf> {
