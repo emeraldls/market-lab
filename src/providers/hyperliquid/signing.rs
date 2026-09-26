@@ -30,7 +30,8 @@ impl HyperliquidWallet {
 
     pub fn from_private_key(value: &str) -> Result<Self> {
         let value = value.trim().strip_prefix("0x").unwrap_or(value.trim());
-        let bytes = hex::decode(value).context("private key is not hexadecimal")?;
+        let bytes =
+            zeroize::Zeroizing::new(hex::decode(value).context("private key is not hexadecimal")?);
         if bytes.len() != 32 {
             bail!("private key must contain exactly 32 bytes");
         }

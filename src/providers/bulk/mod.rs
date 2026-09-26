@@ -181,6 +181,22 @@ async fn set_agent_authorization(
     })
 }
 
+pub async fn verify_agent(network: BulkNetwork, account: &str, agent: &str) -> Result<()> {
+    let body: Value = BulkClient::new(network)?
+        .post(
+            "account",
+            &serde_json::json!({ "type": "fullAccount", "user": account }),
+        )
+        .await?;
+    if !agent_authorization_matches(&body, agent, false)? {
+        bail!(
+            "BULK agent is not authorized for this account on {}",
+            network.label()
+        );
+    }
+    Ok(())
+}
+
 async fn confirm_agent_authorization(
     network: BulkNetwork,
     account: &str,

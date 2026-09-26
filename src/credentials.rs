@@ -20,6 +20,8 @@ use crate::providers::hyperliquid::exchange::{
 };
 use crate::providers::hyperliquid::signing::{HyperliquidWallet, canonical_address};
 
+mod agent;
+
 const MMT_API_KEY_ENV: &str = "MMT_API_KEY";
 const CREDENTIAL_DIRECTORY_MODE: u32 = 0o700;
 const CREDENTIAL_FILE_MODE: u32 = 0o600;
@@ -92,8 +94,8 @@ impl HyperliquidAgentCredential {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.name.is_empty() || self.name.len() > 16 {
-            bail!("stored Hyperliquid agent name must contain 1 to 16 characters");
+        if self.name.len() > 16 {
+            bail!("stored Hyperliquid agent name must contain at most 16 characters");
         }
         let address = parse_hyperliquid_address(&self.address, "agent")?;
         let agent = self.wallet()?;
@@ -184,11 +186,6 @@ impl HyperliquidCredential {
         }
         if let Some(agent) = &self.testnet_agent {
             agent.validate()?;
-        }
-        if let (Some(mainnet), Some(testnet)) = (&self.mainnet_agent, &self.testnet_agent)
-            && mainnet.name == testnet.name
-        {
-            bail!("stored Hyperliquid mainnet and testnet agents must have distinct names");
         }
         validate_named_subaccounts(
             &self.mainnet_subaccounts,
@@ -604,6 +601,9 @@ pub fn hyperlink_accounts() -> Result<Vec<(String, String)>> {
 }
 
 pub async fn handle_set(args: AuthSetArgs) -> Result<()> {
+    if args.agent {
+        return agent::import(args).await;
+    }
     if args.reauthorize && args.subaccount.is_some() {
         bail!("`--reauthorize` and `--subaccount` cannot be used together");
     }
@@ -1634,7 +1634,7 @@ fn load_hyperliquid_credential() -> Result<Option<HyperliquidCredential>> {
 }
 
 fn save_hyperliquid_credential(credential: &HyperliquidCredential) -> Result<()> {
-    credential.validate_complete()?;
+    credential.validate()?;
     let encoded = Zeroizing::new(
         serde_json::to_string(credential)
             .context("failed to encode Hyperliquid agent credential")?,

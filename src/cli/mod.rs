@@ -667,6 +667,21 @@ pub enum AuthCommands {
 pub struct AuthSetArgs {
     #[arg(value_enum)]
     pub provider: AuthProvider,
+    /// Import an already-authorized agent instead of using a main wallet key.
+    #[arg(long, requires = "account", conflicts_with_all = ["reauthorize", "subaccount", "builder", "clear_builder"])]
+    pub agent: bool,
+    /// Public main account address that authorized the agent.
+    #[arg(long, requires = "agent", value_name = "ADDRESS")]
+    pub account: Option<String>,
+    /// Read the agent private key from stdin until EOF instead of a hidden prompt.
+    #[arg(long, requires = "agent")]
+    pub agent_stdin: bool,
+    /// Replace the locally stored agent; does not revoke the old agent remotely.
+    #[arg(long, requires = "agent")]
+    pub replace: bool,
+    /// Output format for agent import (terminal or json).
+    #[arg(long, requires = "agent", value_parser = ["terminal", "json"])]
+    pub output: Option<String>,
     /// Replace remote execution credentials after their replacements are confirmed.
     #[arg(long, default_value_t = false)]
     pub reauthorize: bool,
@@ -679,7 +694,7 @@ pub struct AuthSetArgs {
     /// Stop attaching the configured builder to Hyperliquid orders.
     #[arg(long, default_value_t = false, conflicts_with = "builder")]
     pub clear_builder: bool,
-    /// Configure BULK testnet instead of the default mainnet.
+    /// Use BULK testnet, or Hyperliquid testnet when importing an agent.
     #[arg(long, default_value_t = false)]
     pub testnet: bool,
 }
@@ -3592,6 +3607,7 @@ mod tests {
                     builder: None,
                     clear_builder: false,
                     testnet: false,
+                    ..
                 })
             }
         ));
@@ -3617,6 +3633,7 @@ mod tests {
                     builder: None,
                     clear_builder: false,
                     testnet: false,
+                    ..
                 })
             }
         ));
@@ -3647,6 +3664,7 @@ mod tests {
                     builder: None,
                     clear_builder: false,
                     testnet: false,
+                    ..
                 })
             }
         ));
@@ -3670,6 +3688,7 @@ mod tests {
                     builder: None,
                     clear_builder: false,
                     testnet: false,
+                    ..
                 })
             } if name == "trading-2"
         ));
@@ -3693,6 +3712,7 @@ mod tests {
                     builder: Some(address),
                     clear_builder: false,
                     testnet: false,
+                    ..
                 })
             } if address == "0x1234567890123456789012345678901234567890"
         ));
@@ -3710,6 +3730,7 @@ mod tests {
                     builder: None,
                     clear_builder: true,
                     testnet: false,
+                    ..
                 })
             }
         ));

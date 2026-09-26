@@ -83,6 +83,34 @@ mlab trade long BTC \
 
 Keep `--dry-run` enabled until the printed plan matches your intention.
 
+### Import an existing agent
+
+Approve the agent on the venue first, then import its private key at the hidden prompt:
+
+```bash
+mlab auth set bulk --agent --account <MAIN_ACCOUNT_PUBLIC_KEY>
+mlab auth set hyperliquid --agent --account <MAIN_WALLET_ADDRESS>
+mlab auth set hyperlink --agent --account <MAIN_WALLET_ADDRESS>
+```
+
+Market Lab derives the agent address and verifies its approval. The main account
+address is separate; it cannot be derived from the agent key. BULK accepts a
+base58 keypair; Hyperliquid and HyperLink accept a 32-byte hex key.
+
+For server requests, use `--agent-stdin --output json` and write the private key
+to the process's stdin, then close stdin. Never put private keys in command
+arguments or logs. Set `MLAB_HOME` to the user's runtime directory and use
+`--remote local`; credentials remain in that runtime's private store.
+
+Use `--testnet` for BULK or Hyperliquid testnet. Import configures only the selected
+network and sends no approval transaction. `--replace` replaces a different
+stored agent for the same owner without revoking it remotely. BULK uses one key
+for both networks: replacing it clears the other network's approval until that
+same key is imported there. Hyperliquid preserves the other network's key.
+
+Import does not refresh market snapshots or restart existing jobs. Stop jobs using
+an old agent before replacing it, and restart the daemon before resuming them.
+
 ## One CLI, the complete workflow
 
 | Task | Command |

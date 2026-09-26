@@ -17,6 +17,25 @@ pub struct HyperliquidClient {
 }
 
 impl HyperliquidClient {
+    /// Return the registered name only after confirming an unexpired approval.
+    pub async fn verified_agent_name(&self, account: &str, agent: &str) -> Result<String> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Agent {
+            name: String,
+            address: String,
+            valid_until: u64,
+        }
+        let agents: Vec<Agent> = self
+            .info(&serde_json::json!({"type": "extraAgents", "user": account}))
+            .await?;
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis())?;
+        let approved = agents.into_iter().find(|entry| {
+            entry.address.eq_ignore_ascii_case(agent) && entry.valid_until > now
+        }).context("agent is not authorized for this account on the selected venue/network, or its approval has expired")?;
+        Ok(approved.name)
+    }
+
     pub fn new() -> Result<Self> {
         Self::for_network(HyperliquidNetwork::Mainnet)
     }
