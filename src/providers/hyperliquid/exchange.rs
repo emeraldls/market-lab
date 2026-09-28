@@ -347,14 +347,25 @@ pub async fn approve_builder_fee(
     let builder = super::signing::canonical_address(builder)
         .context("invalid Hyperliquid builder address")?;
     let nonce = next_nonce()?;
+    let signature = master.sign_approve_builder_fee(&builder, max_fee_rate, nonce, network)?;
+    submit_builder_approval(network, &builder, max_fee_rate, nonce, signature, 421_614).await
+}
+
+pub async fn submit_builder_approval(
+    network: HyperliquidNetwork,
+    builder: &str,
+    max_fee_rate: &str,
+    nonce: u64,
+    signature: WireSignature,
+    signature_chain_id: u64,
+) -> Result<ExchangeResponseStatus> {
     let action = Action::ApproveBuilderFee {
-        signature_chain_id: "0x66eee".to_string(),
+        signature_chain_id: format!("0x{signature_chain_id:x}"),
         hyperliquid_chain: network.approval_chain().to_string(),
         max_fee_rate: max_fee_rate.to_string(),
-        builder: builder.clone(),
+        builder: builder.to_string(),
         nonce,
     };
-    let signature = master.sign_approve_builder_fee(&builder, max_fee_rate, nonce, network)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()

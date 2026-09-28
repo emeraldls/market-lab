@@ -160,6 +160,43 @@ pub fn canonical_address(value: &str) -> Result<String> {
     Ok(format!("0x{}", hex::encode(bytes)))
 }
 
+pub fn recover_builder_approval(
+    builder: &str,
+    nonce: u64,
+    signature: &str,
+) -> Result<(String, WireSignature)> {
+    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+    let bytes = hex::decode(
+        signature
+            .strip_prefix("0x")
+            .context("signature must start with 0x")?,
+    )
+    .context("invalid builder approval signature")?;
+    if bytes.len() != 65 || !matches!(bytes[64], 27 | 28) {
+        bail!("builder approval requires a 65-byte signature with v=27 or 28");
+    }
+    let sig = Signature::from_slice(&bytes[..64]).context("invalid builder approval signature")?;
+    let digest = typed_data_digest(
+        transaction_domain_separator(42_161),
+        approve_builder_fee_struct_hash("Mainnet", "0%", address_bytes(builder)?, nonce),
+    );
+    let key = VerifyingKey::recover_from_prehash(
+        &digest,
+        &sig,
+        RecoveryId::from_byte(bytes[64] - 27).context("invalid recovery id")?,
+    )
+    .context("cannot recover builder approval signer")?;
+    let hash = keccak(&key.to_encoded_point(false).as_bytes()[1..]);
+    Ok((
+        format!("0x{}", hex::encode(&hash[12..])),
+        WireSignature {
+            r: format!("0x{}", hex::encode(&bytes[..32])),
+            s: format!("0x{}", hex::encode(&bytes[32..64])),
+            v: bytes[64],
+        },
+    ))
+}
+
 fn exchange_domain_separator() -> [u8; 32] {
     domain_separator("Exchange", 1_337)
 }

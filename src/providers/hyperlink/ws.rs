@@ -48,7 +48,14 @@ pub(super) async fn verify_account(account: &str, wallet: &HyperliquidWallet) ->
                 Some("subscriptionResponse")
                     if value.pointer("/data/method").and_then(Value::as_str)
                         == Some("subscribe")
-                        && value.pointer("/data/subscription") == Some(&subscription) =>
+                        && value
+                            .pointer("/data/subscription/type")
+                            .and_then(Value::as_str)
+                            == Some("orderUpdates")
+                        && value
+                            .pointer("/data/subscription/user")
+                            .and_then(Value::as_str)
+                            .is_some_and(|user| user.eq_ignore_ascii_case(account)) =>
                 {
                     stream.close(None).await?;
                     return Ok(());

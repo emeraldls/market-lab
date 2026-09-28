@@ -141,6 +141,7 @@ async fn main() -> Result<()> {
         Commands::Upgrade(args) => commands::system::upgrade::handle(args).await?,
         Commands::Auth { command } => match command {
             AuthCommands::Set(args) => credentials::handle_set(args).await?,
+            AuthCommands::Builder { command } => credentials::builder::handle(command).await?,
             AuthCommands::Status => credentials::handle_status()?,
             AuthCommands::Remove(args) => credentials::handle_remove(args).await?,
         },

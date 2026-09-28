@@ -659,8 +659,23 @@ impl OutcomeActionCommonArgs {
 #[derive(Subcommand, Debug)]
 pub enum AuthCommands {
     Set(AuthSetArgs),
+    /// Manage the zero-fee Hyperliquid mainnet builder using browser-signed approval.
+    Builder {
+        #[command(subcommand)]
+        command: AuthBuilderCommands,
+    },
     Status,
     Remove(AuthProviderArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuthBuilderCommands {
+    /// Show the configured builder as JSON.
+    Status,
+    /// Read a signed approval JSON from stdin, submit it, and save the builder.
+    Approve,
+    /// Stop attaching the builder to new orders; does not cancel existing orders.
+    Clear,
 }
 
 #[derive(Clone, Debug, Args)]
