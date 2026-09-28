@@ -237,8 +237,30 @@ fn render_outcome(
             )
         })?;
         let values = keyword_values(&outcome.description)?;
-        let outcome_name = interpolate(template, &template.name, &values)?;
+        let mut outcome_name = interpolate(template, &template.name, &values)?;
         let outcome_description = interpolate(template, &template.description, &values)?;
+        // Match Outrive's recurring outcome.xyz family, not every 60-second TWAP market.
+        if template_id == "binaryPrice"
+            && matches!(
+                outcome.venue.as_deref(),
+                Some("out" | "outcome" | "outcome.xyz")
+            )
+            && values.get("seconds").map(String::as_str) == Some("60")
+            && !values.contains_key("period")
+            && !values.contains_key("underlying")
+            && values
+                .get("perp")
+                .is_some_and(|perp| !perp.is_empty() && !perp.contains(':'))
+        {
+            let end =
+                NaiveDateTime::parse_from_str(required_value(&values, "time")?, "%Y%m%d-%H%M")
+                    .context("expected UTC time YYYYMMDD-HHMM")?;
+            outcome_name = format!(
+                "{} up or down 15 minutes (ends {})",
+                required_value(&values, "perp")?,
+                end.format("%H:%M UTC")
+            );
+        }
         let side_names = match &template.role {
             OutcomeTemplateRole::Standalone { standalone } => {
                 if question.is_some() {
@@ -252,7 +274,10 @@ fn render_outcome(
                     format!("template:{}", standalone.side_names[1]),
                 ];
                 require_side_names(outcome, [&expected[0], &expected[1]])?;
-                standalone.side_names.clone()
+                [
+                    interpolate(template, &standalone.side_names[0], &values)?,
+                    interpolate(template, &standalone.side_names[1], &values)?,
+                ]
             }
             OutcomeTemplateRole::QuestionOutcome { question_outcome } => {
                 let question = question.with_context(|| {
@@ -292,17 +317,17 @@ fn render_outcome(
         });
     }
 
-    let question_name = rendered_question.as_ref().map_or_else(
-        || legacy_outcome_name(outcome),
-        |(name, _)| Ok(name.clone()),
-    )?;
+    let outcome_name = legacy_outcome_name(question, outcome)?;
+    let question_name = rendered_question
+        .as_ref()
+        .map_or_else(|| outcome_name.clone(), |(name, _)| name.clone());
     let question_description = rendered_question
         .map(|(_, description)| description)
         .or_else(|| Some(outcome.description.clone()));
     Ok(RenderedOutcome {
         question_name,
         question_description,
-        outcome_name: outcome.name.clone(),
+        outcome_name,
         outcome_description: outcome.description.clone(),
         side_names: [
             outcome.side_specs[0].name.clone(),
@@ -342,12 +367,52 @@ fn render_question(
     ))
 }
 
-fn legacy_outcome_name(outcome: &OutcomeSpec) -> Result<String> {
+fn legacy_outcome_name(question: Option<&QuestionSpec>, outcome: &OutcomeSpec) -> Result<String> {
+    if let Some(question) = question.filter(|question| question.name == "Recurring") {
+        let fields = keyword_values(&question.description)?;
+        if fields.get("class").map(String::as_str) == Some("priceBucket") {
+            if question.fallback_outcome == outcome.outcome {
+                return Ok("Other".to_string());
+            }
+            let thresholds = required_value(&fields, "priceThresholds")?
+                .split(',')
+                .collect::<Vec<_>>();
+            let prices = thresholds
+                .iter()
+                .map(|value| value.parse::<f64>())
+                .collect::<Result<Vec<_>, _>>()
+                .context("invalid recurring price thresholds")?;
+            if prices.len() != 2
+                || prices
+                    .iter()
+                    .any(|price| !price.is_finite() || *price <= 0.0)
+                || prices[0] >= prices[1]
+            {
+                bail!("recurring price buckets require two increasing positive thresholds");
+            }
+            let index = required_value(&keyword_values(&outcome.description)?, "index")?
+                .parse::<usize>()
+                .context("invalid recurring price bucket index")?;
+            if question.named_outcomes.get(index) != Some(&outcome.outcome) {
+                bail!("recurring price bucket index does not match its question");
+            }
+            let low = display_number(thresholds[0]);
+            let high = display_number(thresholds[1]);
+            return match index {
+                0 => Ok(format!("Below {low}")),
+                1 => Ok(format!("{low} to below {high}")),
+                2 => Ok(format!("{high} or above")),
+                _ => bail!("recurring price bucket index must be 0, 1 or 2"),
+            };
+        }
+    }
+    if outcome.name != "Recurring" {
+        return Ok(outcome.name.clone());
+    }
     let fields = keyword_values(&outcome.description)?;
-    if outcome.name == "Recurring" && fields.get("class").map(String::as_str) == Some("priceBinary")
-    {
+    if fields.get("class").map(String::as_str) == Some("priceBinary") {
         return Ok(format!(
-            "{} above {} at {}?",
+            "{} at or above {} at {}?",
             display_underlying(required_value(&fields, "underlying")?),
             display_number(required_value(&fields, "targetPrice")?),
             display_utc_time(required_value(&fields, "expiry")?)?
@@ -361,8 +426,17 @@ fn legacy_question_name(question: &QuestionSpec) -> Result<String> {
     if question.name == "Recurring"
         && fields.get("class").map(String::as_str) == Some("priceBucket")
     {
+        let period = match required_value(&fields, "period")? {
+            "1d" => "Daily(1d)",
+            "1m" => "1 minute",
+            "5m" => "5 minutes",
+            "15m" => "15 minutes",
+            "30m" => "30 minutes",
+            "1h" | "1hr" => "1 hour",
+            period => period,
+        };
         return Ok(format!(
-            "{} price at {}?",
+            "{} up or down {period} (ends {})",
             display_underlying(required_value(&fields, "underlying")?),
             display_utc_time(required_value(&fields, "expiry")?)?
         ));

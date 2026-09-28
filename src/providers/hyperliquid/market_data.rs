@@ -645,27 +645,32 @@ async fn outcome_statistics(period: &str, symbol: Option<&str>) -> Result<Exchan
         }
         None => crate::markets::outcomes::instruments(HyperliquidNetwork::Mainnet).await?,
     };
-    let mids: std::collections::HashMap<String, String> =
-        HyperliquidClient::for_network(HyperliquidNetwork::Mainnet)?
-            .info(&serde_json::json!({ "type": "allMids" }))
-            .await?;
+    let contexts = spot_contexts(HyperliquidNetwork::Mainnet)
+        .await?
+        .into_iter()
+        .map(|context| (context.coin.clone(), context))
+        .collect::<std::collections::HashMap<_, _>>();
     let mut output = Vec::new();
     for instrument in instruments
         .into_iter()
         .filter(|instrument| !instrument.settled)
     {
-        let Some(value) = mids.get(&instrument.coin) else {
+        let Some(context) = contexts.get(&instrument.coin) else {
             continue;
         };
-        let mark = parse(value, "outcome midpoint")?;
+        let mark = parse(&context.mark_px, "outcome mark price")?;
         output.push(MarketStatistics {
             symbol: instrument.symbol,
-            volume: 0.0,
-            quote_volume: 0.0,
-            open_interest: 0.0,
+            volume: parse(&context.day_base_vlm, "outcome day base volume")?,
+            quote_volume: parse(&context.day_ntl_vlm, "outcome day notional volume")?,
+            // Each side contributes half its supply so complementary pairs count once.
+            open_interest: parse(&context.circulating_supply, "outcome circulating supply")? / 2.0,
             funding_rate: 0.0,
             funding_rate_annualized: 0.0,
-            last_price: mark,
+            last_price: context
+                .mid_px
+                .as_deref()
+                .map_or(Ok(mark), |value| parse(value, "outcome midpoint"))?,
             mark_price: mark,
         });
     }
@@ -673,8 +678,8 @@ async fn outcome_statistics(period: &str, symbol: Option<&str>) -> Result<Exchan
         exchange: HyperliquidProduct::Outcome.exchange().to_string(),
         timestamp_ms: now_ms()?,
         period: "1d".to_string(),
-        total_volume_usd: 0.0,
-        total_open_interest_usd: 0.0,
+        total_volume_usd: output.iter().map(|market| market.quote_volume).sum(),
+        total_open_interest_usd: output.iter().map(|market| market.open_interest).sum(),
         markets: output,
         funding: Vec::new(),
     })
@@ -748,6 +753,7 @@ impl HyperliquidContext {
 #[serde(rename_all = "camelCase")]
 struct HyperliquidSpotContext {
     coin: String,
+    circulating_supply: String,
     prev_day_px: String,
     day_ntl_vlm: String,
     day_base_vlm: String,
