@@ -140,9 +140,7 @@ async fn import_evm(args: &AuthSetArgs, account: &str, key: &str) -> Result<Stri
             existing.as_ref().map(|c| c.agent.address.as_str()),
             args.replace,
         )?;
-        let name = HyperliquidClient::with_base_url(crate::providers::hyperlink::HTTP_URL)?
-            .verified_agent_name(account, &address)
-            .await?;
+        let name = crate::providers::hyperlink::verified_agent_name(account, &wallet).await?;
         save_hyperlink_credential(&HyperlinkCredential {
             version: HYPERLINK_CREDENTIAL_VERSION,
             status: HyperlinkCredentialStatus::Active,

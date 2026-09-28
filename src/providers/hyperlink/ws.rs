@@ -14,6 +14,54 @@ use crate::providers::hyperliquid::signing::HyperliquidWallet;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
+pub(super) async fn verify_account(account: &str, wallet: &HyperliquidWallet) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (mut stream, _) = connect_async(super::WS_URL)
+            .await
+            .context("failed to connect to HyperLink for agent verification")?;
+        let subscription = serde_json::json!({ "type": "orderUpdates", "user": account });
+        let nonce = next_nonce()?;
+        let signature = wallet.sign_l1_action(&subscription, nonce, HyperliquidNetwork::Mainnet)?;
+        stream
+            .send(Message::Text(
+                serde_json::json!({
+                    "method": "subscribe", "subscription": subscription,
+                    "signature": signature, "nonce": nonce,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await?;
+        while let Some(message) = stream.next().await {
+            let value: Value = match message? {
+                Message::Text(text) => serde_json::from_str(&text)?,
+                Message::Binary(bytes) => serde_json::from_slice(&bytes)?,
+                Message::Ping(payload) => {
+                    stream.send(Message::Pong(payload)).await?;
+                    continue;
+                }
+                Message::Close(_) => break,
+                _ => continue,
+            };
+            match value.get("channel").and_then(Value::as_str) {
+                Some("error") => bail!("HyperLink agent cannot access the supplied account"),
+                Some("subscriptionResponse")
+                    if value.pointer("/data/method").and_then(Value::as_str)
+                        == Some("subscribe")
+                        && value.pointer("/data/subscription") == Some(&subscription) =>
+                {
+                    stream.close(None).await?;
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        bail!("HyperLink closed the connection before confirming agent access")
+    })
+    .await
+    .context("HyperLink agent verification timed out")?
+}
+
 pub struct HyperlinkAccountStream {
     stream: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
