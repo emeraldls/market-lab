@@ -6,7 +6,7 @@ use sha3::{Digest, Sha3_256};
 use crate::cli::ScriptBacktestArgs;
 use crate::scripting::{jobs::MAX_SCRIPT_SOURCE_BYTES, sandbox};
 
-const POLICY_VERSION: &str = "python-cloud-1";
+const POLICY_VERSION: &str = "python-cloud-2";
 
 // ponytail: release images must be immutable; bind an image digest before allowing independently updated Python environments.
 fn fingerprint(source: &str, params: &[String]) -> Result<String> {

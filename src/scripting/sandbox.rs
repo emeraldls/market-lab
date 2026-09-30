@@ -7,7 +7,8 @@ use anyhow::{Result, bail};
 pub const POLICY_ENV: &str = "MLAB_PYTHON_SANDBOX";
 pub const INTERPRETER: &str = "/usr/bin/python3";
 pub const WORKER_COMMAND: &str = "python-sandbox-worker";
-pub const MEMORY_BYTES: usize = 256 * 1024 * 1024;
+// NumPy/SciPy map native numerical libraries in addition to Python's heap.
+pub const MEMORY_BYTES: usize = 512 * 1024 * 1024;
 
 pub fn required() -> Result<bool> {
     match std::env::var(POLICY_ENV) {
@@ -170,6 +171,7 @@ mod linux {
             .env("MPLBACKEND", "Agg")
             .env("OPENBLAS_NUM_THREADS", "1")
             .env("OMP_NUM_THREADS", "1")
+            .env("JOBLIB_MULTIPROCESSING", "0")
             .env("MKL_NUM_THREADS", "1");
 
         // ABI 6 also isolates signals and abstract Unix sockets from the daemon.
