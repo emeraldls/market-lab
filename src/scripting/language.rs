@@ -65,6 +65,12 @@ pub struct PythonRuntime {
 
 impl PythonRuntime {
     pub fn resolve(script_path: &Path, requested: Option<&Path>) -> Result<Self> {
+        if super::sandbox::required()? {
+            if requested.is_some() {
+                bail!("Cloud Python does not accept --python");
+            }
+            return Self::inspect(PathBuf::from(super::sandbox::INTERPRETER));
+        }
         let interpreter = if let Some(requested) = requested {
             resolve_requested_interpreter(requested)?
         } else if let Some(project_python) = adjacent_virtualenv_python(script_path) {
@@ -87,8 +93,12 @@ impl PythonRuntime {
                 .context("failed to resolve the current directory for the Python interpreter")?
                 .join(interpreter)
         };
-        let output = Command::new(&interpreter)
-            .args([
+        let mut command = Command::new(&interpreter);
+        if super::sandbox::required()? {
+            super::sandbox::validate_interpreter(&interpreter)?;
+            command.env_clear().args(["-I", "-S"]);
+        }
+        let output = command.args([
                 "-c",
                 "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')",
             ])

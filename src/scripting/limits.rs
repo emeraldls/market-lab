@@ -41,14 +41,23 @@ pub fn default_limits() -> ScriptRuntimeLimits {
 }
 
 pub fn python_limits() -> ScriptRuntimeLimits {
+    let sandboxed = std::env::var(super::sandbox::POLICY_ENV).as_deref() == Ok("required");
     ScriptRuntimeLimits {
         heap_bytes: 0,
         stack_bytes: 0,
         hook_timeout_ms: SCRIPT_PYTHON_HOOK_TIMEOUT_MS,
         startup_timeout_ms: SCRIPT_PYTHON_STARTUP_TIMEOUT_MS,
         finish_timeout_ms: SCRIPT_PYTHON_FINISH_TIMEOUT_MS,
-        process_memory_bytes: SCRIPT_PYTHON_MEMORY_BYTES,
-        max_processes: SCRIPT_PYTHON_MAX_PROCESSES,
+        process_memory_bytes: if sandboxed {
+            super::sandbox::MEMORY_BYTES
+        } else {
+            SCRIPT_PYTHON_MEMORY_BYTES
+        },
+        max_processes: if sandboxed {
+            1
+        } else {
+            SCRIPT_PYTHON_MAX_PROCESSES
+        },
         protocol_message_bytes: SCRIPT_PYTHON_PROTOCOL_BYTES,
         log_bytes: SCRIPT_PYTHON_LOG_BYTES,
     }

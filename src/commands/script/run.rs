@@ -245,6 +245,7 @@ pub async fn handle(args: ScriptRunArgs) -> Result<()> {
     }
 
     let script = Script::load_with_python(&args.script, args.python.as_deref())?;
+    super::precheck::require_approval(script.source(), &args.param)?;
     validate_execution_routing(&args, script.language)?;
     let source_values = if script.language == ScriptLanguage::PythonV2 {
         script.source_declarations()
@@ -360,6 +361,7 @@ pub async fn handle_worker(job_id: &str) -> Result<()> {
         job.definition.language,
         job.definition.python_runtime.clone(),
     )?;
+    super::precheck::require_approval(script.source(), &job.definition.params)?;
     let venue = job.definition.venue;
     let args = ScriptRunArgs {
         script: job.definition.snapshot_path.display().to_string(),

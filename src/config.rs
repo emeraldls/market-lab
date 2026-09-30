@@ -200,7 +200,7 @@ fn append_script_config_flags(
         );
     }
 
-    if mode == "backtest"
+    if matches!(mode, "backtest" | "precheck")
         && let Some(backtest) = &config.backtest
     {
         append_optional(args, "--from", backtest.from.as_deref());
@@ -300,7 +300,7 @@ fn config_command(args: &[OsString]) -> Option<ConfigCommand<'_>> {
     if let Some(script_idx) = args.iter().position(|arg| arg == "script") {
         let mode_idx = script_idx + 1;
         let mode = args.get(mode_idx)?.to_str()?;
-        return matches!(mode, "run" | "backtest").then_some(ConfigCommand::Script {
+        return matches!(mode, "run" | "backtest" | "precheck").then_some(ConfigCommand::Script {
             script_idx,
             mode_idx,
             mode,

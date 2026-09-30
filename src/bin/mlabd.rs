@@ -1,7 +1,21 @@
 use anyhow::Result;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref()
+        == Some(std::ffi::OsStr::new(
+            market_lab::scripting::sandbox::WORKER_COMMAND,
+        ))
+    {
+        return market_lab::scripting::sandbox::worker(args);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("serve") | None => market_lab::runtime::serve().await,

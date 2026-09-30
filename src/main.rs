@@ -99,6 +99,7 @@ async fn main() -> Result<()> {
         Commands::Script { command: script } => match script {
             ScriptCommands::Run(args) => commands::script::run::handle(args).await?,
             ScriptCommands::Backtest(args) => commands::script::backtest::handle(args).await?,
+            ScriptCommands::Precheck(args) => commands::script::precheck::handle(args).await?,
             ScriptCommands::Jobs(args) => commands::script::jobs::handle_list(args).await?,
             ScriptCommands::Status(args) => commands::script::jobs::handle_status(args).await?,
             ScriptCommands::Logs(args) => commands::script::jobs::handle_logs(args).await?,

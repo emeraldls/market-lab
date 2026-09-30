@@ -40,6 +40,9 @@ pub struct ScriptJobSubmission {
 
 impl ScriptJobSubmission {
     pub fn validate(&self) -> Result<()> {
+        if super::sandbox::required()? && self.language != ScriptLanguage::PythonV2 {
+            bail!("Cloud scripting accepts Python V2 only");
+        }
         if self.script_name.trim().is_empty() {
             bail!("script job name is required");
         }

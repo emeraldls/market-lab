@@ -11,15 +11,15 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --locked --release --bin mlabd && \
-    cp /src/target/release/mlabd /tmp/mlabd
+    cargo build --locked --release --bins && \
+    cp /src/target/release/mlab /src/target/release/mlabd /tmp/
 
 FROM gcr.io/distroless/python3-debian12:nonroot
 
 LABEL org.opencontainers.image.source="https://github.com/emeraldls/market-lab"
 LABEL org.opencontainers.image.description="Isolated Market Lab daemon runtime"
 
-COPY --from=builder /tmp/mlabd /usr/local/bin/mlabd
+COPY --from=builder /tmp/mlab /tmp/mlabd /usr/local/bin/
 COPY --from=ghcr.io/astral-sh/uv:0.12.1 /uv /uvx /usr/local/bin/
 
 USER nonroot:nonroot

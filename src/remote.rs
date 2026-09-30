@@ -439,6 +439,11 @@ fn prepare_remote_command(
     mut args: Vec<String>,
 ) -> Result<(Vec<String>, Option<RemoteScriptBundle>)> {
     remove_option_with_value(&mut args, "--config")?;
+    if matches!(args.as_slice(), [command, mode, ..] if command == "script" && mode == "precheck") {
+        bail!(
+            "Cloud precheck must run inside its assigned Linux environment, not over the local SSH script bundler"
+        );
+    }
     if !matches!(args.as_slice(), [command, mode, ..] if command == "script" && matches!(mode.as_str(), "run" | "backtest"))
     {
         return Ok((args, None));

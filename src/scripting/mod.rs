@@ -10,5 +10,6 @@ pub mod market_data;
 pub(crate) mod notebook;
 pub mod output;
 pub(crate) mod python;
+pub mod sandbox;
 pub mod studies;
 pub mod telemetry;

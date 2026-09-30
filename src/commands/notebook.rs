@@ -22,6 +22,9 @@ const SESSION_DIRECTORY: &str = "run/notebooks";
 const SOCKET_FILE: &str = "bridge.sock";
 
 pub async fn handle(args: NotebookArgs) -> Result<()> {
+    if crate::scripting::sandbox::required()? {
+        bail!("Jupyter is not available under the Cloud Python sandbox policy");
+    }
     let current_dir = env::current_dir().context("failed to resolve the notebook directory")?;
     let runtime = PythonRuntime::resolve(&current_dir.join("notebook.py"), args.python.as_deref())?;
     let jupyter = resolve_notebook_dependencies(&runtime, &current_dir).await?;

@@ -753,6 +753,8 @@ pub enum StudyCommands {
 pub enum ScriptCommands {
     Run(ScriptRunArgs),
     Backtest(ScriptBacktestArgs),
+    /// Check a Python script in the Cloud sandbox using historical simulated execution.
+    Precheck(ScriptBacktestArgs),
     Jobs(ScriptJobsArgs),
     Status(ScriptJobArgs),
     Logs(ScriptLogsArgs),

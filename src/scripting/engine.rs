@@ -87,6 +87,7 @@ pub struct Script {
     source_declarations: Vec<String>,
     execution_venues: Vec<ExecutionVenue>,
     python_runtime: Option<PythonRuntime>,
+    _sandbox_snapshot: Option<super::sandbox::Workspace>,
 }
 
 impl Script {
@@ -134,6 +135,23 @@ impl Script {
         language: ScriptLanguage,
         python_runtime: Option<PythonRuntime>,
     ) -> Result<Self> {
+        if super::sandbox::required()? && language != ScriptLanguage::PythonV2 {
+            anyhow::bail!("Cloud scripting accepts Python V2 only");
+        }
+        let sandbox_snapshot = if super::sandbox::required()? {
+            if source.len() > super::jobs::MAX_SCRIPT_SOURCE_BYTES {
+                anyhow::bail!("Cloud scripts cannot exceed 1 MiB");
+            }
+            let workspace = super::sandbox::Workspace::new()?;
+            fs::write(workspace.0.join("strategy.py"), &source)?;
+            Some(workspace)
+        } else {
+            None
+        };
+        let snapshot_path = sandbox_snapshot
+            .as_ref()
+            .map(|workspace| workspace.0.join("strategy.py"));
+        let path = snapshot_path.as_deref().unwrap_or(path);
         let (manifest, source_declarations, execution_venues) = match language {
             ScriptLanguage::JavaScriptV1 => {
                 (inspect_manifest(path, &source)?, Vec::new(), Vec::new())
@@ -166,6 +184,7 @@ impl Script {
             source_declarations,
             execution_venues,
             python_runtime,
+            _sandbox_snapshot: sandbox_snapshot,
         })
     }
 
@@ -229,7 +248,7 @@ impl Script {
                 execution,
             )
             .map(|session| ScriptSession {
-                inner: ScriptSessionInner::Python(session),
+                inner: ScriptSessionInner::Python(Box::new(session)),
             });
         }
         let limits = default_limits();
@@ -481,7 +500,7 @@ pub struct ScriptSession {
 
 enum ScriptSessionInner {
     JavaScript(JavaScriptSession),
-    Python(PythonSession),
+    Python(Box<PythonSession>),
 }
 
 impl ScriptSession {

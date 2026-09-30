@@ -134,6 +134,7 @@ pub(crate) struct PythonSession {
     cancelled: Arc<AtomicBool>,
     commands: ScriptCommandBuffer,
     execution: ScriptExecutionContext,
+    artifact_destination: PathBuf,
 }
 
 impl PythonSession {
@@ -148,6 +149,12 @@ impl PythonSession {
         let artifact_dir = artifact_directory(&execution.job_id)?;
         let execution_key_prefix = format!("{:016x}", OsRng.next_u64());
         let mut process = PythonProcess::spawn(path, runtime)?;
+        let sandbox_artifacts = process
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.0.join("artifacts"));
+        let visible_artifacts = sandbox_artifacts.as_ref().unwrap_or(&artifact_dir);
+        fs::create_dir_all(visible_artifacts)?;
         process.send(&json!({
             "type": "init",
             "params": params,
@@ -155,7 +162,7 @@ impl PythonSession {
             "configuredSources": configured_sources,
             "executionEnabled": execution.enabled,
             "executionKeyPrefix": execution_key_prefix,
-            "artifactDir": artifact_dir,
+            "artifactDir": visible_artifacts,
         }))?;
         let response = process.receive(PYTHON_STARTUP_TIMEOUT)?;
         match response.get("type").and_then(Value::as_str) {
@@ -171,6 +178,7 @@ impl PythonSession {
             cancelled: Arc::new(AtomicBool::new(false)),
             commands: Arc::new(Mutex::new(Vec::new())),
             execution,
+            artifact_destination: artifact_dir,
         })
     }
 
@@ -215,11 +223,26 @@ impl PythonSession {
     }
 
     pub(crate) fn run_finish(&self, pnl_history: Value) -> Result<Option<ScriptExecution>> {
-        self.run_hook(
+        let result = self.run_hook(
             "on_finish",
             json!({ "pnlHistory": pnl_history }),
             PYTHON_FINISH_TIMEOUT,
-        )
+        );
+        let mut process = self
+            .process
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Python process lock poisoned"))?;
+        if process.workspace.is_some() {
+            process.kill();
+            if result.is_ok() {
+                process
+                    .workspace
+                    .as_ref()
+                    .unwrap()
+                    .export(&self.artifact_destination)?;
+            }
+        }
+        result
     }
 
     fn run_hook(
@@ -417,6 +440,7 @@ struct PythonProcess {
     process_group: u32,
     limits: PythonProcessLimits,
     resource_failure: Arc<Mutex<Option<String>>>,
+    workspace: Option<super::sandbox::Workspace>,
 }
 
 impl PythonProcess {
@@ -430,13 +454,33 @@ impl PythonProcess {
         mode: &str,
         limits: PythonProcessLimits,
     ) -> Result<Self> {
-        let matplotlib_config = matplotlib_config_directory()?;
-        let mut command = Command::new(&runtime.interpreter);
+        let workspace = if super::sandbox::required()? {
+            super::sandbox::validate_interpreter(&runtime.interpreter)?;
+            Some(super::sandbox::Workspace::new()?)
+        } else {
+            None
+        };
+        let limits = if workspace.is_some() {
+            PythonProcessLimits {
+                memory_bytes: super::sandbox::MEMORY_BYTES,
+                max_processes: 1,
+                ..limits
+            }
+        } else {
+            limits
+        };
+        let mut command = if let Some(workspace) = &workspace {
+            super::sandbox::command(path, mode, &workspace.0)?
+        } else {
+            let mut command = Command::new(&runtime.interpreter);
+            command
+                .args(["-u", "-c", PYTHON_RUNNER])
+                .arg(path)
+                .arg(mode)
+                .env("MPLCONFIGDIR", matplotlib_config_directory()?);
+            command
+        };
         command
-            .args(["-u", "-c", PYTHON_RUNNER])
-            .arg(path)
-            .arg(mode)
-            .env("MPLCONFIGDIR", matplotlib_config)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -453,7 +497,15 @@ impl PythonProcess {
         let stdin = child.stdin.take().context("Python bridge has no stdin")?;
         let stdout = child.stdout.take().context("Python bridge has no stdout")?;
         let stderr = child.stderr.take().context("Python bridge has no stderr")?;
-        let (sender, messages) = mpsc::channel();
+        use std::os::fd::AsRawFd;
+        let fd = stdin.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::last_os_error().into());
+        }
+        let (sender, messages) = mpsc::sync_channel(8);
         let protocol_sender = sender.clone();
         let protocol_reader = thread::Builder::new()
             .name("mlab-python-bridge".to_string())
@@ -470,13 +522,17 @@ impl PythonProcess {
                         }),
                         Ok(None) => {
                             let _ = protocol_sender
-                                .send(Err("Python bridge closed its output".to_string()));
+                                .try_send(Err("Python bridge closed its output".to_string()));
                             break;
                         }
                         Err(error) => Err(format!("failed to read Python bridge: {error}")),
                     };
                     let terminal = message.is_err();
-                    if protocol_sender.send(message).is_err() || terminal {
+                    if protocol_sender.try_send(message).is_err() {
+                        kill_process_group(process_group);
+                        break;
+                    }
+                    if terminal {
                         break;
                     }
                 }
@@ -505,6 +561,7 @@ impl PythonProcess {
             process_group,
             limits,
             resource_failure,
+            workspace,
         })
     }
 
@@ -531,13 +588,26 @@ impl PythonProcess {
                 self.protocol_bytes
             );
         }
-        self.stdin
-            .write_all(&encoded)
-            .context("failed to write to Python bridge")?;
-        self.stdin
-            .write_all(b"\n")
-            .context("failed to delimit Python bridge message")?;
-        self.stdin.flush().context("failed to flush Python bridge")
+        let mut encoded = encoded;
+        encoded.push(b'\n');
+        let deadline = Instant::now() + PYTHON_HOOK_TIMEOUT;
+        let mut remaining = encoded.as_slice();
+        while !remaining.is_empty() {
+            match self.stdin.write(remaining) {
+                Ok(0) => bail!("Python bridge stopped reading"),
+                Ok(written) => remaining = &remaining[written..],
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        self.kill();
+                        bail!("Python bridge input timed out");
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error).context("failed to write to Python bridge"),
+            }
+        }
+        Ok(())
     }
 
     fn receive(&mut self, timeout: Duration) -> Result<Value> {
@@ -606,7 +676,6 @@ fn matplotlib_config_directory() -> Result<PathBuf> {
 
 impl Drop for PythonProcess {
     fn drop(&mut self) {
-        let _ = self.send(&json!({ "type": "shutdown" }));
         if self.child.try_wait().ok().flatten().is_none() {
             self.kill();
         } else {
@@ -677,7 +746,7 @@ fn spawn_resource_monitor(
     limits: PythonProcessLimits,
     stop: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
-    sender: mpsc::Sender<Result<Value, String>>,
+    sender: mpsc::SyncSender<Result<Value, String>>,
 ) -> Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("mlab-python-limits".to_string())
@@ -687,7 +756,7 @@ fn spawn_resource_monitor(
                     if let Ok(mut failure) = failure.lock() {
                         *failure = Some(error.clone());
                     }
-                    let _ = sender.send(Err(error));
+                    let _ = sender.try_send(Err(error));
                     kill_process_group(process_group);
                     stop.store(true, Ordering::Relaxed);
                     break;
@@ -871,7 +940,7 @@ fn python_error_message(response: &Value) -> String {
         .to_string()
 }
 
-const PYTHON_RUNNER: &str = r#"
+pub(crate) const PYTHON_RUNNER: &str = r#"
 import copy
 import ast
 import importlib.util

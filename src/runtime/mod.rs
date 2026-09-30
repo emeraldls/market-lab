@@ -1098,6 +1098,7 @@ async fn pull_docker_image(image: &str) -> Result<()> {
 }
 
 async fn replace_docker_container(config: &DaemonConfig) -> Result<()> {
+    crate::scripting::sandbox::required()?;
     ensure_docker_limits_supported(config).await?;
     docker_home()?;
     remove_docker_container(config).await?;
@@ -1116,6 +1117,7 @@ async fn remove_docker_container(config: &DaemonConfig) -> Result<()> {
 }
 
 async fn create_docker_container(config: &DaemonConfig) -> Result<()> {
+    crate::scripting::sandbox::required()?;
     config.validate()?;
     ensure_docker_limits_supported(config).await?;
     daemon::ensure_token()?;
@@ -1203,6 +1205,12 @@ fn docker_create_args(config: &DaemonConfig, home: &Path, uid: u32, gid: u32) ->
     if let Some(pids) = config.docker.pids_limit {
         args.extend(["--pids-limit".to_string(), pids.to_string()]);
     }
+    if std::env::var_os(crate::scripting::sandbox::POLICY_ENV).is_some() {
+        args.extend([
+            "--env".to_string(),
+            format!("{}=required", crate::scripting::sandbox::POLICY_ENV),
+        ]);
+    }
     args.extend([config.docker.image.clone(), "serve".to_string()]);
     args
 }
@@ -1278,6 +1286,17 @@ fn validate_docker_container_settings(
     config: &DaemonConfig,
     container: &serde_json::Value,
 ) -> Result<()> {
+    if crate::scripting::sandbox::required()? {
+        let expected = format!("{}=required", crate::scripting::sandbox::POLICY_ENV);
+        if !container["Config"]["Env"].as_array().is_some_and(|env| {
+            env.iter()
+                .any(|item| item.as_str() == Some(expected.as_str()))
+        }) {
+            bail!(
+                "Docker runtime lacks the required Python sandbox policy; recreate it before enabling Cloud scripts"
+            );
+        }
+    }
     let limits = &container["HostConfig"];
     let matches = container["Config"]["Image"] == config.docker.image
         && config
@@ -1505,6 +1524,14 @@ pub struct PythonRuntimePreparation {
 
 pub async fn prepare_python_runtime(runtime: &PythonRuntime) -> Result<PythonRuntimePreparation> {
     let config = daemon::load()?;
+    if crate::scripting::sandbox::required()? {
+        crate::scripting::sandbox::validate_interpreter(&runtime.interpreter)?;
+        return Ok(PythonRuntimePreparation {
+            runtime: runtime.clone(),
+            managed: false,
+            reused: true,
+        });
+    }
     if config.backend == DaemonBackend::Native {
         return Ok(PythonRuntimePreparation {
             runtime: runtime.clone(),
@@ -2431,6 +2458,7 @@ fn create_script_job(
         submission.python_runtime = Some(inspected);
     }
     submission.validate()?;
+    crate::commands::script::precheck::require_approval(&submission.source, &submission.params)?;
     if let Some(venue) = submission.venue {
         crate::providers::execution::ExecutionAdapter::configured_account_for(
             venue,
@@ -2511,6 +2539,9 @@ fn create_script_job(
 }
 
 fn validate_managed_python_runtime(runtime: &PythonRuntime) -> Result<()> {
+    if crate::scripting::sandbox::required()? {
+        return crate::scripting::sandbox::validate_interpreter(&runtime.interpreter);
+    }
     let managed = runtime
         .managed
         .as_ref()

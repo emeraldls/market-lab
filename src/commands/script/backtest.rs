@@ -326,13 +326,31 @@ struct BacktestEvent {
 }
 
 pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
+    handle_mode(args, false).await
+}
+
+pub(super) async fn handle_precheck(args: ScriptBacktestArgs) -> Result<()> {
+    handle_mode(args, true).await
+}
+
+async fn handle_mode(args: ScriptBacktestArgs, precheck: bool) -> Result<()> {
     args.validate()?;
     if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {
         bail!("script backtest currently supports only --output terminal|json|jsonl");
     }
 
     let script = Script::load_with_python(&args.script, args.python.as_deref())?;
-    let mut report = report_builder("script.backtest", &script, None, None, None);
+    let mut report = report_builder(
+        if precheck {
+            "script.precheck"
+        } else {
+            "script.backtest"
+        },
+        &script,
+        None,
+        None,
+        None,
+    );
     let source_values = if script.language == crate::scripting::language::ScriptLanguage::PythonV2 {
         script.source_declarations()
     } else {
@@ -373,7 +391,15 @@ pub async fn handle(args: ScriptBacktestArgs) -> Result<()> {
         }
     };
 
-    let result = backtest_events(args, script, source_configs, resolved_params, &mut report).await;
+    let result = backtest_events(
+        args,
+        script,
+        source_configs,
+        resolved_params,
+        &mut report,
+        precheck,
+    )
+    .await;
     let runtime_report = match &result {
         Ok(_) => report.finish_ok(),
         Err(err) if err.is::<ScriptCancelled>() => report.finish_cancelled(),
@@ -389,11 +415,25 @@ async fn backtest_events(
     source_configs: SourceConfigs,
     resolved_params: Value,
     report: &mut crate::scripting::telemetry::ScriptRuntimeReportBuilder,
+    precheck: bool,
 ) -> Result<()> {
-    let data = fetch_sources(&args, &source_configs, report).await?;
+    let precheck_started = Instant::now();
+    let data = if precheck {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            fetch_sources(&args, &source_configs, report),
+        )
+        .await
+        .context("precheck data fetch exceeded 60 seconds")??
+    } else {
+        fetch_sources(&args, &source_configs, report).await?
+    };
     let events = build_event_timeline(&data, &source_configs)?;
     if events.is_empty() {
         bail!("script backtest received no source events in the requested range");
+    }
+    if precheck && events.len() > 1000 {
+        bail!("precheck accepts at most 1000 source events; shorten the time window");
     }
     let reference_sources = resolve_reference_sources(&data, &source_configs)?;
 
@@ -436,6 +476,9 @@ async fn backtest_events(
     write_running_report_best_effort(report);
 
     for (idx, event) in events.iter().enumerate() {
+        if precheck && precheck_started.elapsed().as_secs() >= 60 {
+            bail!("precheck exceeded 60 seconds; shorten the time window");
+        }
         if session.is_cancelled() {
             report.set_progress("cancelled", idx as u64, events.len() as u64);
             return Err(ScriptCancelled.into());
@@ -615,7 +658,11 @@ async fn backtest_events(
         .max()
         .unwrap_or(args.to);
     let result = ScriptBacktestResult {
-        r#type: "script.backtest.result",
+        r#type: if precheck {
+            "script.precheck.result"
+        } else {
+            "script.backtest.result"
+        },
         version: "1",
         provider: provider_label,
         exchange: exchange_label,
