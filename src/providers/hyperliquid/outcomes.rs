@@ -44,6 +44,16 @@ pub struct QuestionSpec {
     pub settled_named_outcomes: Vec<u32>,
 }
 
+/// Creation updates are invalidation hints: HTTP metadata supplies trading rules.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OutcomeMetaUpdate {
+    OutcomeCreated { outcome: u32 },
+    OutcomeSettled(u32),
+    QuestionUpdated { question: u32 },
+    QuestionSettled(u32),
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OutcomeDeployer {
     #[serde(rename(deserialize = "deployer"))]

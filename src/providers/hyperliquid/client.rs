@@ -1,3 +1,4 @@
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -41,7 +42,17 @@ impl HyperliquidClient {
     }
 
     pub fn for_network(network: HyperliquidNetwork) -> Result<Self> {
-        Self::with_base_url(network.http_url())
+        static MAINNET: OnceLock<HyperliquidClient> = OnceLock::new();
+        static TESTNET: OnceLock<HyperliquidClient> = OnceLock::new();
+        let shared = match network {
+            HyperliquidNetwork::Mainnet => &MAINNET,
+            HyperliquidNetwork::Testnet => &TESTNET,
+        };
+        if let Some(client) = shared.get() {
+            return Ok(client.clone());
+        }
+        let client = Self::with_base_url(network.http_url())?;
+        Ok(shared.get_or_init(|| client).clone())
     }
 
     pub fn with_base_url(base_url: impl Into<String>) -> Result<Self> {

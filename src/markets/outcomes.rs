@@ -12,6 +12,8 @@ use crate::providers::hyperliquid::outcomes::{
 };
 use crate::providers::hyperliquid::{HyperliquidNetwork, SPOT_EXCHANGE};
 
+pub mod recurring;
+
 pub const OUTCOME_ASSET_OFFSET: u32 = 100_000_000;
 pub const OUTCOME_MIN_NOTIONAL: f64 = 10.0;
 
@@ -39,6 +41,8 @@ pub struct OutcomeInstrument {
     pub asset_id: u32,
     pub settled: bool,
     pub metadata_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recurring: Option<recurring::RecurringRound>,
 }
 
 impl OutcomeInstrument {
@@ -126,6 +130,7 @@ pub fn instruments_from_metadata(
     for outcome in &metadata.outcomes {
         let parent = parents.get(&outcome.outcome).copied();
         let rendered = render_outcome(parent, outcome, &templates)?;
+        let recurring = recurring::RecurringRound::from_metadata(parent, outcome)?;
         let deployer = outcome
             .venue
             .as_deref()
@@ -162,6 +167,7 @@ pub fn instruments_from_metadata(
                     .context("Hyperliquid outcome asset id exceeds u32")?,
                 settled: settled.contains(&outcome.outcome),
                 metadata_fingerprint: fingerprint(parent, outcome, side)?,
+                recurring: recurring.clone(),
             });
         }
     }

@@ -706,6 +706,58 @@ pub struct HyperliquidAccountStream {
     client: HyperliquidWsClient,
 }
 
+pub struct HyperliquidOutcomeMetaStream {
+    client: HyperliquidWsClient,
+    pending: Option<Vec<super::outcomes::OutcomeMetaUpdate>>,
+}
+
+impl HyperliquidOutcomeMetaStream {
+    pub async fn connect(network: HyperliquidNetwork) -> Result<Self> {
+        let mut client = HyperliquidWsClient::subscribe(
+            network,
+            [serde_json::json!({ "type": "outcomeMetaUpdates" })],
+        )
+        .await?;
+        let pending = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let value = client.next_json().await?;
+                match value.get("channel").and_then(Value::as_str) {
+                    Some("subscriptionResponse")
+                        if value
+                            .pointer("/data/subscription/type")
+                            .and_then(Value::as_str)
+                            == Some("outcomeMetaUpdates") =>
+                    {
+                        return Ok(None);
+                    }
+                    Some("outcomeMetaUpdates") => {
+                        return serde_json::from_value(value["data"].clone())
+                            .map(Some)
+                            .context("invalid outcome metadata update");
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .context("outcome metadata subscription acknowledgement timed out")??;
+        Ok(Self { client, pending })
+    }
+
+    pub async fn next_updates(&mut self) -> Result<Vec<super::outcomes::OutcomeMetaUpdate>> {
+        if let Some(pending) = self.pending.take() {
+            return Ok(pending);
+        }
+        loop {
+            let value = self.client.next_json().await?;
+            if value.get("channel").and_then(Value::as_str) == Some("outcomeMetaUpdates") {
+                return serde_json::from_value(value["data"].clone())
+                    .context("invalid outcome metadata update");
+            }
+        }
+    }
+}
+
 impl HyperliquidAccountStream {
     pub async fn connect(account: &str) -> Result<Self> {
         Self::connect_on(account, HyperliquidNetwork::Mainnet).await

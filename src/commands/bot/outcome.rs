@@ -2575,6 +2575,7 @@ mod tests {
             asset_id: 100_000 + u32::from(side),
             settled: false,
             metadata_fingerprint: format!("fingerprint-{side}"),
+            recurring: None,
         }
     }
 
