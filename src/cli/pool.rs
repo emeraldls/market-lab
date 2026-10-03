@@ -1,10 +1,16 @@
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256, U256};
 use clap::{Args, Subcommand};
 
 use super::OutputFormat;
 
 #[derive(Debug, Subcommand)]
 pub enum PoolCommands {
+    /// Prepare an unsigned pool-creation transaction for the manager's wallet.
+    Create(PoolCreateArgs),
+    /// Resolve a pool address from its confirmed factory creation receipt.
+    Created(PoolCreatedArgs),
+    /// Prepare token approvals and a liquidity deposit. No signing or broadcasting.
+    Deposit(PoolDepositArgs),
     /// Read a MarketLab pool's reserves, fees and permissions. No wallet required.
     Inspect(PoolInspectArgs),
     /// Generate or inspect the dedicated fee operator. Never prints its private key.
@@ -30,6 +36,55 @@ pub enum PoolCommands {
         #[command(flatten)]
         format: PoolOutputArgs,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct PoolWalletArgs {
+    /// Wallet that will sign; never the restricted fee operator.
+    #[arg(long)]
+    pub account: Address,
+    #[arg(long)]
+    pub rpc_url: Option<reqwest::Url>,
+    #[command(flatten)]
+    pub format: PoolOutputArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct PoolCreateArgs {
+    #[arg(long)]
+    pub token_a: Address,
+    #[arg(long)]
+    pub token_b: Address,
+    #[arg(long, default_value_t = 30)]
+    pub fee_bps: u16,
+    #[arg(long, default_value_t = 5)]
+    pub min_fee_bps: u16,
+    #[arg(long, default_value_t = 100)]
+    pub max_fee_bps: u16,
+    #[command(flatten)]
+    pub wallet: PoolWalletArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct PoolCreatedArgs {
+    pub transaction_hash: B256,
+    #[command(flatten)]
+    pub wallet: PoolWalletArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct PoolDepositArgs {
+    pub address: Address,
+    /// Maximum token0 amount in integer base units; read token order with pool inspect.
+    #[arg(long)]
+    pub amount0: U256,
+    /// Maximum token1 amount in integer base units.
+    #[arg(long)]
+    pub amount1: U256,
+    #[arg(long, default_value_t = 50)]
+    pub slippage_bps: u16,
+    #[command(flatten)]
+    pub wallet: PoolWalletArgs,
 }
 
 #[derive(Debug, Subcommand)]

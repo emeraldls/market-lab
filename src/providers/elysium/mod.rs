@@ -8,10 +8,13 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 pub mod transactions;
+pub mod wallet;
 
 sol! {
     interface PoolFactory {
         function isPool(address pool) external view returns (bool registered);
+        function createPool(address tokenA, address tokenB, uint16 initialFeeBps, uint16 minFeeBps, uint16 maxFeeBps) external returns (address pool);
+        event PoolCreated(address indexed pool, address indexed manager, address token0, address token1, uint16 minFeeBps, uint16 maxFeeBps);
     }
 
     interface Pool {
@@ -25,12 +28,17 @@ sol! {
         function minFeeBps() external view returns (uint16 fee);
         function maxFeeBps() external view returns (uint16 fee);
         function setFee(uint16 feeBps) external;
+        function previewDeposit(uint256 max0, uint256 max1) external view returns (uint256 amount0, uint256 amount1, uint256 shares);
+        function deposit(uint256 max0, uint256 max1, uint256 minShares, address recipient, uint256 deadline) external returns (uint256 amount0, uint256 amount1, uint256 shares);
     }
 
     interface Token {
         function symbol() external view returns (string symbol);
         function decimals() external view returns (uint8 decimals);
         function totalSupply() external view returns (uint256 supply);
+        function balanceOf(address account) external view returns (uint256 balance);
+        function allowance(address owner, address spender) external view returns (uint256 amount);
+        function approve(address spender, uint256 amount) external returns (bool);
     }
 }
 

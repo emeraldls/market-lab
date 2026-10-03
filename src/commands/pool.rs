@@ -8,6 +8,55 @@ use crate::runtime::pools::{self, PoolJob, PoolRequest};
 
 pub async fn handle(command: PoolCommands) -> Result<()> {
     let (request, output) = match command {
+        PoolCommands::Create(args) => {
+            let output = args.wallet.format.output;
+            validate_output(output)?;
+            let client = PoolClient::new(args.wallet.rpc_url)?;
+            let plan = tokio::time::timeout(
+                Duration::from_secs(60),
+                client.prepare_create(
+                    args.wallet.account,
+                    args.token_a,
+                    args.token_b,
+                    args.fee_bps,
+                    args.min_fee_bps,
+                    args.max_fee_bps,
+                ),
+            )
+            .await
+            .context("pool creation preparation timed out")??;
+            return print_result(&serde_json::to_value(plan)?, output);
+        }
+        PoolCommands::Created(args) => {
+            let output = args.wallet.format.output;
+            validate_output(output)?;
+            let client = PoolClient::new(args.wallet.rpc_url)?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(60),
+                client.created_pool(args.transaction_hash, args.wallet.account),
+            )
+            .await
+            .context("pool creation receipt lookup timed out")??;
+            return print_result(&serde_json::to_value(result)?, output);
+        }
+        PoolCommands::Deposit(args) => {
+            let output = args.wallet.format.output;
+            validate_output(output)?;
+            let client = PoolClient::new(args.wallet.rpc_url)?;
+            let plan = tokio::time::timeout(
+                Duration::from_secs(60),
+                client.prepare_deposit(
+                    args.address,
+                    args.wallet.account,
+                    args.amount0,
+                    args.amount1,
+                    args.slippage_bps,
+                ),
+            )
+            .await
+            .context("pool deposit preparation timed out")??;
+            return print_result(&serde_json::to_value(plan)?, output);
+        }
         PoolCommands::Inspect(args) => return handle_inspect(args).await,
         PoolCommands::Operator { command } => {
             let address = match command {
