@@ -1,0 +1,20 @@
+[profile.default]
+src = "src"
+script = "script"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.35"
+evm_version = "paris"
+optimizer = true
+optimizer_runs = 200
+fs_permissions = [{ access = "read", path = "./deployments/99801.json" }]
+remappings = [
+  "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+  "forge-std/=lib/forge-std/src/",
+]
+
+[fmt]
+line_length = 100
+
+[rpc_endpoints]
+elysium = "https://testnet-rpc.elysium.kinetiq.xyz"

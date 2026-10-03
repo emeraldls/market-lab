@@ -1,0 +1,36 @@
+{
+  "chainId": 99801,
+  "rpcUrl": "https://testnet-rpc.elysium.kinetiq.xyz",
+  "contracts": {
+    "PoolFactory": {
+      "address": "0xAc139b041074140e98E62B69d1eC1667AAb2caDE",
+      "transactionHash": "0x0009560a96a5a1eb1abd9234962714a0c961434d3b754f8ff19ad7203ffe7684",
+      "blockNumber": 2288716,
+      "blockHash": "0xbc8e6a3cbd7dd0b63a3797b6451c1063574421ff22f5f7c299393359f9b038eb"
+    },
+    "WrappedHype": {
+      "address": "0xA5b72796E5bf80443DC134F3c8a1cc97dcCC39B9",
+      "transactionHash": "0xd5de298715f624c985b31428c1633aa5248ac4eaa85510d92261289852f22968",
+      "blockNumber": 2288724,
+      "blockHash": "0x77e41c6b8fe677f3ee3bd1d0caa494f1c3d056b676d3ad95b70771274ece9036"
+    },
+    "DemoToken": {
+      "address": "0x26D4720e52951c23D27FABD3D73ef94829978450",
+      "transactionHash": "0xe384b640d86c325a7d20f721f838e82f8f69b169070029f507a58b83a52b9e4d",
+      "blockNumber": 2288732,
+      "blockHash": "0xef4af0c13f5f007181d0fdaaa96639fb4d5a923584d69c571ee051b080730a34"
+    }
+  },
+  "pools": [
+    {
+      "address": "0x20BE1d4Ef3B47ce8c5B48a23B152DD1008b74826",
+      "manager": "0x0361c685f6ba3cd66e9e8fe6095c91ab0b4e5b8e",
+      "token0": "0x26d4720e52951c23d27fabd3d73ef94829978450",
+      "token1": "0xa5b72796e5bf80443dc134f3c8a1cc97dccc39b9",
+      "creationTransactionHash": "0x9cc9a19f0cf6ede27d00ed272e95aed8ad852015b3f2521512e7c1547784944c",
+      "creationBlockNumber": 2293763,
+      "seedTransactionHash": "0xe7e0bffe788e8e0e842a867fb76db0cb18b9f9d40ec8f255962fd642f61ed057",
+      "seedBlockNumber": 2293810
+    }
+  ]
+}
