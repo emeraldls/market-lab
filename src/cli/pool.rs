@@ -5,12 +5,22 @@ use super::OutputFormat;
 
 #[derive(Debug, Subcommand)]
 pub enum PoolCommands {
+    /// List pools registered with the factory, newest first.
+    List(PoolListArgs),
     /// Prepare an unsigned pool-creation transaction for the manager's wallet.
     Create(PoolCreateArgs),
     /// Resolve a pool address from its confirmed factory creation receipt.
     Created(PoolCreatedArgs),
     /// Prepare token approvals and a liquidity deposit. No signing or broadcasting.
     Deposit(PoolDepositArgs),
+    /// Read wallet balances and its share of a pool.
+    Position(PoolAccountArgs),
+    /// Prepare a swap and any required token approval. No signing or broadcasting.
+    Swap(PoolSwapArgs),
+    /// Prepare a withdrawal of LP shares. No signing or broadcasting.
+    Withdraw(PoolWithdrawArgs),
+    /// Prepare manager approval or revocation of the fee operator.
+    Authorize(PoolAuthorizeArgs),
     /// Read a MarketLab pool's reserves, fees and permissions. No wallet required.
     Inspect(PoolInspectArgs),
     /// Generate or inspect the dedicated fee operator. Never prints its private key.
@@ -36,6 +46,58 @@ pub enum PoolCommands {
         #[command(flatten)]
         format: PoolOutputArgs,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct PoolListArgs {
+    #[arg(long, default_value_t = 0)]
+    pub offset: u64,
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=50))]
+    pub limit: u64,
+    #[arg(long)]
+    pub rpc_url: Option<reqwest::Url>,
+    #[command(flatten)]
+    pub format: PoolOutputArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct PoolAccountArgs {
+    pub address: Address,
+    #[command(flatten)]
+    pub wallet: PoolWalletArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct PoolSwapArgs {
+    #[command(flatten)]
+    pub pool: PoolAccountArgs,
+    #[arg(long)]
+    pub token_in: Address,
+    /// Input amount in integer token base units.
+    #[arg(long)]
+    pub amount_in: U256,
+    #[arg(long, default_value_t = 50)]
+    pub slippage_bps: u16,
+}
+
+#[derive(Debug, Args)]
+pub struct PoolWithdrawArgs {
+    #[command(flatten)]
+    pub pool: PoolAccountArgs,
+    /// LP shares in integer base units.
+    #[arg(long)]
+    pub shares: U256,
+    #[arg(long, default_value_t = 50)]
+    pub slippage_bps: u16,
+}
+
+#[derive(Debug, Args)]
+pub struct PoolAuthorizeArgs {
+    #[command(flatten)]
+    pub pool: PoolAccountArgs,
+    /// Fee operator address; the zero address revokes delegated access.
+    #[arg(long)]
+    pub operator: Address,
 }
 
 #[derive(Debug, Args)]

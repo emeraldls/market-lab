@@ -9,6 +9,7 @@ ENV MLAB_VOLUME_INGEST_KEY=${MLAB_VOLUME_INGEST_KEY}
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY contracts/pools/deployments/99801.json ./contracts/pools/deployments/99801.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --locked --release --bins && \

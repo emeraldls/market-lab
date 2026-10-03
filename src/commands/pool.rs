@@ -8,6 +8,18 @@ use crate::runtime::pools::{self, PoolJob, PoolRequest};
 
 pub async fn handle(command: PoolCommands) -> Result<()> {
     let (request, output) = match command {
+        PoolCommands::List(args) => {
+            let output = args.format.output;
+            validate_output(output)?;
+            let client = PoolClient::new(args.rpc_url)?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(60),
+                client.list(args.offset, args.limit),
+            )
+            .await
+            .context("pool listing timed out")??;
+            return print_result(&result, output);
+        }
         PoolCommands::Create(args) => {
             let output = args.wallet.format.output;
             validate_output(output)?;
@@ -58,6 +70,69 @@ pub async fn handle(command: PoolCommands) -> Result<()> {
             return print_result(&serde_json::to_value(plan)?, output);
         }
         PoolCommands::Inspect(args) => return handle_inspect(args).await,
+        PoolCommands::Position(args) => {
+            let output = args.wallet.format.output;
+            validate_output(output)?;
+            let client = PoolClient::new(args.wallet.rpc_url)?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(60),
+                client.position(args.address, args.wallet.account),
+            )
+            .await
+            .context("pool position lookup timed out")??;
+            return print_result(&result, output);
+        }
+        PoolCommands::Swap(args) => {
+            let output = args.pool.wallet.format.output;
+            validate_output(output)?;
+            let client = PoolClient::new(args.pool.wallet.rpc_url)?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(60),
+                client.prepare_swap(
+                    args.pool.address,
+                    args.pool.wallet.account,
+                    args.token_in,
+                    args.amount_in,
+                    args.slippage_bps,
+                ),
+            )
+            .await
+            .context("pool swap preparation timed out")??;
+            return print_result(&result, output);
+        }
+        PoolCommands::Withdraw(args) => {
+            let output = args.pool.wallet.format.output;
+            validate_output(output)?;
+            let client = PoolClient::new(args.pool.wallet.rpc_url)?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(60),
+                client.prepare_withdraw(
+                    args.pool.address,
+                    args.pool.wallet.account,
+                    args.shares,
+                    args.slippage_bps,
+                ),
+            )
+            .await
+            .context("pool withdrawal preparation timed out")??;
+            return print_result(&result, output);
+        }
+        PoolCommands::Authorize(args) => {
+            let output = args.pool.wallet.format.output;
+            validate_output(output)?;
+            let client = PoolClient::new(args.pool.wallet.rpc_url)?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(60),
+                client.prepare_authorize(
+                    args.pool.address,
+                    args.pool.wallet.account,
+                    args.operator,
+                ),
+            )
+            .await
+            .context("pool operator approval preparation timed out")??;
+            return print_result(&result, output);
+        }
         PoolCommands::Operator { command } => {
             let address = match command {
                 PoolOperatorCommands::Create => crate::credentials::pool::create()?,

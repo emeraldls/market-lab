@@ -138,6 +138,13 @@ pub struct PoolJob {
     pub samples: VecDeque<Sample>,
 }
 
+impl PoolJob {
+    fn public_value(mut self) -> Result<Value> {
+        self.rpc_url = None;
+        Ok(serde_json::to_value(self)?)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PendingFee {
     job_id: String,
@@ -315,13 +322,27 @@ impl Service {
                     registry.jobs.insert(id.clone(), job.clone());
                     Ok(job)
                 })?;
-                Ok(serde_json::to_value(job)?)
+                job.public_value()
             }
             PoolRequest::Jobs => {
                 let registry = self.store.read()?;
-                Ok(
-                    json!({ "jobs": registry.jobs.values().collect::<Vec<_>>(), "pending": registry.pending }),
-                )
+                let jobs = registry
+                    .jobs
+                    .into_values()
+                    .map(PoolJob::public_value)
+                    .collect::<Result<Vec<_>>>()?;
+                let pending = registry.pending.map(|pending| {
+                    let tx = pending.transaction;
+                    json!({
+                        "job_id": pending.job_id,
+                        "transaction": {
+                            "hash": tx.hash, "sender": tx.sender, "nonce": tx.nonce,
+                            "pool": tx.pool, "fee_bps": tx.fee_bps,
+                            "max_gas_cost_wei": tx.max_gas_cost_wei
+                        }
+                    })
+                });
+                Ok(json!({ "jobs": jobs, "pending": pending }))
             }
             PoolRequest::Stop { job_id } => {
                 let job = self.store.update(|registry| {
@@ -332,7 +353,7 @@ impl Service {
                     job.status = JobStatus::Stopped;
                     Ok(job.clone())
                 })?;
-                Ok(serde_json::to_value(job)?)
+                job.public_value()
             }
             PoolRequest::Logs { job_id, limit } => {
                 ensure!(

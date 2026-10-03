@@ -12,6 +12,8 @@ pub mod wallet;
 
 sol! {
     interface PoolFactory {
+        function poolCount() external view returns (uint256 count);
+        function pools(uint256 index) external view returns (address pool);
         function isPool(address pool) external view returns (bool registered);
         function createPool(address tokenA, address tokenB, uint16 initialFeeBps, uint16 minFeeBps, uint16 maxFeeBps) external returns (address pool);
         event PoolCreated(address indexed pool, address indexed manager, address token0, address token1, uint16 minFeeBps, uint16 maxFeeBps);
@@ -28,6 +30,11 @@ sol! {
         function minFeeBps() external view returns (uint16 fee);
         function maxFeeBps() external view returns (uint16 fee);
         function setFee(uint16 feeBps) external;
+        function setOperator(address operator) external;
+        function quoteSwap(address tokenIn, uint256 amountIn) external view returns (uint256 amountOut, uint256 feeAmount);
+        function swapExactInput(address tokenIn, uint256 amountIn, uint256 minAmountOut, address recipient, uint256 deadline) external returns (uint256 amountOut);
+        function previewWithdraw(uint256 shares) external view returns (uint256 amount0, uint256 amount1);
+        function withdraw(uint256 shares, uint256 min0, uint256 min1, address recipient, uint256 deadline) external returns (uint256 amount0, uint256 amount1);
         function previewDeposit(uint256 max0, uint256 max1) external view returns (uint256 amount0, uint256 amount1, uint256 shares);
         function deposit(uint256 max0, uint256 max1, uint256 minShares, address recipient, uint256 deadline) external returns (uint256 amount0, uint256 amount1, uint256 shares);
     }
@@ -174,6 +181,10 @@ impl PoolClient {
         let block: Block = self
             .rpc("eth_getBlockByNumber", json!(["latest", false]))
             .await?;
+        self.inspect_at(pool, &block).await
+    }
+
+    async fn inspect_at(&self, pool: Address, block: &Block) -> Result<PoolSnapshot> {
         // Every value must come from this same canonical block, not successive moving heads.
         let at = json!({ "blockHash": block.hash, "requireCanonical": true });
         let registered = self
@@ -221,6 +232,48 @@ impl PoolClient {
             lp_decimals,
             lp_supply: TokenAmount::new(supply, lp_decimals)?,
         })
+    }
+
+    pub async fn list(&self, offset: u64, limit: u64) -> Result<Value> {
+        use futures_util::{StreamExt, TryStreamExt, stream};
+
+        ensure!(
+            (1..=50).contains(&limit),
+            "pool page limit must be between 1 and 50"
+        );
+        let block = self.wallet_block().await?;
+        let at = json!({ "blockHash": block.hash, "requireCanonical": true });
+        let total: u64 = self
+            .call(self.factory, PoolFactory::poolCountCall {}, &at)
+            .await?
+            .try_into()
+            .context("pool count exceeds supported range")?;
+        let end = offset.saturating_add(limit).min(total);
+        let pools: Vec<PoolSnapshot> = stream::iter(offset..end)
+            .map(|index| {
+                let block = &block;
+                let at = &at;
+                async move {
+                    let pool = self
+                        .call(
+                            self.factory,
+                            PoolFactory::poolsCall {
+                                index: U256::from(total - index - 1),
+                            },
+                            at,
+                        )
+                        .await?;
+                    self.inspect_at(pool, block).await
+                }
+            })
+            .buffered(4)
+            .try_collect()
+            .await?;
+        Ok(json!({
+            "chain_id": self.chain_id, "factory": self.factory,
+            "block_number": block.number.to::<u64>(), "block_hash": block.hash,
+            "total": total, "offset": offset, "limit": limit, "pools": pools
+        }))
     }
 
     async fn reserve(&self, address: Address, amount: U256, at: &Value) -> Result<PoolReserve> {

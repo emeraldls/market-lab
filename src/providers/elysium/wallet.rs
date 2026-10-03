@@ -93,7 +93,7 @@ struct ReceiptLog {
 }
 
 impl PoolClient {
-    async fn wallet_block(&self) -> Result<Block> {
+    pub(super) async fn wallet_block(&self) -> Result<Block> {
         let chain: U64 = self.rpc("eth_chainId", json!([])).await?;
         ensure!(
             chain.to::<u64>() == self.chain_id,
@@ -270,11 +270,7 @@ impl PoolClient {
                 &at,
             )
             .await?;
-        let minimum = quote
-            .shares
-            .checked_mul(U256::from(10_000 - slippage_bps))
-            .context("share amount overflow")?
-            / U256::from(10_000);
+        let minimum = minimum_amount(quote.shares, slippage_bps)?;
         ensure!(
             !minimum.is_zero(),
             "deposit is too small for the selected slippage"
@@ -282,51 +278,7 @@ impl PoolClient {
         let decimals = self.call(pool, Token::decimalsCall {}, &at).await?;
         let mut transactions = Vec::new();
         for (token, amount) in [(token0, amount0), (token1, amount1)] {
-            ensure!(
-                self.call(token, Token::balanceOfCall { account }, &at)
-                    .await?
-                    >= amount,
-                "wallet has insufficient balance for token {token}"
-            );
-            let allowance = self
-                .call(
-                    token,
-                    Token::allowanceCall {
-                        owner: account,
-                        spender: pool,
-                    },
-                    &at,
-                )
-                .await?;
-            if allowance < amount {
-                // Some ERC-20s require clearing a nonzero approval before changing it.
-                if !allowance.is_zero() {
-                    transactions.push(WalletStep {
-                        action: "reset_approval",
-                        transaction: WalletTransaction::new(
-                            self.chain_id,
-                            account,
-                            token,
-                            Token::approveCall {
-                                spender: pool,
-                                amount: U256::ZERO,
-                            },
-                        ),
-                    });
-                }
-                transactions.push(WalletStep {
-                    action: "approve",
-                    transaction: WalletTransaction::new(
-                        self.chain_id,
-                        account,
-                        token,
-                        Token::approveCall {
-                            spender: pool,
-                            amount,
-                        },
-                    ),
-                });
-            }
+            transactions.extend(self.approvals(pool, account, token, amount, &at).await?);
         }
         let deadline = block
             .timestamp
@@ -364,4 +316,258 @@ impl PoolClient {
             transactions,
         })
     }
+
+    async fn approvals(
+        &self,
+        pool: Address,
+        account: Address,
+        token: Address,
+        amount: U256,
+        at: &Value,
+    ) -> Result<Vec<WalletStep>> {
+        ensure!(
+            self.call(token, Token::balanceOfCall { account }, at)
+                .await?
+                >= amount,
+            "wallet has insufficient balance for token {token}"
+        );
+        let allowance = self
+            .call(
+                token,
+                Token::allowanceCall {
+                    owner: account,
+                    spender: pool,
+                },
+                at,
+            )
+            .await?;
+        let mut steps = Vec::new();
+        if allowance < amount {
+            // Some ERC-20s require clearing a nonzero approval before changing it.
+            if !allowance.is_zero() {
+                steps.push(WalletStep {
+                    action: "reset_approval",
+                    transaction: WalletTransaction::new(
+                        self.chain_id,
+                        account,
+                        token,
+                        Token::approveCall {
+                            spender: pool,
+                            amount: U256::ZERO,
+                        },
+                    ),
+                });
+            }
+            steps.push(WalletStep {
+                action: "approve",
+                transaction: WalletTransaction::new(
+                    self.chain_id,
+                    account,
+                    token,
+                    Token::approveCall {
+                        spender: pool,
+                        amount,
+                    },
+                ),
+            });
+        }
+        Ok(steps)
+    }
+
+    async fn registered_block(&self, pool: Address, account: Address) -> Result<(Block, Value)> {
+        ensure!(!account.is_zero(), "wallet must not be zero");
+        let block = self.wallet_block().await?;
+        let at = json!({ "blockHash": block.hash, "requireCanonical": true });
+        ensure!(
+            self.call(self.factory, PoolFactory::isPoolCall { pool }, &at)
+                .await?,
+            "pool is not registered with the MarketLab factory"
+        );
+        Ok((block, at))
+    }
+
+    pub async fn position(&self, pool: Address, account: Address) -> Result<Value> {
+        let (block, at) = self.registered_block(pool, account).await?;
+        let snapshot = self.inspect_at(pool, &block).await?;
+        let shares = self
+            .call(pool, Token::balanceOfCall { account }, &at)
+            .await?;
+        let (amount0, amount1) = if shares.is_zero() {
+            (U256::ZERO, U256::ZERO)
+        } else {
+            let quote = self
+                .call(pool, Pool::previewWithdrawCall { shares }, &at)
+                .await?;
+            (quote.amount0, quote.amount1)
+        };
+        let mut balances = Vec::new();
+        for token in &snapshot.reserves {
+            let balance = self
+                .call(token.address, Token::balanceOfCall { account }, &at)
+                .await?;
+            balances.push(self.reserve(token.address, balance, &at).await?);
+        }
+        let hype = self.rpc("eth_getBalance", json!([account, at])).await?;
+        Ok(json!({
+            "chain_id": self.chain_id, "block_hash": block.hash, "pool": pool, "account": account,
+            "shares": TokenAmount::new(shares, snapshot.lp_decimals)?,
+            "withdrawable": [self.reserve(snapshot.reserves[0].address, amount0, &at).await?,
+                self.reserve(snapshot.reserves[1].address, amount1, &at).await?],
+            "balances": balances, "hype_balance": TokenAmount::new(hype, 18)?
+        }))
+    }
+
+    pub async fn prepare_swap(
+        &self,
+        pool: Address,
+        account: Address,
+        token_in: Address,
+        amount_in: U256,
+        slippage_bps: u16,
+    ) -> Result<Value> {
+        let (block, at) = self.registered_block(pool, account).await?;
+        let quote = self
+            .call(
+                pool,
+                Pool::quoteSwapCall {
+                    tokenIn: token_in,
+                    amountIn: amount_in,
+                },
+                &at,
+            )
+            .await?;
+        let minimum = minimum_amount(quote.amountOut, slippage_bps)?;
+        ensure!(
+            !minimum.is_zero(),
+            "swap is too small for the selected slippage"
+        );
+        let token0 = self.call(pool, Pool::token0Call {}, &at).await?;
+        let token_out = if token_in == token0 {
+            self.call(pool, Pool::token1Call {}, &at).await?
+        } else {
+            token0
+        };
+        let deadline = block
+            .timestamp
+            .to::<u64>()
+            .checked_add(1200)
+            .context("swap deadline overflow")?;
+        let mut transactions = self
+            .approvals(pool, account, token_in, amount_in, &at)
+            .await?;
+        transactions.push(WalletStep {
+            action: "swap",
+            transaction: WalletTransaction::new(
+                self.chain_id,
+                account,
+                pool,
+                Pool::swapExactInputCall {
+                    tokenIn: token_in,
+                    amountIn: amount_in,
+                    minAmountOut: minimum,
+                    recipient: account,
+                    deadline: U256::from(deadline),
+                },
+            ),
+        });
+        Ok(json!({
+            "chain_id": self.chain_id, "block_hash": block.hash, "pool": pool, "account": account,
+            "input": self.reserve(token_in, amount_in, &at).await?,
+            "expected_output": self.reserve(token_out, quote.amountOut, &at).await?,
+            "minimum_output": self.reserve(token_out, minimum, &at).await?,
+            "fee": self.reserve(token_in, quote.feeAmount, &at).await?,
+            "deadline": deadline, "transactions": transactions
+        }))
+    }
+
+    pub async fn prepare_withdraw(
+        &self,
+        pool: Address,
+        account: Address,
+        shares: U256,
+        slippage_bps: u16,
+    ) -> Result<Value> {
+        let (block, at) = self.registered_block(pool, account).await?;
+        ensure!(
+            self.call(pool, Token::balanceOfCall { account }, &at)
+                .await?
+                >= shares,
+            "wallet has insufficient LP shares"
+        );
+        let quote = self
+            .call(pool, Pool::previewWithdrawCall { shares }, &at)
+            .await?;
+        let min0 = minimum_amount(quote.amount0, slippage_bps)?;
+        let min1 = minimum_amount(quote.amount1, slippage_bps)?;
+        ensure!(
+            !min0.is_zero() || !min1.is_zero(),
+            "withdrawal is too small for the selected slippage"
+        );
+        let token0 = self.call(pool, Pool::token0Call {}, &at).await?;
+        let token1 = self.call(pool, Pool::token1Call {}, &at).await?;
+        let decimals = self.call(pool, Token::decimalsCall {}, &at).await?;
+        let deadline = block
+            .timestamp
+            .to::<u64>()
+            .checked_add(1200)
+            .context("withdrawal deadline overflow")?;
+        let transaction = WalletTransaction::new(
+            self.chain_id,
+            account,
+            pool,
+            Pool::withdrawCall {
+                shares,
+                min0,
+                min1,
+                recipient: account,
+                deadline: U256::from(deadline),
+            },
+        );
+        let _: Bytes = self
+            .rpc("eth_call", json!([transaction, at]))
+            .await
+            .context("withdrawal simulation failed")?;
+        Ok(json!({
+            "chain_id": self.chain_id, "block_hash": block.hash, "pool": pool, "account": account,
+            "shares": TokenAmount::new(shares, decimals)?,
+            "expected_amounts": [self.reserve(token0, quote.amount0, &at).await?, self.reserve(token1, quote.amount1, &at).await?],
+            "minimum_amounts": [self.reserve(token0, min0, &at).await?, self.reserve(token1, min1, &at).await?],
+            "deadline": deadline, "transaction": transaction
+        }))
+    }
+
+    pub async fn prepare_authorize(
+        &self,
+        pool: Address,
+        account: Address,
+        operator: Address,
+    ) -> Result<Value> {
+        let (block, at) = self.registered_block(pool, account).await?;
+        ensure!(
+            self.call(pool, Pool::ownerCall {}, &at).await? == account,
+            "only the pool manager can change its fee operator"
+        );
+        let transaction = WalletTransaction::new(
+            self.chain_id,
+            account,
+            pool,
+            Pool::setOperatorCall { operator },
+        );
+        let _: Bytes = self
+            .rpc("eth_call", json!([transaction, at]))
+            .await
+            .context("operator approval simulation failed")?;
+        Ok(json!({
+            "chain_id": self.chain_id, "block_hash": block.hash, "pool": pool, "account": account,
+            "operator": operator, "transaction": transaction
+        }))
+    }
+}
+
+fn minimum_amount(amount: U256, slippage_bps: u16) -> Result<U256> {
+    ensure!(slippage_bps < 10_000, "slippage must be below 10000 bps");
+    // Avoid multiplying the full amount: token supplies can use the entire uint256 range.
+    let bps = U256::from(10_000);
+    let retained = U256::from(10_000 - slippage_bps);
+    Ok(amount / bps * retained + amount % bps * retained / bps)
 }
