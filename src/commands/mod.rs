@@ -4,6 +4,7 @@ pub mod market;
 pub mod markets;
 pub mod notebook;
 pub mod outcome;
+pub mod pool;
 pub mod remote;
 pub mod runtime;
 pub mod script;

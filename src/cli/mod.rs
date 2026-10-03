@@ -3,6 +3,9 @@ use chrono::{NaiveDate, NaiveDateTime};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+mod pool;
+pub use pool::{PoolCommands, PoolInspectArgs};
+
 use crate::bots::grid::MAX_GRID_LEVELS_PER_SIDE;
 use crate::domain::enums::{BookMode, ProviderKind, Side};
 use crate::domain::execution::{ExecutionVenue, OrderKind, TimeInForce};
@@ -27,6 +30,11 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     Markets(MarketsArgs),
+    /// Inspect on-chain liquidity pools.
+    Pool {
+        #[command(subcommand)]
+        command: PoolCommands,
+    },
     Trade {
         #[command(subcommand)]
         command: TradeCommands,

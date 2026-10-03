@@ -6,6 +6,7 @@ use crate::domain::types::{OrderBookSnapshot, ProviderHealth, TopOfBook};
 
 pub mod binance;
 pub mod bulk;
+pub mod elysium;
 pub mod execution;
 pub mod hyperlink;
 pub mod hyperliquid;

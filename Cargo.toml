@@ -13,6 +13,8 @@ name = "mlabd"
 path = "src/bin/mlabd.rs"
 
 [dependencies]
+alloy-primitives = { version = "1.7", default-features = false, features = ["std", "serde"] }
+alloy-sol-types = "1.7"
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 base64 = "0.22.1"
