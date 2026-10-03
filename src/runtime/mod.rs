@@ -44,8 +44,12 @@ use crate::strategies::jobs::{
 use crate::venues::VenueMarket;
 use crate::volume::{FillVolumeInput, VolumeExporter};
 
+pub mod pools;
+
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-pub const RUNTIME_VERSION: u8 = 46;
+pub const RUNTIME_VERSION: u8 = 47;
+// Pool jobs have their own journal; this IPC addition does not change the existing state schema.
+const RUNTIME_STATE_VERSION: u8 = 46;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
 const ACCOUNT_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_RUNTIME_REQUEST_BYTES: usize = 1024 * 1024 + 128 * 1024;
@@ -142,6 +146,9 @@ impl RuntimeStatus {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum RuntimeRequest {
+    Pool {
+        request: pools::PoolRequest,
+    },
     Ping,
     Status,
     ReloadMarkets,
@@ -583,7 +590,7 @@ pub async fn serve() -> Result<()> {
         RuntimeListener::Unix(listener)
     };
     let mut state = load_state(&paths)?.unwrap_or_else(|| RuntimeState {
-        version: RUNTIME_VERSION,
+        version: RUNTIME_STATE_VERSION,
         pid: std::process::id(),
         started_at_ms: now_ms().unwrap_or(0),
         account_stream_connected: false,
@@ -606,12 +613,13 @@ pub async fn serve() -> Result<()> {
         account_positions: BTreeMap::new(),
         account_positions_refreshed_at_ms: BTreeMap::new(),
     });
-    state.version = RUNTIME_VERSION;
+    state.version = RUNTIME_STATE_VERSION;
     state.pid = std::process::id();
     state.started_at_ms = now_ms()?;
     state.account_stream_connected = false;
     persist_state(&paths, &state)?;
     let adapter = BulkExecutionAdapter::new(false)?;
+    let pool_service = pools::Service::start(&paths.directory)?;
     let volume_exporter = match VolumeExporter::start(&daemon::market_lab_home()?) {
         Ok(exporter) => exporter,
         Err(error) => {
@@ -650,8 +658,8 @@ pub async fn serve() -> Result<()> {
                     &paths,
                     &adapter,
                     &mut state,
-                    &account_tx,
-                    &mut account_supervisors,
+                    (&account_tx, &mut account_supervisors),
+                    &pool_service,
                 ).await {
                     Ok(stop) => should_stop = stop,
                     Err(error) => record_runtime_error(
@@ -679,6 +687,7 @@ pub async fn serve() -> Result<()> {
         }
     }
 
+    drop(pool_service);
     let active_jobs = state
         .script_jobs
         .values()
@@ -4493,9 +4502,10 @@ async fn handle_connection(
     paths: &RuntimePaths,
     adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
-    account_tx: &mpsc::Sender<AccountConnectionEvent>,
-    account_supervisors: &mut HashSet<String>,
+    account: (&mpsc::Sender<AccountConnectionEvent>, &mut HashSet<String>),
+    pool_service: &pools::Service,
 ) -> Result<bool> {
+    let (account_tx, account_supervisors) = account;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut line = String::new();
     BufReader::new(reader)
@@ -4548,6 +4558,13 @@ async fn handle_connection(
     }
     let should_stop = matches!(request, RuntimeRequest::Stop);
     let response = match request {
+        RuntimeRequest::Pool { request } => match pool_service.handle(request) {
+            Ok(value) => RuntimeResponse {
+                action_response: Some(value),
+                ..RuntimeResponse::empty()
+            },
+            Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+        },
         RuntimeRequest::Ping => RuntimeResponse {
             ok: true,
             message: "pong".to_string(),
@@ -6554,7 +6571,7 @@ fn load_state(paths: &RuntimePaths) -> Result<Option<RuntimeState>> {
         .get("version")
         .and_then(serde_json::Value::as_u64)
         .context("mlabd state is missing its schema version")?;
-    if version != u64::from(RUNTIME_VERSION) {
+    if version != u64::from(RUNTIME_STATE_VERSION) {
         return Ok(None);
     }
     let state: RuntimeState = serde_json::from_value(encoded)
@@ -6969,7 +6986,7 @@ mod tests {
 
     #[test]
     fn runtime_protocol_v46_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 46);
+        assert_eq!(RUNTIME_VERSION, 47);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",

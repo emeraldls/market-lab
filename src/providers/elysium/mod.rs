@@ -7,6 +7,8 @@ use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
+pub mod transactions;
+
 sol! {
     interface PoolFactory {
         function isPool(address pool) external view returns (bool registered);
@@ -22,6 +24,7 @@ sol! {
         function feeBps() external view returns (uint16 fee);
         function minFeeBps() external view returns (uint16 fee);
         function maxFeeBps() external view returns (uint16 fee);
+        function setFee(uint16 feeBps) external;
     }
 
     interface Token {
@@ -103,13 +106,15 @@ pub struct PoolSnapshot {
 struct Block {
     number: U64,
     hash: B256,
+    timestamp: U64,
 }
 
 #[derive(Deserialize)]
-struct RpcResponse<T> {
+struct RpcResponse {
     jsonrpc: String,
     id: u64,
-    result: Option<T>,
+    #[serde(default)]
+    result: Value,
     error: Option<RpcError>,
 }
 
@@ -128,9 +133,10 @@ pub struct PoolClient {
 
 impl PoolClient {
     pub fn new(rpc_url: Option<Url>) -> Result<Self> {
-        let deployment: Deployment =
-            serde_json::from_str(include_str!("../../contracts/pools/deployments/99801.json"))
-                .context("invalid embedded Elysium deployment")?;
+        let deployment: Deployment = serde_json::from_str(include_str!(
+            "../../../contracts/pools/deployments/99801.json"
+        ))
+        .context("invalid embedded Elysium deployment")?;
         let rpc_url = match rpc_url {
             Some(url) => url,
             None => deployment
@@ -231,7 +237,7 @@ impl PoolClient {
     }
 
     async fn rpc<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
-        let response: RpcResponse<T> = self
+        let response: RpcResponse = self
             .http
             .post(self.rpc_url.clone())
             .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
@@ -255,8 +261,7 @@ impl PoolClient {
                 error.message
             );
         }
-        response
-            .result
-            .with_context(|| format!("Elysium {method} returned no result"))
+        serde_json::from_value(response.result)
+            .with_context(|| format!("Elysium {method} returned an invalid result"))
     }
 }

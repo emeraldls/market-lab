@@ -13,6 +13,10 @@ name = "mlabd"
 path = "src/bin/mlabd.rs"
 
 [dependencies]
+alloy-consensus = { version = "2.5", features = ["k256"] }
+alloy-eips = "2.5"
+alloy-signer = "2.5"
+alloy-signer-local = "2.5"
 alloy-primitives = { version = "1.7", default-features = false, features = ["std", "serde"] }
 alloy-sol-types = "1.7"
 anyhow = "1.0.102"
@@ -25,6 +29,7 @@ serde_json = "1.0.149"
 tokio = { version = "1.52.3", features = ["full"] }
 mimalloc = "0.1"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
+url = { version = "2.5", features = ["serde"] }
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3.32"
 k256 = { version = "0.13.4", features = ["ecdsa"] }

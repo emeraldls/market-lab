@@ -2,8 +2,155 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::cli::{OutputFormat, PoolInspectArgs};
+use crate::cli::{OutputFormat, PoolCommands, PoolInspectArgs, PoolOperatorCommands, PoolRunArgs};
 use crate::providers::elysium::PoolClient;
+use crate::runtime::pools::{self, PoolJob, PoolRequest};
+
+pub async fn handle(command: PoolCommands) -> Result<()> {
+    let (request, output) = match command {
+        PoolCommands::Inspect(args) => return handle_inspect(args).await,
+        PoolCommands::Operator { command } => {
+            let address = match command {
+                PoolOperatorCommands::Create => crate::credentials::pool::create()?,
+                PoolOperatorCommands::Address => crate::credentials::pool::address()?,
+            };
+            println!("{address}");
+            return Ok(());
+        }
+        PoolCommands::Run(args) => return handle_run(args).await,
+        PoolCommands::Jobs(format) => (PoolRequest::Jobs, format.output),
+        PoolCommands::Stop { job_id, format } => (PoolRequest::Stop { job_id }, format.output),
+        PoolCommands::Logs {
+            job_id,
+            limit,
+            format,
+        } => (PoolRequest::Logs { job_id, limit }, format.output),
+    };
+    validate_output(output)?;
+    let result = pools::request(request).await?;
+    print_result(&result, output)
+}
+
+fn validate_output(output: OutputFormat) -> Result<()> {
+    if matches!(output, OutputFormat::Csv | OutputFormat::Parquet) {
+        bail!("pool commands support --output terminal, json or jsonl");
+    }
+    Ok(())
+}
+
+async fn handle_run(args: PoolRunArgs) -> Result<()> {
+    let output = args.format.output;
+    validate_output(output)?;
+    args.policy.validate()?;
+    let client = PoolClient::new(args.rpc_url.clone())?;
+    let snapshot = tokio::time::timeout(Duration::from_secs(60), client.observe(args.address))
+        .await
+        .context("pool preview timed out")??;
+    anyhow::ensure!(
+        (snapshot.min_fee_bps..=snapshot.max_fee_bps).contains(&args.policy.base_fee_bps),
+        "base fee is outside this pool's bounds"
+    );
+    if args.dry_run {
+        let preview = serde_json::json!({ "pool": args.address, "strategy": "adaptive_fee", "policy": args.policy, "snapshot": snapshot, "dry_run": true });
+        return print_result(&preview, output);
+    }
+    anyhow::ensure!(
+        snapshot.operator == crate::credentials::pool::address()?,
+        "the manager must grant this operator permission with setOperator first"
+    );
+    anyhow::ensure!(
+        !snapshot.reserve0.is_zero() && !snapshot.reserve1.is_zero(),
+        "pool has no liquidity"
+    );
+    if matches!(output, OutputFormat::Terminal) {
+        println!(
+            "pool {}\nstrategy: adaptive-fee\nfee bounds: {}-{} bps\nbase fee: {} bps\ninterval: {}s; cooldown: {}s\nmax gas per transaction: {} HYPE",
+            args.address,
+            snapshot.min_fee_bps,
+            snapshot.max_fee_bps,
+            args.policy.base_fee_bps,
+            args.policy.interval,
+            args.policy.cooldown,
+            args.policy.max_tx_gas_hype
+        );
+    }
+    if !args.yes
+        && !super::execution::confirm_live_action(
+            output,
+            "Start automatic fee changes using the operator's HYPE?",
+        )?
+    {
+        return Ok(());
+    }
+    let result = pools::request(PoolRequest::Start {
+        pool: args.address,
+        rpc_url: args.rpc_url,
+        policy: args.policy,
+    })
+    .await?;
+    print_result(&result, output)
+}
+
+fn print_job(job: &PoolJob) {
+    let fee = |value: Option<u16>| {
+        value
+            .map(|value| format!("{value} bps"))
+            .unwrap_or_else(|| "waiting".into())
+    };
+    println!(
+        "{}  {:?}\n  pool: {}\n  fee: {}; target: {}",
+        job.id,
+        job.status,
+        job.pool,
+        fee(job.current_fee_bps),
+        fee(job.target_fee_bps)
+    );
+    if let Some(hash) = job.last_transaction {
+        println!("  transaction: {hash}");
+    }
+    if let Some(error) = &job.last_error {
+        println!("  error: {error}");
+    }
+}
+
+fn print_result(value: &serde_json::Value, output: OutputFormat) -> Result<()> {
+    match output {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(value)?),
+        OutputFormat::Jsonl => println!("{value}"),
+        OutputFormat::Terminal => {
+            if let Some(jobs) = value.get("jobs").and_then(serde_json::Value::as_array) {
+                if jobs.is_empty() {
+                    println!("No pool jobs.");
+                }
+                for job in jobs {
+                    print_job(&serde_json::from_value(job.clone())?);
+                }
+                if let Some(pending) = value.get("pending").filter(|pending| !pending.is_null()) {
+                    println!("pending transaction: {}", pending["transaction"]["hash"]);
+                }
+            } else if value.get("id").is_some() {
+                print_job(&serde_json::from_value(value.clone())?);
+            } else if let Some(events) = value.as_array() {
+                for event in events {
+                    let timestamp = event["ts_ms"]
+                        .as_i64()
+                        .and_then(chrono::DateTime::from_timestamp_millis)
+                        .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                        .unwrap_or_default();
+                    println!(
+                        "{timestamp}  {}  {}",
+                        event["event"].as_str().unwrap_or_default(),
+                        event["data"]
+                    );
+                }
+            } else {
+                println!("{}", serde_json::to_string_pretty(value)?);
+            }
+        }
+        OutputFormat::Csv | OutputFormat::Parquet => unreachable!("validated output"),
+    }
+    Ok(())
+}
 
 pub async fn handle_inspect(args: PoolInspectArgs) -> Result<()> {
     if matches!(args.output, OutputFormat::Csv | OutputFormat::Parquet) {

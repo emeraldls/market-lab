@@ -1184,7 +1184,7 @@ fn render_cancel_plan(plan: &CancelPlan, dry_run: bool, output: OutputFormat) ->
     Ok(())
 }
 
-fn confirm_live_action(output: OutputFormat, prompt: &str) -> Result<bool> {
+pub(super) fn confirm_live_action(output: OutputFormat, prompt: &str) -> Result<bool> {
     if !matches!(output, OutputFormat::Terminal) {
         bail!("live execution with structured output requires --yes");
     }

@@ -22,6 +22,7 @@ use crate::providers::hyperliquid::signing::{HyperliquidWallet, canonical_addres
 
 mod agent;
 pub mod builder;
+pub mod pool;
 
 const MMT_API_KEY_ENV: &str = "MMT_API_KEY";
 const CREDENTIAL_DIRECTORY_MODE: u32 = 0o700;

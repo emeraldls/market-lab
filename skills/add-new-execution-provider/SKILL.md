@@ -25,7 +25,7 @@ Exchange-specific behavior belongs in:
 - `src/providers/execution.rs` for shared execution registration
 - `src/venues.rs` for venue identity and backend routing
 - `src/markets/` for market discovery and normalized trading rules
-- `src/credentials.rs` and `src/cli/mod.rs` only when the provider needs distinct authentication
+- `src/credentials/mod.rs` and `src/cli/mod.rs` only when the provider needs distinct authentication
 
 Never add exchange-name checks to:
 
@@ -117,7 +117,7 @@ Register the factory once in `execution_factory`. Do not introduce another execu
 If the provider has distinct credentials:
 
 - add its `AuthProvider` CLI value
-- add setup and reauthorization in `src/credentials.rs`
+- add setup and reauthorization in `src/credentials/mod.rs`
 - store only delegated or agent credentials when the protocol permits it
 - load credentials inside `mlabd`
 - redact secrets from logs, errors, job records, and generated files

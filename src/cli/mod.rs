@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 mod pool;
-pub use pool::{PoolCommands, PoolInspectArgs};
+pub use pool::{PoolCommands, PoolInspectArgs, PoolOperatorCommands, PoolRunArgs};
 
 use crate::bots::grid::MAX_GRID_LEVELS_PER_SIDE;
 use crate::domain::enums::{BookMode, ProviderKind, Side};
@@ -30,7 +30,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     Markets(MarketsArgs),
-    /// Inspect on-chain liquidity pools.
+    /// Inspect liquidity pools and manage bounded fee strategies.
     Pool {
         #[command(subcommand)]
         command: PoolCommands,

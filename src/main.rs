@@ -4,8 +4,8 @@ use mimalloc::MiMalloc;
 
 use market_lab::cli::{
     AuthCommands, BotCommands, BotRunCommands, Cli, Commands, DaemonCommands, OutcomeCommands,
-    PoolCommands, RemoteCommands, ScriptCommands, ScriptRunHistoryCommands, SourceCommands,
-    StrategyCommands, StrategyRunCommands, StudyCommands, TradeCommands, TransportCommands,
+    RemoteCommands, ScriptCommands, ScriptRunHistoryCommands, SourceCommands, StrategyCommands,
+    StrategyRunCommands, StudyCommands, TradeCommands, TransportCommands,
 };
 use market_lab::commands;
 use market_lab::config;
@@ -38,9 +38,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Markets(args) => commands::markets::handle(args).await?,
-        Commands::Pool { command } => match command {
-            PoolCommands::Inspect(args) => commands::pool::handle_inspect(args).await?,
-        },
+        Commands::Pool { command } => commands::pool::handle(command).await?,
         Commands::Trade { command } => match command {
             TradeCommands::Long(args) => {
                 commands::execution::handle_trade(args, PositionDirection::Long).await?
