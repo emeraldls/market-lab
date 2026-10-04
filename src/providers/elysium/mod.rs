@@ -7,6 +7,7 @@ use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
+pub mod token;
 pub mod transactions;
 pub mod wallet;
 

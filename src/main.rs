@@ -39,6 +39,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Markets(args) => commands::markets::handle(args).await?,
         Commands::Pool { command } => commands::pool::handle(command).await?,
+        Commands::Token { command } => commands::token::handle(command).await?,
         Commands::Trade { command } => match command {
             TradeCommands::Long(args) => {
                 commands::execution::handle_trade(args, PositionDirection::Long).await?

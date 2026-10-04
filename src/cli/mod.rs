@@ -4,7 +4,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 mod pool;
+mod token;
 pub use pool::{PoolCommands, PoolInspectArgs, PoolOperatorCommands, PoolRunArgs};
+pub use token::TokenCommands;
 
 use crate::bots::grid::MAX_GRID_LEVELS_PER_SIDE;
 use crate::domain::enums::{BookMode, ProviderKind, Side};
@@ -30,6 +32,11 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     Markets(MarketsArgs),
+    /// Create fixed-supply tokens for testing Elysium liquidity pools.
+    Token {
+        #[command(subcommand)]
+        command: TokenCommands,
+    },
     /// Inspect liquidity pools and manage bounded fee strategies.
     Pool {
         #[command(subcommand)]

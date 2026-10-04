@@ -10,9 +10,11 @@ deps:
 
 build:
 	$(FORGE) build --use $(SOLC) -j 1
+	python3 script/export_test_token.py
 
 check:
-	$(FORGE) script script/Smoke.s.sol:Smoke --use $(SOLC) --chain 31337 -j 1
+	$(FORGE) test --use $(SOLC) -j 1
+	python3 script/export_test_token.py --check
 
 demo:
 	$(FORGE) script script/Smoke.s.sol:Smoke --use $(SOLC) --rpc-url $(RPC) --broadcast --slow -j 1

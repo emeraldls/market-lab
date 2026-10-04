@@ -2,3 +2,5 @@
 .env
 /dist
 .DS_Store
+
+test_token.json
