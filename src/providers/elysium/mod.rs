@@ -2,11 +2,12 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, B256, Bytes, U64, U256, utils::format_units};
 use alloy_sol_types::{SolCall, sol};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use reqwest::{Client, Url};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+mod rpc;
 pub mod token;
 pub mod transactions;
 pub mod wallet;
@@ -196,25 +197,68 @@ impl PoolClient {
             "{pool} is not registered with the MarketLab pool factory"
         );
 
-        let token0 = self.call(pool, Pool::token0Call {}, &at).await?;
-        let token1 = self.call(pool, Pool::token1Call {}, &at).await?;
-        let reserves = self.call(pool, Pool::getReservesCall {}, &at).await?;
-        let first = self.reserve(token0, reserves.reserve0, &at).await?;
-        let second = self.reserve(token1, reserves.reserve1, &at).await?;
-        let manager = self.call(pool, Pool::ownerCall {}, &at).await?;
-        let pending = self.call(pool, Pool::pendingOwnerCall {}, &at).await?;
-        let operator = self.call(pool, Pool::operatorCall {}, &at).await?;
+        self.snapshot_at(pool, block).await
+    }
+
+    async fn snapshot_at(&self, pool: Address, block: &Block) -> Result<PoolSnapshot> {
+        let at = json!({ "blockHash": block.hash, "requireCanonical": true });
+        let values = self
+            .calls(
+                &[
+                    (pool, Pool::token0Call {}.abi_encode()),
+                    (pool, Pool::token1Call {}.abi_encode()),
+                    (pool, Pool::getReservesCall {}.abi_encode()),
+                    (pool, Pool::ownerCall {}.abi_encode()),
+                    (pool, Pool::pendingOwnerCall {}.abi_encode()),
+                    (pool, Pool::operatorCall {}.abi_encode()),
+                    (pool, Pool::feeBpsCall {}.abi_encode()),
+                    (pool, Pool::minFeeBpsCall {}.abi_encode()),
+                    (pool, Pool::maxFeeBpsCall {}.abi_encode()),
+                    (pool, Token::decimalsCall {}.abi_encode()),
+                    (pool, Token::totalSupplyCall {}.abi_encode()),
+                ],
+                &at,
+            )
+            .await?;
+        let token0 = decode::<Pool::token0Call>(&values[0])?;
+        let token1 = decode::<Pool::token1Call>(&values[1])?;
+        let reserves = decode::<Pool::getReservesCall>(&values[2])?;
+        let manager = decode::<Pool::ownerCall>(&values[3])?;
+        let pending = decode::<Pool::pendingOwnerCall>(&values[4])?;
+        let operator = decode::<Pool::operatorCall>(&values[5])?;
+        let fee_bps = decode::<Pool::feeBpsCall>(&values[6])?;
+        let min_fee_bps = decode::<Pool::minFeeBpsCall>(&values[7])?;
+        let max_fee_bps = decode::<Pool::maxFeeBpsCall>(&values[8])?;
+        let lp_decimals = decode::<Token::decimalsCall>(&values[9])?;
+        let supply = decode::<Token::totalSupplyCall>(&values[10])?;
+        let tokens = self
+            .calls(
+                &[
+                    (token0, Token::symbolCall {}.abi_encode()),
+                    (token0, Token::decimalsCall {}.abi_encode()),
+                    (token1, Token::symbolCall {}.abi_encode()),
+                    (token1, Token::decimalsCall {}.abi_encode()),
+                ],
+                &at,
+            )
+            .await?;
+        let reserve = |address, amount, symbol: &Bytes, decimals: &Bytes| -> Result<PoolReserve> {
+            let decimals = decode::<Token::decimalsCall>(decimals)?;
+            Ok(PoolReserve {
+                address,
+                symbol: decode::<Token::symbolCall>(symbol)?,
+                decimals,
+                amount: TokenAmount::new(amount, decimals)?,
+            })
+        };
+        let first = reserve(token0, reserves.reserve0, &tokens[0], &tokens[1])?;
+        let second = reserve(token1, reserves.reserve1, &tokens[2], &tokens[3])?;
         let operator_hype_balance = if operator.is_zero() {
             None
         } else {
             let balance = self.rpc("eth_getBalance", json!([operator, at])).await?;
             Some(TokenAmount::new(balance, 18)?)
         };
-        let fee_bps = self.call(pool, Pool::feeBpsCall {}, &at).await?;
-        let min_fee_bps = self.call(pool, Pool::minFeeBpsCall {}, &at).await?;
-        let max_fee_bps = self.call(pool, Pool::maxFeeBpsCall {}, &at).await?;
-        let lp_decimals = self.call(pool, Token::decimalsCall {}, &at).await?;
-        let supply = self.call(pool, Token::totalSupplyCall {}, &at).await?;
 
         Ok(PoolSnapshot {
             chain_id: self.chain_id,
@@ -236,8 +280,6 @@ impl PoolClient {
     }
 
     pub async fn list(&self, offset: u64, limit: u64) -> Result<Value> {
-        use futures_util::{StreamExt, TryStreamExt, stream};
-
         ensure!(
             (1..=50).contains(&limit),
             "pool page limit must be between 1 and 50"
@@ -250,26 +292,25 @@ impl PoolClient {
             .try_into()
             .context("pool count exceeds supported range")?;
         let end = offset.saturating_add(limit).min(total);
-        let pools: Vec<PoolSnapshot> = stream::iter(offset..end)
+        let requests: Vec<_> = (offset..end)
             .map(|index| {
-                let block = &block;
-                let at = &at;
-                async move {
-                    let pool = self
-                        .call(
-                            self.factory,
-                            PoolFactory::poolsCall {
-                                index: U256::from(total - index - 1),
-                            },
-                            at,
-                        )
-                        .await?;
-                    self.inspect_at(pool, block).await
-                }
+                (
+                    self.factory,
+                    PoolFactory::poolsCall {
+                        index: U256::from(total - index - 1),
+                    }
+                    .abi_encode(),
+                )
             })
-            .buffered(4)
-            .try_collect()
-            .await?;
+            .collect();
+        let addresses = self.calls(&requests, &at).await?;
+        let mut pools = Vec::with_capacity(addresses.len());
+        // Factory enumeration already verifies membership. Keep snapshots sequential
+        // so a cold list does not fan out into four competing RPC bursts.
+        for address in addresses {
+            let pool = decode::<PoolFactory::poolsCall>(&address)?;
+            pools.push(self.snapshot_at(pool, &block).await?);
+        }
         Ok(json!({
             "chain_id": self.chain_id, "factory": self.factory,
             "block_number": block.number.to::<u64>(), "block_hash": block.hash,
@@ -297,33 +338,9 @@ impl PoolClient {
         C::abi_decode_returns_validate(&result)
             .with_context(|| format!("invalid {} response from {address}", C::SIGNATURE))
     }
+}
 
-    async fn rpc<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
-        let response: RpcResponse = self
-            .http
-            .post(self.rpc_url.clone())
-            .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
-            .send()
-            .await
-            .map_err(reqwest::Error::without_url)
-            .with_context(|| format!("Elysium {method} request failed"))?
-            .error_for_status()
-            .map_err(reqwest::Error::without_url)?
-            .json()
-            .await
-            .with_context(|| format!("invalid Elysium {method} response"))?;
-        ensure!(
-            response.id == 1 && response.jsonrpc == "2.0",
-            "invalid Elysium RPC response identity"
-        );
-        if let Some(error) = response.error {
-            bail!(
-                "Elysium {method} failed ({}): {}",
-                error.code,
-                error.message
-            );
-        }
-        serde_json::from_value(response.result)
-            .with_context(|| format!("Elysium {method} returned an invalid result"))
-    }
+fn decode<C: SolCall>(value: &Bytes) -> Result<C::Return> {
+    C::abi_decode_returns_validate(value)
+        .with_context(|| format!("invalid {} response", C::SIGNATURE))
 }
