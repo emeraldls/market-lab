@@ -7,6 +7,7 @@ use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub mod curve;
 mod rpc;
 pub mod token;
 pub mod transactions;
@@ -142,6 +143,7 @@ struct RpcError {
 }
 
 pub struct PoolClient {
+    market: curve::FeeMarket,
     http: Client,
     rpc_url: Url,
     chain_id: u64,
@@ -166,6 +168,7 @@ impl PoolClient {
             "RPC URL must use HTTP or HTTPS"
         );
         Ok(Self {
+            market: curve::FeeMarket::Pool,
             http: Client::builder().timeout(Duration::from_secs(15)).build()?,
             rpc_url,
             chain_id: deployment.chain_id,

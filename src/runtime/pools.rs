@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 
 use crate::credentials;
 use crate::providers::elysium::PoolClient;
+use crate::providers::elysium::curve::FeeMarket;
 use crate::providers::elysium::transactions::SignedFee;
 
 use super::{RuntimeRequest, append_json_line, now_ms};
@@ -123,6 +124,8 @@ pub enum JobStatus {
 pub struct PoolJob {
     pub id: String,
     pub pool: Address,
+    #[serde(default)]
+    pub market: FeeMarket,
     pub rpc_url: Option<Url>,
     pub policy: FeePolicy,
     pub status: JobStatus,
@@ -162,6 +165,8 @@ struct Registry {
 pub enum PoolRequest {
     Start {
         pool: Address,
+        #[serde(default)]
+        market: FeeMarket,
         rpc_url: Option<Url>,
         policy: FeePolicy,
     },
@@ -282,11 +287,12 @@ impl Service {
         match request {
             PoolRequest::Start {
                 pool,
+                market,
                 rpc_url,
                 policy,
             } => {
                 policy.validate()?;
-                PoolClient::new(rpc_url.clone())?;
+                PoolClient::for_market(rpc_url.clone(), market.clone())?;
                 credentials::pool::address()?;
                 let created_at_ms = now_ms()?;
                 let id = format!("pool_{created_at_ms:013x}");
@@ -306,6 +312,7 @@ impl Service {
                     let job = PoolJob {
                         id: id.clone(),
                         pool,
+                        market,
                         rpc_url,
                         policy,
                         status: JobStatus::Running,
@@ -403,7 +410,7 @@ async fn tick(store: &Store) -> Result<()> {
             .jobs
             .get(&pending.job_id)
             .context("pending fee has no job")?;
-        let client = PoolClient::new(job.rpc_url.clone())?;
+        let client = PoolClient::for_market(job.rpc_url.clone(), job.market.clone())?;
         let result =
             tokio::time::timeout(Duration::from_secs(60), reconcile(store, &client, &pending))
                 .await
@@ -458,7 +465,7 @@ fn record_error(store: &Store, id: &str, error: &anyhow::Error, fail: bool) -> R
 }
 
 async fn observe_job(store: &Store, original: &PoolJob) -> Result<()> {
-    let client = PoolClient::new(original.rpc_url.clone())?;
+    let client = PoolClient::for_market(original.rpc_url.clone(), original.market.clone())?;
     let observation = client.observe(original.pool).await?;
     let signer = credentials::pool::load()?;
     ensure!(
@@ -469,10 +476,6 @@ async fn observe_job(store: &Store, original: &PoolJob) -> Result<()> {
         (observation.min_fee_bps..=observation.max_fee_bps).contains(&original.policy.base_fee_bps),
         "base fee is outside the pool bounds"
     );
-    ensure!(
-        !observation.reserve0.is_zero() && !observation.reserve1.is_zero(),
-        "pool has no liquidity"
-    );
     let now = now_ms()?;
     ensure!(
         now / 1000
@@ -481,8 +484,7 @@ async fn observe_job(store: &Store, original: &PoolJob) -> Result<()> {
                 .saturating_add(original.policy.interval.max(60) * 2),
         "RPC pool data is stale"
     );
-    let log_price = observation.reserve1.to_string().parse::<f64>()?.ln()
-        - observation.reserve0.to_string().parse::<f64>()?.ln();
+    let log_price = observation.log_price()?;
     let proposal = store.update(|registry| {
         let job = registry
             .jobs

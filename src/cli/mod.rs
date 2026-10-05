@@ -3,6 +3,8 @@ use chrono::{NaiveDate, NaiveDateTime};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+mod curve;
+pub use curve::{CurveArgs, CurveCommands, CurveSide};
 mod pool;
 mod token;
 pub use pool::{PoolCommands, PoolInspectArgs, PoolOperatorCommands, PoolRunArgs};
@@ -32,6 +34,8 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     Markets(MarketsArgs),
+    /// Open and trade two-way Elysium bonding markets, with optional automatic fees.
+    Curve(CurveArgs),
     /// Create fixed-supply tokens for testing Elysium liquidity pools.
     Token {
         #[command(subcommand)]

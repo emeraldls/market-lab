@@ -208,6 +208,7 @@ async fn handle_run(args: PoolRunArgs) -> Result<()> {
     }
     let result = pools::request(PoolRequest::Start {
         pool: args.address,
+        market: Default::default(),
         rpc_url: args.rpc_url,
         policy: args.policy,
     })
@@ -237,7 +238,7 @@ fn print_job(job: &PoolJob) {
     }
 }
 
-fn print_result(value: &serde_json::Value, output: OutputFormat) -> Result<()> {
+pub(super) fn print_result(value: &serde_json::Value, output: OutputFormat) -> Result<()> {
     match output {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(value)?),
         OutputFormat::Jsonl => println!("{value}"),

@@ -14,7 +14,7 @@ pub struct WalletTransaction {
 }
 
 impl WalletTransaction {
-    fn new<C: SolCall>(chain_id: u64, from: Address, to: Address, call: C) -> Self {
+    pub(super) fn new<C: SolCall>(chain_id: u64, from: Address, to: Address, call: C) -> Self {
         Self {
             chain_id: U64::from(chain_id),
             from,
@@ -317,7 +317,7 @@ impl PoolClient {
         })
     }
 
-    async fn approvals(
+    pub(super) async fn approvals(
         &self,
         pool: Address,
         account: Address,
@@ -564,7 +564,7 @@ impl PoolClient {
     }
 }
 
-fn minimum_amount(amount: U256, slippage_bps: u16) -> Result<U256> {
+pub(super) fn minimum_amount(amount: U256, slippage_bps: u16) -> Result<U256> {
     ensure!(slippage_bps < 10_000, "slippage must be below 10000 bps");
     // Avoid multiplying the full amount: token supplies can use the entire uint256 range.
     let bps = U256::from(10_000);

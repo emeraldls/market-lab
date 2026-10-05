@@ -47,7 +47,7 @@ use crate::volume::{FillVolumeInput, VolumeExporter};
 pub mod pools;
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-pub const RUNTIME_VERSION: u8 = 47;
+pub const RUNTIME_VERSION: u8 = 48;
 // Pool jobs have their own journal; this IPC addition does not change the existing state schema.
 const RUNTIME_STATE_VERSION: u8 = 46;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
@@ -6986,7 +6986,7 @@ mod tests {
 
     #[test]
     fn runtime_protocol_v46_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 47);
+        assert_eq!(RUNTIME_VERSION, 48);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",

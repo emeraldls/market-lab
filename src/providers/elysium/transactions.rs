@@ -11,12 +11,29 @@ pub struct Observation {
     pub block: u64,
     pub block_hash: B256,
     pub timestamp: u64,
+    #[serde(default)]
+    pub spot_price: Option<U256>,
     pub reserve0: U256,
     pub reserve1: U256,
     pub operator: Address,
     pub fee_bps: u16,
     pub min_fee_bps: u16,
     pub max_fee_bps: u16,
+}
+
+impl Observation {
+    pub fn log_price(&self) -> Result<f64> {
+        if let Some(price) = self.spot_price {
+            ensure!(!price.is_zero(), "market price must be positive");
+            return Ok(price.to_string().parse::<f64>()?.ln());
+        }
+        ensure!(
+            !self.reserve0.is_zero() && !self.reserve1.is_zero(),
+            "pool has no liquidity"
+        );
+        Ok(self.reserve1.to_string().parse::<f64>()?.ln()
+            - self.reserve0.to_string().parse::<f64>()?.ln())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -43,6 +60,9 @@ pub struct FeeReceipt {
 
 impl PoolClient {
     pub async fn observe(&self, pool: Address) -> Result<Observation> {
+        if matches!(self.market, curve::FeeMarket::Curve { .. }) {
+            return self.observe_curve(pool).await;
+        }
         let chain: U64 = self.rpc("eth_chainId", json!([])).await?;
         ensure!(
             chain.to::<u64>() == self.chain_id,
@@ -62,6 +82,7 @@ impl PoolClient {
             block: block.number.to(),
             block_hash: block.hash,
             timestamp: block.timestamp.to(),
+            spot_price: None,
             reserve0: reserves.reserve0,
             reserve1: reserves.reserve1,
             operator: self.call(pool, Pool::operatorCall {}, &at).await?,

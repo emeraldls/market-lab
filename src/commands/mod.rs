@@ -1,4 +1,5 @@
 pub mod bot;
+pub mod curve;
 pub mod execution;
 pub mod market;
 pub mod markets;
