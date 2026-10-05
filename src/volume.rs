@@ -267,6 +267,7 @@ fn market_name(market: VenueMarket, venue: ExecutionVenue, symbol: &str) -> &'st
         VenueMarket::Perpetual => "perpetual",
         VenueMarket::Spot => "spot",
         VenueMarket::Outcome => "outcome",
+        VenueMarket::Contract => "contract",
     }
 }
 

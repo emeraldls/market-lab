@@ -142,6 +142,8 @@ pub struct TradeTick {
     pub price: f64,
     pub size: f64,
     pub taker_buy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onchain: Option<Box<crate::domain::onchain::OnchainTrade>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

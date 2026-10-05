@@ -45,6 +45,13 @@ pub trait MarketDataProvider: Send + Sync {
         None
     }
 
+    /// Resolve a source symbol; dynamic providers validate membership when connecting.
+    async fn resolve_symbol(&self, symbol: &str) -> Result<String> {
+        Ok(crate::markets::exchange_market(self.exchange(), symbol)?
+            .symbol
+            .clone())
+    }
+
     async fn health(&self) -> Result<ProviderHealth>;
 
     async fn candles(
@@ -227,6 +234,17 @@ struct HyperliquidMarketData {
 
 #[async_trait]
 impl MarketDataProvider for HyperliquidMarketData {
+    async fn resolve_symbol(&self, symbol: &str) -> Result<String> {
+        if self.product == HyperliquidProduct::Outcome {
+            return Ok(crate::markets::outcomes::resolve(self.network, symbol)
+                .await?
+                .symbol);
+        }
+        Ok(crate::markets::exchange_market(self.exchange(), symbol)?
+            .symbol
+            .clone())
+    }
+
     fn exchange(&self) -> &str {
         &self.exchange
     }
@@ -469,6 +487,9 @@ impl MarketDataAdapter {
         spec.validate_network(testnet)?;
         let market_data = spec.market_data_venue.spec()?;
         let provider: Box<dyn MarketDataProvider> = match market_data.execution {
+            ExecutionBackend::Elysium => {
+                Box::new(crate::providers::elysium::market_data::ElysiumMarketData)
+            }
             ExecutionBackend::Bulk => Box::new(BulkMarketData {
                 provider: BulkProvider::new(testnet),
             }),
@@ -526,6 +547,10 @@ impl MarketDataAdapter {
 
     pub fn timeframe_from_seconds(&self, seconds: u32) -> Result<&'static str> {
         self.provider.timeframe_from_seconds(seconds)
+    }
+
+    pub async fn resolve_symbol(&self, symbol: &str) -> Result<String> {
+        self.provider.resolve_symbol(symbol).await
     }
 
     pub async fn health(&self) -> Result<ProviderHealth> {
@@ -731,8 +756,26 @@ impl VenueOrderBookStream {
     }
 }
 
+/// A canonical-history violation must stop the consumer, not reconnect at a new head.
+#[derive(Debug)]
+pub struct StreamIntegrityError(pub &'static str);
+
+impl std::fmt::Display for StreamIntegrityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for StreamIntegrityError {}
+
 #[async_trait]
 pub trait TradeEvents: Send {
+    fn checkpoint(&self) -> Option<serde_json::Value> {
+        None
+    }
+    fn restore_checkpoint(&mut self, _checkpoint: serde_json::Value) -> Result<()> {
+        bail!("trade stream does not support restoring checkpoints")
+    }
+
     async fn next_trades(&mut self) -> Result<Vec<TradeTick>>;
 }
 
@@ -769,5 +812,12 @@ impl VenueTradesStream {
 
     pub async fn next_trades(&mut self) -> Result<Vec<TradeTick>> {
         self.inner.next_trades().await
+    }
+
+    pub fn resume_from(&mut self, previous: &Self) -> Result<()> {
+        if let Some(checkpoint) = previous.inner.checkpoint() {
+            self.inner.restore_checkpoint(checkpoint)?;
+        }
+        Ok(())
     }
 }

@@ -545,11 +545,7 @@ fn validate_source_market(_provider: ProviderKind, exchange: &str, symbol: &str)
     if exchange.eq_ignore_ascii_case("hyperliquidf") {
         return crate::providers::hyperliquid::parse_perpetual_symbol(symbol).map(|_| ());
     }
-    let market_type = if crate::markets::is_futures_exchange(exchange)? {
-        crate::markets::MarketType::Futures
-    } else {
-        crate::markets::MarketType::Spot
-    };
+    let market_type = crate::markets::market_type(exchange)?;
     crate::markets::canonical_market_symbol(symbol, market_type).map(|_| ())
 }
 

@@ -5,6 +5,7 @@ use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 
 use super::*;
+use crate::domain::contracts::{SignedTransaction, WalletTransaction};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Observation {
@@ -47,16 +48,7 @@ pub struct SignedFee {
     pub max_gas_cost_wei: U256,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FeeReceipt {
-    pub transaction_hash: B256,
-    pub block_hash: B256,
-    pub block_number: U64,
-    pub status: U64,
-    pub gas_used: U64,
-    pub effective_gas_price: U128,
-}
+pub use crate::domain::contracts::TransactionReceipt as FeeReceipt;
 
 impl PoolClient {
     pub async fn observe(&self, pool: Address) -> Result<Observation> {
@@ -109,6 +101,49 @@ impl PoolClient {
             (observation.min_fee_bps..=observation.max_fee_bps).contains(&fee_bps),
             "requested fee is outside the pool bounds"
         );
+        let signed = self
+            .prepare_transaction(
+                &WalletTransaction::new(
+                    self.chain_id,
+                    signer.address(),
+                    pool,
+                    Pool::setFeeCall { feeBps: fee_bps },
+                ),
+                signer,
+                max_gas_cost,
+            )
+            .await?;
+        Ok(SignedFee {
+            hash: signed.hash,
+            raw: signed.raw,
+            sender: signed.sender,
+            nonce: signed.nonce,
+            pool,
+            fee_bps,
+            max_gas_cost_wei: signed.max_gas_cost_wei,
+        })
+    }
+
+    /// Sign a provider-prepared call. Callers serialize wallet access and persist before broadcast.
+    pub async fn prepare_transaction(
+        &self,
+        call: &WalletTransaction,
+        signer: &PrivateKeySigner,
+        max_gas_cost: U256,
+    ) -> Result<SignedTransaction> {
+        ensure!(
+            call.chain_id.to::<u64>() == self.chain_id,
+            "transaction targets a different chain"
+        );
+        ensure!(
+            call.from == signer.address(),
+            "transaction sender does not match signing wallet"
+        );
+        let chain: U64 = self.rpc("eth_chainId", json!([])).await?;
+        ensure!(
+            chain.to::<u64>() == self.chain_id,
+            "incorrect Elysium chain ID"
+        );
         let sender = signer.address();
         let latest: U64 = self
             .rpc("eth_getTransactionCount", json!([sender, "latest"]))
@@ -118,17 +153,9 @@ impl PoolClient {
             .await?;
         ensure!(
             latest == pending,
-            "operator has an untracked pending transaction; wait for it to settle"
+            "wallet has an untracked pending transaction; wait for it to settle"
         );
-        let data: Bytes = Pool::setFeeCall { feeBps: fee_bps }.abi_encode().into();
-        let estimate: U64 = self
-            .rpc(
-                "eth_estimateGas",
-                json!([{
-                    "from": sender, "to": pool, "data": data, "value": "0x0"
-                }]),
-            )
-            .await?;
+        let estimate: U64 = self.rpc("eth_estimateGas", json!([call])).await?;
         let gas_limit = estimate
             .to::<u64>()
             .checked_mul(120)
@@ -147,14 +174,18 @@ impl PoolClient {
         let max_gas_cost_wei = U256::from(gas_limit) * U256::from(max_fee_per_gas);
         ensure!(
             max_gas_cost_wei <= max_gas_cost,
-            "fee transaction exceeds the configured HYPE gas cap"
+            "transaction exceeds the configured HYPE gas cap"
         );
         let balance: U256 = self
             .rpc("eth_getBalance", json!([sender, "pending"]))
             .await?;
+        let total = call
+            .value
+            .checked_add(max_gas_cost_wei)
+            .context("transaction cost overflow")?;
         ensure!(
-            balance >= max_gas_cost_wei,
-            "pool operator needs more native HYPE for gas"
+            balance >= total,
+            "signing wallet needs more native HYPE for the payment and gas"
         );
         let transaction = TxEip1559 {
             chain_id: self.chain_id,
@@ -162,33 +193,51 @@ impl PoolClient {
             gas_limit,
             max_fee_per_gas,
             max_priority_fee_per_gas: priority.to(),
-            to: TxKind::Call(pool),
-            input: data,
+            to: TxKind::Call(call.to),
+            input: call.data.clone(),
+            value: call.value,
             ..Default::default()
         };
         let signature = signer.sign_hash_sync(&transaction.signature_hash())?;
         let envelope: TxEnvelope = transaction.into_signed(signature).into();
         let raw: Bytes = envelope.encoded_2718().into();
-        Ok(SignedFee {
+        Ok(SignedTransaction {
+            chain_id: self.chain_id,
             hash: keccak256(&raw),
             raw,
             sender,
             nonce: pending.to(),
-            pool,
-            fee_bps,
+            to: call.to,
+            value: call.value,
             max_gas_cost_wei,
         })
     }
 
+    pub async fn broadcast_transaction(&self, signed: &SignedTransaction) -> Result<()> {
+        ensure!(
+            signed.chain_id == self.chain_id,
+            "transaction targets a different chain"
+        );
+        self.broadcast_raw(signed.hash, &signed.raw).await
+    }
+
     pub async fn broadcast_fee(&self, fee: &SignedFee) -> Result<()> {
+        self.broadcast_raw(fee.hash, &fee.raw).await
+    }
+
+    async fn broadcast_raw(&self, expected_hash: B256, raw: &Bytes) -> Result<()> {
+        ensure!(
+            keccak256(raw) == expected_hash,
+            "signed transaction hash mismatch"
+        );
         let chain: U64 = self.rpc("eth_chainId", json!([])).await?;
         ensure!(
             chain.to::<u64>() == self.chain_id,
             "incorrect Elysium chain ID"
         );
-        let hash: B256 = self.rpc("eth_sendRawTransaction", json!([fee.raw])).await?;
+        let hash: B256 = self.rpc("eth_sendRawTransaction", json!([raw])).await?;
         ensure!(
-            hash == fee.hash,
+            hash == expected_hash,
             "RPC returned a different transaction hash"
         );
         Ok(())

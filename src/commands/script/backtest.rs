@@ -1526,6 +1526,9 @@ fn apply_script_execution_commands(
     let mut submitted = 0;
     for command in commands {
         match command {
+            ScriptExecutionCommand::Contract { .. } => bail!(
+                "contract execution backtests require historical AMM state simulation and are not supported yet"
+            ),
             ScriptExecutionCommand::Trade {
                 order,
                 exchange,

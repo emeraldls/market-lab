@@ -713,8 +713,8 @@ pub struct AuthSetArgs {
     /// Replace the locally stored agent; does not revoke the old agent remotely.
     #[arg(long, requires = "agent")]
     pub replace: bool,
-    /// Output format for agent import (terminal or json).
-    #[arg(long, requires = "agent", value_parser = ["terminal", "json"])]
+    /// Output format for agent import or Elysium wallet setup (terminal or json).
+    #[arg(long, value_parser = ["terminal", "json"])]
     pub output: Option<String>,
     /// Replace remote execution credentials after their replacements are confirmed.
     #[arg(long, default_value_t = false)]
@@ -741,6 +741,7 @@ pub struct AuthProviderArgs {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum AuthProvider {
+    Elysium,
     Mmt,
     Bulk,
     Hyperliquid,
@@ -2588,6 +2589,7 @@ fn validate_execution_symbol(venue: ExecutionVenueArg, symbol: &str) -> Result<(
         return crate::markets::outcomes::parse_symbol(symbol).map(|_| ());
     }
     let market_type = match market {
+        crate::venues::VenueMarket::Contract => crate::markets::MarketType::Contract,
         crate::venues::VenueMarket::Spot => crate::markets::MarketType::Spot,
         crate::venues::VenueMarket::Perpetual => crate::markets::MarketType::Futures,
         crate::venues::VenueMarket::Outcome => unreachable!("handled above"),

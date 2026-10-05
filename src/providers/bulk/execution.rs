@@ -39,6 +39,7 @@ impl BulkExecutionAdapter {
     pub fn capabilities() -> VenueCapabilities {
         VenueCapabilities {
             venue: ExecutionVenue::Bulk,
+            contract_actions: false,
             order_kinds: vec![OrderKind::Market, OrderKind::Limit],
             time_in_forces: vec![
                 crate::domain::execution::TimeInForce::Gtc,

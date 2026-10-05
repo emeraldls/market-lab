@@ -73,6 +73,9 @@ impl HyperliquidProduct {
             anyhow::bail!("`{venue}` is not a Hyperliquid execution venue");
         }
         match market {
+            crate::venues::VenueMarket::Contract => {
+                anyhow::bail!("Hyperliquid does not execute EVM contract calls")
+            }
             crate::venues::VenueMarket::Spot => Ok(Self::Spot),
             crate::venues::VenueMarket::Outcome => Ok(Self::Outcome),
             crate::venues::VenueMarket::Perpetual => Ok(Self::Perpetual),

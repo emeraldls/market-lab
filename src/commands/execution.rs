@@ -1031,6 +1031,9 @@ fn execution_rules(
     market: &Market,
 ) -> Result<crate::markets::ExecutionRules> {
     match crate::markets::execution_market(venue, &market.symbol)? {
+        VenueMarket::Contract => {
+            bail!("contract markets use swaps and liquidity actions, not order-book orders")
+        }
         VenueMarket::Spot => market
             .network_variant(HyperliquidNetwork::from_testnet(testnet).label())
             .map(|variant| variant.execution),
@@ -1043,6 +1046,9 @@ fn execution_rules(
 
 fn execution_venue_symbol(venue: ExecutionVenue, testnet: bool, market: &Market) -> Result<String> {
     match crate::markets::execution_market(venue, &market.symbol)? {
+        VenueMarket::Contract => {
+            bail!("contract markets use swaps and liquidity actions, not order-book orders")
+        }
         VenueMarket::Spot => market
             .network_variant(HyperliquidNetwork::from_testnet(testnet).label())
             .map(|variant| variant.venue_symbol),

@@ -1,6 +1,6 @@
 {
   "chainId": 99801,
-  "rpcUrl": "https://testnet-rpc.elysium.kinetiq.xyz",
+  "rpcUrl": "https://elysium-testnet-rpc.hypedexer.com",
   "contracts": {
     "PoolFactory": {
       "address": "0xAc139b041074140e98E62B69d1eC1667AAb2caDE",

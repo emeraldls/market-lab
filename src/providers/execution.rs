@@ -15,6 +15,9 @@ use crate::providers::hyperliquid::ws::{HyperliquidAccountStream, HyperliquidTra
 use crate::providers::hyperliquid::{HyperliquidNetwork, HyperliquidProduct};
 use crate::venues::{AuthBackend, ExecutionBackend, VenueMarket};
 
+mod contracts;
+pub use contracts::{ContractProvider, contract_provider};
+
 /// Common contract implemented by every execution exchange.
 ///
 /// Runtime, bots, strategies, and scripts depend on this contract only. A new
@@ -333,6 +336,17 @@ impl AccountEvents for HyperlinkAccountStream {
 trait ExecutionProviderFactory: Send + Sync {
     fn capabilities(&self, venue: ExecutionVenue) -> VenueCapabilities;
 
+    fn environment_names(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    async fn contracts(
+        &self,
+        _market: alloy_primitives::Address,
+    ) -> Result<Box<dyn ContractProvider>> {
+        bail!("this execution venue does not support contract operations")
+    }
+
     async fn adapter(
         &self,
         venue: ExecutionVenue,
@@ -359,6 +373,21 @@ trait ExecutionProviderFactory: Send + Sync {
     async fn connect_transport(&self, testnet: bool) -> Result<()>;
 }
 
+/// Explicit provider configuration that may be forwarded into a managed daemon.
+pub(crate) fn daemon_environment_names() -> Vec<&'static str> {
+    crate::venues::BUILTIN_VENUES
+        .iter()
+        .flat_map(|venue| {
+            execution_factory(venue.id)
+                .environment_names()
+                .iter()
+                .copied()
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 struct BulkFactory;
 struct HyperliquidFactory;
 struct HyperlinkFactory;
@@ -369,6 +398,7 @@ static HYPERLINK_FACTORY: HyperlinkFactory = HyperlinkFactory;
 
 fn execution_factory(venue: ExecutionVenue) -> &'static dyn ExecutionProviderFactory {
     match venue.execution_backend() {
+        ExecutionBackend::Elysium => &contracts::ElysiumFactory,
         ExecutionBackend::Bulk => &BULK_FACTORY,
         ExecutionBackend::Hyperliquid => &HYPERLIQUID_FACTORY,
         ExecutionBackend::Hyperlink => &HYPERLINK_FACTORY,
@@ -527,6 +557,7 @@ impl ExecutionProviderFactory for HyperlinkFactory {
             HyperliquidExecutionAdapter::new_hyperlink_for(match market {
                 VenueMarket::Spot => HyperliquidProduct::Spot,
                 VenueMarket::Perpetual => HyperliquidProduct::Perpetual,
+                VenueMarket::Contract => bail!("HyperLink does not support contract operations"),
                 VenueMarket::Outcome => bail!("HyperLink does not support outcome markets"),
             })
             .await?,
@@ -980,6 +1011,7 @@ fn execution_transports(venues: &[ExecutionVenue]) -> Vec<ExecutionVenue> {
     let mut transports = Vec::new();
     for venue in venues {
         let transport = match venue.execution_backend() {
+            ExecutionBackend::Elysium => ExecutionVenue::Elysium,
             ExecutionBackend::Bulk => ExecutionVenue::Bulk,
             ExecutionBackend::Hyperliquid => ExecutionVenue::Hyperliquid,
             ExecutionBackend::Hyperlink => ExecutionVenue::Hyperlink,
@@ -1061,6 +1093,7 @@ impl ExecutionAdapter {
                 account_name,
             ),
             AuthBackend::Hyperlink => credentials::hyperlink_account_for(account_name),
+            AuthBackend::Elysium => credentials::elysium::account(account_name),
         }
     }
 
@@ -1076,6 +1109,10 @@ impl ExecutionAdapter {
                 credentials::hyperliquid_accounts(HyperliquidNetwork::from_testnet(testnet))
             }
             AuthBackend::Hyperlink => credentials::hyperlink_accounts(),
+            AuthBackend::Elysium => Ok(vec![(
+                "main".into(),
+                credentials::elysium::account("main")?,
+            )]),
         }
     }
 

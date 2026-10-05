@@ -23,7 +23,6 @@ use crate::domain::types::{
     OiCandle, OpenInterestSnapshot, OrderBookSnapshot, TradeTick, VdCandle, VolumeDeltaTick,
     VolumeProfile,
 };
-use crate::providers::hyperliquid::{HyperliquidNetwork, HyperliquidProduct};
 use crate::providers::market_data::{
     MarketDataAdapter, VenueCandleStream, VenueOrderBookStream, VenueTickerStream,
     VenueTradesStream,
@@ -129,6 +128,7 @@ enum ScriptStreamEvent {
     Update(Box<LiveUpdate>),
     Disconnected { error: String, retry_seconds: u64 },
     Reconnected,
+    Failed { error: String },
 }
 
 struct ScriptWorkerState<'a> {
@@ -585,6 +585,7 @@ async fn stream_sources(
             event = stream_events.recv() => {
                 match event.context("script market-data supervisor stopped unexpectedly")? {
                     ScriptStreamEvent::Update(update) => *update,
+                    ScriptStreamEvent::Failed { error } => bail!("market-data stream stopped: {error}"),
                     ScriptStreamEvent::Disconnected { error, retry_seconds } => {
                         execution_references.clear();
                         let cleanup_error = if script.language == ScriptLanguage::PythonV2
@@ -765,6 +766,11 @@ async fn dispatch_execution_commands(
 ) -> Result<()> {
     for command in commands {
         let result = match command {
+            ScriptExecutionCommand::Contract { submission } => {
+                crate::runtime::contracts::submit(job_id, submission)
+                    .await
+                    .map(|_| ())
+            }
             ScriptExecutionCommand::Trade {
                 order,
                 exchange,
@@ -1112,7 +1118,7 @@ impl ScriptLiveStreams {
         result
     }
 
-    fn carry_runtime_state_from(&mut self, previous: &Self) {
+    fn carry_runtime_state_from(&mut self, previous: &Self) -> Result<()> {
         for current in &mut self.direct {
             if let Some(previous) = previous.direct.iter().find(|previous| {
                 previous.provider == current.provider
@@ -1120,8 +1126,14 @@ impl ScriptLiveStreams {
                     && previous.symbol == current.symbol
             }) {
                 current.cumulative_delta = previous.cumulative_delta;
+                current.pending = previous.pending.clone();
+                current.latest_trade = previous.latest_trade.clone();
+                if let (Some(current), Some(previous)) = (&mut current.trades, &previous.trades) {
+                    current.resume_from(previous)?;
+                }
             }
         }
+        Ok(())
     }
 }
 
@@ -1130,27 +1142,9 @@ async fn resolve_direct_market_symbol(
     requested: &str,
     testnet: bool,
 ) -> Result<String> {
-    if let Ok(venue) = ExecutionVenue::parse(exchange) {
-        let market_data_venue = venue.market_data_id();
-        let product =
-            HyperliquidProduct::from_exchange_symbol(market_data_venue.as_str(), requested).ok();
-        if product == Some(HyperliquidProduct::Outcome) {
-            return Ok(crate::markets::outcomes::resolve(
-                HyperliquidNetwork::from_testnet(testnet),
-                requested,
-            )
-            .await?
-            .symbol);
-        }
-        return Ok(
-            crate::markets::exchange_market(market_data_venue.as_str(), requested)?
-                .symbol
-                .clone(),
-        );
-    }
-    Ok(crate::markets::exchange_market(exchange, requested)?
-        .symbol
-        .clone())
+    MarketDataAdapter::for_exchange_market(exchange, testnet, requested)?
+        .resolve_symbol(requested)
+        .await
 }
 
 fn spawn_script_stream_supervisor(
@@ -1189,6 +1183,14 @@ async fn supervise_script_streams(
             }
             Ok(None) => {}
             Err(error) => {
+                if error.is::<crate::providers::market_data::StreamIntegrityError>() {
+                    let _ = sender
+                        .send(ScriptStreamEvent::Failed {
+                            error: format!("{error:#}"),
+                        })
+                        .await;
+                    return;
+                }
                 if sender
                     .send(ScriptStreamEvent::Disconnected {
                         error: format!("{error:#}"),
@@ -1203,7 +1205,14 @@ async fn supervise_script_streams(
                     tokio::time::sleep(Duration::from_secs(retry_seconds)).await;
                     match ScriptLiveStreams::connect(&source_configs, testnet).await {
                         Ok(mut reconnected) => {
-                            reconnected.carry_runtime_state_from(&streams);
+                            if let Err(error) = reconnected.carry_runtime_state_from(&streams) {
+                                let _ = sender
+                                    .send(ScriptStreamEvent::Failed {
+                                        error: format!("{error:#}"),
+                                    })
+                                    .await;
+                                return;
+                            }
                             streams = reconnected;
                             retry_seconds = 1;
                             if sender.send(ScriptStreamEvent::Reconnected).await.is_err() {
@@ -1765,6 +1774,7 @@ fn mmt_trade_updates(
             LiveRecord::Trades(LiveTrade {
                 timestamp_ms,
                 record: ScriptTrade {
+                    onchain: None,
                     price: raw.p,
                     size: raw.q,
                 },
@@ -1784,6 +1794,7 @@ fn mmt_trade_updates(
             price: raw.p,
             size: raw.q,
             taker_buy: !raw.b,
+            onchain: None,
         };
         let aggregator = candle_aggregators
             .get_mut(&config.selector)
@@ -2169,6 +2180,33 @@ impl std::error::Error for ScriptCancelled {}
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn resolves_dynamic_contract_sources_without_snapshots() {
+        let address = "0x59675174f1700677e608f86016f1cea764e1abfa";
+        assert!(crate::markets::exchange_market("elysium", address).is_err());
+        let resolved = resolve_direct_market_symbol("elysium", &address.to_uppercase(), false)
+            .await
+            .unwrap();
+        assert_eq!(resolved.to_lowercase(), address);
+        for invalid in [
+            "gurt",
+            "0x1234",
+            "0x0000000000000000000000000000000000000000",
+        ] {
+            assert!(
+                resolve_direct_market_symbol("elysium", invalid, false)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            resolve_direct_market_symbol("bulkf", "btc", false)
+                .await
+                .unwrap(),
+            "BTC"
+        );
+    }
+
     fn candle(close: f64) -> ScriptCandle {
         ScriptCandle {
             t: 1_780_000_000_000,
@@ -2342,6 +2380,7 @@ mod tests {
             LiveRecord::Trades(LiveTrade {
                 timestamp_ms: 1_700_000_000_000,
                 record: ScriptTrade {
+                    onchain: None,
                     price: 42_000.0,
                     size: 0.25,
                 },

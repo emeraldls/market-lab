@@ -562,6 +562,7 @@ impl HyperliquidTradesStream {
                         price: parse(&trade.px, "trade price")?,
                         size: parse(&trade.sz, "trade size")?,
                         taker_buy: trade.side.eq_ignore_ascii_case("B"),
+                        onchain: None,
                     })
                 })
                 .collect();

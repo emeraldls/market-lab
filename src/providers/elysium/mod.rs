@@ -7,9 +7,12 @@ use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub mod contracts;
 pub mod curve;
+pub mod market_data;
 mod rpc;
 pub mod token;
+mod trade_socket;
 pub mod transactions;
 pub mod wallet;
 
@@ -347,3 +350,6 @@ fn decode<C: SolCall>(value: &Bytes) -> Result<C::Return> {
     C::abi_decode_returns_validate(value)
         .with_context(|| format!("invalid {} response", C::SIGNATURE))
 }
+
+#[cfg(test)]
+mod contracts_tests;

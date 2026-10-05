@@ -1111,7 +1111,7 @@ def inspect_execution_venues(tree, constants):
         function = node.func
         if not (
             isinstance(function, ast.Attribute)
-            and function.attr in ("trade", "order")
+            and function.attr in ("trade", "order", "swap", "deposit", "withdraw")
             and isinstance(function.value, ast.Name)
             and function.value.id == "ctx"
         ):
@@ -1385,6 +1385,15 @@ class Context:
 
     def cancel(self, request):
         return self._execution("cancel", request)
+
+    def swap(self, request):
+        return self._execution("swap", request)
+
+    def deposit(self, request):
+        return self._execution("deposit", request)
+
+    def withdraw(self, request):
+        return self._execution("withdraw", request)
 
     def artifact_path(self, name):
         if not isinstance(name, str) or not name.strip():
@@ -2227,6 +2236,49 @@ def on_data(ctx, history):
         };
         assert!(format!("{error:#}").contains("cannot declare a source dynamically"));
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn python_contract_helpers_declare_venue_and_queue_exact_amounts() {
+        let path = write_python_script(
+            r#"
+script = {"name": "contracts", "version": "2"}
+MARKET = "0x1111111111111111111111111111111111111111"
+
+def on_data(ctx):
+    buy = ctx.swap({"exchange": "elysium", "market": MARKET, "token_in": "native", "amount": "0.000000000000000001", "key": "buy"})
+    ctx.deposit({"exchange": "elysium", "market": MARKET, "amount0": "1", "amount1": "2"})
+    ctx.withdraw({"exchange": "elysium", "market": MARKET, "shares": "0.1"})
+    return {"metrics": {"key": buy["key"]}}
+"#,
+            "contracts",
+        );
+        if !python_available(&path) {
+            let _ = fs::remove_file(path);
+            return;
+        }
+        let script = Script::load(&path).unwrap();
+        assert_eq!(script.execution_venues(), [ExecutionVenue::Elysium]);
+        let session = script
+            .start_session_with_execution(
+                &json!({}),
+                ScriptExecutionContext {
+                    job_id: "script_test".into(),
+                    enabled: true,
+                    request_routed: true,
+                },
+            )
+            .unwrap();
+        let execution = session.run_event(candle_event(1_000, 100.0)).unwrap();
+        assert_eq!(execution.commands.len(), 3);
+        assert_eq!(execution.output.metrics["key"], "buy");
+        let ScriptExecutionCommand::Contract { submission } = &execution.commands[0] else {
+            panic!("expected contract operation");
+        };
+        assert!(
+            matches!(&submission.request.action, crate::domain::contracts::ContractAction::Swap { amount, .. } if amount == "0.000000000000000001")
+        );
         let _ = fs::remove_file(path);
     }
 

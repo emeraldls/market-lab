@@ -44,10 +44,11 @@ use crate::strategies::jobs::{
 use crate::venues::VenueMarket;
 use crate::volume::{FillVolumeInput, VolumeExporter};
 
+pub mod contracts;
 pub mod pools;
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-pub const RUNTIME_VERSION: u8 = 48;
+pub const RUNTIME_VERSION: u8 = 49;
 // Pool jobs have their own journal; this IPC addition does not change the existing state schema.
 const RUNTIME_STATE_VERSION: u8 = 46;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
@@ -146,6 +147,10 @@ impl RuntimeStatus {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum RuntimeRequest {
+    ScriptContract {
+        job_id: String,
+        submission: contracts::Submission,
+    },
     Pool {
         request: pools::PoolRequest,
     },
@@ -620,6 +625,8 @@ pub async fn serve() -> Result<()> {
     persist_state(&paths, &state)?;
     let adapter = BulkExecutionAdapter::new(false)?;
     let pool_service = pools::Service::start(&paths.directory)?;
+    let contract_service = contracts::Service::start(&paths.directory)?;
+    let mut contract_events = tokio::time::interval(std::time::Duration::from_millis(500));
     let volume_exporter = match VolumeExporter::start(&daemon::market_lab_home()?) {
         Ok(exporter) => exporter,
         Err(error) => {
@@ -650,6 +657,11 @@ pub async fn serve() -> Result<()> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => should_stop = true,
             _ = terminate.recv() => should_stop = true,
+            _ = contract_events.tick() => {
+                if let Err(error) = contract_service.flush_events(&paths, &mut state) {
+                    record_runtime_error(&paths, &mut state, format!("contract event delivery failed: {error:#}"));
+                }
+            }
             accepted = listener.accept() => {
                 let stream = accepted.context("mlabd failed to accept a local connection")?;
                 match handle_connection(
@@ -659,7 +671,7 @@ pub async fn serve() -> Result<()> {
                     &adapter,
                     &mut state,
                     (&account_tx, &mut account_supervisors),
-                    &pool_service,
+                    (&pool_service, &contract_service),
                 ).await {
                     Ok(stop) => should_stop = stop,
                     Err(error) => record_runtime_error(
@@ -687,6 +699,7 @@ pub async fn serve() -> Result<()> {
         }
     }
 
+    drop(contract_service);
     drop(pool_service);
     let active_jobs = state
         .script_jobs
@@ -1219,6 +1232,12 @@ fn docker_create_args(config: &DaemonConfig, home: &Path, uid: u32, gid: u32) ->
             "--env".to_string(),
             format!("{}=required", crate::scripting::sandbox::POLICY_ENV),
         ]);
+    }
+    for name in crate::providers::execution::daemon_environment_names() {
+        if std::env::var_os(name).is_some() {
+            // Docker copies the environment value without exposing RPC credentials in argv.
+            args.extend(["--env".to_string(), name.to_string()]);
+        }
     }
     args.extend([config.docker.image.clone(), "serve".to_string()]);
     args
@@ -4503,9 +4522,10 @@ async fn handle_connection(
     adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
     account: (&mpsc::Sender<AccountConnectionEvent>, &mut HashSet<String>),
-    pool_service: &pools::Service,
+    services: (&pools::Service, &contracts::Service),
 ) -> Result<bool> {
     let (account_tx, account_supervisors) = account;
+    let (pool_service, contract_service) = services;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut line = String::new();
     BufReader::new(reader)
@@ -4558,6 +4578,16 @@ async fn handle_connection(
     }
     let should_stop = matches!(request, RuntimeRequest::Stop);
     let response = match request {
+        RuntimeRequest::ScriptContract { job_id, submission } => {
+            persist_state(paths, state)?;
+            match contract_service.enqueue(state, &job_id, submission) {
+                Ok(reference) => RuntimeResponse {
+                    action_response: Some(serde_json::to_value(reference)?),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
         RuntimeRequest::Pool { request } => match pool_service.handle(request) {
             Ok(value) => RuntimeResponse {
                 action_response: Some(value),
@@ -6986,7 +7016,7 @@ mod tests {
 
     #[test]
     fn runtime_protocol_v46_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 48);
+        assert_eq!(RUNTIME_VERSION, 49);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",

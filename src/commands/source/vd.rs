@@ -301,6 +301,7 @@ mod tests {
                 price: 100_000.0,
                 size: 0.15,
                 taker_buy: true,
+                onchain: None,
             },
             TradeTick {
                 exchange: "bulkf".to_string(),
@@ -309,6 +310,7 @@ mod tests {
                 price: 100_001.0,
                 size: 0.05,
                 taker_buy: false,
+                onchain: None,
             },
         ];
         let mut cumulative = 1.0;

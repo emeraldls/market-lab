@@ -53,6 +53,8 @@ pub enum PriceEncoding {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VenueCapabilities {
     pub venue: ExecutionVenue,
+    #[serde(default)]
+    pub contract_actions: bool,
     pub order_kinds: Vec<OrderKind>,
     pub time_in_forces: Vec<TimeInForce>,
     pub reduce_only: bool,

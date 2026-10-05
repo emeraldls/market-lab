@@ -3,6 +3,9 @@ use crate::providers::hyperliquid::client::HyperliquidClient;
 
 pub(super) async fn import(args: AuthSetArgs) -> Result<()> {
     let provider = match args.provider {
+        AuthProvider::Elysium => bail!(
+            "Elysium uses a funded trading wallet, not an exchange agent; run `mlab auth set elysium`"
+        ),
         AuthProvider::Mmt => bail!("MMT uses an API key, not an agent wallet"),
         AuthProvider::Bulk => "bulk",
         AuthProvider::Hyperliquid => "hyperliquid",
@@ -25,7 +28,7 @@ pub(super) async fn import(args: AuthSetArgs) -> Result<()> {
         AuthProvider::Hyperliquid | AuthProvider::Hyperlink => {
             import_evm(&args, &account, &private_key).await?
         }
-        AuthProvider::Mmt => unreachable!(),
+        AuthProvider::Mmt | AuthProvider::Elysium => unreachable!(),
     };
     let network = if args.testnet { "testnet" } else { "mainnet" };
     if args.output.as_deref() == Some("json") {

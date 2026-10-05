@@ -3,15 +3,7 @@ use alloy_sol_types::SolEvent;
 
 use super::*;
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WalletTransaction {
-    pub chain_id: U64,
-    pub from: Address,
-    pub to: Address,
-    pub data: Bytes,
-    pub value: U256,
-}
+pub use crate::domain::contracts::WalletTransaction;
 
 impl WalletTransaction {
     pub(super) fn new<C: SolCall>(chain_id: u64, from: Address, to: Address, call: C) -> Self {

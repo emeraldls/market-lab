@@ -9,6 +9,8 @@ use crate::domain::types::{
 pub struct ScriptTrade {
     pub price: f64,
     pub size: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onchain: Option<Box<crate::domain::onchain::OnchainTrade>>,
 }
 
 impl ScriptTrade {
@@ -16,6 +18,7 @@ impl ScriptTrade {
         Self {
             price: trade.price,
             size: trade.size,
+            onchain: trade.onchain.clone(),
         }
     }
 }
@@ -485,6 +488,7 @@ mod tests {
             price,
             size,
             taker_buy,
+            onchain: None,
         }
     }
 }

@@ -29,6 +29,9 @@ impl VenueId {
     #[allow(non_upper_case_globals)]
     pub const HyperliquidSpot: Self = Self::from_static("hyperliquid");
 
+    #[allow(non_upper_case_globals)]
+    pub const Elysium: Self = Self::from_static("elysium");
+
     const fn from_static(value: &str) -> Self {
         let source = value.as_bytes();
         assert!(!source.is_empty() && source.len() <= MAX_VENUE_ID_LEN);
@@ -191,6 +194,7 @@ impl std::error::Error for VenueIdError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionBackend {
+    Elysium,
     Bulk,
     Hyperliquid,
     Hyperlink,
@@ -198,6 +202,7 @@ pub enum ExecutionBackend {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthBackend {
+    Elysium,
     Bulk,
     Hyperliquid,
     Hyperlink,
@@ -205,6 +210,7 @@ pub enum AuthBackend {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VenueMarket {
+    Contract,
     Perpetual,
     Spot,
     Outcome,
@@ -240,6 +246,7 @@ pub struct VenueSpec {
 impl VenueSpec {
     pub fn label(self) -> String {
         match self.id {
+            VenueId::Elysium => "Elysium".to_string(),
             VenueId::Bulk => "BULK".to_string(),
             VenueId::Hyperliquid => "Hyperliquid".to_string(),
             VenueId::Hyperlink => "HyperLink".to_string(),
@@ -316,12 +323,22 @@ const HYPERLIQUID_SPOT: VenueSpec = VenueSpec {
     market_data_venue: VenueId::HyperliquidSpot,
 };
 
+const ELYSIUM: VenueSpec = VenueSpec {
+    id: VenueId::Elysium,
+    execution: ExecutionBackend::Elysium,
+    auth: AuthBackend::Elysium,
+    market: VenueMarket::Contract,
+    network: NetworkPolicy::TestnetOnly,
+    market_data_venue: VenueId::Elysium,
+};
+
 pub const BUILTIN_VENUES: &[VenueSpec] = &[
     BULK,
     HYPERLIQUID,
     HYPERLINK,
     HYPERLINK_SPOT,
     HYPERLIQUID_SPOT,
+    ELYSIUM,
 ];
 
 pub fn resolve(venue: VenueId) -> Result<VenueSpec> {

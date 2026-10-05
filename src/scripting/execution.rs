@@ -474,6 +474,9 @@ pub struct ScriptOrderRef {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScriptExecutionCommand {
+    Contract {
+        submission: crate::runtime::contracts::Submission,
+    },
     Trade {
         order: ScriptOrderRef,
         exchange: Option<ExecutionVenue>,
@@ -587,6 +590,69 @@ pub(crate) fn queue_execution_call(
         bail!("script execution is disabled; deploy the script with --venue");
     }
     match operation {
+        "swap" | "deposit" | "withdraw" => {
+            if !request_routed {
+                bail!("contract operations require Python V2");
+            }
+            let mut value: serde_json::Value = serde_json::from_str(payload)?;
+            let object = value
+                .as_object_mut()
+                .context("contract request must be an object")?;
+            let key = object
+                .remove("key")
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .context("contract request requires a key")?;
+            if key.is_empty() || key.len() > MAX_EXECUTION_KEY_BYTES {
+                bail!("contract key must be 1-128 bytes");
+            }
+            let exchange = serde_json::from_value(
+                object
+                    .remove("exchange")
+                    .context("contract request requires exchange")?,
+            )?;
+            if !crate::providers::execution::ExecutionAdapter::capabilities(exchange)
+                .contract_actions
+            {
+                bail!("exchange does not support contract operations");
+            }
+            let gas = object.remove("max_gas").unwrap_or_else(|| json!("0.0001"));
+            let gas = gas
+                .as_str()
+                .context("max_gas must be a decimal string in native token units")?;
+            let parts = gas.split('.').collect::<Vec<_>>();
+            if parts.len() > 2
+                || parts
+                    .iter()
+                    .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()))
+                || parts.get(1).is_some_and(|part| part.len() > 18)
+            {
+                bail!("max_gas must be positive with at most 18 decimals");
+            }
+            let max_gas_wei: alloy_primitives::U256 =
+                alloy_primitives::utils::parse_units(gas, 18)?.into();
+            if max_gas_wei.is_zero() {
+                bail!("max_gas must be positive");
+            }
+            if object.insert("action".into(), json!(operation)).is_some() {
+                bail!("contract action is selected by the ctx helper");
+            }
+            let request = serde_json::from_value(value)?;
+            let reference = ScriptOrderRef {
+                id: local_order_id(job_id, &key),
+                key: key.clone(),
+            };
+            let submission = crate::runtime::contracts::Submission {
+                key,
+                exchange,
+                request,
+                max_gas_wei,
+            };
+            commands
+                .lock()
+                .map_err(|_| anyhow::anyhow!("script execution queue lock poisoned"))?
+                .push(ScriptExecutionCommand::Contract { submission });
+            Ok(serde_json::to_value(reference)?)
+        }
         "trade" => {
             let (exchange, request) = decode_execution_request::<ScriptTradeRequest>(
                 payload,

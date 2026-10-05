@@ -113,6 +113,7 @@ impl PoolClient {
                 | "eth_getBlockByNumber"
                 | "eth_getBalance"
                 | "eth_getCode"
+                | "eth_getLogs"
                 | "eth_getTransactionCount"
                 | "eth_getTransactionReceipt"
                 | "eth_getTransactionByHash"

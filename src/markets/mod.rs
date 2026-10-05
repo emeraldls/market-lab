@@ -61,6 +61,7 @@ pub enum ProviderType {
 pub enum MarketType {
     Spot,
     Futures,
+    Contract,
 }
 
 impl MarketType {
@@ -72,6 +73,7 @@ impl MarketType {
         match self {
             Self::Spot => "spot",
             Self::Futures => "futures",
+            Self::Contract => "contract",
         }
     }
 }
@@ -831,16 +833,25 @@ pub fn direct_exchange(exchange: &str) -> Result<(MarketSnapshot, ExchangeMarket
 }
 
 pub fn is_futures_exchange(exchange: &str) -> Result<bool> {
+    Ok(market_type(exchange)?.is_futures())
+}
+
+pub fn market_type(exchange: &str) -> Result<MarketType> {
     ensure_public_exchange_id(exchange)?;
     if let Ok(venue) = crate::domain::execution::ExecutionVenue::parse(exchange) {
-        return Ok(venue.is_perpetual());
+        return Ok(match venue.market() {
+            crate::venues::VenueMarket::Contract => MarketType::Contract,
+            crate::venues::VenueMarket::Perpetual => MarketType::Futures,
+            crate::venues::VenueMarket::Spot | crate::venues::VenueMarket::Outcome => {
+                MarketType::Spot
+            }
+        });
     }
     let registry = market_registry()?;
     registry
         .exchange_types
         .get(&key(exchange))
         .copied()
-        .map(MarketType::is_futures)
         .with_context(|| {
             format!(
                 "exchange `{exchange}` is not present in the installed market snapshots; refresh its markets first"
@@ -853,6 +864,9 @@ pub async fn refresh_route(provider: Option<&str>, exchange: &str) -> Result<Mar
     let snapshot = match provider.map(key).as_deref() {
         Some("mmt") => fetch_mmt_snapshot().await?,
         Some(provider) => bail!("market refresh is not implemented for provider `{provider}`"),
+        None if exchange.eq_ignore_ascii_case("elysium") => {
+            crate::providers::elysium::market_data::market_snapshot().await?
+        }
         None if exchange.eq_ignore_ascii_case("bulkf") => {
             fetch_bulk_snapshot(crate::providers::bulk::BulkNetwork::Mainnet).await?
         }
@@ -1999,6 +2013,9 @@ fn validate_optional_increment(
 
 pub fn canonical_market_symbol(symbol: &str, market_type: MarketType) -> Result<String> {
     let trimmed = symbol.trim();
+    if market_type == MarketType::Contract {
+        return Ok(crate::providers::elysium::market_data::market_address(trimmed)?.to_string());
+    }
     if market_type.is_futures() {
         if let Some((dex, coin)) = trimmed.split_once(':') {
             if dex.is_empty()

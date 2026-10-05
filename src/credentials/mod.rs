@@ -22,6 +22,7 @@ use crate::providers::hyperliquid::signing::{HyperliquidWallet, canonical_addres
 
 mod agent;
 pub mod builder;
+pub mod elysium;
 pub mod pool;
 
 const MMT_API_KEY_ENV: &str = "MMT_API_KEY";
@@ -606,6 +607,9 @@ pub async fn handle_set(args: AuthSetArgs) -> Result<()> {
     if args.agent {
         return agent::import(args).await;
     }
+    if args.output.is_some() && !matches!(args.provider, AuthProvider::Elysium) {
+        bail!("--output is supported for agent import or Elysium wallet setup");
+    }
     if args.reauthorize && args.subaccount.is_some() {
         bail!("`--reauthorize` and `--subaccount` cannot be used together");
     }
@@ -624,6 +628,29 @@ pub async fn handle_set(args: AuthSetArgs) -> Result<()> {
         bail!("`--testnet` is available here only for BULK");
     }
     match args.provider {
+        AuthProvider::Elysium => {
+            if args.reauthorize || args.subaccount.is_some() {
+                bail!(
+                    "Elysium uses one funded trading wallet; replacement and subaccounts are not supported"
+                );
+            }
+            let address = elysium::setup()?;
+            if args.output.as_deref() == Some("json") {
+                println!(
+                    "{}",
+                    serde_json::json!({"provider":"elysium", "account":address, "network":"testnet", "chain_id":99801})
+                );
+                return Ok(());
+            }
+            println!("elysium: trading wallet {address}");
+            println!(
+                "  Fund this address with native HYPE for gas and the assets your scripts trade."
+            );
+            println!(
+                "  This is not your fee operator. Back up the credential file before funding it."
+            );
+            print_credential_location("elysium-trading.key")?;
+        }
         AuthProvider::Mmt => {
             if args.subaccount.is_some() {
                 bail!("MMT does not support execution subaccounts");
@@ -670,6 +697,10 @@ pub fn handle_status() -> Result<()> {
     print_bulk_status()?;
     print_hyperliquid_status()?;
     print_hyperlink_status()?;
+    match elysium::address()? {
+        Some(address) => println!("elysium: trading wallet {address}"),
+        None => println!("elysium: not configured"),
+    }
     Ok(())
 }
 
@@ -980,6 +1011,9 @@ async fn handle_create_bulk_subaccount(name: &str, network: BulkNetwork) -> Resu
 
 pub async fn handle_remove(args: AuthProviderArgs) -> Result<()> {
     match args.provider {
+        AuthProvider::Elysium => bail!(
+            "Elysium stores a funded wallet, not a revocable agent. Back up elysium-trading.key and move its assets before removing it manually."
+        ),
         AuthProvider::Mmt => {
             delete_credential_file(MMT_CREDENTIAL_FILE, "MMT API key")?;
             println!("mmt: removed");
@@ -1904,7 +1938,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
 
-    fn test_credential_directory(name: &str) -> PathBuf {
+    pub(super) fn test_credential_directory(name: &str) -> PathBuf {
         let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
             "market-lab-credentials-{name}-{}-{sequence}",

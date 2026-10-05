@@ -641,6 +641,7 @@ impl BulkTradesStream {
                         price: trade.price,
                         size: trade.size,
                         taker_buy: trade.side,
+                        onchain: None,
                     })
                 })
                 .collect();

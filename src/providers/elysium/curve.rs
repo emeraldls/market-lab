@@ -108,7 +108,12 @@ impl PoolClient {
         self.curve_snapshot(market, &block, &at).await
     }
 
-    async fn curve_snapshot(&self, market: Address, block: &Block, at: &Value) -> Result<Value> {
+    pub(super) async fn curve_snapshot(
+        &self,
+        market: Address,
+        block: &Block,
+        at: &Value,
+    ) -> Result<Value> {
         let values = self
             .calls(
                 &[
@@ -327,7 +332,7 @@ impl PoolClient {
                 transaction,
             }];
             details = json!({ "minimum_tokens": self.reserve(token, minimum, &at).await?, "expected_tokens": self.reserve(token, quote.tokens, &at).await?,
-                "maximum_hype": TokenAmount::new(amount, 18)?, "unused_hype_refunded": true });
+                "maximum_hype": TokenAmount::new(amount, 18)?, "fee": TokenAmount::new(quote.fee, 18)?, "unused_hype_refunded": true });
         }
         Ok(
             json!({ "chain_id": self.chain_id, "market": market, "account": account,

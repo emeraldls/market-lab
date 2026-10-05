@@ -74,6 +74,7 @@ impl HyperliquidExecutionAdapter {
     pub fn capabilities_for(product: HyperliquidProduct) -> VenueCapabilities {
         VenueCapabilities {
             venue: venue_for_product(product),
+            contract_actions: false,
             order_kinds: vec![OrderKind::Market, OrderKind::Limit],
             time_in_forces: vec![TimeInForce::Gtc, TimeInForce::Ioc, TimeInForce::Alo],
             reduce_only: product.is_perpetual(),
