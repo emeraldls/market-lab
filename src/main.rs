@@ -147,6 +147,7 @@ async fn main() -> Result<()> {
             AuthCommands::Set(args) => credentials::handle_set(args).await?,
             AuthCommands::Builder { command } => credentials::builder::handle(command).await?,
             AuthCommands::Status => credentials::handle_status()?,
+            AuthCommands::ElysiumWallet => credentials::elysium::print_status()?,
             AuthCommands::Remove(args) => credentials::handle_remove(args).await?,
         },
     }

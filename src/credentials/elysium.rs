@@ -5,6 +5,19 @@ use alloy_signer_local::PrivateKeySigner;
 
 const FILE: &str = "elysium-trading.key";
 
+pub fn print_status() -> Result<()> {
+    println!(
+        "{}",
+        serde_json::json!({
+            "provider": "elysium",
+            "account": address()?,
+            "network": "testnet",
+            "chain_id": 99801,
+        })
+    );
+    Ok(())
+}
+
 pub fn setup() -> Result<Address> {
     setup_at(&credential_directory()?)
 }

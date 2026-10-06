@@ -27,7 +27,7 @@ use crate::scripting::inputs::{
     SourceConfig, SourceConfigs, configured_source_selectors, parse_param_values,
     parse_source_configs, resolve_params, source_configs_payload, source_exchange_label,
     source_provider_label, source_provider_name, source_type_names,
-    validate_historical_source_config, validate_source_configs,
+    validate_historical_source_config, validate_source_configs, validate_source_configs_for_run,
 };
 use crate::scripting::manifest::ScriptSource;
 use crate::scripting::market_data::{
@@ -364,7 +364,11 @@ async fn handle_mode(args: ScriptBacktestArgs, precheck: bool) -> Result<()> {
             return Err(err);
         }
     };
-    let source_validation = validate_source_configs(&script.manifest, &source_configs);
+    let source_validation = if precheck {
+        validate_source_configs_for_run(&script.manifest, &source_configs)
+    } else {
+        validate_source_configs(&script.manifest, &source_configs)
+    };
     if let Err(err) = source_validation {
         let runtime_report = report.finish_error(&err);
         write_report_best_effort(&runtime_report);
@@ -391,6 +395,25 @@ async fn handle_mode(args: ScriptBacktestArgs, precheck: bool) -> Result<()> {
         }
     };
 
+    // Live-only sources and contract actions have no historical simulator. Validate
+    // startup in the same sandbox with execution disabled, never send real trades.
+    if precheck && needs_startup_precheck(&script, &source_configs) {
+        let configured = configured_source_selectors(&source_configs);
+        let session = script.start_session_with_execution_and_sources(
+            &resolved_params,
+            ScriptExecutionContext::disabled(),
+            Some(&configured),
+        )?;
+        drop(session);
+        eprintln!("sandbox startup check passed; live hooks were not backtested");
+        println!(
+            "{}",
+            json!({"type": "script.precheck", "status": "passed", "mode": "startup"})
+        );
+        write_report_best_effort(&report.finish_ok());
+        return Ok(());
+    }
+
     let result = backtest_events(
         args,
         script,
@@ -407,6 +430,57 @@ async fn handle_mode(args: ScriptBacktestArgs, precheck: bool) -> Result<()> {
     };
     write_report_best_effort(&runtime_report);
     result
+}
+
+fn needs_startup_precheck(script: &Script, sources: &SourceConfigs) -> bool {
+    sources
+        .values()
+        .any(|source| validate_historical_source_config(source).is_err())
+        || script.execution_venues().iter().any(|venue| {
+            crate::providers::execution::ExecutionAdapter::capabilities(*venue).contract_actions
+        })
+}
+
+#[cfg(test)]
+mod startup_precheck_tests {
+    use super::*;
+
+    #[test]
+    fn chooses_startup_checks_for_live_sources_and_contract_execution_only() {
+        let cases = [
+            (
+                "candles",
+                "    history.source('btc@candles@hyperliquidf:timeframe=60')",
+                false,
+            ),
+            (
+                "elysium",
+                "    history.source('0x59675174f1700677e608f86016f1cea764e1abfa@trades@elysium')",
+                true,
+            ),
+            (
+                "contract",
+                "    history.source('btc@candles@hyperliquidf:timeframe=60')\n    ctx.swap({'exchange': 'elysium', 'market': '0x59675174f1700677e608f86016f1cea764e1abfa', 'token_in': 'native', 'amount': '0.001', 'key': 'buy'})",
+                true,
+            ),
+        ];
+        for (name, body, expected) in cases {
+            let path = std::env::temp_dir().join(format!(
+                "mlab-startup-check-{}-{name}.py",
+                std::process::id()
+            ));
+            std::fs::write(&path, format!("script = {{'name': 'startup-check', 'version': '2'}}\ndef on_data(ctx, history):\n{body}\n")).unwrap();
+            let script = Script::load(&path).unwrap();
+            let sources = parse_source_configs(script.source_declarations()).unwrap();
+            validate_source_configs_for_run(&script.manifest, &sources).unwrap();
+            assert_eq!(
+                needs_startup_precheck(&script, &sources),
+                expected,
+                "{name}"
+            );
+            std::fs::remove_file(path).unwrap();
+        }
+    }
 }
 
 async fn backtest_events(

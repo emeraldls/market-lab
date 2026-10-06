@@ -678,6 +678,8 @@ impl OutcomeActionCommonArgs {
 #[derive(Subcommand, Debug)]
 pub enum AuthCommands {
     Set(AuthSetArgs),
+    /// Show the public Elysium trading wallet address as JSON; never creates a wallet.
+    ElysiumWallet,
     /// Manage the zero-fee Hyperliquid mainnet builder using browser-signed approval.
     Builder {
         #[command(subcommand)]
