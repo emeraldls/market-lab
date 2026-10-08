@@ -274,8 +274,10 @@ struct BulkMarket {
     quote_asset: String,
     status: String,
     price_precision: u8,
+    #[serde(rename = "sizeDecimals", alias = "sizePrecision")]
     size_precision: u8,
     tick_size: f64,
+    #[serde(rename = "sizeIncrement", alias = "lotSize")]
     lot_size: f64,
     min_notional: f64,
     max_leverage: u16,
@@ -2606,6 +2608,32 @@ fn test_snapshots() -> Vec<MarketSnapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_exchange_info_size_metadata_compatibility() {
+        for payload in [
+            include_str!("../../tests/fixtures/bulk-exchange-info-mainnet.json"),
+            include_str!("../../tests/fixtures/bulk-exchange-info-testnet.json"),
+        ] {
+            let markets: Vec<BulkMarket> =
+                serde_json::from_str(payload).expect("live catalog fixture decodes");
+            let btc = markets
+                .iter()
+                .find(|m| m.symbol == "BTC-USD")
+                .expect("BTC present");
+            assert_eq!(btc.size_precision, 8);
+            assert_eq!(btc.lot_size, 0.00000001);
+            for field in ["sizeDecimals", "sizePrecision", "sizeIncrement", "lotSize"] {
+                let mut raw: serde_json::Value = serde_json::from_str(payload).unwrap();
+                if raw[0].as_object_mut().unwrap().remove(field).is_some() {
+                    assert!(
+                        serde_json::from_value::<Vec<BulkMarket>>(raw).is_err(),
+                        "missing {field} must not silently default"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn snapshots_build_provider_and_direct_indexes() {
