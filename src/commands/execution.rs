@@ -19,6 +19,44 @@ use crate::providers::market_data::MarketDataAdapter;
 use crate::venues::{ExecutionBackend, NetworkPolicy, VenueMarket};
 
 const HYPERLINK_RECONCILIATION_ATTEMPTS: usize = 3;
+
+pub async fn handle_protect(args: crate::cli::ProtectPositionArgs) -> Result<()> {
+    crate::cli::AccountQueryArgs {
+        venue: args.venue,
+        testnet: args.testnet,
+        symbol: Some(args.symbol.clone()),
+        output: args.output,
+    }
+    .validate()?;
+    if !args.dry_run && !args.yes {
+        bail!("protect requires --dry-run for preview or --yes to submit");
+    }
+    let account = ExecutionAdapter::configured_account_for(args.venue, args.testnet, "main")?;
+    let request = crate::domain::execution::PositionProtectionRequest {
+        venue: args.venue,
+        testnet: args.testnet,
+        account,
+        symbol: args.symbol,
+        direction: if args.direction == "long" {
+            PositionDirection::Long
+        } else {
+            PositionDirection::Short
+        },
+        size: args.size,
+        tp: args.tp,
+        sl: args.sl,
+    };
+    let output = if args.dry_run {
+        ExecutionAdapter::new_for_market(request.venue, request.testnet, "main", &request.symbol)
+            .await?
+            .position_protection(&request, false)
+            .await?
+    } else {
+        crate::runtime::submit_position_protection(&request).await?
+    };
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
 const HYPERLINK_RECONCILIATION_DELAY: Duration = Duration::from_millis(250);
 
 pub async fn handle_trade(args: TradeArgs, direction: PositionDirection) -> Result<()> {

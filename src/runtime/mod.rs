@@ -48,7 +48,7 @@ pub mod contracts;
 pub mod pools;
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-pub const RUNTIME_VERSION: u8 = 49;
+pub const RUNTIME_VERSION: u8 = 50;
 // Pool jobs have their own journal; this IPC addition does not change the existing state schema.
 const RUNTIME_STATE_VERSION: u8 = 46;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
@@ -163,6 +163,9 @@ enum RuntimeRequest {
     },
     ExecuteTrade {
         plan: TradePlan,
+    },
+    ProtectPosition {
+        request: crate::domain::execution::PositionProtectionRequest,
     },
     CancelOrder {
         plan: CancelPlan,
@@ -1519,6 +1522,22 @@ pub async fn submit_trade(plan: &TradePlan) -> Result<ExecutionReceipt> {
     response
         .receipt
         .context("mlabd trade response omitted its execution receipt")
+}
+
+pub async fn submit_position_protection(
+    request: &crate::domain::execution::PositionProtectionRequest,
+) -> Result<serde_json::Value> {
+    ensure_running().await?;
+    let response = self::request(RuntimeRequest::ProtectPosition {
+        request: request.clone(),
+    })
+    .await?;
+    if !response.ok {
+        bail!("{}", response.message);
+    }
+    response
+        .action_response
+        .context("position protection response omitted its result")
 }
 
 pub async fn submit_cancel(plan: &CancelPlan) -> Result<ExecutionReceipt> {
@@ -4666,6 +4685,40 @@ async fn handle_connection(
                     message: format!("{error:#}"),
                     status: Some(runtime_status(state)),
                     receipt: None,
+                    ..RuntimeResponse::empty()
+                },
+            }
+        }
+        RuntimeRequest::ProtectPosition { request } => {
+            ensure_account_supervisor(
+                request.venue,
+                request.testnet,
+                &request.account,
+                account_tx,
+                account_supervisors,
+            );
+            let result = async {
+                crate::providers::execution::ExecutionAdapter::new_for_market(
+                    request.venue,
+                    request.testnet,
+                    "main",
+                    &request.symbol,
+                )
+                .await?
+                .position_protection(&request, true)
+                .await
+            }
+            .await;
+            match result {
+                Ok(value) => RuntimeResponse {
+                    ok: true,
+                    message: "protection submitted".into(),
+                    action_response: Some(value),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse {
+                    ok: false,
+                    message: format!("{error:#}"),
                     ..RuntimeResponse::empty()
                 },
             }

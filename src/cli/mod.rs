@@ -55,6 +55,8 @@ pub enum Commands {
     Fills(AccountQueryArgs),
     Cancel(CancelOrderArgs),
     Close(ClosePositionArgs),
+    /// Add native TP/SL to an existing position without placing an entry order.
+    Protect(ProtectPositionArgs),
     Outcome {
         #[command(subcommand)]
         command: OutcomeCommands,
@@ -442,6 +444,29 @@ pub struct ClosePositionArgs {
     #[arg(long, default_value_t = false)]
     pub yes: bool,
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ProtectPositionArgs {
+    pub symbol: String,
+    #[arg(long, default_value_t = ExecutionVenueArg::Bulk)]
+    pub venue: ExecutionVenueArg,
+    #[arg(long)]
+    pub testnet: bool,
+    #[arg(long, value_parser = ["long", "short"])]
+    pub direction: String,
+    #[arg(long)]
+    pub size: f64,
+    #[arg(long)]
+    pub tp: Option<f64>,
+    #[arg(long)]
+    pub sl: Option<f64>,
+    #[arg(long, conflicts_with = "yes")]
+    pub dry_run: bool,
+    #[arg(long)]
+    pub yes: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
     pub output: OutputFormat,
 }
 

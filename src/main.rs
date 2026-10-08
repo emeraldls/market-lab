@@ -54,6 +54,7 @@ async fn main() -> Result<()> {
         Commands::Fills(args) => commands::execution::handle_fills(args).await?,
         Commands::Cancel(args) => commands::execution::handle_cancel(args).await?,
         Commands::Close(args) => commands::execution::handle_close(args).await?,
+        Commands::Protect(args) => commands::execution::handle_protect(args).await?,
         Commands::Outcome { command } => match command {
             OutcomeCommands::Split(args) => commands::outcome::handle_split(args).await?,
             OutcomeCommands::Merge(args) => commands::outcome::handle_merge(args).await?,

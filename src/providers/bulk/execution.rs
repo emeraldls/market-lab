@@ -36,6 +36,103 @@ pub struct BulkExecutionAdapter {
 }
 
 impl BulkExecutionAdapter {
+    pub async fn position_protection(
+        &self,
+        request: &crate::domain::execution::PositionProtectionRequest,
+        submit: bool,
+    ) -> Result<Value> {
+        let market = markets::market(&request.symbol)?;
+        let rules = market.execution_rules()?;
+        let response: Value = self
+            .client
+            .post(
+                "account",
+                &AccountQuery {
+                    query_type: "fullAccount",
+                    user: &request.account,
+                },
+            )
+            .await?;
+        let full = response
+            .as_array()
+            .and_then(|items| items.iter().find_map(|item| item.get("fullAccount")))
+            .context("BULK response omitted fullAccount")?;
+        let positions = full
+            .get("positions")
+            .and_then(Value::as_array)
+            .context("BULK response omitted positions")?;
+        let position = positions
+            .iter()
+            .find(|p| p.get("symbol").and_then(Value::as_str) == Some(market.venue_symbol.as_str()))
+            .context("This position is no longer open. Refresh account activity.")?;
+        let size = position
+            .get("size")
+            .and_then(Value::as_f64)
+            .context("position omitted size")?;
+        let mark = position
+            .get("fairPrice")
+            .and_then(Value::as_f64)
+            .context("position omitted mark price")?;
+        if position.get("iso").and_then(Value::as_bool) == Some(true) {
+            bail!("Managing isolated-position protection is not supported yet");
+        }
+        validate_position_protection(request, size, mark, rules.tick_size)?;
+        // Never stack new protection over existing stops or cancel unrelated orders.
+        let protected = position
+            .pointer("/protection/orders")
+            .and_then(Value::as_array)
+            .is_some_and(|orders| !orders.is_empty());
+        let orders = full
+            .get("openOrders")
+            .and_then(Value::as_array)
+            .context("BULK response omitted open orders")?;
+        let conditional = orders.iter().any(|order| {
+            order.get("symbol").and_then(Value::as_str) == Some(market.venue_symbol.as_str())
+                && (!matches!(
+                    order.get("orderType").and_then(Value::as_str),
+                    Some("limit" | "market")
+                ) || order
+                    .get("trigger")
+                    .is_some_and(|trigger| !trigger.is_null()))
+        });
+        if protected || conditional {
+            bail!(
+                "This position already has conditional orders. Cancel the existing protection before adding new TP/SL."
+            );
+        }
+        if !submit {
+            return Ok(
+                serde_json::json!({"symbol": request.symbol, "direction": request.direction, "size": size.abs(), "mark_price": mark, "tp": request.tp, "sl": request.sl}),
+            );
+        }
+        let credential =
+            crate::credentials::active_bulk_credential_for_account(self.network, &request.account)?;
+        let account = credential.account;
+        let mut signer = signer(self.network, credential.agent);
+        let order = position_protection_order(request, &market.venue_symbol);
+        let signed = signer
+            .sign_action(
+                &Action::Order {
+                    orders: vec![order],
+                },
+                next_nonce()?,
+                &account,
+            )
+            .context("failed to sign position protection")?;
+        // A timeout may occur after acceptance. Do not retry a protection submission.
+        let response = self.trading.post(&signed).await.context(
+            "Protection submission status is unknown. Check open orders before trying again.",
+        )?;
+        if is_trading_acknowledgement(&response) {
+            Ok(serde_json::json!({"status": "submitted"}))
+        } else {
+            Ok(serde_json::to_value(receipt_from_response(
+                &request.account,
+                None,
+                response,
+            )?)?)
+        }
+    }
     pub fn capabilities() -> VenueCapabilities {
         VenueCapabilities {
             venue: ExecutionVenue::Bulk,
@@ -2157,5 +2254,138 @@ mod tests {
             signed_order_ids(&multiple, 2).expect("multiple ids").len(),
             2
         );
+    }
+}
+
+fn validate_position_protection(
+    request: &crate::domain::execution::PositionProtectionRequest,
+    signed_size: f64,
+    mark: f64,
+    tick: f64,
+) -> Result<()> {
+    let long = request.direction == PositionDirection::Long;
+    if !request.size.is_finite()
+        || request.size <= 0.0
+        || !signed_size.is_finite()
+        || signed_size == 0.0
+        || (signed_size > 0.0) != long
+        || (signed_size.abs() - request.size).abs() > 1e-10
+    {
+        bail!("The position changed. Refresh account activity and review TP/SL again.");
+    }
+    if !mark.is_finite() || mark <= 0.0 {
+        bail!("A current mark price is required");
+    }
+    if request.tp.is_none() && request.sl.is_none() {
+        bail!("Enter a take-profit or stop-loss price");
+    }
+    for (name, value, above) in [
+        ("Take-profit", request.tp, long),
+        ("Stop-loss", request.sl, !long),
+    ] {
+        if let Some(price) = value {
+            if !price.is_finite() || price <= 0.0 || !is_step_aligned(price, tick) {
+                bail!("{name} must be positive and aligned to tick size {tick}");
+            }
+            if (above && price <= mark) || (!above && price >= mark) {
+                bail!(
+                    "{name} must be {} the current mark price {mark}",
+                    if above { "above" } else { "below" }
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn position_protection_order(
+    request: &crate::domain::execution::PositionProtectionRequest,
+    symbol: &str,
+) -> OrderItem {
+    let long = request.direction == PositionDirection::Long;
+    match (request.sl, request.tp) {
+        (Some(sl), Some(tp)) => OrderItem::RangeOco(RangeOco {
+            symbol: symbol.into(),
+            is_buy: long,
+            size: request.size,
+            collar_min: sl.min(tp),
+            collar_max: sl.max(tp),
+            limit_min: f64::NAN,
+            limit_max: f64::NAN,
+            iso: false,
+        }),
+        (Some(sl), None) => OrderItem::Stop(Stop {
+            symbol: symbol.into(),
+            is_buy: !long,
+            size: request.size,
+            trigger_price: sl,
+            limit_price: f64::NAN,
+            iso: false,
+        }),
+        (None, Some(tp)) => OrderItem::TakeProfit(TakeProfit {
+            symbol: symbol.into(),
+            is_buy: long,
+            size: request.size,
+            trigger_price: tp,
+            limit_price: f64::NAN,
+            iso: false,
+        }),
+        (None, None) => unreachable!("validated before signing"),
+    }
+}
+
+#[cfg(test)]
+mod position_protection_tests {
+    use super::*;
+    use crate::domain::execution::PositionProtectionRequest;
+    fn request() -> PositionProtectionRequest {
+        PositionProtectionRequest {
+            venue: ExecutionVenue::Bulk,
+            testnet: true,
+            account: "test".into(),
+            symbol: "BTC".into(),
+            direction: PositionDirection::Long,
+            size: 1.0,
+            tp: Some(110.0),
+            sl: Some(90.0),
+        }
+    }
+    #[test]
+    fn validates_position_and_trigger_boundaries() {
+        let mut r = request();
+        assert!(validate_position_protection(&r, 1.0, 100.0, 0.1).is_ok());
+        for size in [0.0, -1.0, 2.0] {
+            assert!(validate_position_protection(&r, size, 100.0, 0.1).is_err());
+        }
+        r.tp = Some(99.0);
+        assert!(validate_position_protection(&r, 1.0, 100.0, 0.1).is_err());
+        r.tp = Some(110.05);
+        assert!(validate_position_protection(&r, 1.0, 100.0, 0.1).is_err());
+        r.tp = None;
+        r.sl = None;
+        assert!(validate_position_protection(&r, 1.0, 100.0, 0.1).is_err());
+        r.direction = PositionDirection::Short;
+        r.tp = Some(90.0);
+        r.sl = Some(110.0);
+        assert!(validate_position_protection(&r, -1.0, 100.0, 0.1).is_ok());
+    }
+    #[test]
+    fn native_protection_never_contains_an_entry_order() {
+        let mut r = request();
+        assert!(matches!(
+            position_protection_order(&r, "BTC-USD"),
+            OrderItem::RangeOco(RangeOco { is_buy: true, .. })
+        ));
+        r.tp = None;
+        assert!(matches!(
+            position_protection_order(&r, "BTC-USD"),
+            OrderItem::Stop(Stop { is_buy: false, .. })
+        ));
+        r.sl = None;
+        r.tp = Some(110.0);
+        assert!(matches!(
+            position_protection_order(&r, "BTC-USD"),
+            OrderItem::TakeProfit(TakeProfit { is_buy: true, .. })
+        ));
     }
 }

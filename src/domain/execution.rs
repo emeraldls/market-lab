@@ -2,6 +2,18 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::venues::VenueId as ExecutionVenue;
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PositionProtectionRequest {
+    pub venue: ExecutionVenue,
+    pub testnet: bool,
+    pub account: String,
+    pub symbol: String,
+    pub direction: PositionDirection,
+    pub size: f64,
+    pub tp: Option<f64>,
+    pub sl: Option<f64>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PositionDirection {

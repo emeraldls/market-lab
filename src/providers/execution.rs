@@ -25,6 +25,13 @@ pub use contracts::{ContractProvider, contract_provider};
 /// no orchestration module needs an exchange-specific branch.
 #[async_trait]
 pub trait ExecutionProvider: Send + Sync {
+    async fn position_protection(
+        &self,
+        _request: &crate::domain::execution::PositionProtectionRequest,
+        _submit: bool,
+    ) -> Result<serde_json::Value> {
+        bail!("this venue does not support managing existing-position TP/SL")
+    }
     fn venue_capabilities(&self) -> VenueCapabilities;
     fn validate_order_id(&self, order_id: &str) -> Result<()>;
     async fn account_snapshot(&self, account: &str) -> Result<AccountSnapshot>;
@@ -108,6 +115,13 @@ pub struct AccountGapRecovery {
 
 #[async_trait]
 impl ExecutionProvider for BulkExecutionAdapter {
+    async fn position_protection(
+        &self,
+        request: &crate::domain::execution::PositionProtectionRequest,
+        submit: bool,
+    ) -> Result<serde_json::Value> {
+        Self::position_protection(self, request, submit).await
+    }
     fn venue_capabilities(&self) -> VenueCapabilities {
         Self::capabilities()
     }
@@ -1164,6 +1178,14 @@ impl ExecutionAdapter {
 
     pub async fn submit_trade(&self, plan: &TradePlan) -> Result<ExecutionReceipt> {
         self.provider.submit_trade(plan).await
+    }
+
+    pub async fn position_protection(
+        &self,
+        request: &crate::domain::execution::PositionProtectionRequest,
+        submit: bool,
+    ) -> Result<serde_json::Value> {
+        self.provider.position_protection(request, submit).await
     }
 
     pub async fn submit_user_outcome(
