@@ -222,6 +222,51 @@ pub async fn handle_leverage_limit(args: AccountQueryArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+struct Balance {
+    available: f64,
+    total: f64,
+}
+
+fn validate_balance_args(args: &AccountQueryArgs) -> Result<()> {
+    args.validate()?;
+    if args.venue.market() != VenueMarket::Perpetual {
+        bail!("balance requires a perpetual venue with a margin account");
+    }
+    if args.symbol.is_some() {
+        bail!("balance is account-wide and does not support --symbol");
+    }
+    Ok(())
+}
+
+fn account_balance(snapshot: &crate::domain::execution::AccountSnapshot) -> Result<Balance> {
+    // Margin is required by AccountSnapshot and provider deserializers; never
+    // substitute a default margin when the venue payload is missing it.
+    let available = snapshot.margin.available_balance;
+    let total = snapshot.margin.total_balance;
+    if !available.is_finite() || !total.is_finite() {
+        bail!("account margin contains a non-finite balance");
+    }
+    Ok(Balance { available, total })
+}
+
+pub async fn handle_balance(args: AccountQueryArgs) -> Result<()> {
+    validate_balance_args(&args)?;
+    let account = ExecutionAdapter::configured_account_for(args.venue, args.testnet, "main")?;
+    let snapshot = ExecutionAdapter::new(args.venue, args.testnet)
+        .await?
+        .account_snapshot(&account)
+        .await?;
+    if snapshot.venue != args.venue || snapshot.account != account {
+        bail!("balance snapshot does not match the requested venue and account");
+    }
+    let balance = account_balance(&snapshot)?;
+    render_structured(&balance, args.output, || {
+        println!("Available: {}", balance.available);
+        println!("Total: {}", balance.total);
+    })
+}
+
 pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
     args.validate()?;
     let venue = args.venue;
@@ -1529,6 +1574,76 @@ fn now_ms() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn balance_cli_validates_venue_network_and_scope() {
+        use clap::Parser;
+        for venue in [
+            "bulkf",
+            "hyperliquidf",
+            "hyperlinkf",
+            "hyperliquid",
+            "hyperlink",
+        ] {
+            for testnet in [false, true] {
+                let mut argv = vec!["mlab", "balance", "--venue", venue, "--output=json"];
+                if testnet {
+                    argv.push("--testnet");
+                }
+                let cli = crate::cli::Cli::try_parse_from(argv).expect("balance parses");
+                let crate::cli::Commands::Balance(mut args) = cli.command else {
+                    panic!("wrong command")
+                };
+                let supported = ["bulkf", "hyperliquidf", "hyperlinkf"].contains(&venue)
+                    && !(venue == "hyperlinkf" && testnet);
+                assert_eq!(
+                    validate_balance_args(&args).is_ok(),
+                    supported,
+                    "{venue} testnet={testnet}"
+                );
+                args.symbol = Some("BTC".to_string());
+                assert!(validate_balance_args(&args).is_err());
+            }
+        }
+        assert!(crate::cli::Cli::try_parse_from(["mlab", "balance", "--venue=unknown"]).is_err());
+        let cli = crate::cli::Cli::try_parse_from(["mlab", "balance", "--output=csv"]).unwrap();
+        let crate::cli::Commands::Balance(args) = cli.command else {
+            panic!("wrong command")
+        };
+        assert!(validate_balance_args(&args).is_err());
+    }
+
+    #[test]
+    fn balance_requires_margin_and_preserves_reported_values() {
+        use crate::domain::execution::AccountSnapshot;
+        let mut value = serde_json::json!({
+            "venue": "hyperliquidf", "account": "test", "fetched_at_ms": 1,
+            "positions": [], "open_orders": [], "leverage_settings": []
+        });
+        assert!(serde_json::from_value::<AccountSnapshot>(value.clone()).is_err());
+        value["margin"] = serde_json::json!({"available_balance": 1.0});
+        assert!(serde_json::from_value::<AccountSnapshot>(value.clone()).is_err());
+        value["margin"] = serde_json::json!({
+            "available_balance": 12.5, "total_balance": 20.0,
+            "margin_used": 7.5, "notional": 0.0, "realized_pnl": 0.0,
+            "unrealized_pnl": 0.0, "fees": 0.0, "funding": 0.0
+        });
+        let mut snapshot: AccountSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            serde_json::to_value(account_balance(&snapshot).unwrap()).unwrap(),
+            serde_json::json!({"available": 12.5, "total": 20.0})
+        );
+        snapshot.margin.available_balance = 0.0;
+        snapshot.margin.total_balance = -2.0;
+        assert_eq!(account_balance(&snapshot).unwrap().total, -2.0);
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            snapshot.margin.available_balance = invalid;
+            assert!(account_balance(&snapshot).is_err());
+            snapshot.margin.available_balance = 0.0;
+            snapshot.margin.total_balance = invalid;
+            assert!(account_balance(&snapshot).is_err());
+        }
+    }
 
     #[test]
     fn step_alignment_handles_decimal_market_rules() {

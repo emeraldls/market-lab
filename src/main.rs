@@ -49,6 +49,7 @@ async fn main() -> Result<()> {
                 commands::execution::handle_trade(args, PositionDirection::Short).await?
             }
         },
+        Commands::Balance(args) => commands::execution::handle_balance(args).await?,
         Commands::Positions(args) => commands::execution::handle_positions(args).await?,
         Commands::LeverageLimit(args) => commands::execution::handle_leverage_limit(args).await?,
         Commands::Orders(args) => commands::execution::handle_orders(args).await?,

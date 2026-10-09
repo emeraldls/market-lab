@@ -50,6 +50,8 @@ pub enum Commands {
         #[command(subcommand)]
         command: TradeCommands,
     },
+    /// Read available collateral and total equity without changing account state.
+    Balance(AccountQueryArgs),
     Positions(AccountQueryArgs),
     /// Read the connected account's maximum leverage for one market. Does not change leverage.
     LeverageLimit(AccountQueryArgs),
