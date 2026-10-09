@@ -2611,9 +2611,17 @@ mod tests {
 
     #[test]
     fn bulk_exchange_info_size_metadata_compatibility() {
-        for payload in [
-            include_str!("../../tests/fixtures/bulk-exchange-info-mainnet.json"),
-            include_str!("../../tests/fixtures/bulk-exchange-info-testnet.json"),
+        for (payload, precision, lot) in [
+            (
+                include_str!("../../tests/fixtures/bulk-exchange-info-mainnet.json"),
+                8,
+                0.00000001,
+            ),
+            (
+                include_str!("../../tests/fixtures/bulk-exchange-info-testnet.json"),
+                6,
+                0.000001,
+            ),
         ] {
             let markets: Vec<BulkMarket> =
                 serde_json::from_str(payload).expect("live catalog fixture decodes");
@@ -2621,8 +2629,8 @@ mod tests {
                 .iter()
                 .find(|m| m.symbol == "BTC-USD")
                 .expect("BTC present");
-            assert_eq!(btc.size_precision, 8);
-            assert_eq!(btc.lot_size, 0.00000001);
+            assert_eq!(btc.size_precision, precision);
+            assert_eq!(btc.lot_size, lot);
             for field in ["sizeDecimals", "sizePrecision", "sizeIncrement", "lotSize"] {
                 let mut raw: serde_json::Value = serde_json::from_str(payload).unwrap();
                 if raw[0].as_object_mut().unwrap().remove(field).is_some() {

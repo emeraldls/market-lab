@@ -96,6 +96,11 @@ fn render_job(job: &StrategyJob, output: OutputFormat) -> Result<()> {
             println!("  strategy:         {}", job.definition.name());
             println!("  symbol:           {}", job.definition.symbol());
             match &job.definition {
+                StrategyJobDefinition::Pov(d)
+                | StrategyJobDefinition::Iceberg(d)
+                | StrategyJobDefinition::Scale(d) => {
+                    println!("{}", serde_json::to_string_pretty(d)?)
+                }
                 StrategyJobDefinition::Twap(definition) => {
                     println!("  venue:            {}", definition.venue);
                     println!("  side:             {:?}", definition.side);

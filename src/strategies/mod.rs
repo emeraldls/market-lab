@@ -3,3 +3,5 @@ pub mod jobs;
 pub mod oiwap;
 pub mod twap;
 pub mod vwap;
+
+pub mod managed;

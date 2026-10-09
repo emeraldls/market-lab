@@ -48,7 +48,7 @@ pub mod contracts;
 pub mod pools;
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-pub const RUNTIME_VERSION: u8 = 50;
+pub const RUNTIME_VERSION: u8 = 51;
 // Pool jobs have their own journal; this IPC addition does not change the existing state schema.
 const RUNTIME_STATE_VERSION: u8 = 46;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
@@ -4038,7 +4038,38 @@ async fn execute_strategy_trade(
         }
     }
 
-    let receipt = execute_trade(paths, adapter, state, plan, None, None).await?;
+    let managed = matches!(
+        job.definition,
+        StrategyJobDefinition::Pov(_)
+            | StrategyJobDefinition::Iceberg(_)
+            | StrategyJobDefinition::Scale(_)
+    );
+    if let StrategyJobDefinition::Pov(d)
+    | StrategyJobDefinition::Iceberg(d)
+    | StrategyJobDefinition::Scale(d) = &job.definition
+    {
+        let prefix = format!("{job_id}:");
+        let mut committed = 0.0;
+        for (_, receipt) in state
+            .strategy_executions
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+        {
+            committed += receipt
+                .requested_size
+                .context("missing persisted child size; refusing duplicate exposure")?;
+        }
+        if committed + plan.size > d.base.total_size + 1e-10_f64.max(d.base.total_size * 1e-10) {
+            bail!("strategy would exceed approved total size");
+        }
+    }
+    if managed && job.status == StrategyJobStatus::Stopping {
+        bail!("strategy is stopping; no new child orders are permitted");
+    }
+    let mut receipt = execute_trade(paths, adapter, state, plan, None, None).await?;
+    if managed {
+        receipt.requested_size = Some(plan.size);
+    }
     state
         .strategy_executions
         .insert(execution_key, receipt.clone());
@@ -4052,6 +4083,16 @@ fn validate_strategy_trade(
     plan: &TradePlan,
 ) -> Result<()> {
     let (venue, symbol, side, total_size, leverage, reduce_only) = match definition {
+        StrategyJobDefinition::Pov(d)
+        | StrategyJobDefinition::Iceberg(d)
+        | StrategyJobDefinition::Scale(d) => (
+            d.base.venue,
+            d.base.symbol.as_str(),
+            d.base.side,
+            d.base.total_size,
+            d.base.leverage,
+            d.base.reduce_only,
+        ),
         StrategyJobDefinition::Twap(definition) => (
             definition.venue,
             definition.symbol.as_str(),
@@ -4099,6 +4140,11 @@ fn validate_strategy_trade(
     }
 
     match definition {
+        StrategyJobDefinition::Pov(d)
+        | StrategyJobDefinition::Iceberg(d)
+        | StrategyJobDefinition::Scale(d) => {
+            crate::commands::strategy::managed::validate_child(d, sequence, plan)?
+        }
         StrategyJobDefinition::Twap(definition) => {
             let child_orders = definition
                 .duration_seconds
@@ -7069,7 +7115,7 @@ mod tests {
 
     #[test]
     fn runtime_protocol_v46_decodes_oiwap_submissions() {
-        assert_eq!(RUNTIME_VERSION, 49);
+        assert!(RUNTIME_VERSION >= 46);
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",

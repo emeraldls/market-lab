@@ -202,6 +202,9 @@ pub enum StrategyJobDefinition {
     Twap(TwapJobDefinition),
     Vwap(VwapJobDefinition),
     Oiwap(OiwapJobDefinition),
+    Pov(crate::strategies::managed::ManagedDefinition),
+    Iceberg(crate::strategies::managed::ManagedDefinition),
+    Scale(crate::strategies::managed::ManagedDefinition),
 }
 
 impl StrategyJobDefinition {
@@ -210,6 +213,9 @@ impl StrategyJobDefinition {
             Self::Twap(_) => "twap",
             Self::Vwap(_) => "vwap",
             Self::Oiwap(_) => "oiwap",
+            Self::Pov(_) => "pov",
+            Self::Iceberg(_) => "iceberg",
+            Self::Scale(_) => "scale",
         }
     }
 
@@ -218,6 +224,9 @@ impl StrategyJobDefinition {
             Self::Twap(definition) => &definition.symbol,
             Self::Vwap(definition) => &definition.symbol,
             Self::Oiwap(definition) => &definition.symbol,
+            Self::Pov(definition) | Self::Iceberg(definition) | Self::Scale(definition) => {
+                &definition.base.symbol
+            }
         }
     }
 
@@ -226,6 +235,9 @@ impl StrategyJobDefinition {
             Self::Twap(definition) => definition.venue,
             Self::Vwap(definition) => definition.venue,
             Self::Oiwap(definition) => definition.venue,
+            Self::Pov(definition) | Self::Iceberg(definition) | Self::Scale(definition) => {
+                definition.base.venue
+            }
         }
     }
 
@@ -234,6 +246,9 @@ impl StrategyJobDefinition {
             Self::Twap(definition) => definition.testnet,
             Self::Vwap(definition) => definition.testnet,
             Self::Oiwap(definition) => definition.testnet,
+            Self::Pov(definition) | Self::Iceberg(definition) | Self::Scale(definition) => {
+                definition.base.testnet
+            }
         }
     }
 
@@ -242,6 +257,12 @@ impl StrategyJobDefinition {
             Self::Twap(definition) => definition.validate(),
             Self::Vwap(definition) => definition.validate(),
             Self::Oiwap(definition) => definition.validate(),
+            Self::Pov(d) | Self::Iceberg(d) | Self::Scale(d) => {
+                if d.style.name() != self.name() {
+                    bail!("strategy style does not match job name");
+                }
+                d.validate()
+            }
         }
     }
 }

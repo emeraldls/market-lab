@@ -1,4 +1,5 @@
 pub mod jobs;
+pub mod managed;
 pub mod oiwap;
 pub mod twap;
 pub mod vwap;
@@ -6,6 +7,11 @@ pub mod vwap;
 pub async fn handle_worker(job_id: &str) -> anyhow::Result<()> {
     let job = crate::runtime::get_strategy_job_from_running_daemon(job_id).await?;
     match job.definition {
+        crate::strategies::jobs::StrategyJobDefinition::Pov(_)
+        | crate::strategies::jobs::StrategyJobDefinition::Iceberg(_)
+        | crate::strategies::jobs::StrategyJobDefinition::Scale(_) => {
+            managed::handle_worker_job(job_id, job).await
+        }
         crate::strategies::jobs::StrategyJobDefinition::Twap(_) => {
             twap::handle_worker_job(job_id, job).await
         }

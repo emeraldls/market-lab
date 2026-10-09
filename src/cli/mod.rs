@@ -848,6 +848,9 @@ pub enum StrategyRunCommands {
     Twap(RunTwapArgs),
     Vwap(RunVwapArgs),
     Oiwap(RunOiwapArgs),
+    Pov(RunManagedArgs),
+    Iceberg(RunManagedArgs),
+    Scale(RunManagedArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -5066,4 +5069,28 @@ mod tests {
         );
         assert!(parse_datetime_ms("1704067200000").is_err());
     }
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct RunManagedArgs {
+    #[command(flatten)]
+    pub base: RunTwapArgs,
+    /// Maximum buy price / minimum sell price for POV or Iceberg.
+    #[arg(long)]
+    pub limit_price: Option<f64>,
+    /// Percentage of observed execution-venue volume, 0 < value <= 100.
+    #[arg(long)]
+    pub participation: Option<f64>,
+    /// Maximum visible base-asset size per Iceberg child.
+    #[arg(long)]
+    pub display_size: Option<f64>,
+    /// Lower bound of the Scale price range.
+    #[arg(long)]
+    pub start_price: Option<f64>,
+    /// Upper bound of the Scale price range.
+    #[arg(long)]
+    pub end_price: Option<f64>,
+    /// Number of evenly sized Scale orders, 2 to 100.
+    #[arg(long)]
+    pub levels: Option<u64>,
 }

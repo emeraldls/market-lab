@@ -118,6 +118,27 @@ async fn main() -> Result<()> {
         Commands::Notebook(args) => commands::notebook::handle(args).await?,
         Commands::Strategy { command: strategy } => match strategy {
             StrategyCommands::Run { command } => match command {
+                StrategyRunCommands::Pov(args) => {
+                    commands::strategy::managed::handle(
+                        args,
+                        market_lab::strategies::managed::ExecutionStyle::Pov,
+                    )
+                    .await?
+                }
+                StrategyRunCommands::Iceberg(args) => {
+                    commands::strategy::managed::handle(
+                        args,
+                        market_lab::strategies::managed::ExecutionStyle::Iceberg,
+                    )
+                    .await?
+                }
+                StrategyRunCommands::Scale(args) => {
+                    commands::strategy::managed::handle(
+                        args,
+                        market_lab::strategies::managed::ExecutionStyle::Scale,
+                    )
+                    .await?
+                }
                 StrategyRunCommands::Twap(args) => commands::strategy::twap::handle(args).await?,
                 StrategyRunCommands::Vwap(args) => commands::strategy::vwap::handle(args).await?,
                 StrategyRunCommands::Oiwap(args) => commands::strategy::oiwap::handle(args).await?,
