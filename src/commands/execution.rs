@@ -200,6 +200,28 @@ async fn reconcile_post_trade_state(
     }
 }
 
+pub async fn handle_leverage_limit(args: AccountQueryArgs) -> Result<()> {
+    args.validate()?;
+    let symbol = validate_optional_symbol(args.venue, args.symbol.as_deref())?
+        .context("leverage-limit requires --symbol")?;
+    let max = ExecutionAdapter::new_for_market(args.venue, args.testnet, "main", &symbol)
+        .await?
+        .max_leverage(&symbol)
+        .await?;
+    if max == 0 {
+        bail!("venue returned zero maximum leverage");
+    }
+    if matches!(args.output, OutputFormat::Terminal) {
+        println!("{symbol}: {max}x max");
+    } else {
+        println!(
+            "{}",
+            serde_json::json!({"venue": args.venue, "symbol": symbol, "testnet": args.testnet, "maxLeverage": max})
+        );
+    }
+    Ok(())
+}
+
 pub async fn handle_positions(args: AccountQueryArgs) -> Result<()> {
     args.validate()?;
     let venue = args.venue;

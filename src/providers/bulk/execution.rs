@@ -14,8 +14,8 @@ use tokio::sync::Mutex;
 use crate::credentials::ActiveBulkCredential;
 use crate::domain::execution::{
     AccountSnapshot, CancelPlan, ExecutionOutcome, ExecutionReceipt, ExecutionVenue, Fill,
-    LeverageSetting, MarginSummary, OpenOrder, OrderKind, OrderRecord, OrderSide, Position,
-    PositionDirection, TradePlan, VenueCapabilities,
+    LeverageSetting, MarginSummary, OpenOrder, OrderKind, OrderRecord, OrderSide, OrderTrigger,
+    Position, PositionDirection, PositionProtectionOrder, TradePlan, VenueCapabilities,
 };
 
 use super::client::BulkClient;
@@ -1339,9 +1339,54 @@ impl From<BulkMargin> for MarginSummary {
     }
 }
 
+fn normalized_order_kind(kind: &str) -> String {
+    match kind {
+        "stop" => "stop_loss",
+        "takeProfit" => "take_profit",
+        "range" => "tp_sl",
+        other => other,
+    }
+    .to_string()
+}
+
+#[derive(Deserialize)]
+struct BulkTrigger {
+    px: f64,
+    #[serde(rename = "pxHi")]
+    px_hi: Option<f64>,
+    lim: Option<f64>,
+    #[serde(rename = "limHi")]
+    lim_hi: Option<f64>,
+}
+
+impl From<BulkTrigger> for OrderTrigger {
+    fn from(value: BulkTrigger) -> Self {
+        Self {
+            price: value.px,
+            price_high: value.px_hi,
+            limit_price: value.lim,
+            limit_price_high: value.lim_hi,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct BulkProtection {
+    orders: Vec<BulkProtectionOrder>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BulkProtectionOrder {
+    order_id: String,
+    order_type: String,
+    trigger: Option<BulkTrigger>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BulkPosition {
+    protection: Option<BulkProtection>,
     symbol: String,
     size: f64,
     price: f64,
@@ -1383,6 +1428,17 @@ impl TryFrom<BulkPosition> for Position {
             fees: value.fees,
             funding: value.funding,
             maintenance_margin: value.maintenance_margin,
+            protection: value.protection.map(|protection| {
+                protection
+                    .orders
+                    .into_iter()
+                    .map(|order| PositionProtectionOrder {
+                        order_id: order.order_id,
+                        order_kind: normalized_order_kind(&order.order_type),
+                        trigger: order.trigger.map(Into::into),
+                    })
+                    .collect()
+            }),
         })
     }
 }
@@ -1396,6 +1452,9 @@ struct OpenOrderEnvelope {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BulkOpenOrder {
+    #[serde(alias = "ot")]
+    order_type: Option<String>,
+    trigger: Option<BulkTrigger>,
     #[serde(alias = "sym")]
     symbol: String,
     #[serde(alias = "oid")]
@@ -1435,6 +1494,8 @@ impl TryFrom<BulkOpenOrder> for OpenOrder {
         };
         let is_buy = value.is_buy.unwrap_or(signed_size >= 0.0);
         Ok(Self {
+            order_kind: value.order_type.as_deref().map(normalized_order_kind),
+            trigger: value.trigger.map(Into::into),
             venue: ExecutionVenue::Bulk,
             internal_symbol,
             venue_symbol,
@@ -1835,6 +1896,8 @@ mod tests {
     #[test]
     fn normalizes_account_timestamps_and_symbols() {
         let order = BulkOpenOrder {
+            order_type: None,
+            trigger: None,
             symbol: "BTC-USD".to_string(),
             order_id: "oid".to_string(),
             price: 100_000.0,
@@ -2336,6 +2399,40 @@ fn position_protection_order(
 
 #[cfg(test)]
 mod position_protection_tests {
+    #[test]
+    fn conditional_metadata_survives_account_normalization() {
+        let position: super::BulkPosition = serde_json::from_value(serde_json::json!({
+            "symbol": "BTC-USD", "size": -1.0, "price": 100.0, "fairPrice": 100.0,
+            "notional": 100.0, "realizedPnl": 0.0, "unrealizedPnl": 0.0,
+            "leverage": 2.0, "liquidationPrice": 150.0, "fees": 0.0,
+            "funding": 0.0, "maintenanceMargin": 1.0,
+            "protection": { "orders": [{"orderId": "protection-1", "orderType": "range", "trigger": {"px": 90.0, "pxHi": 110.0}}] }
+        })).unwrap();
+        let position = crate::domain::execution::Position::try_from(position).unwrap();
+        let protection = position.protection.unwrap();
+        assert_eq!(protection[0].order_id, "protection-1");
+        assert_eq!(protection[0].order_kind, "tp_sl");
+        assert_eq!(
+            protection[0].trigger.as_ref().unwrap().price_high,
+            Some(110.0)
+        );
+        for (wire, kind) in [
+            ("stop", "stop_loss"),
+            ("takeProfit", "take_profit"),
+            ("range", "tp_sl"),
+            ("limit", "limit"),
+        ] {
+            let order: super::BulkOpenOrder = serde_json::from_value(serde_json::json!({
+                "sym": "BTC-USD", "oid": "id", "ot": wire, "px": 90.0,
+                "origSz": -1.0, "sz": -1.0, "fillSz": 0.0, "mk": false,
+                "r": true, "tif": "gtc", "status": "resting", "ts": 1699564800000000000u64,
+                "trigger": if wire == "limit" { serde_json::Value::Null } else { serde_json::json!({"px": 90.0, "pxHi": 110.0}) }
+            })).unwrap();
+            let order = crate::domain::execution::OpenOrder::try_from(order).unwrap();
+            assert_eq!(order.order_kind.as_deref(), Some(kind));
+            assert_eq!(order.trigger.is_some(), wire != "limit");
+        }
+    }
     use super::*;
     use crate::domain::execution::PositionProtectionRequest;
     fn request() -> PositionProtectionRequest {

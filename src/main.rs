@@ -50,6 +50,7 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Positions(args) => commands::execution::handle_positions(args).await?,
+        Commands::LeverageLimit(args) => commands::execution::handle_leverage_limit(args).await?,
         Commands::Orders(args) => commands::execution::handle_orders(args).await?,
         Commands::Fills(args) => commands::execution::handle_fills(args).await?,
         Commands::Cancel(args) => commands::execution::handle_cancel(args).await?,

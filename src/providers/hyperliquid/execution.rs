@@ -1738,6 +1738,7 @@ impl HyperliquidAssetPosition {
             fees: 0.0,
             funding: parse(&self.position.cum_funding.since_open, "cumulative funding")?,
             maintenance_margin: 0.0,
+            protection: None,
         })
     }
 }
@@ -1821,6 +1822,8 @@ impl HyperliquidOpenOrder {
             .as_deref()
             .map_or(Ok(remaining), |value| parse(value, "original order size"))?;
         Ok(Some(OpenOrder {
+            order_kind: None,
+            trigger: None,
             venue: venue_for_product(product),
             internal_symbol,
             venue_symbol: self.coin,

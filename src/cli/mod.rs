@@ -51,6 +51,8 @@ pub enum Commands {
         command: TradeCommands,
     },
     Positions(AccountQueryArgs),
+    /// Read the connected account's maximum leverage for one market. Does not change leverage.
+    LeverageLimit(AccountQueryArgs),
     Orders(AccountQueryArgs),
     Fills(AccountQueryArgs),
     Cancel(CancelOrderArgs),

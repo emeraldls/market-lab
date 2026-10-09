@@ -182,6 +182,21 @@ pub struct MarginSummary {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct OrderTrigger {
+    pub price: f64,
+    pub price_high: Option<f64>,
+    pub limit_price: Option<f64>,
+    pub limit_price_high: Option<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PositionProtectionOrder {
+    pub order_id: String,
+    pub order_kind: String,
+    pub trigger: Option<OrderTrigger>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Position {
     pub venue: ExecutionVenue,
     pub internal_symbol: String,
@@ -199,10 +214,16 @@ pub struct Position {
     pub fees: f64,
     pub funding: f64,
     pub maintenance_margin: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protection: Option<Vec<PositionProtectionOrder>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OpenOrder {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<OrderTrigger>,
     pub venue: ExecutionVenue,
     pub internal_symbol: String,
     pub venue_symbol: String,
