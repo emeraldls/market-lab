@@ -3,8 +3,9 @@ use async_trait::async_trait;
 
 use crate::domain::execution::ExecutionVenue;
 use crate::domain::types::{
-    ExchangeStatistics, FundingRateSnapshot, HistoricalCandle, MarketTicker, OhlcvCandle, OhlcvSeries,
-    OpenInterestSnapshot, OrderBookSnapshot, ProviderHealth, TopOfBook, TradeTick, VolumeBarSeries,
+    ExchangeStatistics, FundingRateSnapshot, HistoricalCandle, MarketTicker, OhlcvCandle,
+    OhlcvSeries, OpenInterestSnapshot, OrderBookSnapshot, ProviderHealth, TopOfBook, TradeTick,
+    VolumeBarSeries,
 };
 use crate::providers::binance::{BinanceMarket, BinanceProvider};
 use crate::providers::bulk::market_data::BulkProvider;
@@ -66,10 +67,19 @@ pub trait MarketDataProvider: Send + Sync {
     }
 
     async fn backtest_candles(
-        &self, symbol: &str, interval: &str, from: u64, to: u64,
+        &self,
+        symbol: &str,
+        interval: &str,
+        from: u64,
+        to: u64,
     ) -> Result<Vec<HistoricalCandle>> {
-        Ok(self.candles(symbol, interval, from, to).await?.data.into_iter()
-            .map(HistoricalCandle::Totals).collect())
+        Ok(self
+            .candles(symbol, interval, from, to)
+            .await?
+            .data
+            .into_iter()
+            .map(HistoricalCandle::Totals)
+            .collect())
     }
 
     async fn volume_bars(
@@ -295,14 +305,28 @@ impl MarketDataProvider for HyperliquidMarketData {
     }
 
     async fn backtest_candles(
-        &self, symbol: &str, interval: &str, from: u64, to: u64,
+        &self,
+        symbol: &str,
+        interval: &str,
+        from: u64,
+        to: u64,
     ) -> Result<Vec<HistoricalCandle>> {
-        if self.product == HyperliquidProduct::Perpetual && self.network == HyperliquidNetwork::Mainnet {
+        if self.product == HyperliquidProduct::Perpetual
+            && self.network == HyperliquidNetwork::Mainnet
+        {
             let symbol = self.resolve_symbol(symbol).await?;
-            return crate::providers::marketlab_cloud::history::candles(&symbol, interval, from, to).await;
+            return crate::providers::marketlab_cloud::history::candles(
+                &symbol, interval, from, to,
+            )
+            .await;
         }
-        Ok(self.candles(symbol, interval, from, to).await?.data.into_iter()
-            .map(HistoricalCandle::Totals).collect())
+        Ok(self
+            .candles(symbol, interval, from, to)
+            .await?
+            .data
+            .into_iter()
+            .map(HistoricalCandle::Totals)
+            .collect())
     }
 
     async fn volume_bars(
@@ -586,9 +610,15 @@ impl MarketDataAdapter {
     }
 
     pub async fn backtest_candles(
-        &self, symbol: &str, interval: &str, from: u64, to: u64,
+        &self,
+        symbol: &str,
+        interval: &str,
+        from: u64,
+        to: u64,
     ) -> Result<Vec<HistoricalCandle>> {
-        self.provider.backtest_candles(symbol, interval, from, to).await
+        self.provider
+            .backtest_candles(symbol, interval, from, to)
+            .await
     }
 
     pub async fn volume_bars(

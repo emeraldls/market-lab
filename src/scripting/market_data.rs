@@ -1,8 +1,8 @@
 use serde::Serialize;
 
 use crate::domain::types::{
-    HistoricalCandle, OhlcvCandle, OhlcvtCandle, OiCandle, OpenInterestSnapshot, TradeTick, VdCandle, VolumeBar,
-    VolumeDeltaTick, VolumeProfile,
+    HistoricalCandle, OhlcvCandle, OhlcvtCandle, OiCandle, OpenInterestSnapshot, TradeTick,
+    VdCandle, VolumeBar, VolumeDeltaTick, VolumeProfile,
 };
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -242,9 +242,15 @@ impl ScriptVolume {
     pub fn from_history(candle: HistoricalCandle) -> Self {
         let candle = ScriptCandle::from_history(candle);
         Self {
-            t: candle.t, volume: candle.volume, trades: Some(candle.trades),
-            close_time: candle.close_time, price: Some(candle.c),
-            p: None, b: None, s: None, pg: None,
+            t: candle.t,
+            volume: candle.volume,
+            trades: Some(candle.trades),
+            close_time: candle.close_time,
+            price: Some(candle.c),
+            p: None,
+            b: None,
+            s: None,
+            pg: None,
         }
     }
 

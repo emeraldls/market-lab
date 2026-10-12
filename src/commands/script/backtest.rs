@@ -1158,10 +1158,7 @@ async fn fetch_direct_sources(
                 data.series.insert(
                     config.selector.clone(),
                     BacktestSeries::Candles(
-                        series
-                            .into_iter()
-                            .map(ScriptCandle::from_history)
-                            .collect(),
+                        series.into_iter().map(ScriptCandle::from_history).collect(),
                     ),
                 );
             }
@@ -1169,10 +1166,7 @@ async fn fetch_direct_sources(
                 data.series.insert(
                     config.selector.clone(),
                     BacktestSeries::Volumes(
-                        series
-                            .into_iter()
-                            .map(ScriptVolume::from_history)
-                            .collect(),
+                        series.into_iter().map(ScriptVolume::from_history).collect(),
                     ),
                 );
             }

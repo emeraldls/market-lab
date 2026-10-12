@@ -22,7 +22,9 @@ struct Page {
     data: Vec<Candle>,
 }
 
-fn required_cursor<'de, D: serde::Deserializer<'de>>(value: D) -> std::result::Result<Option<u64>, D::Error> {
+fn required_cursor<'de, D: serde::Deserializer<'de>>(
+    value: D,
+) -> std::result::Result<Option<u64>, D::Error> {
     Option::<u64>::deserialize(value)
 }
 
@@ -66,7 +68,9 @@ pub async fn candles(symbol: &str, tf: &str, from: u64, to: u64) -> Result<Vec<H
         let response = loop {
             let response = http.get(CANDLES_URL).query(&query).send().await;
             let retry = match &response {
-                Ok(response) => response.status().as_u16() == 429 || response.status().is_server_error(),
+                Ok(response) => {
+                    response.status().as_u16() == 429 || response.status().is_server_error()
+                }
                 Err(error) => error.is_timeout() || error.is_connect(),
             };
             if retry && attempt < 3 {
@@ -76,36 +80,69 @@ pub async fn candles(symbol: &str, tf: &str, from: u64, to: u64) -> Result<Vec<H
             }
             break response.context("Marketlab Cloud candle request failed")?;
         };
-        let response = response.error_for_status().context("Marketlab Cloud history endpoint rejected the request")?;
-        let page: Page = response.json().await.context("Invalid Marketlab Cloud candle response")?;
-        if page.exchange != "hyperliquidf" || page.symbol != symbol || page.tf != tf
-            || page.from != from || page.to != to || page.data.len() > PAGE_SIZE
+        let response = response
+            .error_for_status()
+            .context("Marketlab Cloud history endpoint rejected the request")?;
+        let page: Page = response
+            .json()
+            .await
+            .context("Invalid Marketlab Cloud candle response")?;
+        if page.exchange != "hyperliquidf"
+            || page.symbol != symbol
+            || page.tf != tf
+            || page.from != from
+            || page.to != to
+            || page.data.len() > PAGE_SIZE
         {
             bail!("Marketlab Cloud returned a different market/range or an oversized page");
         }
         if page.coverage_from > from || page.coverage_to < to {
-            bail!("Marketlab Cloud history for {symbol} covers {}..{} ms; requested {from}..{to} ms. Choose an available range",
-                  page.coverage_from, page.coverage_to);
+            bail!(
+                "Marketlab Cloud history for {symbol} covers {}..{} ms; requested {from}..{to} ms. Choose an available range",
+                page.coverage_from,
+                page.coverage_to
+            );
         }
         let mut last = after;
         for row in page.data {
             let prices = [row.open, row.high, row.low, row.close];
-            if row.unix < from || row.unix >= to || row.close_time <= row.unix || row.close_time > to
+            if row.unix < from
+                || row.unix >= to
+                || row.close_time <= row.unix
+                || row.close_time > to
                 || last.is_some_and(|last| row.unix <= last)
                 || prices.iter().any(|v| !v.is_finite() || *v <= 0.0)
-                || row.low > row.open.min(row.close) || row.high < row.open.max(row.close)
-                || !row.v_buy.is_finite() || !row.v_sell.is_finite() || row.v_buy < 0.0 || row.v_sell < 0.0
-                || !(row.v_buy + row.v_sell).is_finite() || row.t_buy.checked_add(row.t_sell).is_none()
+                || row.low > row.open.min(row.close)
+                || row.high < row.open.max(row.close)
+                || !row.v_buy.is_finite()
+                || !row.v_sell.is_finite()
+                || row.v_buy < 0.0
+                || row.v_sell < 0.0
+                || !(row.v_buy + row.v_sell).is_finite()
+                || row.t_buy.checked_add(row.t_sell).is_none()
             {
                 bail!("Invalid or out-of-order Marketlab Cloud candle for {symbol}");
             }
             last = Some(row.unix);
-            result.push(HistoricalCandle::Split(OhlcvtCandle {
-                t: row.unix, o: row.open, h: row.high, l: row.low, c: row.close,
-                vb: row.v_buy, vs: row.v_sell, tb: row.t_buy, ts: row.t_sell,
-            }, row.close_time));
+            result.push(HistoricalCandle::Split(
+                OhlcvtCandle {
+                    t: row.unix,
+                    o: row.open,
+                    h: row.high,
+                    l: row.low,
+                    c: row.close,
+                    vb: row.v_buy,
+                    vs: row.v_sell,
+                    tb: row.t_buy,
+                    ts: row.t_sell,
+                },
+                row.close_time,
+            ));
         }
-        eprintln!("Marketlab Cloud: fetched {} candles for {symbol}", result.len());
+        eprintln!(
+            "Marketlab Cloud: fetched {} candles for {symbol}",
+            result.len()
+        );
         match page.next_cursor {
             Some(cursor) if Some(cursor) == last && after != last => after = Some(cursor),
             Some(_) => bail!("Marketlab Cloud returned a non-advancing history cursor"),
