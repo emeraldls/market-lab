@@ -8,6 +8,7 @@ use crate::domain::requests::{InspectRequest, ReplayRequest};
 use crate::domain::types::{OrderBookLevel, OrderBookSnapshot, ProviderHealth, TopOfBook};
 
 mod client;
+pub mod history;
 
 pub use client::MarketLabCloudClient;
 

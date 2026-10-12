@@ -104,6 +104,12 @@ pub struct OhlcvCandle {
     pub trades: u64,
 }
 
+/// Normalized backtest candles retain taker splits when the source supplies them.
+pub enum HistoricalCandle {
+    Totals(OhlcvCandle),
+    Split(OhlcvtCandle, u64),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OhlcvSeries {
     pub exchange: String,

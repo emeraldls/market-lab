@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use crate::domain::types::{
-    OhlcvCandle, OhlcvtCandle, OiCandle, OpenInterestSnapshot, TradeTick, VdCandle, VolumeBar,
+    HistoricalCandle, OhlcvCandle, OhlcvtCandle, OiCandle, OpenInterestSnapshot, TradeTick, VdCandle, VolumeBar,
     VolumeDeltaTick, VolumeProfile,
 };
 
@@ -45,6 +45,17 @@ pub struct ScriptCandle {
 }
 
 impl ScriptCandle {
+    pub fn from_history(candle: HistoricalCandle) -> Self {
+        match candle {
+            HistoricalCandle::Totals(candle) => Self::from_bulk(candle),
+            HistoricalCandle::Split(candle, close_time) => {
+                let mut candle = Self::from_mmt(candle);
+                candle.close_time = Some(close_time);
+                candle
+            }
+        }
+    }
+
     pub fn from_mmt(candle: OhlcvtCandle) -> Self {
         Self {
             t: timestamp_ms(candle.t),
@@ -228,6 +239,15 @@ pub struct ScriptVolume {
 }
 
 impl ScriptVolume {
+    pub fn from_history(candle: HistoricalCandle) -> Self {
+        let candle = ScriptCandle::from_history(candle);
+        Self {
+            t: candle.t, volume: candle.volume, trades: Some(candle.trades),
+            close_time: candle.close_time, price: Some(candle.c),
+            p: None, b: None, s: None, pg: None,
+        }
+    }
+
     pub fn from_mmt(profile: VolumeProfile) -> Self {
         let volume = profile.b.iter().sum::<f64>() + profile.s.iter().sum::<f64>();
         let price = profile_price(&profile);

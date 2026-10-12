@@ -3,7 +3,7 @@ use async_trait::async_trait;
 
 use crate::domain::execution::ExecutionVenue;
 use crate::domain::types::{
-    ExchangeStatistics, FundingRateSnapshot, MarketTicker, OhlcvCandle, OhlcvSeries,
+    ExchangeStatistics, FundingRateSnapshot, HistoricalCandle, MarketTicker, OhlcvCandle, OhlcvSeries,
     OpenInterestSnapshot, OrderBookSnapshot, ProviderHealth, TopOfBook, TradeTick, VolumeBarSeries,
 };
 use crate::providers::binance::{BinanceMarket, BinanceProvider};
@@ -63,6 +63,13 @@ pub trait MarketDataProvider: Send + Sync {
     ) -> Result<OhlcvSeries> {
         let _ = (symbol, interval, from, to);
         bail!("{} does not provide historical candles", self.label())
+    }
+
+    async fn backtest_candles(
+        &self, symbol: &str, interval: &str, from: u64, to: u64,
+    ) -> Result<Vec<HistoricalCandle>> {
+        Ok(self.candles(symbol, interval, from, to).await?.data.into_iter()
+            .map(HistoricalCandle::Totals).collect())
     }
 
     async fn volume_bars(
@@ -285,6 +292,17 @@ impl MarketDataProvider for HyperliquidMarketData {
     ) -> Result<OhlcvSeries> {
         HyperliquidProvider::candles_for(self.product, symbol, interval, from, to, self.network)
             .await
+    }
+
+    async fn backtest_candles(
+        &self, symbol: &str, interval: &str, from: u64, to: u64,
+    ) -> Result<Vec<HistoricalCandle>> {
+        if self.product == HyperliquidProduct::Perpetual && self.network == HyperliquidNetwork::Mainnet {
+            let symbol = self.resolve_symbol(symbol).await?;
+            return crate::providers::marketlab_cloud::history::candles(&symbol, interval, from, to).await;
+        }
+        Ok(self.candles(symbol, interval, from, to).await?.data.into_iter()
+            .map(HistoricalCandle::Totals).collect())
     }
 
     async fn volume_bars(
@@ -565,6 +583,12 @@ impl MarketDataAdapter {
         to: u64,
     ) -> Result<OhlcvSeries> {
         self.provider.candles(symbol, interval, from, to).await
+    }
+
+    pub async fn backtest_candles(
+        &self, symbol: &str, interval: &str, from: u64, to: u64,
+    ) -> Result<Vec<HistoricalCandle>> {
+        self.provider.backtest_candles(symbol, interval, from, to).await
     }
 
     pub async fn volume_bars(

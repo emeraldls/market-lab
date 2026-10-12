@@ -1144,7 +1144,7 @@ async fn fetch_direct_sources(
             from_utc,
             to_utc
         );
-        let future = adapter.candles(&market_symbol, interval, from, to);
+        let future = adapter.backtest_candles(&market_symbol, interval, from, to);
         let series = tokio::select! {
             result = future => result?,
             _ = &mut cancel => {
@@ -1152,16 +1152,15 @@ async fn fetch_direct_sources(
                 return Err(ScriptCancelled.into());
             }
         };
-        let points = series.data.len();
+        let points = series.len();
         match source {
             ScriptSource::Candles => {
                 data.series.insert(
                     config.selector.clone(),
                     BacktestSeries::Candles(
                         series
-                            .data
                             .into_iter()
-                            .map(ScriptCandle::from_bulk)
+                            .map(ScriptCandle::from_history)
                             .collect(),
                     ),
                 );
@@ -1171,9 +1170,8 @@ async fn fetch_direct_sources(
                     config.selector.clone(),
                     BacktestSeries::Volumes(
                         series
-                            .data
                             .into_iter()
-                            .map(ScriptVolume::from_bulk_candle)
+                            .map(ScriptVolume::from_history)
                             .collect(),
                     ),
                 );
