@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
         },
         Commands::Notebook(args) => commands::notebook::handle(args).await?,
         Commands::Strategy { command: strategy } => match strategy {
-            StrategyCommands::Run { command } => match command {
+            StrategyCommands::Run { command } => match *command {
                 StrategyRunCommands::Pov(args) => {
                     commands::strategy::managed::handle(
                         args,

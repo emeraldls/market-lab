@@ -7115,7 +7115,7 @@ mod tests {
 
     #[test]
     fn runtime_protocol_v46_decodes_oiwap_submissions() {
-        assert!(RUNTIME_VERSION >= 46);
+        const { assert!(RUNTIME_VERSION >= 46) };
 
         let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "type": "submit_strategy_job",

@@ -172,10 +172,10 @@ fn reconcile_fills(
         if !orders.contains_key(&id) || !fill.amount.is_finite() || fill.amount <= 0.0 {
             continue;
         }
-        if let Some(trade_id) = fill.trade_id {
-            if !seen.insert((id.clone(), trade_id)) {
-                continue;
-            }
+        if let Some(trade_id) = fill.trade_id
+            && !seen.insert((id.clone(), trade_id))
+        {
+            continue;
         }
         *totals.entry(id).or_default() += fill.amount;
     }

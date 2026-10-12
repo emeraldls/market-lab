@@ -837,7 +837,7 @@ pub enum ScriptRunHistoryCommands {
 pub enum StrategyCommands {
     Run {
         #[command(subcommand)]
-        command: StrategyRunCommands,
+        command: Box<StrategyRunCommands>,
     },
     Jobs(StrategyJobsArgs),
     Status(StrategyJobArgs),
@@ -4222,11 +4222,11 @@ mod tests {
 
         match cli.command {
             Commands::Strategy {
-                command:
-                    StrategyCommands::Run {
-                        command: StrategyRunCommands::Twap(args),
-                    },
+                command: StrategyCommands::Run { command },
             } => {
+                let StrategyRunCommands::Twap(args) = *command else {
+                    panic!("expected strategy run twap command");
+                };
                 args.validate().expect("TWAP arguments should validate");
                 assert_eq!(args.margin, Some(1000.0));
                 assert_eq!(args.duration, 300);
@@ -4535,11 +4535,11 @@ mod tests {
 
         match cli.command {
             Commands::Strategy {
-                command:
-                    StrategyCommands::Run {
-                        command: StrategyRunCommands::Vwap(args),
-                    },
+                command: StrategyCommands::Run { command },
             } => {
+                let StrategyRunCommands::Vwap(args) = *command else {
+                    panic!("expected strategy run vwap command");
+                };
                 args.validate().expect("VWAP arguments should validate");
                 assert_eq!(args.duration, 3600);
                 assert_eq!(
@@ -4597,11 +4597,11 @@ mod tests {
 
         match cli.command {
             Commands::Strategy {
-                command:
-                    StrategyCommands::Run {
-                        command: StrategyRunCommands::Oiwap(args),
-                    },
+                command: StrategyCommands::Run { command },
             } => {
+                let StrategyRunCommands::Oiwap(args) = *command else {
+                    panic!("expected strategy run oiwap command");
+                };
                 args.validate().expect("OIWAP arguments should validate");
                 assert_eq!(args.duration, 3600);
                 assert_eq!(args.oi_sources, ["binancef@mmt", "hyperliquidf@mmt"]);
@@ -4628,12 +4628,12 @@ mod tests {
         ])
         .expect("CLI shape parses before semantic validation");
         let Commands::Strategy {
-            command:
-                StrategyCommands::Run {
-                    command: StrategyRunCommands::Oiwap(args),
-                },
+            command: StrategyCommands::Run { command },
         } = cli.command
         else {
+            panic!("expected strategy run oiwap command");
+        };
+        let StrategyRunCommands::Oiwap(args) = *command else {
             panic!("expected strategy run oiwap command");
         };
         assert!(
@@ -4704,11 +4704,11 @@ mod tests {
 
         match cli.command {
             Commands::Strategy {
-                command:
-                    StrategyCommands::Run {
-                        command: StrategyRunCommands::Twap(args),
-                    },
+                command: StrategyCommands::Run { command },
             } => {
+                let StrategyRunCommands::Twap(args) = *command else {
+                    panic!("expected strategy run twap command");
+                };
                 let error = args.validate().expect_err("zero duration must fail");
                 assert!(error.to_string().contains("--duration"));
             }
