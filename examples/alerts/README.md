@@ -14,6 +14,6 @@ Add `--testnet` for Bulk/Hyperliquid testnet feeds. Setup privately prompts for 
 
 The sequence waits for Bulk BTC to cross the breakout, then a later Hyperliquid trade must confirm the spread within 30 seconds. Both quotes must be fresh within 5 seconds. It resets after firing, expiry or stale data. Parameters control those values. No orders are placed.
 
-`ctx.alert` returns `buffered` in live jobs and `simulated` in analysis/backtests. Buffering is not delivery confirmation. Run history records `script.alert.submission` (queued, suppressed or rejected) and `script.alert.result` (delivered or failed). The daemon retains per-job/key attempt cooldowns across restart, limits accepted messages to one per second, and never automatically retries an uncertain send. Restarting with a new job ID starts a separate cooldown; sequence state starts empty.
+`ctx.alert` returns `buffered` in live jobs and `simulated` in analysis/backtests. Buffering is not delivery confirmation. Run history records `script.alert.submission` (queued, suppressed or rejected) and `script.alert.result` (delivered or failed). The daemon retains per-job/key attempt cooldowns across restart, spaces sends by at least one second, and never automatically retries an uncertain send. Restarting with a new job ID starts a separate cooldown; sequence state starts empty.
 
 Tokens stay in `credentials/telegram.json` (0600), not in the script. Run `mlab alert remove` to disconnect.

@@ -10,6 +10,28 @@ pub enum AlertCommands {
     Status,
     /// Remove the saved Telegram configuration.
     Remove,
+    #[command(hide = true)]
+    Connection {
+        #[command(subcommand)]
+        command: AlertConnectionCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AlertConnectionCommands {
+    /// Read a token from stdin and begin private-chat pairing.
+    Begin,
+    Check {
+        id: String,
+    },
+    Confirm {
+        id: String,
+    },
+    Cancel {
+        id: String,
+    },
+    Status,
+    Remove,
 }
 
 #[derive(Debug, Args)]

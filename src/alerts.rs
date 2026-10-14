@@ -198,6 +198,50 @@ impl TelegramClient {
             .map_err(|_| anyhow::anyhow!("Telegram setup timed out. Run `mlab alert setup` again and send the new code. Existing credentials are unchanged"))?
     }
 
+    pub(crate) async fn prepare_pairing(&self, token: &str) -> Result<()> {
+        let webhook = self.call(token, "getWebhookInfo", json!({})).await?;
+        ensure!(
+            webhook["url"].as_str() == Some(""),
+            "Use a dedicated Telegram bot for this connection. Its existing webhook was not changed"
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn pairing_update(
+        &self,
+        token: &str,
+        code: &str,
+        since: u64,
+        offset: &mut i64,
+    ) -> Result<Option<i64>> {
+        let result = self
+            .call(
+                token,
+                "getUpdates",
+                json!({"offset":*offset,"limit":100,"timeout":1}),
+            )
+            .await?;
+        for update in result
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Telegram returned invalid updates"))?
+        {
+            let id = update["update_id"]
+                .as_i64()
+                .filter(|id| *id >= 0)
+                .ok_or_else(|| anyhow::anyhow!("Invalid Telegram update ID"))?;
+            if id < *offset {
+                continue;
+            }
+            *offset = id
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("Invalid Telegram update ID"))?;
+            if let Some(chat) = pairing_chat(update, code, since) {
+                return Ok(Some(chat));
+            }
+        }
+        Ok(None)
+    }
+
     pub async fn send(&self, credential: &TelegramCredential, message: &str) -> Result<i64> {
         credential.validate()?;
         ensure!(

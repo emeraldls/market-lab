@@ -15,7 +15,6 @@ const QUEUE_CAPACITY: usize = 64;
 #[derive(Default, Deserialize, Serialize)]
 struct Cooldowns {
     until: BTreeMap<String, u64>,
-    next_send_ms: u64,
 }
 
 impl Cooldowns {
@@ -26,16 +25,11 @@ impl Cooldowns {
             return Ok(false);
         }
         ensure!(
-            now >= self.next_send_ms,
-            "Telegram alert rate limit: at most one accepted message per second"
-        );
-        ensure!(
             self.until.len() < MAX_KEYS,
             "Telegram alert cooldown capacity reached"
         );
         self.until
             .insert(key, now.saturating_add(request.cooldown_seconds * 1000));
-        self.next_send_ms = now.saturating_add(1000);
         Ok(true)
     }
 }
@@ -175,4 +169,38 @@ pub async fn submit(job_id: &str, alert: AlertRequest) -> Result<Value> {
     response
         .action_response
         .context("daemon omitted alert result")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simultaneous_alerts_are_queued_not_dropped_by_sender_pacing() {
+        let mut cooldowns = Cooldowns::default();
+        let alert = AlertRequest {
+            source: "telegram".into(),
+            key: "cross".into(),
+            message: "BTC crossed".into(),
+            cooldown_seconds: 5,
+        };
+        assert!(cooldowns.reserve("first", &alert, 1000).unwrap());
+        assert!(cooldowns.reserve("second", &alert, 1000).unwrap());
+        assert!(!cooldowns.reserve("first", &alert, 1001).unwrap());
+        assert!(cooldowns.reserve("first", &alert, 6000).unwrap());
+    }
+
+    #[test]
+    fn old_cooldown_journals_remain_readable() {
+        let mut cooldowns: Cooldowns =
+            serde_json::from_str(r#"{"until":{"first:cross":9000},"next_send_ms":99999}"#).unwrap();
+        let alert = AlertRequest {
+            source: "telegram".into(),
+            key: "cross".into(),
+            message: "BTC crossed".into(),
+            cooldown_seconds: 5,
+        };
+        assert!(cooldowns.reserve("second", &alert, 1000).unwrap());
+        assert!(!cooldowns.reserve("first", &alert, 1000).unwrap());
+    }
 }

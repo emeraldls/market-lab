@@ -8,11 +8,13 @@ use zeroize::Zeroizing;
 use crate::alerts::TelegramClient;
 use crate::cli::AlertCommands;
 use crate::credentials::telegram::{self, TelegramCredential};
+mod connection;
 
 const TEST_MESSAGE: &str = "Market Lab: Telegram alerts are connected. Did you receive this message? Confirm in your terminal.";
 
 pub async fn handle(command: AlertCommands) -> Result<()> {
     match command {
+        AlertCommands::Connection { command } => connection::handle(command).await?,
         AlertCommands::Setup(args) => {
             ensure!(
                 std::io::stdin().is_terminal() && !crate::remote::is_transport_child(),

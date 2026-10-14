@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 mod alert;
-pub use alert::{AlertCommands, AlertSetupArgs};
+pub use alert::{AlertCommands, AlertConnectionCommands, AlertSetupArgs};
 mod curve;
 pub use curve::{CurveArgs, CurveCommands, CurveSide};
 mod pool;

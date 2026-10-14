@@ -1898,7 +1898,7 @@ pub(crate) fn write_credential_at(
     result
 }
 
-fn delete_credential_at(directory: &Path, file_name: &str, label: &str) -> Result<()> {
+pub(crate) fn delete_credential_at(directory: &Path, file_name: &str, label: &str) -> Result<()> {
     ensure_credential_directory(directory)?;
     let path = directory.join(file_name);
     let metadata = match fs::symlink_metadata(&path) {
