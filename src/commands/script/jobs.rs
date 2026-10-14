@@ -226,6 +226,28 @@ struct TerminalOrder {
 
 fn format_terminal_log(value: &serde_json::Value, state: &mut TerminalLogState) -> Option<String> {
     let record_type = value.get("type")?.as_str()?;
+    if matches!(
+        record_type,
+        "script.alert.submission" | "script.alert.result"
+    ) {
+        let result = value.get("result")?;
+        let status = result
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let key = value
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("alert");
+        let error = result
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(String::new, |error| format!(": {error}"));
+        return Some(format!(
+            "[{}] Telegram alert {key}: {status}{error}",
+            log_time(value.get("ts_ms").and_then(serde_json::Value::as_u64))
+        ));
+    }
     if record_type == "script.run.initializing" {
         let script = value
             .get("script")
@@ -705,6 +727,24 @@ fn validate_output(output: OutputFormat) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_logs_show_alert_delivery_status_and_failure_reason() {
+        let mut state = TerminalLogState::default();
+        for (status, error) in [
+            ("queued", None),
+            ("suppressed", None),
+            ("delivered", None),
+            ("failed", Some("Telegram rate limit reached")),
+        ] {
+            let event = serde_json::json!({"type":"script.alert.result", "key":"breakout", "ts_ms":1000, "result":{"status":status,"error":error}});
+            let line = format_terminal_log(&event, &mut state).unwrap();
+            assert!(line.contains(&format!("Telegram alert breakout: {status}")));
+            if let Some(error) = error {
+                assert!(line.contains(error));
+            }
+        }
+    }
 
     fn event(event: serde_json::Value) -> serde_json::Value {
         serde_json::json!({

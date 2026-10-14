@@ -44,11 +44,12 @@ use crate::strategies::jobs::{
 use crate::venues::VenueMarket;
 use crate::volume::{FillVolumeInput, VolumeExporter};
 
+pub mod alerts;
 pub mod contracts;
 pub mod pools;
 
 // Bump whenever the IPC/state schema changes or the CLI must replace an older daemon.
-pub const RUNTIME_VERSION: u8 = 51;
+pub const RUNTIME_VERSION: u8 = 52;
 // Pool jobs have their own journal; this IPC addition does not change the existing state schema.
 const RUNTIME_STATE_VERSION: u8 = 46;
 const ACCOUNT_RECONNECT_MAX_SECS: u64 = 30;
@@ -147,6 +148,10 @@ impl RuntimeStatus {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum RuntimeRequest {
+    ScriptAlert {
+        job_id: String,
+        alert: crate::alerts::AlertRequest,
+    },
     ScriptContract {
         job_id: String,
         submission: contracts::Submission,
@@ -629,6 +634,7 @@ pub async fn serve() -> Result<()> {
     let adapter = BulkExecutionAdapter::new(false)?;
     let pool_service = pools::Service::start(&paths.directory)?;
     let contract_service = contracts::Service::start(&paths.directory)?;
+    let mut alert_service = alerts::Service::start(&paths.directory)?;
     let mut contract_events = tokio::time::interval(std::time::Duration::from_millis(500));
     let volume_exporter = match VolumeExporter::start(&daemon::market_lab_home()?) {
         Ok(exporter) => exporter,
@@ -674,7 +680,7 @@ pub async fn serve() -> Result<()> {
                     &adapter,
                     &mut state,
                     (&account_tx, &mut account_supervisors),
-                    (&pool_service, &contract_service),
+                    (&pool_service, &contract_service, &mut alert_service),
                 ).await {
                     Ok(stop) => should_stop = stop,
                     Err(error) => record_runtime_error(
@@ -702,6 +708,7 @@ pub async fn serve() -> Result<()> {
         }
     }
 
+    drop(alert_service);
     drop(contract_service);
     drop(pool_service);
     let active_jobs = state
@@ -4587,10 +4594,10 @@ async fn handle_connection(
     adapter: &BulkExecutionAdapter,
     state: &mut RuntimeState,
     account: (&mpsc::Sender<AccountConnectionEvent>, &mut HashSet<String>),
-    services: (&pools::Service, &contracts::Service),
+    services: (&pools::Service, &contracts::Service, &mut alerts::Service),
 ) -> Result<bool> {
     let (account_tx, account_supervisors) = account;
-    let (pool_service, contract_service) = services;
+    let (pool_service, contract_service, alert_service) = services;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut line = String::new();
     BufReader::new(reader)
@@ -4643,6 +4650,15 @@ async fn handle_connection(
     }
     let should_stop = matches!(request, RuntimeRequest::Stop);
     let response = match request {
+        RuntimeRequest::ScriptAlert { job_id, alert } => {
+            match alert_service.enqueue(state, &job_id, alert) {
+                Ok(value) => RuntimeResponse {
+                    action_response: Some(value),
+                    ..RuntimeResponse::empty()
+                },
+                Err(error) => RuntimeResponse::error(format!("{error:#}"), state),
+            }
+        }
         RuntimeRequest::ScriptContract { job_id, submission } => {
             persist_state(paths, state)?;
             match contract_service.enqueue(state, &job_id, submission) {

@@ -3,6 +3,8 @@ use chrono::{NaiveDate, NaiveDateTime};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+mod alert;
+pub use alert::{AlertCommands, AlertSetupArgs};
 mod curve;
 pub use curve::{CurveArgs, CurveCommands, CurveSide};
 mod pool;
@@ -33,6 +35,11 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Configure Telegram notifications for Python scripts.
+    Alert {
+        #[command(subcommand)]
+        command: AlertCommands,
+    },
     Markets(MarketsArgs),
     /// Open and trade two-way Elysium bonding markets, with optional automatic fees.
     Curve(CurveArgs),

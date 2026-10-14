@@ -1,3 +1,4 @@
+pub mod alerts;
 pub mod bots;
 pub mod cli;
 pub mod commands;

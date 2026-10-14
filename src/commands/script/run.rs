@@ -765,7 +765,20 @@ async fn dispatch_execution_commands(
     execution_references: &BTreeMap<String, LiveExecutionReference>,
 ) -> Result<()> {
     for command in commands {
+        if let ScriptExecutionCommand::Alert { request } = command {
+            let key = request.key.clone();
+            let result = match crate::runtime::alerts::submit(job_id, request).await {
+                Ok(value) => value,
+                Err(error) => json!({"status":"rejected", "error":format!("{error:#}")}),
+            };
+            crate::runtime::append_script_output(
+                job_id,
+                &json!({"type":"script.alert.submission", "source":"telegram", "key":key, "ts_ms":now_ms(), "result":result}),
+            )?;
+            continue;
+        }
         let result = match command {
+            ScriptExecutionCommand::Alert { .. } => unreachable!(),
             ScriptExecutionCommand::Contract { submission } => {
                 crate::runtime::contracts::submit(job_id, submission)
                     .await
@@ -2012,6 +2025,7 @@ fn live_stream_payload(
     positions: &BTreeMap<String, Vec<Position>>,
 ) -> Result<Value> {
     let mut payload = serde_json::Map::new();
+    payload.insert("timestamp_ms".into(), json!(update.ts_ms()));
     payload.insert("source".to_string(), Value::String(update.selector.clone()));
     payload.insert(
         "source_type".to_string(),

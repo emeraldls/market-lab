@@ -1204,6 +1204,14 @@ struct EventPayloadContext<'a> {
 fn build_event_payload(ctx: EventPayloadContext<'_>) -> Result<Value> {
     let mut root = Map::new();
     root.insert(
+        "timestamp_ms".into(),
+        json!(backtest_series_event_ts_ms(
+            ctx.series,
+            ctx.record_idx,
+            ctx.config
+        )?),
+    );
+    root.insert(
         "provider".to_string(),
         Value::String(source_provider_name(ctx.config.provider).to_string()),
     );
@@ -1592,6 +1600,9 @@ fn apply_script_execution_commands(
     let mut submitted = 0;
     for command in commands {
         match command {
+            ScriptExecutionCommand::Alert { .. } => {
+                bail!("backtests must simulate alerts in the Python bridge")
+            }
             ScriptExecutionCommand::Contract { .. } => bail!(
                 "contract execution backtests require historical AMM state simulation and are not supported yet"
             ),

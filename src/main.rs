@@ -37,6 +37,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse_from(args);
 
     match cli.command {
+        Commands::Alert { command } => commands::alert::handle(command).await?,
         Commands::Curve(args) => commands::curve::handle(args).await?,
         Commands::Markets(args) => commands::markets::handle(args).await?,
         Commands::Pool { command } => commands::pool::handle(command).await?,

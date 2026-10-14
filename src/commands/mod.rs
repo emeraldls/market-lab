@@ -1,3 +1,4 @@
+pub mod alert;
 pub mod bot;
 pub mod curve;
 pub mod execution;

@@ -474,6 +474,9 @@ pub struct ScriptOrderRef {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScriptExecutionCommand {
+    Alert {
+        request: crate::alerts::AlertRequest,
+    },
     Contract {
         submission: crate::runtime::contracts::Submission,
     },

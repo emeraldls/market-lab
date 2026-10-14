@@ -266,6 +266,7 @@ impl PythonSession {
         request["id"] = Value::from(request_id);
         process.send(&request)?;
 
+        let mut alert_requests = 0;
         loop {
             let remaining = timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {
@@ -287,6 +288,10 @@ impl PythonSession {
             match response.get("type").and_then(Value::as_str) {
                 Some("execution") => {
                     self.handle_execution_request(&mut process, &response)?;
+                }
+                Some("alert") => {
+                    alert_requests += 1;
+                    self.handle_alert_request(&mut process, &response, alert_requests <= 8)?;
                 }
                 Some("study") => {
                     self.handle_study_request(&mut process, &response)?;
@@ -374,6 +379,52 @@ impl PythonSession {
             }),
         };
         process.send(&reply)
+    }
+
+    fn handle_alert_request(
+        &self,
+        process: &mut PythonProcess,
+        response: &Value,
+        within_limit: bool,
+    ) -> Result<()> {
+        let request_id = response
+            .get("requestId")
+            .and_then(Value::as_u64)
+            .context("Python alert request has no request id")?;
+        let result = (|| -> Result<Value> {
+            if !within_limit {
+                bail!("at most 8 alerts may be buffered per Python hook");
+            }
+            let request: crate::alerts::AlertRequest = serde_json::from_value(
+                response
+                    .get("payload")
+                    .cloned()
+                    .context("Python alert has no payload")?,
+            )?;
+            request.validate()?;
+            if matches!(self.execution.job_id.as_str(), "analysis" | "backtest") {
+                return Ok(json!({"status":"simulated", "key":request.key}));
+            }
+            let mut commands = self
+                .commands
+                .lock()
+                .map_err(|_| anyhow::anyhow!("script command queue lock poisoned"))?;
+            if commands
+                .iter()
+                .filter(|c| matches!(c, ScriptExecutionCommand::Alert { .. }))
+                .count()
+                >= 8
+            {
+                bail!("at most 8 alerts may be buffered per Python hook");
+            }
+            let value = json!({"status":"buffered", "key":request.key});
+            commands.push(ScriptExecutionCommand::Alert { request });
+            Ok(value)
+        })();
+        process.send(&match result {
+            Ok(value) => json!({"type":"alert_result", "requestId":request_id, "ok":true, "value":value}),
+            Err(error) => json!({"type":"alert_result", "requestId":request_id, "ok":false, "error":format!("{error:#}")}),
+        })
     }
 
     fn handle_study_request(&self, process: &mut PythonProcess, response: &Value) -> Result<()> {
@@ -1286,6 +1337,7 @@ class Context:
     def __init__(self, params, execution_enabled, execution_key_prefix, artifact_dir):
         self.params = copy.deepcopy(params)
         self.study = Studies(self)
+        self.timestamp_ms = None
         self.source = None
         self.source_type = None
         self.provider = None
@@ -1307,6 +1359,7 @@ class Context:
 
     def _set_market_state(self, event):
         event = event if isinstance(event, dict) else {}
+        self.timestamp_ms = event.get("timestamp_ms")
         self.source = event.get("source")
         self.source_type = event.get("source_type")
         self.provider = event.get("provider")
@@ -1375,6 +1428,23 @@ class Context:
             raise RuntimeError("MarketLab returned an invalid execution response")
         if not response.get("ok"):
             raise RuntimeError(response.get("error", "MarketLab rejected the execution request"))
+        return response.get("value")
+
+    def alert(self, payload):
+        if self._finishing:
+            raise RuntimeError("ctx.alert is unavailable during on_finish")
+        if not isinstance(payload, dict):
+            raise TypeError("ctx.alert expects a dictionary")
+        request_id = self._next_request_id()
+        write_message({"type": "alert", "requestId": request_id, "payload": copy.deepcopy(payload)})
+        line = sys.stdin.readline()
+        if not line:
+            raise RuntimeError("MarketLab closed the alert bridge")
+        response = json.loads(line)
+        if response.get("type") != "alert_result" or response.get("requestId") != request_id:
+            raise RuntimeError("MarketLab returned an invalid alert response")
+        if not response.get("ok"):
+            raise RuntimeError(response.get("error", "Alert request failed"))
         return response.get("value")
 
     def trade(self, request):
@@ -1605,6 +1675,96 @@ mod tests {
             .expect("limited Python process should start");
         assert_eq!(ready["type"], "ready");
         process
+    }
+
+    #[test]
+    fn python_alerts_buffer_without_execution_permissions_and_simulate_backtests() {
+        let path = write_python_script(
+            r#"
+script = {"name": "alerts", "version": "2"}
+def on_data(ctx, history):
+    history.source("btc@candles@binancef", 0)
+    return {"metrics": {"alert": ctx.alert({"source":"telegram", "key":"cross", "message":"BTC crossed"}), "timestamp":ctx.timestamp_ms}}
+"#,
+            "alerts",
+        );
+        let runtime =
+            resolved_python(&path).expect("Python runtime required for alert bridge tests");
+        for (job_id, expected, count) in [
+            ("alert-job", "buffered", 1),
+            ("backtest", "simulated", 0),
+            ("analysis", "simulated", 0),
+        ] {
+            let session = PythonSession::start(
+                &path,
+                &runtime,
+                &json!({}),
+                2,
+                None,
+                ScriptExecutionContext {
+                    job_id: job_id.into(),
+                    enabled: false,
+                    request_routed: false,
+                },
+            )
+            .unwrap();
+            let mut event = candle_event(1000, 100.0);
+            event["timestamp_ms"] = json!(1000);
+            let execution = session
+                .run_event(
+                    event,
+                    "btc@candles@binancef".into(),
+                    json!({"t":1000,"c":100.0}),
+                    Some(1000),
+                    json!([]),
+                )
+                .unwrap();
+            assert_eq!(execution.output.metrics["alert"]["status"], expected);
+            assert_eq!(execution.output.metrics["timestamp"], 1000);
+            assert_eq!(execution.commands.len(), count);
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn python_alerts_are_bounded_and_discarded_when_hook_fails() {
+        let path = write_python_script(
+            r#"
+script = {"name": "bad-alerts", "version": "2"}
+def on_data(ctx, history):
+    history.source("btc@candles@binancef", 0)
+    for n in range(9):
+        ctx.alert({"source":"telegram", "key":str(n), "message":"hello"})
+"#,
+            "bad-alerts",
+        );
+        let runtime =
+            resolved_python(&path).expect("Python runtime required for alert bridge tests");
+        let session = PythonSession::start(
+            &path,
+            &runtime,
+            &json!({}),
+            2,
+            None,
+            ScriptExecutionContext {
+                job_id: "alert-job".into(),
+                enabled: false,
+                request_routed: false,
+            },
+        )
+        .unwrap();
+        let error = session
+            .run_event(
+                candle_event(1000, 100.0),
+                "btc@candles@binancef".into(),
+                json!({"t":1000,"c":100.0}),
+                Some(1000),
+                json!([]),
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("at most 8 alerts"));
+        assert!(session.drain_commands().unwrap().is_empty());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

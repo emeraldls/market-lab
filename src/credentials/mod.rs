@@ -24,6 +24,7 @@ mod agent;
 pub mod builder;
 pub mod elysium;
 pub mod pool;
+pub mod telegram;
 
 const MMT_API_KEY_ENV: &str = "MMT_API_KEY";
 const CREDENTIAL_DIRECTORY_MODE: u32 = 0o700;
@@ -1799,7 +1800,7 @@ fn validate_credential_metadata(path: &Path, metadata: &fs::Metadata, label: &st
     Ok(())
 }
 
-fn read_credential_at(
+pub(crate) fn read_credential_at(
     directory: &Path,
     file_name: &str,
     label: &str,
@@ -1829,7 +1830,7 @@ fn read_credential_at(
     Ok(Some(Zeroizing::new(contents)))
 }
 
-fn write_credential_at(
+pub(crate) fn write_credential_at(
     directory: &Path,
     file_name: &str,
     contents: &[u8],
