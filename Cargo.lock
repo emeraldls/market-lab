@@ -2465,7 +2465,7 @@ dependencies = [
 
 [[package]]
 name = "market-lab"
-version = "0.1.94"
+version = "0.1.95"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
